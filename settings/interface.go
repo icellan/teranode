@@ -198,6 +198,7 @@ type BlockSettings struct {
 	UtxoStore                             *url.URL
 	FileStoreReadConcurrency              int
 	FileStoreWriteConcurrency             int
+	FileStoreUseSystemLimits              bool
 }
 
 type BlockChainSettings struct {

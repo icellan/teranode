@@ -107,7 +107,7 @@ const (
 	defaultReadLimit  = 768 // 75% of original 1024 total
 	defaultWriteLimit = 256 // 25% of original 1024 total
 	minSemaphoreLimit = 1
-	maxSemaphoreLimit = 10000
+	maxSemaphoreLimit = 256_000
 )
 
 // GLOBAL SEMAPHORE DESIGN - ULIMIT PROTECTION AND RACE CONDITION MITIGATION:
