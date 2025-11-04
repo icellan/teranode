@@ -35,14 +35,21 @@ func RunDaemon(progname, version, commit string) {
 	writeLimit := tSettings.Block.FileStoreWriteConcurrency
 
 	if tSettings.Block.FileStoreUseSystemLimits {
-		// determine system ulimit for user processes
-		out, _ := exec.Command("bash", "-c", "ulimit -u").Output()
-		limit, _ := strconv.Atoi(strings.TrimSpace(string(out)))
+		out, err := exec.Command("bash", "-c", "ulimit -u").Output()
+		if err != nil {
+			fmt.Printf("Warning: Failed to get ulimit: %v, using configured limits\n", err)
+		} else {
+			limit, err := strconv.Atoi(strings.TrimSpace(string(out)))
+			if err != nil {
+				fmt.Printf("Warning: Failed to parse ulimit: %v, using configured limits\n", err)
+			} else if limit > 0 {
+				if limit > file.MaxSemaphoreLimit {
+					limit = file.MaxSemaphoreLimit
+				}
 
-		if limit > 0 {
-			// set read and write limits based on ulimit
-			readLimit = limit * 3 / 4
-			writeLimit = limit / 4
+				readLimit = limit * 3 / 4
+				writeLimit = limit / 4
+			}
 		}
 	}
 
