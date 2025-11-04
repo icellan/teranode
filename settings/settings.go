@@ -386,6 +386,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PeerHealthCheckInterval:       getDuration("p2p_health_check_interval", 30*time.Second, alternativeContext...),
 			PeerHealthHTTPTimeout:         getDuration("p2p_health_http_timeout", 5*time.Second, alternativeContext...),
 			PeerHealthRemoveAfterFailures: getInt("p2p_health_remove_after_failures", 3, alternativeContext...),
+			// DHT configuration
+			DHTMode:            getString("p2p_dht_mode", "server", alternativeContext...),
+			DHTCleanupInterval: getDuration("p2p_dht_cleanup_interval", 24*time.Hour, alternativeContext...),
 			// Full/pruned node selection configuration
 			AllowPrunedNodeFallback: getBool("p2p_allow_pruned_node_fallback", true, alternativeContext...),
 		},

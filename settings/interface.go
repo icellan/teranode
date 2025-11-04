@@ -423,6 +423,10 @@ type P2PSettings struct {
 	PeerHealthHTTPTimeout         time.Duration // HTTP timeout for DataHub checks (default: 5s)
 	PeerHealthRemoveAfterFailures int           // Consecutive failures before removing a peer (default: 3)
 
+	// DHT configuration
+	DHTMode            string        // DHT mode: "server" (default, advertises on DHT) or "client" (query-only, no provider storage)
+	DHTCleanupInterval time.Duration // Interval for DHT provider record cleanup (default: 24h, only applies to server mode)
+
 	// Node mode configuration (full vs pruned)
 	AllowPrunedNodeFallback bool // If true, fall back to pruned nodes when no full nodes available (default: true). Selects youngest pruned node (smallest height) to minimize UTXO pruning risk.
 }

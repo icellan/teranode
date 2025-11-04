@@ -319,13 +319,15 @@ func NewServer(
 		return nil, errors.NewServiceError("failed to unmarshal key", err)
 	}
 	conf := p2pMessageBus.Config{
-		PrivateKey:      privKey,
-		Name:            tSettings.ClientName,
-		Logger:          logger,
-		PeerCacheFile:   getPeerCacheFilePath(tSettings.P2P.PeerCacheDir),
-		BootstrapPeers:  staticPeers,
-		RelayPeers:      tSettings.P2P.RelayPeers,
-		ProtocolVersion: bitcoinProtocolVersion,
+		PrivateKey:         privKey,
+		Name:               tSettings.ClientName,
+		Logger:             logger,
+		PeerCacheFile:      getPeerCacheFilePath(tSettings.P2P.PeerCacheDir),
+		BootstrapPeers:     staticPeers,
+		RelayPeers:         tSettings.P2P.RelayPeers,
+		ProtocolVersion:    bitcoinProtocolVersion,
+		DHTMode:            tSettings.P2P.DHTMode,
+		DHTCleanupInterval: tSettings.P2P.DHTCleanupInterval,
 	}
 
 	if len(advertiseAddresses) > 0 {
