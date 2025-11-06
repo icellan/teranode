@@ -328,6 +328,7 @@ func NewServer(
 		ProtocolVersion:    bitcoinProtocolVersion,
 		DHTMode:            tSettings.P2P.DHTMode,
 		DHTCleanupInterval: tSettings.P2P.DHTCleanupInterval,
+		DisableNAT:         tSettings.P2P.DisableNAT,
 	}
 
 	if len(advertiseAddresses) > 0 {

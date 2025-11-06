@@ -391,6 +391,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			DHTCleanupInterval: getDuration("p2p_dht_cleanup_interval", 24*time.Hour, alternativeContext...),
 			// Full/pruned node selection configuration
 			AllowPrunedNodeFallback: getBool("p2p_allow_pruned_node_fallback", true, alternativeContext...),
+			DisableNAT:              getBool("p2p_disable_nat", false, alternativeContext...),
 		},
 		Coinbase: CoinbaseSettings{
 			DB:                    getString("coinbaseDB", "", alternativeContext...),

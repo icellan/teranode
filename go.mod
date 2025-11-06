@@ -174,7 +174,7 @@ require (
 	github.com/bsv-blockchain/go-batcher v1.1.0
 	github.com/bsv-blockchain/go-bn v1.0.3
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
-	github.com/bsv-blockchain/go-p2p-message-bus v0.1.1
+	github.com/bsv-blockchain/go-p2p-message-bus v0.1.2
 	github.com/bsv-blockchain/go-safe-conversion v1.0.3
 	github.com/bsv-blockchain/go-sdk v1.2.6
 	github.com/bsv-blockchain/go-tx-map v1.1.0

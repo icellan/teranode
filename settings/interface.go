@@ -427,6 +427,11 @@ type P2PSettings struct {
 	DHTMode            string        // DHT mode: "server" (default, advertises on DHT) or "client" (query-only, no provider storage)
 	DHTCleanupInterval time.Duration // Interval for DHT provider record cleanup (default: 24h, only applies to server mode)
 
+	// DisableNAT disables NAT traversal features (UPnP/NAT-PMP port mapping, NAT service, hole punching).
+	// Set to true in test environments where NAT traversal is not needed.
+	// Default: false (NAT features enabled)
+	DisableNAT bool
+
 	// Node mode configuration (full vs pruned)
 	AllowPrunedNodeFallback bool // If true, fall back to pruned nodes when no full nodes available (default: true). Selects youngest pruned node (smallest height) to minimize UTXO pruning risk.
 }
