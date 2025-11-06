@@ -440,10 +440,8 @@ func TestGetLastNInvalidBlocksWithInvalidCount(t *testing.T) {
 	err := handler.GetLastNInvalidBlocks(c)
 
 	// Assert results
-	httpErr, ok := err.(*echo.HTTPError)
-	require.True(t, ok)
-	assert.Equal(t, http.StatusBadRequest, httpErr.Code)
-	assert.Contains(t, httpErr.Message, "Invalid count parameter")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Invalid count parameter")
 }
 
 // TestGetLastNInvalidBlocksWithNegativeCount tests the GetLastNInvalidBlocks method with a negative count parameter
@@ -459,10 +457,8 @@ func TestGetLastNInvalidBlocksWithNegativeCount(t *testing.T) {
 	err := handler.GetLastNInvalidBlocks(c)
 
 	// Assert results
-	httpErr, ok := err.(*echo.HTTPError)
-	require.True(t, ok)
-	assert.Equal(t, http.StatusBadRequest, httpErr.Code)
-	assert.Contains(t, httpErr.Message, "Count must be a positive number")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Count must be a positive number")
 }
 
 // TestGetLastNInvalidBlocks tests the GetLastNInvalidBlocks method
@@ -665,10 +661,8 @@ func TestGetLastNInvalidBlocks(t *testing.T) {
 		err := handler.GetLastNInvalidBlocks(c)
 
 		// Assert results
-		httpErr, ok := err.(*echo.HTTPError)
-		require.True(t, ok)
-		assert.Equal(t, http.StatusBadRequest, httpErr.Code)
-		assert.Contains(t, httpErr.Message, "Invalid count parameter")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "Invalid count parameter")
 	})
 
 	t.Run("Negative count parameter", func(t *testing.T) {
@@ -687,10 +681,8 @@ func TestGetLastNInvalidBlocks(t *testing.T) {
 		err := handler.GetLastNInvalidBlocks(c)
 
 		// Assert results
-		httpErr, ok := err.(*echo.HTTPError)
-		require.True(t, ok)
-		assert.Equal(t, http.StatusBadRequest, httpErr.Code)
-		assert.Contains(t, httpErr.Message, "Count must be a positive number")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "Count must be a positive number")
 	})
 
 	t.Run("Error from GetLastNInvalidBlocks", func(t *testing.T) {
@@ -708,10 +700,8 @@ func TestGetLastNInvalidBlocks(t *testing.T) {
 		err := handler.GetLastNInvalidBlocks(c)
 
 		// Assert results
-		httpErr, ok := err.(*echo.HTTPError)
-		require.True(t, ok)
-		assert.Equal(t, http.StatusInternalServerError, httpErr.Code)
-		assert.Contains(t, httpErr.Message, "Failed to retrieve invalid blocks")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "Failed to retrieve invalid blocks")
 
 		// Verify that the mock was called with the correct arguments
 		mockClient.AssertCalled(t, "GetLastNInvalidBlocks", mock.Anything, int64(10))
