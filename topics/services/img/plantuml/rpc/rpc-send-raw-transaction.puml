@@ -1,0 +1,70 @@
+@startuml
+skinparam backgroundColor #F0F8FF
+skinparam defaultFontColor #333333
+skinparam arrowColor #666666
+
+' Define borders for all elements
+skinparam entity {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam control {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+skinparam participant {
+  BorderColor #666666
+  BackgroundColor #DDDDDD
+}
+
+
+
+participant Client
+participant "RPC Server" as RPC
+participant "Propagation Service" as Propagation
+
+Client -> RPC : SendRawTransactionCmd(HexTx, AllowHighFees)
+activate RPC
+
+RPC -> RPC : Prepend "0" if odd length
+RPC -> RPC : hex.DecodeString(hexStr)
+
+alt If Hex Decoding Fails
+    RPC -> Client : Return rpcDecodeHexError
+else If Hex Decoding Succeeds
+    RPC -> RPC : bt.NewTxFromBytes(serializedTx)
+
+    alt If Parsing Fails
+        RPC -> Client : Return ErrRPCDeserialization
+    else If Parsing Succeeds
+        RPC -> RPC : Check propagationClient is available
+
+        alt If Propagation Client Not Available
+            RPC -> Client : Return ErrRPCInternal
+        else If Client Available
+            RPC -> Propagation : ProcessTransaction(ctx, tx) via gRPC
+            activate Propagation
+            note right: Direct call to cluster's\npropagation service
+            Propagation -> RPC : return error or nil
+            deactivate Propagation
+
+            alt If Transaction Rejected
+                RPC -> Client : Return ErrRPCInvalidParameter with error message
+            else If Transaction Accepted
+                RPC -> Client : Return transaction hash (txid)
+                note right
+                Simple string response:
+                Transaction hash only
+                end note
+            end
+        end
+    end
+end
+
+deactivate RPC
+
+left footer Last Modified On: %date("dd-MMM-yyyy")
+
+@enduml
