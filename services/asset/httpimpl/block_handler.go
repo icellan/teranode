@@ -7,6 +7,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/labstack/echo/v4"
 )
@@ -21,6 +22,8 @@ import (
 type BlockHandler struct {
 	// blockchainClient provides access to the blockchain service for executing operations
 	blockchainClient blockchain.ClientI
+	// blockvalidationClient provides access to the block validation service for revalidating blocks
+	blockvalidationClient blockvalidation.Interface
 	// logger enables structured logging of handler operations and errors
 	logger ulogger.Logger
 }
@@ -51,10 +54,12 @@ type blockRequest struct {
 //
 // Returns:
 //   - *BlockHandler: Fully initialized handler ready to process block operations
-func NewBlockHandler(blockchainClient blockchain.ClientI, logger ulogger.Logger) *BlockHandler {
+func NewBlockHandler(blockchainClient blockchain.ClientI, blockvalidationClient blockvalidation.Interface,
+	logger ulogger.Logger) *BlockHandler {
 	return &BlockHandler{
-		blockchainClient: blockchainClient,
-		logger:           logger,
+		blockchainClient:      blockchainClient,
+		blockvalidationClient: blockvalidationClient,
+		logger:                logger,
 	}
 }
 
@@ -182,7 +187,15 @@ func (h *BlockHandler) InvalidateBlock(c echo.Context) error {
 //   - error: Any error encountered during block revalidation
 func (h *BlockHandler) RevalidateBlock(c echo.Context) error {
 	return h.handleBlockOperation(c, "revalidate", func(ctx echo.Context, blockHash *chainhash.Hash) error {
-		return h.blockchainClient.RevalidateBlock(ctx.Request().Context(), blockHash)
+		block, err := h.blockchainClient.GetBlock(ctx.Request().Context(), blockHash)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+
+		options := &blockvalidation.ValidateBlockOptions{
+			IsRevalidation: true,
+		}
+		return h.blockvalidationClient.ValidateBlock(ctx.Request().Context(), block, options)
 	})
 }
 
