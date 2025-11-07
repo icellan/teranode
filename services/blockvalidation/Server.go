@@ -1037,7 +1037,7 @@ func (u *Server) BlockFound(ctx context.Context, req *blockvalidation_api.BlockF
 func (u *Server) RevalidateBlock(ctx context.Context, request *blockvalidation_api.RevalidateBlockRequest) (*blockvalidation_api.EmptyMessage, error) {
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "RevalidateBlock",
 		tracing.WithParentStat(u.stats),
-		tracing.WithLogMessage(u.logger, "[ProcessBlock][%s] revalidate block called", utils.ReverseAndHexEncodeSlice(request.Hash)),
+		tracing.WithLogMessage(u.logger, "[RevalidateBlock][%s] revalidate block called", utils.ReverseAndHexEncodeSlice(request.Hash)),
 	)
 	defer deferFn()
 
@@ -1064,7 +1064,7 @@ func (u *Server) RevalidateBlock(ctx context.Context, request *blockvalidation_a
 
 	err = u.blockValidation.ValidateBlockWithOptions(ctx, block, blockHeaderMeta.PeerID, u.blockValidation.bloomFilterStats, opts)
 	if err != nil {
-		return nil, errors.WrapGRPC(errors.NewServiceError("failed block validation BlockFound [%s]", block.String(), err))
+		return nil, errors.WrapGRPC(errors.NewServiceError("[RevalidateBlock][%s] failed block re-validation", block.String(), err))
 	}
 
 	return &blockvalidation_api.EmptyMessage{}, nil
