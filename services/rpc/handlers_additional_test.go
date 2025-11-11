@@ -5333,6 +5333,10 @@ func (m *mockP2PClient) ReportValidBlock(ctx context.Context, peerID string, blo
 	return nil
 }
 
+func (m *mockP2PClient) RecordBytesDownloaded(ctx context.Context, peerID string, bytesDownloaded uint64) error {
+	return nil
+}
+
 func (m *mockP2PClient) GetPeerRegistry(ctx context.Context) ([]*p2p.PeerInfo, error) {
 	if m.getPeerRegistryFunc != nil {
 		return m.getPeerRegistryFunc(ctx)

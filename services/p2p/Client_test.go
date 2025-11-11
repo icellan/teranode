@@ -179,6 +179,10 @@ func (m *MockPeerServiceClient) GetPeerRegistry(ctx context.Context, in *emptypb
 	}, nil
 }
 
+func (m *MockPeerServiceClient) RecordBytesDownloaded(ctx context.Context, in *p2p_api.RecordBytesDownloadedRequest, opts ...grpc.CallOption) (*p2p_api.RecordBytesDownloadedResponse, error) {
+	return &p2p_api.RecordBytesDownloadedResponse{Ok: true}, nil
+}
+
 func TestSimpleClientGetPeers(t *testing.T) {
 	mockClient := &MockPeerServiceClient{
 		GetPeersFunc: func(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*p2p_api.GetPeersResponse, error) {
