@@ -297,8 +297,11 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 				_ = countingBody.Close()
 
 				// Track bytes downloaded from peer after stream is consumed
+				// Decouple the context to ensure tracking completes even if parent context is cancelled
 				if u.p2pClient != nil && peerID != "" {
-					if err := u.p2pClient.RecordBytesDownloaded(gCtx, peerID, bytesRead); err != nil {
+					trackCtx, _, deferFn := tracing.DecoupleTracingSpan(gCtx, "subtreevalidation", "recordBytesDownloaded")
+					defer deferFn()
+					if err := u.p2pClient.RecordBytesDownloaded(trackCtx, peerID, bytesRead); err != nil {
 						u.logger.Warnf("[CheckBlockSubtrees][%s] failed to record %d bytes downloaded from peer %s: %v", subtreeHash.String(), bytesRead, peerID, err)
 					}
 				}

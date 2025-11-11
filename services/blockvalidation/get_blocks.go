@@ -609,8 +609,11 @@ func (u *Server) fetchSubtreeDataFromPeer(ctx context.Context, subtreeHash *chai
 		reader: subtreeDataReader,
 		onClose: func(bytesRead uint64) {
 			// Track bytes downloaded from peer when reader is closed (after all data consumed)
+			// Decouple the context to ensure tracking completes even if parent context is cancelled
 			if u.p2pClient != nil && peerID != "" {
-				if err := u.p2pClient.RecordBytesDownloaded(ctx, peerID, bytesRead); err != nil {
+				trackCtx, _, deferFn := tracing.DecoupleTracingSpan(ctx, "blockvalidation", "recordBytesDownloaded")
+				defer deferFn()
+				if err := u.p2pClient.RecordBytesDownloaded(trackCtx, peerID, bytesRead); err != nil {
 					u.logger.Warnf("[fetchSubtreeDataFromPeer][%s] failed to record %d bytes downloaded from peer %s: %v", subtreeHash.String(), bytesRead, peerID, err)
 				}
 			}
