@@ -34,6 +34,10 @@ type P2PClientI interface {
 	// Returns a slice of PeerInfo sorted by reputation (highest first).
 	GetPeersForCatchup(ctx context.Context) ([]*p2p.PeerInfo, error)
 
+	// GetPeer returns information about a specific peer.
+	// Returns nil if the peer is not found.
+	GetPeer(ctx context.Context, peerID string) (*p2p.PeerInfo, error)
+
 	// ReportValidBlock reports that a block was successfully received and validated from a peer.
 	ReportValidBlock(ctx context.Context, peerID string, blockHash string) error
 

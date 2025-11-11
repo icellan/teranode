@@ -42,6 +42,7 @@ const (
 	PeerService_IsPeerUnhealthy_FullMethodName         = "/p2p_api.PeerService/IsPeerUnhealthy"
 	PeerService_GetPeerRegistry_FullMethodName         = "/p2p_api.PeerService/GetPeerRegistry"
 	PeerService_RecordBytesDownloaded_FullMethodName   = "/p2p_api.PeerService/RecordBytesDownloaded"
+	PeerService_GetPeer_FullMethodName                 = "/p2p_api.PeerService/GetPeer"
 )
 
 // PeerServiceClient is the client API for PeerService service.
@@ -77,6 +78,8 @@ type PeerServiceClient interface {
 	GetPeerRegistry(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetPeerRegistryResponse, error)
 	// Record bytes downloaded via HTTP from a peer
 	RecordBytesDownloaded(ctx context.Context, in *RecordBytesDownloadedRequest, opts ...grpc.CallOption) (*RecordBytesDownloadedResponse, error)
+	// Get single peer information by peer ID
+	GetPeer(ctx context.Context, in *GetPeerRequest, opts ...grpc.CallOption) (*GetPeerResponse, error)
 }
 
 type peerServiceClient struct {
@@ -307,6 +310,16 @@ func (c *peerServiceClient) RecordBytesDownloaded(ctx context.Context, in *Recor
 	return out, nil
 }
 
+func (c *peerServiceClient) GetPeer(ctx context.Context, in *GetPeerRequest, opts ...grpc.CallOption) (*GetPeerResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetPeerResponse)
+	err := c.cc.Invoke(ctx, PeerService_GetPeer_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PeerServiceServer is the server API for PeerService service.
 // All implementations must embed UnimplementedPeerServiceServer
 // for forward compatibility.
@@ -340,6 +353,8 @@ type PeerServiceServer interface {
 	GetPeerRegistry(context.Context, *emptypb.Empty) (*GetPeerRegistryResponse, error)
 	// Record bytes downloaded via HTTP from a peer
 	RecordBytesDownloaded(context.Context, *RecordBytesDownloadedRequest) (*RecordBytesDownloadedResponse, error)
+	// Get single peer information by peer ID
+	GetPeer(context.Context, *GetPeerRequest) (*GetPeerResponse, error)
 	mustEmbedUnimplementedPeerServiceServer()
 }
 
@@ -415,6 +430,9 @@ func (UnimplementedPeerServiceServer) GetPeerRegistry(context.Context, *emptypb.
 }
 func (UnimplementedPeerServiceServer) RecordBytesDownloaded(context.Context, *RecordBytesDownloadedRequest) (*RecordBytesDownloadedResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RecordBytesDownloaded not implemented")
+}
+func (UnimplementedPeerServiceServer) GetPeer(context.Context, *GetPeerRequest) (*GetPeerResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetPeer not implemented")
 }
 func (UnimplementedPeerServiceServer) mustEmbedUnimplementedPeerServiceServer() {}
 func (UnimplementedPeerServiceServer) testEmbeddedByValue()                     {}
@@ -833,6 +851,24 @@ func _PeerService_RecordBytesDownloaded_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PeerService_GetPeer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPeerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).GetPeer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerService_GetPeer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerServiceServer).GetPeer(ctx, req.(*GetPeerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // PeerService_ServiceDesc is the grpc.ServiceDesc for PeerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -927,6 +963,10 @@ var PeerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RecordBytesDownloaded",
 			Handler:    _PeerService_RecordBytesDownloaded_Handler,
+		},
+		{
+			MethodName: "GetPeer",
+			Handler:    _PeerService_GetPeer_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
