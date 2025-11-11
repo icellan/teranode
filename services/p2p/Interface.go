@@ -75,6 +75,16 @@ type ClientI interface {
 	// Returns a slice of PeerInfo or an error if the operation fails.
 	GetPeers(ctx context.Context) ([]*PeerInfo, error)
 
+	// GetPeer retrieves information about a specific peer from the P2P network.
+	// Returns nil if the peer is not found in the registry.
+	//
+	// Parameters:
+	// - ctx: Context for the operation
+	// - peerID: The peer ID to look up
+	//
+	// Returns the peer information or nil if not found, or an error if the operation fails.
+	GetPeer(ctx context.Context, peerID string) (*PeerInfo, error)
+
 	// BanPeer adds a peer to the ban list to prevent future connections.
 	// It can ban by peer ID, IP address, or subnet depending on the request parameters.
 	//

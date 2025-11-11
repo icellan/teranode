@@ -1921,3 +1921,77 @@ func (s *Server) GetPeerRegistry(_ context.Context, _ *emptypb.Empty) (*p2p_api.
 		Peers: peers,
 	}, nil
 }
+
+// GetPeer returns information about a specific peer by peer ID
+func (s *Server) GetPeer(_ context.Context, req *p2p_api.GetPeerRequest) (*p2p_api.GetPeerResponse, error) {
+	s.logger.Debugf("[GetPeer] called for peer %s", req.PeerId)
+
+	if s.peerRegistry == nil {
+		return &p2p_api.GetPeerResponse{
+			Found: false,
+		}, nil
+	}
+
+	// Decode peer ID
+	peerID, err := peer.Decode(req.PeerId)
+	if err != nil {
+		s.logger.Warnf("[GetPeer] invalid peer ID %s: %v", req.PeerId, err)
+		return &p2p_api.GetPeerResponse{
+			Found: false,
+		}, nil
+	}
+
+	// Get peer from registry
+	peerInfo, found := s.peerRegistry.GetPeer(peerID)
+	if !found {
+		s.logger.Debugf("[GetPeer] peer %s not found in registry", req.PeerId)
+		return &p2p_api.GetPeerResponse{
+			Found: false,
+		}, nil
+	}
+
+	// Helper function to convert time to Unix timestamp, returning 0 for zero times
+	timeToUnix := func(t time.Time) int64 {
+		if t.IsZero() {
+			return 0
+		}
+		return t.Unix()
+	}
+
+	// Convert to protobuf format
+	peerRegistryInfo := &p2p_api.PeerRegistryInfo{
+		Id:              peerInfo.ID.String(),
+		Height:          peerInfo.Height,
+		BlockHash:       peerInfo.BlockHash,
+		DataHubUrl:      peerInfo.DataHubURL,
+		BanScore:        int32(peerInfo.BanScore),
+		IsBanned:        peerInfo.IsBanned,
+		IsConnected:     peerInfo.IsConnected,
+		ConnectedAt:     timeToUnix(peerInfo.ConnectedAt),
+		BytesReceived:   peerInfo.BytesReceived,
+		LastBlockTime:   timeToUnix(peerInfo.LastBlockTime),
+		LastMessageTime: timeToUnix(peerInfo.LastMessageTime),
+		UrlResponsive:   peerInfo.URLResponsive,
+		LastUrlCheck:    timeToUnix(peerInfo.LastURLCheck),
+
+		// Interaction/catchup metrics
+		InteractionAttempts:    peerInfo.InteractionAttempts,
+		InteractionSuccesses:   peerInfo.InteractionSuccesses,
+		InteractionFailures:    peerInfo.InteractionFailures,
+		LastInteractionAttempt: timeToUnix(peerInfo.LastInteractionAttempt),
+		LastInteractionSuccess: timeToUnix(peerInfo.LastInteractionSuccess),
+		LastInteractionFailure: timeToUnix(peerInfo.LastInteractionFailure),
+		ReputationScore:        peerInfo.ReputationScore,
+		MaliciousCount:         peerInfo.MaliciousCount,
+		AvgResponseTimeMs:      peerInfo.AvgResponseTime.Milliseconds(),
+		Storage:                peerInfo.Storage,
+		ClientName:             peerInfo.ClientName,
+		LastCatchupError:       peerInfo.LastCatchupError,
+		LastCatchupErrorTime:   timeToUnix(peerInfo.LastCatchupErrorTime),
+	}
+
+	return &p2p_api.GetPeerResponse{
+		Peer:  peerRegistryInfo,
+		Found: true,
+	}, nil
+}

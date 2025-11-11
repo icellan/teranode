@@ -41,6 +41,7 @@ const (
 	PeerService_IsPeerMalicious_FullMethodName         = "/p2p_api.PeerService/IsPeerMalicious"
 	PeerService_IsPeerUnhealthy_FullMethodName         = "/p2p_api.PeerService/IsPeerUnhealthy"
 	PeerService_GetPeerRegistry_FullMethodName         = "/p2p_api.PeerService/GetPeerRegistry"
+	PeerService_GetPeer_FullMethodName                 = "/p2p_api.PeerService/GetPeer"
 )
 
 // PeerServiceClient is the client API for PeerService service.
@@ -74,6 +75,8 @@ type PeerServiceClient interface {
 	IsPeerUnhealthy(ctx context.Context, in *IsPeerUnhealthyRequest, opts ...grpc.CallOption) (*IsPeerUnhealthyResponse, error)
 	// Get full peer registry data with all metadata
 	GetPeerRegistry(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*GetPeerRegistryResponse, error)
+	// Get single peer information by peer ID
+	GetPeer(ctx context.Context, in *GetPeerRequest, opts ...grpc.CallOption) (*GetPeerResponse, error)
 }
 
 type peerServiceClient struct {
@@ -294,6 +297,16 @@ func (c *peerServiceClient) GetPeerRegistry(ctx context.Context, in *emptypb.Emp
 	return out, nil
 }
 
+func (c *peerServiceClient) GetPeer(ctx context.Context, in *GetPeerRequest, opts ...grpc.CallOption) (*GetPeerResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetPeerResponse)
+	err := c.cc.Invoke(ctx, PeerService_GetPeer_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PeerServiceServer is the server API for PeerService service.
 // All implementations must embed UnimplementedPeerServiceServer
 // for forward compatibility.
@@ -325,6 +338,8 @@ type PeerServiceServer interface {
 	IsPeerUnhealthy(context.Context, *IsPeerUnhealthyRequest) (*IsPeerUnhealthyResponse, error)
 	// Get full peer registry data with all metadata
 	GetPeerRegistry(context.Context, *emptypb.Empty) (*GetPeerRegistryResponse, error)
+	// Get single peer information by peer ID
+	GetPeer(context.Context, *GetPeerRequest) (*GetPeerResponse, error)
 	mustEmbedUnimplementedPeerServiceServer()
 }
 
@@ -397,6 +412,9 @@ func (UnimplementedPeerServiceServer) IsPeerUnhealthy(context.Context, *IsPeerUn
 }
 func (UnimplementedPeerServiceServer) GetPeerRegistry(context.Context, *emptypb.Empty) (*GetPeerRegistryResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetPeerRegistry not implemented")
+}
+func (UnimplementedPeerServiceServer) GetPeer(context.Context, *GetPeerRequest) (*GetPeerResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetPeer not implemented")
 }
 func (UnimplementedPeerServiceServer) mustEmbedUnimplementedPeerServiceServer() {}
 func (UnimplementedPeerServiceServer) testEmbeddedByValue()                     {}
@@ -797,6 +815,24 @@ func _PeerService_GetPeerRegistry_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _PeerService_GetPeer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPeerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PeerServiceServer).GetPeer(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PeerService_GetPeer_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PeerServiceServer).GetPeer(ctx, req.(*GetPeerRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // PeerService_ServiceDesc is the grpc.ServiceDesc for PeerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -887,6 +923,10 @@ var PeerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetPeerRegistry",
 			Handler:    _PeerService_GetPeerRegistry_Handler,
+		},
+		{
+			MethodName: "GetPeer",
+			Handler:    _PeerService_GetPeer_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
