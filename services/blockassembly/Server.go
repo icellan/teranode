@@ -1396,6 +1396,7 @@ func (ba *BlockAssembly) GetBlockAssemblyState(ctx context.Context, _ *blockasse
 		BlockAssemblyState:    StateStrings[ba.blockAssembler.GetCurrentRunningState()],
 		SubtreeProcessorState: subtreeprocessor.StateStrings[ba.blockAssembler.subtreeProcessor.GetCurrentRunningState()],
 		SubtreeCount:          subtreeCountUint32,
+		SubtreeSize:           uint32(ba.blockAssembler.subtreeProcessor.GetCurrentSubtree().Size()), // nolint:gosec
 		TxCount:               ba.blockAssembler.TxCount(),
 		QueueCount:            ba.blockAssembler.QueueLength(),
 		CurrentHeight:         currentHeight,
