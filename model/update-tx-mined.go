@@ -8,6 +8,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -177,7 +178,15 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 		blockInvalidError   error
 		blockInvalidErrorMu = sync.Mutex{}
 		setMinedErrorCount  = atomic.Uint64{}
+		lowBlockIdsOnChain  = txmap.NewSyncedMap[uint32, bool]()
 	)
+
+	lowestBlockID := uint32(0)
+	for bID := range chainBlockIDsMap {
+		if lowestBlockID == 0 || bID < lowestBlockID {
+			lowestBlockID = bID
+		}
+	}
 
 	for subtreeIdx, subtree := range block.SubtreeSlices {
 		subtreeIdx := subtreeIdx
@@ -245,6 +254,12 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 											blockInvalidError = errors.NewBlockInvalidError("[UpdateTxMinedStatus][%s] block contains a transaction already on our chain: %s, blockID %d", block.Hash().String(), hash.String(), bID)
 											blockInvalidErrorMu.Unlock()
 										}
+
+										if lowestBlockID > bID {
+											// we cannot determine whether the transaction is on our chain, the blockID is too low
+											// we need to do a lookup from the DB to be sure
+											lowBlockIdsOnChain.Set(bID, true)
+										}
 									}
 								}
 							}
@@ -282,6 +297,12 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 										blockInvalidError = errors.NewBlockInvalidError("[UpdateTxMinedStatus][%s] block contains a transaction already on our chain: %s, blockID %d", block.Hash().String(), hash.String(), bID)
 										blockInvalidErrorMu.Unlock()
 									}
+
+									if lowestBlockID > bID {
+										// we cannot determine whether the transaction is on our chain, the blockID is too low
+										// we need to do a lookup from the DB to be sure
+										lowBlockIdsOnChain.Set(bID, true)
+									}
 								}
 							}
 						}
@@ -307,6 +328,12 @@ func updateTxMinedStatus(ctx context.Context, logger ulogger.Logger, tSettings *
 			// For valid blocks, SetMinedMulti errors are critical - return error
 			return errors.NewProcessingError("[UpdateTxMinedStatus][%s] failed to set mined status for %d batches", block.Hash().String(), setMinedErrorCount.Load())
 		}
+	}
+
+	// check lowBlockIdsOnChain are not on our chain, that would make the block invalid
+	if lowBlockIdsOnChain.Length() > 0 {
+		logger.Warnf("[UpdateTxMinedStatus][%s] checking %d low blockIDs for tx on our chain", block.Hash().String(), lowBlockIdsOnChain.Length())
+		// TODO: implement a method to check from the DB whether these blockIDs contain any transactions on our chain
 	}
 
 	// if the block was found to be invalid, return that error
