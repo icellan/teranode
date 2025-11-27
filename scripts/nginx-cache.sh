@@ -52,6 +52,7 @@ case "$ACTION" in
         # DNS resolver 127.0.0.11 works for both Docker and standalone containers
         # host.docker.internal is resolved via /etc/hosts (--add-host), not DNS
         TMP_CONF=$(mktemp)
+        trap "rm -f ${TMP_CONF}" EXIT
         sed "s/asset:8090/host.docker.internal:8090/g" "$NGINX_CONF" > "$TMP_CONF"
 
         # Run container
