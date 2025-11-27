@@ -48,15 +48,11 @@ case "$ACTION" in
             exit 1
         fi
 
-        # Detect DNS resolver from temp container
-        DNS_RESOLVER=$(docker run --rm "$NGINX_IMAGE" awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)
-        echo "Detected DNS resolver: ${DNS_RESOLVER}"
-
-        # Create temp config with sed substitutions for local dev
+        # Create temp config with backend substitution for local dev
+        # DNS resolver 127.0.0.11 works for both Docker and standalone containers
+        # host.docker.internal is resolved via /etc/hosts (--add-host), not DNS
         TMP_CONF=$(mktemp)
-        sed -e "s/127.0.0.11/${DNS_RESOLVER}/g" \
-            -e "s/asset:8090/host.docker.internal:8090/g" \
-            "$NGINX_CONF" > "$TMP_CONF"
+        sed "s/asset:8090/host.docker.internal:8090/g" "$NGINX_CONF" > "$TMP_CONF"
 
         # Run container
         docker run -d \
