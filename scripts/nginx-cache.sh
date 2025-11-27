@@ -1,72 +1,90 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 # Script to run nginx cache proxy locally for development
 # This connects to the asset server running on localhost:8090
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NGINX_CONF="${SCRIPT_DIR}/nginx-cache.conf"
+DOCKER_SERVICES="${SCRIPT_DIR}/../deploy/docker/base/docker-services.yml"
+NGINX_CONF="${SCRIPT_DIR}/../deploy/docker/base/asset-cache-nginx.conf"
 CONTAINER_NAME="teranode-nginx-cache"
-NGINX_PORT="${NGINX_PORT:-8001}"
+NGINX_PORT="${NGINX_PORT:-8000}"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+# Extract nginx image from docker-services.yml (single source of truth)
+NGINX_IMAGE=$(grep -A2 'asset-cache:' "$DOCKER_SERVICES" | grep 'image:' | awk '{print $2}')
 
-echo -e "${GREEN}Starting local nginx cache proxy...${NC}"
+# Default action is 'up' if no argument provided
+ACTION="${1:-up}"
 
-# Check if container is already running
-if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-    echo -e "${YELLOW}Stopping existing container...${NC}"
-    docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-    docker rm "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-fi
-
-# Check if the nginx config exists
-if [ ! -f "${NGINX_CONF}" ]; then
-    echo -e "${RED}Error: nginx config not found at ${NGINX_CONF}${NC}"
+# Function to display usage
+usage() {
+    echo "Usage: $0 [up|down|restart]"
+    echo "  up      - Start nginx cache proxy (default)"
+    echo "  down    - Stop nginx cache proxy"
+    echo "  restart - Restart nginx cache proxy"
     exit 1
-fi
+}
 
-echo -e "${GREEN}Starting nginx container...${NC}"
-echo -e "  - Nginx will be available at: ${YELLOW}http://localhost:${NGINX_PORT}${NC}"
-echo -e "  - Backend asset server: ${YELLOW}localhost:8090${NC}"
-echo -e "  - Cache directory: ${YELLOW}/tmp/nginx/cache${NC}"
-echo ""
+# Validate action
+case "$ACTION" in
+    up|down|restart)
+        ;;
+    *)
+        echo "Error: Invalid action '$ACTION'"
+        usage
+        ;;
+esac
 
-# Create a temporary nginx config with dynamic DNS resolver
-TMP_CONF=$(mktemp)
-trap "rm -f ${TMP_CONF}" EXIT
+# Execute the requested action
+case "$ACTION" in
+    up)
+        # Stop existing if running
+        docker stop "$CONTAINER_NAME" 2>/dev/null || true
+        docker rm "$CONTAINER_NAME" 2>/dev/null || true
 
-# Start a temporary container to get the DNS resolver
-TEMP_CONTAINER=$(docker run -d --rm nginx:alpine sleep 10)
-DNS_RESOLVER=$(docker exec "${TEMP_CONTAINER}" awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)
-docker stop "${TEMP_CONTAINER}" >/dev/null 2>&1
+        # Check if the nginx config exists
+        if [ ! -f "${NGINX_CONF}" ]; then
+            echo "Error: nginx config not found at ${NGINX_CONF}"
+            exit 1
+        fi
 
-echo -e "${GREEN}Detected DNS resolver: ${YELLOW}${DNS_RESOLVER}${NC}"
+        # Detect DNS resolver from temp container
+        DNS_RESOLVER=$(docker run --rm "$NGINX_IMAGE" awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)
+        echo "Detected DNS resolver: ${DNS_RESOLVER}"
 
-# Replace the placeholder resolver with the detected one
-sed "s/resolver 0\.0\.0\.0 valid=/resolver ${DNS_RESOLVER} valid=/" "${NGINX_CONF}" > "${TMP_CONF}"
+        # Create temp config with sed substitutions for local dev
+        TMP_CONF=$(mktemp)
+        sed -e "s/127.0.0.11/${DNS_RESOLVER}/g" \
+            -e "s/asset:8090/host.docker.internal:8090/g" \
+            "$NGINX_CONF" > "$TMP_CONF"
 
-# Run nginx in Docker with host networking on Linux, or host.docker.internal on macOS
-docker run -d \
-    --name "${CONTAINER_NAME}" \
-    -p "${NGINX_PORT}:8000" \
-    -v "${TMP_CONF}:/etc/nginx/nginx.conf:ro" \
-    --add-host host.docker.internal:host-gateway \
-    --tmpfs /tmp/nginx:rw,exec,size=512m \
-    nginx:alpine sh -c "mkdir -p /tmp/nginx/cache && nginx -g 'daemon off;'"
+        # Run container
+        docker run -d \
+            --name "$CONTAINER_NAME" \
+            -p "${NGINX_PORT}:8000" \
+            -v "${TMP_CONF}:/etc/nginx/nginx.conf:ro" \
+            --add-host host.docker.internal:host-gateway \
+            --tmpfs /tmp/nginx:rw,exec,size=512m \
+            "$NGINX_IMAGE" sh -c "mkdir -p /tmp/nginx/cache && nginx -g 'daemon off;'"
 
-echo -e "${GREEN}✓ Nginx cache proxy started successfully!${NC}"
-echo ""
-echo -e "Test with:"
-echo -e "  ${YELLOW}curl -v http://localhost:${NGINX_PORT}/api/v1/block/<block_hash>${NC}"
-echo ""
-echo -e "View logs:"
-echo -e "  ${YELLOW}docker logs -f ${CONTAINER_NAME}${NC}"
-echo ""
-echo -e "Stop the proxy:"
-echo -e "  ${YELLOW}docker stop ${CONTAINER_NAME}${NC}"
-echo ""
+        echo "Nginx cache proxy started"
+        echo "  Image: ${NGINX_IMAGE}"
+        echo "  Cache proxy: http://localhost:${NGINX_PORT}"
+        echo "  Backend: localhost:8090 (via host.docker.internal)"
+        echo ""
+        echo "Test with:"
+        echo "  curl -v http://localhost:${NGINX_PORT}/api/v1/block/<block_hash>"
+        echo ""
+        echo "View logs:"
+        echo "  docker logs -f ${CONTAINER_NAME}"
+        ;;
+    down)
+        docker stop "$CONTAINER_NAME" 2>/dev/null || true
+        docker rm "$CONTAINER_NAME" 2>/dev/null || true
+        echo "Nginx cache proxy stopped"
+        ;;
+    restart)
+        "$0" down
+        "$0" up
+        ;;
+esac
