@@ -19,7 +19,7 @@
       
       
       <link rel="icon" href="../../architecture/img/bsvblockchain_blue_logo.svg">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.0">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.1">
     
     
       
@@ -27,7 +27,7 @@
       
     
     
-      <link rel="stylesheet" href="../../../assets/stylesheets/main.618322db.min.css">
+      <link rel="stylesheet" href="../../../assets/stylesheets/main.484c7ddc.min.css">
       
       
 
@@ -2642,9 +2642,93 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../features/peer_registry_reputation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Peer Registry and Reputation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../features/utxo_lock_records/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    UTXO Lock Records
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../dashboard/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Dashboard
+  
+
+    
+  </span>
+  
+  
+
+      </a>
     </li>
   
 
@@ -2675,10 +2759,10 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_13" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_14" >
         
           
-          <label class="md-nav__link" for="__nav_4_13" id="__nav_4_13_label" tabindex="">
+          <label class="md-nav__link" for="__nav_4_14" id="__nav_4_14_label" tabindex="">
             
   
   
@@ -2696,8 +2780,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_13_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_13">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_14_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_14">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -2964,10 +3048,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_14" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_15" checked>
         
           
-          <label class="md-nav__link" for="__nav_4_14" id="__nav_4_14_label" tabindex="">
+          <label class="md-nav__link" for="__nav_4_15" id="__nav_4_15_label" tabindex="">
             
   
   
@@ -2985,8 +3069,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_14_label" aria-expanded="true">
-          <label class="md-nav__title" for="__nav_4_14">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_15_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_4_15">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -3136,13 +3220,41 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#23-subtree-processing-details" class="md-nav__link">
+  <a href="#23-subtree-processing-details-two-phase-architecture" class="md-nav__link">
     <span class="md-ellipsis">
       
-        2.3 Subtree Processing Details
+        2.3 Subtree Processing Details (Two-Phase Architecture)
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="2.3 Subtree Processing Details (Two-Phase Architecture)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#phase-1-create-subtree-data-files-parallel" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 1: Create Subtree Data Files (Parallel)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-2-process-utxo-changes-sequential" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 2: Process UTXO Changes (Sequential)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
         
@@ -3373,6 +3485,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../pruner/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pruner
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../legacy/" class="md-nav__link">
         
   
@@ -3483,10 +3623,10 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_15" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_16" >
         
           
-          <label class="md-nav__link" for="__nav_4_15" id="__nav_4_15_label" tabindex="">
+          <label class="md-nav__link" for="__nav_4_16" id="__nav_4_16_label" tabindex="">
             
   
   
@@ -3504,8 +3644,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_15_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_15">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_16_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_16">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -3604,10 +3744,10 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_16" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_17" >
         
           
-          <label class="md-nav__link" for="__nav_4_16" id="__nav_4_16_label" tabindex="">
+          <label class="md-nav__link" for="__nav_4_17" id="__nav_4_17_label" tabindex="">
             
   
   
@@ -3625,8 +3765,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_16_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_16">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_17_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_17">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -3809,10 +3949,10 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_17" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_18" >
         
           
-          <label class="md-nav__link" for="__nav_4_17" id="__nav_4_17_label" tabindex="">
+          <label class="md-nav__link" for="__nav_4_18" id="__nav_4_18_label" tabindex="">
             
   
   
@@ -3830,8 +3970,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_17_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_17">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_18_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_18">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -3902,10 +4042,10 @@
         
           
         
-        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_18" >
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4_19" >
         
           
-          <label class="md-nav__link" for="__nav_4_18" id="__nav_4_18_label" tabindex="">
+          <label class="md-nav__link" for="__nav_4_19" id="__nav_4_19_label" tabindex="">
             
   
   
@@ -3923,8 +4063,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_18_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_18">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_19_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_19">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -4950,6 +5090,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../../references/services/pruner_reference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pruner
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../../references/services/rpc_reference/" class="md-nav__link">
         
   
@@ -5632,6 +5800,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../../references/settings/services/pruner_settings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pruner
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../../references/settings/services/rpc_settings/" class="md-nav__link">
         
   
@@ -6264,13 +6460,41 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#23-subtree-processing-details" class="md-nav__link">
+  <a href="#23-subtree-processing-details-two-phase-architecture" class="md-nav__link">
     <span class="md-ellipsis">
       
-        2.3 Subtree Processing Details
+        2.3 Subtree Processing Details (Two-Phase Architecture)
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="2.3 Subtree Processing Details (Two-Phase Architecture)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#phase-1-create-subtree-data-files-parallel" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 1: Create Subtree Data Files (Parallel)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#phase-2-process-utxo-changes-sequential" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 2: Process UTXO Changes (Sequential)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
         
@@ -6499,7 +6723,6 @@
 <p>The service initializes through the following sequence:</p>
 <ol>
 <li>Loads configuration settings</li>
-<li>Initializes state management</li>
 <li>Establishes connection with blockchain client</li>
 <li>Waits for FSM transition from IDLE state</li>
 <li>Starts block processing loop</li>
@@ -6511,9 +6734,9 @@
 <li>
 <p><strong>Block Discovery</strong></p>
 <ul>
-<li>Retrieves last persisted block height from the local state</li>
-<li>Polls the Blockchain service to get the current best block header</li>
-<li>Determines if new blocks need processing based on <code>BlockPersisterPersistAge</code>. Blocks are only processed when <code>(currentTip - lastPersistedHeight) &gt; BlockPersisterPersistAge</code>. This means the service intentionally stays at least <code>BlockPersisterPersistAge</code> blocks behind the tip to avoid reorgs and ensure block finality.</li>
+<li>Queries the database for blocks where <code>persisted_at IS NULL</code> and <code>invalid = false</code></li>
+<li>Retrieves blocks in ascending height order to ensure sequential processing</li>
+<li>Returns immediately if no unpersisted blocks are found</li>
 </ul>
 </li>
 <li>
@@ -6531,7 +6754,7 @@
 <li>A Subtree file for each subtree in the block (.subtree), including the number of transactions in the subtree, and the decorated transactions (with UTXO meta data).</li>
 <li>UTXO additions (.utxo-additions), containing the UTXOs created in the block. This represents a list of new transaction outputs, including the Coinbase transaction outputs.</li>
 <li>UTXO deletions (.utxo-deletions), containing the UTXOs spent in the block. This represents a list of transaction inputs that reference and spend previous outputs.</li>
-<li>Updates the local state with the new block height</li>
+<li>Updates the block's <code>persisted_at</code> timestamp in the database</li>
 </ul>
 </li>
 <li>
@@ -6549,41 +6772,69 @@
 </ul>
 </li>
 </ol>
-<h3 id="23-subtree-processing-details">2.3 Subtree Processing Details</h3>
+<h3 id="23-subtree-processing-details-two-phase-architecture">2.3 Subtree Processing Details (Two-Phase Architecture)</h3>
 <p><img alt="block_persister_receive_new_blocks_subtrees.svg" src="../img/plantuml/blockpersister/block_persister_receive_new_blocks_subtrees.svg" /></p>
-<p>The detailed subtree processing workflow includes:</p>
+<p>The Block Persister uses a <strong>two-phase architecture</strong> for efficient subtree processing:</p>
+<h4 id="phase-1-create-subtree-data-files-parallel">Phase 1: Create Subtree Data Files (Parallel)</h4>
+<p>Multiple subtrees are processed concurrently with configurable concurrency:</p>
 <ol>
 <li>
 <p><strong>Subtree Retrieval</strong></p>
 <ul>
-<li>Retrieves subtree data from the blockchain service</li>
-<li>Deserializes transaction data within the subtree</li>
+<li>Retrieves subtree structure from the subtree store</li>
+<li>Checks if subtree data already exists (skips if present)</li>
 </ul>
 </li>
 <li>
 <p><strong>Transaction Metadata Loading</strong></p>
 <ul>
 <li>Loads transaction metadata in batches for efficiency</li>
-<li>Decorates transactions with UTXO metadata</li>
-<li>Processes transactions individually if batch processing fails</li>
+<li>Decorates transactions with UTXO metadata from the store</li>
+<li>Falls back to individual processing if batch fails</li>
 </ul>
 </li>
 <li>
-<p><strong>File Creation</strong></p>
+<p><strong>Streaming File Creation</strong></p>
 <ul>
+<li>Uses <code>SubtreeDataWriter</code> for ordered batch writes</li>
+<li>Streams data directly to storage without buffering entire file</li>
 <li>Stores decorated subtree files (.subtree extension)</li>
-<li>Calculates and stores UTXO changes (additions and deletions)</li>
-<li>Updates the UTXO difference tracking</li>
 </ul>
 </li>
 <li>
-<p><strong>Concurrency</strong></p>
+<p><strong>Error Recovery</strong></p>
 <ul>
-<li>Processes multiple subtrees concurrently using configurable concurrency limits</li>
-<li>Uses error groups to handle concurrent processing errors</li>
+<li>Uses success-flag pattern to ensure incomplete files are never finalized</li>
+<li>On error, <code>Abort()</code> is called instead of <code>Close()</code> to remove temporary files</li>
+<li>No incomplete subtree files are left in storage after failures</li>
 </ul>
 </li>
 </ol>
+<h4 id="phase-2-process-utxo-changes-sequential">Phase 2: Process UTXO Changes (Sequential)</h4>
+<p>UTXO processing runs sequentially to maintain correct ordering:</p>
+<ol>
+<li>
+<p><strong>Read Subtree Data Files</strong></p>
+<ul>
+<li>Opens each subtree data file for streaming read</li>
+<li>Processes subtrees in order</li>
+</ul>
+</li>
+<li>
+<p><strong>UTXO Diff Processing</strong></p>
+<ul>
+<li>Processes each transaction through the UTXO diff tracker</li>
+<li>Records additions (new outputs) and deletions (spent outputs)</li>
+<li>Writes to <code>.utxo-additions</code> and <code>.utxo-deletions</code> files</li>
+</ul>
+</li>
+</ol>
+<p>This two-phase approach provides:</p>
+<ul>
+<li><strong>Maximum parallelism</strong> for I/O-bound subtree file creation</li>
+<li><strong>Correct ordering</strong> for UTXO state updates</li>
+<li><strong>Memory efficiency</strong> through streaming reads/writes</li>
+</ul>
 <h2 id="3-data-model">3. Data Model</h2>
 <p>The Block Persister service data model is identical in scope to the Block Validation model. Please refer to the <a href="../blockValidation/#4-data-model">Block Validation documentation</a> for more information.</p>
 <p>In addition to blocks and subtrees, utxo additions and deletions files are created for each block, containing the newly created and spent UTXOs, respectively.</p>
@@ -6676,13 +6927,19 @@
 <h2 id="5-directory-structure-and-main-files">5. Directory Structure and Main Files</h2>
 <p>The Block Persister service is located in the <code>services/blockpersister</code> directory.</p>
 <div class="highlight"><pre><span></span><code>services/blockpersister/
-├── state/          # State management
-├── server.go       # Main service implementation
-└── metrics.go      # Prometheus metrics
+├── Server.go                          # Main service implementation
+├── Server_test.go                     # Service tests
+├── persist_block.go                   # Block persistence logic
+├── persist_block_test.go              # Block persistence tests
+├── streaming_process_subtree.go       # Subtree processing with streaming writes
+├── streaming_process_subtree_test.go  # Subtree processing tests
+├── subtree_data_writer.go             # Ordered batch writer for subtree data
+├── processTxMetaUsingStore.go         # Transaction metadata processing
+└── metrics.go                         # Prometheus metrics
 </code></pre></div>
 <h2 id="6-how-to-run">6. How to run</h2>
 <p>To run the Block Persister Service locally, you can execute the following command:</p>
-<div class="highlight"><pre><span></span><code><span class="nv">SETTINGS_CONTEXT</span><span class="o">=</span>dev.<span class="o">[</span>YOUR_CONTEXT<span class="o">]</span><span class="w"> </span>go<span class="w"> </span>run<span class="w"> </span>-BlockPersister<span class="o">=</span><span class="m">1</span>
+<div class="highlight"><pre><span></span><code><span class="nv">SETTINGS_CONTEXT</span><span class="o">=</span>dev.<span class="o">[</span>YOUR_CONTEXT<span class="o">]</span><span class="w"> </span>go<span class="w"> </span>run<span class="w"> </span>.<span class="w"> </span>-blockpersister<span class="o">=</span><span class="m">1</span>
 </code></pre></div>
 <p>Please refer to the <a href="../../../howto/locallyRunningServices/">Locally Running Services Documentation</a> document for more information on running the Block Persister Service locally.</p>
 <h2 id="7-configuration-options-settings-flags">7. Configuration options (settings flags)</h2>
@@ -6753,10 +7010,10 @@
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.instant", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.7a47a382.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.instant", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../../assets/javascripts/bundle.e71a0d61.min.js"></script>
+      <script src="../../../assets/javascripts/bundle.79ae519e.min.js"></script>
       
         <script src="../../../assets/external/unpkg.com/mermaid@11/dist/mermaid.min.js"></script>
       
