@@ -262,13 +262,23 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 
 	storeBatchSize := tSettings.UtxoStore.StoreBatcherSize
 	storeBatchDuration := tSettings.Aerospike.StoreBatcherDuration
+	batcherMaxConcurrent := tSettings.UtxoStore.BatcherMaxConcurrent
+	batcherBackground := tSettings.BatcherBackground
 
-	s.storeBatcher = batcher.New(storeBatchSize, storeBatchDuration, s.sendStoreBatch, !tSettings.BatcherDrainMode)
+	storeBatcherInst := batcher.NewWithPool(storeBatchSize, storeBatchDuration, s.sendStoreBatch, batcherBackground)
+	if batcherMaxConcurrent > 0 {
+		storeBatcherInst.SetMaxConcurrent(batcherMaxConcurrent)
+	}
+	s.storeBatcher = storeBatcherInst
 
 	getBatchSize := s.settings.UtxoStore.GetBatcherSize
 	getBatchDurationStr := s.settings.UtxoStore.GetBatcherDurationMillis
 	getBatchDuration := time.Duration(getBatchDurationStr) * time.Millisecond
-	s.getBatcher = batcher.New(getBatchSize, getBatchDuration, s.sendGetBatch, !tSettings.BatcherDrainMode)
+	getBatcherInst := batcher.NewWithPool(getBatchSize, getBatchDuration, s.sendGetBatch, batcherBackground)
+	if batcherMaxConcurrent > 0 {
+		getBatcherInst.SetMaxConcurrent(batcherMaxConcurrent)
+	}
+	s.getBatcher = getBatcherInst
 
 	// Make sure the udf lua scripts are installed in the cluster
 	// update the version of the lua script when a new version is launched, do not re-use the old one
@@ -294,7 +304,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	spendBatchSize := s.settings.UtxoStore.SpendBatcherSize
 	spendBatchDurationStr := s.settings.UtxoStore.SpendBatcherDurationMillis
 	spendBatchDuration := time.Duration(spendBatchDurationStr) * time.Millisecond
-	s.spendBatcher = batcher.New(spendBatchSize, spendBatchDuration, s.sendSpendBatchLua, !tSettings.BatcherDrainMode)
+	spendBatcherInst := batcher.NewWithPool(spendBatchSize, spendBatchDuration, s.sendSpendBatchLua, batcherBackground)
+	if batcherMaxConcurrent > 0 {
+		spendBatcherInst.SetMaxConcurrent(batcherMaxConcurrent)
+	}
+	s.spendBatcher = spendBatcherInst
 
 	if failureThreshold := tSettings.UtxoStore.SpendCircuitBreakerFailureCount; failureThreshold > 0 {
 		s.spendCircuitBreaker = newCircuitBreaker(
@@ -307,22 +321,38 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	outpointBatchSize := s.settings.UtxoStore.OutpointBatcherSize
 	outpointBatchDurationStr := s.settings.UtxoStore.OutpointBatcherDurationMillis
 	outpointBatchDuration := time.Duration(outpointBatchDurationStr) * time.Millisecond
-	s.outpointBatcher = batcher.New(outpointBatchSize, outpointBatchDuration, s.sendOutpointBatch, true)
+	outpointBatcherInst := batcher.NewWithPool(outpointBatchSize, outpointBatchDuration, s.sendOutpointBatch, batcherBackground)
+	if batcherMaxConcurrent > 0 {
+		outpointBatcherInst.SetMaxConcurrent(batcherMaxConcurrent)
+	}
+	s.outpointBatcher = outpointBatcherInst
 
 	incrementBatchSize := tSettings.UtxoStore.IncrementBatcherSize
 	incrementBatchDurationStr := tSettings.UtxoStore.IncrementBatcherDurationMillis
 	incrementBatchDuration := time.Duration(incrementBatchDurationStr) * time.Millisecond
-	s.incrementBatcher = batcher.New(incrementBatchSize, incrementBatchDuration, s.sendIncrementBatch, true)
+	incrementBatcherInst := batcher.NewWithPool(incrementBatchSize, incrementBatchDuration, s.sendIncrementBatch, batcherBackground)
+	if batcherMaxConcurrent > 0 {
+		incrementBatcherInst.SetMaxConcurrent(batcherMaxConcurrent)
+	}
+	s.incrementBatcher = incrementBatcherInst
 
 	setDAHBatchSize := tSettings.UtxoStore.SetDAHBatcherSize
 	setDAHBatchDurationStr := tSettings.UtxoStore.SetDAHBatcherDurationMillis
 	setDAHBatchDuration := time.Duration(setDAHBatchDurationStr) * time.Millisecond
-	s.setDAHBatcher = batcher.New(setDAHBatchSize, setDAHBatchDuration, s.sendSetDAHBatch, true)
+	setDAHBatcherInst := batcher.NewWithPool(setDAHBatchSize, setDAHBatchDuration, s.sendSetDAHBatch, batcherBackground)
+	if batcherMaxConcurrent > 0 {
+		setDAHBatcherInst.SetMaxConcurrent(batcherMaxConcurrent)
+	}
+	s.setDAHBatcher = setDAHBatcherInst
 
 	lockedBatcherSize := tSettings.UtxoStore.LockedBatcherSize
 	lockedBatchDurationStr := tSettings.UtxoStore.LockedBatcherDurationMillis
 	lockedBatchDuration := time.Duration(lockedBatchDurationStr) * time.Millisecond
-	s.lockedBatcher = batcher.New(lockedBatcherSize, lockedBatchDuration, s.setLockedBatch, !tSettings.BatcherDrainMode)
+	lockedBatcherInst := batcher.NewWithPool(lockedBatcherSize, lockedBatchDuration, s.setLockedBatch, batcherBackground)
+	if batcherMaxConcurrent > 0 {
+		lockedBatcherInst.SetMaxConcurrent(batcherMaxConcurrent)
+	}
+	s.lockedBatcher = lockedBatcherInst
 
 	if tSettings.BatcherDrainMode {
 		s.getBatcher.SetDrainMode(true)

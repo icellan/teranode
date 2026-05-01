@@ -84,6 +84,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 		GRPCAdminAPIKey:            getString("grpc_admin_api_key", "", alternativeContext...),
 		GlobalBlockHeightRetention: globalBlockHeightRetention,
 		BatcherDrainMode:           getBool("batcher_drainMode", false, alternativeContext...),
+		BatcherBackground:          getBool("batcher_background", true, alternativeContext...),
 
 		ChainCfgParams: params,
 		Policy: &PolicySettings{
@@ -436,6 +437,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			BatchSQLOperations:                      getBool("utxostore_batch_sql_operations", true, alternativeContext...),
 			DisableDAHCleaner:                       getBool("utxostore_disableDAHCleaner", false, alternativeContext...),
 			ReAssignedUtxoSpendableAfterBlocks:      getUint32("utxostore_reassignedUtxoSpendableAfterBlocks", 1000, alternativeContext...),
+			BatcherMaxConcurrent:                    getInt("utxostore_batcherMaxConcurrent", 64, alternativeContext...),
 			QueryIdleTimeoutSeconds:                 getInt("utxostore_queryIdleTimeoutSeconds", 60, alternativeContext...),
 		},
 		P2P: P2PSettings{

@@ -114,7 +114,7 @@ func NewClient(ctx context.Context, logger ulogger.Logger, tSettings *settings.S
 	sendBatch := func(batch []*batchItem) {
 		client.sendBatchToBlockAssembly(ctx, batch)
 	}
-	b := batcher.New(batchSize, duration, sendBatch, !tSettings.BatcherDrainMode)
+	b := batcher.New(batchSize, duration, sendBatch, tSettings.BatcherBackground)
 	if tSettings.BatcherDrainMode {
 		b.SetDrainMode(true)
 	}
@@ -168,7 +168,7 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 	sendBatch := func(batch []*batchItem) {
 		client.sendBatchToBlockAssembly(ctx, batch)
 	}
-	b := batcher.New(batchSize, duration, sendBatch, !tSettings.BatcherDrainMode)
+	b := batcher.New(batchSize, duration, sendBatch, tSettings.BatcherBackground)
 	if tSettings.BatcherDrainMode {
 		b.SetDrainMode(true)
 	}
