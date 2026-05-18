@@ -2,14 +2,12 @@
 Package validator implements BSV Blockchain transaction validation functionality.
 
 This package provides comprehensive transaction validation for BSV Blockchain nodes,
-including script verification, UTXO management, and policy enforcement. It supports
-multiple script interpreters (GoBT, GoSDK, GoBDK) and implements the full Bitcoin
-transaction validation ruleset.
+including BDK transaction validation, UTXO management, and policy enforcement.
 
 Key features:
   - Transaction validation against Bitcoin consensus rules
   - UTXO spending and creation
-  - Script verification using multiple interpreters
+  - BDK transaction validation
   - Policy enforcement
   - Block assembly integration
   - Kafka integration for transaction metadata
@@ -495,10 +493,7 @@ func TestValidateTx4da809a914526f0c4770ea19b5f25f89e9acf82a4184e86a0a3ae8ad250e3
 	ctx, _, endSpan := tracing.Tracer("validator").Start(ctx, "Test")
 	defer endSpan()
 
-	err = v.validateTransaction(ctx, tx, height, nil, &Options{})
-	require.NoError(t, err)
-
-	err = v.validateTransactionScripts(ctx, tx, height, utxos, &Options{SkipPolicyChecks: true})
+	err = v.validateTransaction(ctx, tx, height, utxos, &Options{SkipPolicyChecks: true})
 	require.NoError(t, err)
 }
 
@@ -526,10 +521,7 @@ func TestValidateTxda47bd83967d81f3cf6520f4ff81b3b6c4797bfe7ac2b5969aedbf01a840c
 	ctx, _, endSpan := tracing.Tracer("validator").Start(ctx, "Test")
 	defer endSpan()
 
-	err = v.validateTransaction(ctx, tx, height, nil, &Options{})
-	require.NoError(t, err)
-
-	err = v.validateTransactionScripts(ctx, tx, height, utxos, &Options{SkipPolicyChecks: true})
+	err = v.validateTransaction(ctx, tx, height, utxos, &Options{SkipPolicyChecks: true})
 	require.NoError(t, err)
 }
 
@@ -557,10 +549,7 @@ func TestValidateTx956685dffd466d3051c8372c4f3bdf0e061775ed054d7e8f0bc5695ca747d
 	ctx, _, endSpan := tracing.Tracer("validator").Start(ctx, "Test")
 	defer endSpan()
 
-	err = v.validateTransaction(ctx, tx, height, nil, &Options{})
-	require.NoError(t, err)
-
-	err = v.validateTransactionScripts(ctx, tx, height, []uint32{height}, &Options{SkipPolicyChecks: true})
+	err = v.validateTransaction(ctx, tx, height, []uint32{height}, &Options{SkipPolicyChecks: true})
 	require.NoError(t, err)
 }
 
@@ -585,10 +574,7 @@ func TestValidateTx7f4244335dec8d941e3fc1847ac3d020fac9347a0c0335294bf56ede8aa58
 	ctx, _, endSpan := tracing.Tracer("validator").Start(context.Background(), "Test")
 	defer endSpan()
 
-	err = v.validateTransaction(ctx, tx, height, nil, &Options{})
-	require.NoError(t, err)
-
-	err = v.validateTransactionScripts(ctx, tx, height, []uint32{1553030, 1550102}, &Options{SkipPolicyChecks: true})
+	err = v.validateTransaction(ctx, tx, height, []uint32{1553030, 1550102}, &Options{SkipPolicyChecks: true})
 	require.NoError(t, err)
 }
 
@@ -677,10 +663,7 @@ func TestValidateTransactions(t *testing.T) {
 		ctx, _, endSpan := tracing.Tracer("validator").Start(context.Background(), "Test")
 		defer endSpan()
 
-		err = v.validateTransaction(ctx, tx, testData.BlockHeight, testData.UTXOHeights, &Options{})
-		require.NoError(t, err)
-
-		err = v.validateTransactionScripts(ctx, tx, testData.BlockHeight, testData.UTXOHeights, &Options{SkipPolicyChecks: true})
+		err = v.validateTransaction(ctx, tx, testData.BlockHeight, testData.UTXOHeights, &Options{SkipPolicyChecks: true})
 		require.NoError(t, err, fmt.Sprintf("Failed with TxID %v", testData.TxID))
 	}
 }
@@ -706,10 +689,7 @@ func TestValidateTxba4f9786bb34571bd147448ab3c303ae4228b9c22c89e58cc50e26ff7538b
 	ctx, _, endSpan := tracing.Tracer("validator").Start(context.Background(), "Test")
 	defer endSpan()
 
-	err = v.validateTransaction(ctx, tx, height, nil, &Options{})
-	require.NoError(t, err)
-
-	err = v.validateTransactionScripts(ctx, tx, height, []uint32{height}, &Options{SkipPolicyChecks: true})
+	err = v.validateTransaction(ctx, tx, height, []uint32{height}, &Options{SkipPolicyChecks: true})
 	require.NoError(t, err)
 }
 
@@ -734,10 +714,7 @@ func TestValidateTx944d2299bbc9fbd46ce18de462690907341cad4730a4d3008d70637f41a36
 	ctx, _, endSpan := tracing.Tracer("validator").Start(context.Background(), "Test")
 	defer endSpan()
 
-	err = v.validateTransaction(ctx, tx, height, nil, &Options{})
-	require.NoError(t, err)
-
-	err = v.validateTransactionScripts(ctx, tx, height, []uint32{height}, &Options{SkipPolicyChecks: true})
+	err = v.validateTransaction(ctx, tx, height, []uint32{height}, &Options{SkipPolicyChecks: true})
 	require.NoError(t, err)
 }
 
@@ -829,10 +806,7 @@ func Benchmark_validateInternal(b *testing.B) {
 	}
 
 	for i := 0; i < b.N; i++ {
-		err = v.validateTransaction(context.Background(), tx, 740975, nil, &Options{})
-		require.NoError(b, err)
-
-		err = v.validateTransactionScripts(context.Background(), tx, 740975, utxoHeights, &Options{SkipPolicyChecks: true})
+		err = v.validateTransaction(context.Background(), tx, 740975, utxoHeights, &Options{SkipPolicyChecks: true})
 		require.NoError(b, err)
 	}
 }
@@ -1067,7 +1041,7 @@ func TestFalseOrEmptyTopStackElementScriptError(t *testing.T) {
 	ctx, _, endSpan := tracing.Tracer("validator").Start(ctx, "Test")
 	defer endSpan()
 
-	err := v.validateTransactionScripts(ctx, tx, height, []uint32{}, &Options{SkipPolicyChecks: true})
+	err := v.validateTransaction(ctx, tx, height, []uint32{}, &Options{SkipPolicyChecks: true})
 	require.Error(t, err)
 }
 
@@ -1916,6 +1890,7 @@ func TestValidateTransaction_BIP68PathReadsMTPStore(t *testing.T) {
 		stats:            gocore.NewStat("validator_test"),
 		mtpStore:         mtpStore,
 	}
+	v.txValidator.(*TxValidator).bdk = noopBDKValidator{}
 
 	ctx, _, endSpan := tracing.Tracer("validator").Start(context.Background(), "Test")
 	defer endSpan()
@@ -1949,6 +1924,7 @@ func TestValidateTransaction_BIP68GuardFiresOnUnpopulatedStore(t *testing.T) {
 		stats:            gocore.NewStat("validator_test"),
 		// mtpStore intentionally empty
 	}
+	v.txValidator.(*TxValidator).bdk = noopBDKValidator{}
 
 	ctx, _, endSpan := tracing.Tracer("validator").Start(context.Background(), "Test")
 	defer endSpan()
