@@ -111,12 +111,41 @@ func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) err
 			content:    content,
 			enqueuedAt: time.Now(),
 		}
-		if err := u.enqueueTxmetaWorkItem(workItem); err != nil {
+		ok, err := u.enqueueTxmetaWorkItem(ctx, workItem)
+		if err != nil {
 			return err
+		}
+		if !ok {
+			// Caught-up (normal) mode: shard queue is full. The remainder of the
+			// batch is abandoned; the cache will be repopulated from Kafka on the
+			// next restart (best-effort by design). Caller side already logged a
+			// warning.
+			return nil
 		}
 	}
 
+	// Latch from startup (blocking) to caught-up (drop-on-full) mode the first
+	// time we observe a message at the partition's tail. One-way: never reverts.
+	u.maybeMarkTxmetaCaughtUp(msg)
+
 	return nil
+}
+
+// maybeMarkTxmetaCaughtUp flips the txmetaCaughtUp latch the first time a Kafka
+// message is observed at the partition's high water mark. HighWaterMark is the
+// next offset that will be produced; msg.Offset+1 == HighWaterMark means this
+// message is the current tail of the partition. The latch is one-way: once set
+// it stays set even if the consumer falls behind later.
+func (u *Server) maybeMarkTxmetaCaughtUp(msg *kafka.KafkaMessage) {
+	if u.txmetaCaughtUp.Load() {
+		return
+	}
+	if msg.HighWaterMark <= 0 || msg.Offset+1 < msg.HighWaterMark {
+		return
+	}
+	if u.txmetaCaughtUp.CompareAndSwap(false, true) {
+		u.logger.Infof("[txmetaHandler] caught up on %s partition %d at offset %d (HWM %d); switching to drop-on-full mode", msg.Topic, msg.Partition, msg.Offset, msg.HighWaterMark)
+	}
 }
 
 func (u *Server) ensureTxmetaWorkers(ctx context.Context) error {
@@ -176,13 +205,40 @@ func (u *Server) processTxmetaWorkItem(workItem txmetaWorkItem) {
 	}
 }
 
-func (u *Server) enqueueTxmetaWorkItem(workItem txmetaWorkItem) error {
+// enqueueTxmetaWorkItem dispatches a work item to the shard worker queue. Two
+// modes:
+//
+//   - Startup mode (txmetaCaughtUp == false): block on send until the worker
+//     accepts the item or ctx is cancelled. This applies natural backpressure
+//     to the Kafka consumer during catch-up so no work is dropped while the
+//     cache is cold.
+//
+//   - Caught-up mode (txmetaCaughtUp == true): non-blocking send; if the shard
+//     queue is full, log a warning and signal the caller to abandon the
+//     remainder of the batch. Live-traffic backpressure is by design
+//     best-effort (the cache repopulates from Kafka on restart).
+//
+// Returns (true, nil) on successful enqueue, (false, nil) when an item was
+// dropped in caught-up mode, and (false, ctx.Err()) when ctx is cancelled
+// during a startup-mode blocking send.
+func (u *Server) enqueueTxmetaWorkItem(ctx context.Context, workItem txmetaWorkItem) (bool, error) {
 	shard := int(workItem.hash[0]) % len(u.txmetaWorkerQueues)
+	ch := u.txmetaWorkerQueues[shard]
+
+	if u.txmetaCaughtUp.Load() {
+		select {
+		case ch <- workItem:
+			return true, nil
+		default:
+			u.logger.Warnf("[txmetaHandler] txmeta worker queue full for shard %d, dropping remainder of batch", shard)
+			return false, nil
+		}
+	}
 
 	select {
-	case u.txmetaWorkerQueues[shard] <- workItem:
-		return nil
-	default:
-		return errors.NewProcessingError("[txmetaHandler] txmeta worker queue full for shard %d", shard)
+	case ch <- workItem:
+		return true, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
 	}
 }
