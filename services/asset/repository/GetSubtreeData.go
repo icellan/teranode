@@ -67,7 +67,14 @@ func (repo *Repository) GetSubtreeDataReader(ctx context.Context, subtreeHash *c
 	// Note: semaphore will be released when the returned reader is closed
 
 	subtreeDataExists, err := repo.SubtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData)
-	if err == nil && subtreeDataExists {
+	if err != nil {
+		// Surface storage errors instead of falling through to the NotFound /
+		// on-demand path — otherwise an IO failure here would be silently
+		// reclassified as 404 or trigger an unnecessary regeneration attempt.
+		releaseSemaphorePermit(repo.semGetSubtreeDataReader)
+		return nil, err
+	}
+	if subtreeDataExists {
 		reader, err := repo.SubtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtreeData)
 		if err != nil {
 			releaseSemaphorePermit(repo.semGetSubtreeDataReader)
