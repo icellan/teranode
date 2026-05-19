@@ -80,6 +80,30 @@ func (repo *Repository) GetSubtreeDataReader(ctx context.Context, subtreeHash *c
 		}, nil
 	}
 
+	// SubtreeData doesn't exist. The on-demand fallback (dualStreamWithFileCreation)
+	// regenerates the data from the underlying subtree file in a goroutine *after* the
+	// HTTP handler has committed to 200 OK. If neither the subtree nor the
+	// subtreeToCheck file is present we cannot regenerate, and the handler would
+	// otherwise emit "200 OK + empty body", which peers report as
+	// ErrSubtreeLengthMismatch. Surface a NotFound instead so the handler returns 404
+	// and callers can attempt another peer.
+	subtreeExists, existsErr := repo.SubtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+	if existsErr != nil {
+		releaseSemaphorePermit(repo.semGetSubtreeDataReader)
+		return nil, existsErr
+	}
+	if !subtreeExists {
+		toCheckExists, toCheckErr := repo.SubtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+		if toCheckErr != nil {
+			releaseSemaphorePermit(repo.semGetSubtreeDataReader)
+			return nil, toCheckErr
+		}
+		if !toCheckExists {
+			releaseSemaphorePermit(repo.semGetSubtreeDataReader)
+			return nil, errors.NewNotFoundError("subtree %s not found", subtreeHash.String())
+		}
+	}
+
 	// File doesn't exist - create it on-demand while streaming to HTTP response
 	return repo.dualStreamWithFileCreation(ctx, subtreeHash)
 }
