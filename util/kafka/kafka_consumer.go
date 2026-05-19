@@ -480,7 +480,11 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 							if err := consumerFn(kafkaMsg); err != nil {
 								k.Config.Logger.Errorf("[kafka_consumer] failed to process message (topic: %s, partition: %d, offset: %d): %v",
 									record.Topic, record.Partition, record.Offset, err)
-								return
+								// Continue to the next record. Skipping the
+								// uncommittedRecords append keeps the failed
+								// record from being marked done, matching the
+								// pre-refactor EachRecord behavior.
+								continue
 							}
 
 							if !k.Config.AutoCommitEnabled {

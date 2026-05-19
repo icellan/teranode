@@ -116,10 +116,10 @@ func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) err
 			return err
 		}
 		if !ok {
-			// Caught-up (normal) mode: shard queue is full. The remainder of the
-			// batch is abandoned; the cache will be repopulated from Kafka on the
-			// next restart (best-effort by design). Caller side already logged a
-			// warning.
+			// Caught-up (normal) mode: shard queue is full. The remainder of
+			// the batch is abandoned; the cache will be repopulated from Kafka
+			// on the next restart (best-effort by design).
+			// enqueueTxmetaWorkItem has already emitted the Warn log.
 			return nil
 		}
 	}
@@ -134,8 +134,25 @@ func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) err
 // maybeMarkTxmetaCaughtUp flips the txmetaCaughtUp latch the first time a Kafka
 // message is observed at the partition's high water mark. HighWaterMark is the
 // next offset that will be produced; msg.Offset+1 == HighWaterMark means this
-// message is the current tail of the partition. The latch is one-way: once set
-// it stays set even if the consumer falls behind later.
+// message is the current tail of the partition.
+//
+// Latch semantics (deliberate trade-offs):
+//
+//   - One-way: once set it stays set even if the consumer falls behind later
+//     (e.g., a long pause and re-catch-up). Live drop semantics persist.
+//
+//   - Any-partition: for multi-partition txmeta topics, the latch flips as
+//     soon as ANY assigned partition reaches its tail, not when all do. This
+//     is intentional — txmeta is sharded by tx hash, partitions are evenly
+//     loaded under normal traffic, so seeing the tail on one partition is a
+//     strong signal we're broadly caught up. A stricter per-partition gating
+//     would extend cold-cache blocking unnecessarily if one partition is
+//     temporarily empty or slow.
+//
+//   - Fail-closed on HighWaterMark<=0: an unset HWM (in-memory consumer,
+//     hand-constructed messages) keeps the latch in startup (blocking) mode.
+//     Smoke tests are low-throughput so the shard queues should never fill,
+//     making the blocking mode effectively a no-op there.
 func (u *Server) maybeMarkTxmetaCaughtUp(msg *kafka.KafkaMessage) {
 	if u.txmetaCaughtUp.Load() {
 		return
