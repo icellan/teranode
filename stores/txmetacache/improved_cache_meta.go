@@ -5,9 +5,7 @@ import (
 	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
-	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
 // improvedCacheGetScratchInitialCap matches txMetaCacheReadBufferInitialCapacity
@@ -38,7 +36,6 @@ var improvedCacheGetScratchPool = sync.Pool{
 // UpdateStats so the rate is observable.
 type improvedCacheBackend struct {
 	cache           *ImprovedCache
-	logger          ulogger.Logger
 	unmarshalErrors atomic.Uint64
 }
 
@@ -102,25 +99,23 @@ func (b *improvedCacheBackend) Get(hash chainhash.Hash) (*meta.Data, bool) {
 	}()
 
 	if err := b.cache.Get(&scratch, hash[:]); err != nil {
-		if errors.Is(err, errors.ErrNotFound) {
-			return nil, false
-		}
-
+		// ErrNotFound and any other backend error both surface as a miss to
+		// the caller — the cacheBackend.Get contract has no error channel.
 		return nil, false
 	}
 
-	if len(scratch) == 0 {
-		return nil, false
-	}
-
+	// NewMetaDataFromBytes handles short/empty input via its own length
+	// check (returns an error for len<17), so no separate empty-scratch
+	// guard is needed here.
 	data := &meta.Data{}
 	if err := meta.NewMetaDataFromBytes(scratch, data); err != nil {
+		// Deserialise failure means either an empty entry, or in-place
+		// corruption / format mismatch. Evict so subsequent Gets on the
+		// same key don't replay the same bad parse, and bump a counter so
+		// operators can see the rate. Logging is deliberately omitted to
+		// avoid flooding on pathological keys.
 		b.unmarshalErrors.Add(1)
 		b.cache.Del(hash[:])
-
-		if b.logger != nil {
-			b.logger.Warnf("txMetaCache: failed to unmarshal cached entry for %s (evicting): %v", hash.String(), err)
-		}
 
 		return nil, false
 	}

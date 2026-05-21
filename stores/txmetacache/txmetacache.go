@@ -225,7 +225,7 @@ func NewTxMetaCache(
 			return nil, errors.NewProcessingError("error creating cache", err)
 		}
 
-		cache = &improvedCacheBackend{cache: c, logger: logger}
+		cache = &improvedCacheBackend{cache: c}
 	}
 
 	const percentageOfGlobalBlockHeightRetentionToKeep = 10

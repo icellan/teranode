@@ -157,6 +157,59 @@ func TestPointerCache_Del(t *testing.T) {
 	require.False(t, ok)
 }
 
+// TestPointerCache_DelDoesNotLeakRingCapacity pins the fix for the FIFO
+// stale-slot bug: after Del, the ring slot still names the deleted key but
+// the map no longer has it. A subsequent Set on a different key targeting
+// the same bucket must NOT count the stale slot as a live eviction, and a
+// full Set→Del→Set cycle must not silently shrink effective capacity.
+func TestPointerCache_DelDoesNotLeakRingCapacity(t *testing.T) {
+	// Per-bucket ring capacity of 1 makes the leak observable immediately.
+	maxBytes := BucketsCount * pointerCacheAvgEntryBytes
+	c, err := NewPointerCache(maxBytes)
+	require.NoError(t, err)
+
+	// Find two keys that fall in the same bucket so we exercise eviction
+	// pressure on a single shard.
+	var first, second *chainhash.Hash
+
+	target := xxhash.Sum64(hashN(0)[:]) % BucketsCount
+
+	for n := uint64(1); n < 1_000_000; n++ {
+		h := hashN(n)
+		if xxhash.Sum64(h[:])%BucketsCount != target {
+			continue
+		}
+
+		if first == nil {
+			first = h
+		} else {
+			second = h
+			break
+		}
+	}
+
+	require.NotNil(t, first)
+	require.NotNil(t, second)
+
+	// Set then delete `first` — fills the ring, then leaves a stale slot.
+	require.NoError(t, c.Set(first, &meta.Data{Fee: 1}))
+	c.Del(first[:])
+
+	b := c.bucketFor(*first)
+
+	evictedBefore := b.evicted.Load()
+
+	// Insert `second` — should reuse the stale slot, not count an eviction.
+	require.NoError(t, c.Set(second, &meta.Data{Fee: 2}))
+
+	got, ok := c.Get(*second)
+	require.True(t, ok)
+	require.Equal(t, uint64(2), got.Fee)
+
+	require.Equal(t, evictedBefore, b.evicted.Load(),
+		"Set after Del must not count the stale ring slot as a live eviction")
+}
+
 func TestPointerCache_Reset(t *testing.T) {
 	c, err := NewPointerCache(64 * 1024 * 1024)
 	require.NoError(t, err)

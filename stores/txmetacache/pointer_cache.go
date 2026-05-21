@@ -5,9 +5,11 @@ import (
 	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/cespare/xxhash/v2"
+	"golang.org/x/sync/errgroup"
 )
 
 // pointerCacheAvgEntryBytes is the heap-cost estimate per cached entry used to
@@ -92,6 +94,12 @@ func (c *PointerCache) bucketFor(hash chainhash.Hash) *pointerBucket {
 // insert is the shared insertion path used by Set (pointer-native) and
 // SetFromBytes (byte adapter). Caller has already prepared the stripped
 // metadata-only *meta.Data.
+//
+// Stale ring slots: Del removes from the map but leaves the slot's old key
+// in the ring. When the ring is full we walk past stale entries (keys no
+// longer in the map) until we find a live one to evict, or until we've
+// walked the whole ring. This keeps Del cheap while preventing stale slots
+// from silently reducing effective capacity through Set→Del→Set cycles.
 func (c *PointerCache) insert(hash chainhash.Hash, data *meta.Data) {
 	b := c.bucketFor(hash)
 
@@ -104,9 +112,22 @@ func (c *PointerCache) insert(hash chainhash.Hash, data *meta.Data) {
 	}
 
 	if b.full {
-		evict := b.ring[b.head]
-		delete(b.m, evict)
-		b.evicted.Add(1)
+		ringSize := len(b.ring)
+		for skipped := 0; skipped < ringSize; skipped++ {
+			evict := b.ring[b.head]
+			if _, exists := b.m[evict]; exists {
+				delete(b.m, evict)
+				b.evicted.Add(1)
+				break
+			}
+
+			b.head++
+			if b.head >= ringSize {
+				b.head = 0
+			}
+		}
+		// If every ring slot was stale, no eviction happened — fall through
+		// and write below; the new key fills the slot at b.head naturally.
 	}
 
 	b.ring[b.head] = hash
@@ -128,11 +149,18 @@ func (c *PointerCache) insert(hash chainhash.Hash, data *meta.Data) {
 // and timestamps. Without this strip, pointer mode would retain full
 // transactions in the cache and diverge in semantics from the byte path.
 //
-// TxInpoints is copied as a value; its ParentTxHashes / voutIdxs slices
-// share backing arrays with the caller. Callers and other readers must
-// treat them as read-only.
+// TxInpoints is deep-cloned via Serialize + NewTxInpointsFromBytes — a
+// struct copy alone would alias the caller's ParentTxHashes / voutIdxs
+// backing arrays, which the cache hands out concurrently to every reader.
+// A caller doing `append(ParentTxHashes, …)` could otherwise corrupt the
+// cached entry observed by other readers. The round-trip is the only public
+// path through subtree's API that produces fresh backing slices (voutIdxs
+// is unexported).
+//
+// On the rare serialize/deserialize failure the original TxInpoints is
+// reused as a shallow copy — preferable to dropping the entry entirely.
 func metadataOnly(data *meta.Data) *meta.Data {
-	return &meta.Data{
+	cloned := &meta.Data{
 		Fee:         data.Fee,
 		SizeInBytes: data.SizeInBytes,
 		IsCoinbase:  data.IsCoinbase,
@@ -141,6 +169,24 @@ func metadataOnly(data *meta.Data) *meta.Data {
 		Locked:      data.Locked,
 		TxInpoints:  data.TxInpoints,
 	}
+
+	if len(data.TxInpoints.ParentTxHashes) == 0 {
+		return cloned
+	}
+
+	bts, err := data.TxInpoints.Serialize()
+	if err != nil {
+		return cloned
+	}
+
+	fresh, err := subtree.NewTxInpointsFromBytes(bts)
+	if err != nil {
+		return cloned
+	}
+
+	cloned.TxInpoints = fresh
+
+	return cloned
 }
 
 // Set is the pointer-native insert. The caller's *meta.Data may carry fields
@@ -189,20 +235,61 @@ func (c *PointerCache) SetFromBytes(key, value []byte) error {
 	return nil
 }
 
-// SetMultiFromBytes applies SetFromBytes to each (key, value) pair.
+// SetMultiFromBytes applies SetFromBytes to each (key, value) pair, fanning
+// out across shards so a single Kafka batch doesn't serialise on one
+// goroutine. Mirrors ImprovedCache.SetMulti's pattern: bucket the inputs by
+// xxhash, then run one goroutine per non-empty bucket.
 // Implements cacheBackend.
 func (c *PointerCache) SetMultiFromBytes(keys, values [][]byte) error {
 	if len(keys) != len(values) {
 		return errors.NewProcessingError("keys and values length mismatch; got %d keys and %d values", len(keys), len(values))
 	}
 
-	for i := range keys {
-		if err := c.SetFromBytes(keys[i], values[i]); err != nil {
-			return err
-		}
+	if len(keys) == 0 {
+		return nil
 	}
 
-	return nil
+	// Small batches: skip the bucketing overhead.
+	if len(keys) <= smallSetMultiBatchThreshold {
+		for i := range keys {
+			if err := c.SetFromBytes(keys[i], values[i]); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	batchedKeys := make([][][]byte, BucketsCount)
+	batchedValues := make([][][]byte, BucketsCount)
+
+	for i, key := range keys {
+		idx := xxhash.Sum64(key) % BucketsCount
+		batchedKeys[idx] = append(batchedKeys[idx], key)
+		batchedValues[idx] = append(batchedValues[idx], values[i])
+	}
+
+	g := errgroup.Group{}
+
+	for idx := range batchedKeys {
+		if len(batchedKeys[idx]) == 0 {
+			continue
+		}
+
+		idx := idx
+
+		g.Go(func() error {
+			for i, k := range batchedKeys[idx] {
+				if err := c.SetFromBytes(k, batchedValues[idx][i]); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		})
+	}
+
+	return g.Wait()
 }
 
 // SetMultiSequential is identical to SetMultiFromBytes for the pointer
