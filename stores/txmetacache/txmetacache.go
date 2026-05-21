@@ -19,6 +19,7 @@ package txmetacache
 
 import (
 	"context"
+	"encoding/binary"
 	"sync"
 	"sync/atomic"
 
@@ -42,12 +43,14 @@ import (
 // These metrics are critical for operational monitoring and can help identify:
 // - Cache hit ratio (hits vs. misses) to evaluate cache effectiveness
 // - Insertion and eviction rates to detect memory pressure
+// - Age-related expiration patterns through hitOldTx tracking
 type metrics struct {
 	insertions atomic.Uint64 // Tracks number of items inserted into the cache; indicates write throughput
 	hits       atomic.Uint64 // Tracks number of successful cache retrievals; indicates cache effectiveness
 	misses     atomic.Uint64 // Tracks number of failed cache retrievals; helps identify sizing issues
 	evictions  atomic.Uint64 // Tracks number of items evicted from the cache; indicates memory pressure
 	getOrigin  atomic.Uint64 // Tracks origin-store metadata retrievals
+	hitOldTx   atomic.Uint64 // Tracks number of cache hits for outdated transactions; monitors expiration policy
 }
 
 const (
@@ -91,10 +94,11 @@ func putTxMetaCacheReadBuffer(buf *[]byte) {
 //
 // Thread-safety: All operations are thread-safe and can be called concurrently from multiple goroutines.
 type TxMetaCache struct {
-	utxoStore utxo.Store     // The underlying UTXO store that this cache wraps; provides persistence
-	cache     cacheBackend   // Storage primitive (ImprovedCache or PointerCache) chosen by BucketType at construction
-	metrics   metrics        // Performance metrics for monitoring cache efficiency and throughput
-	logger    ulogger.Logger // Logger for operational logging and diagnostic information
+	utxoStore                     utxo.Store     // The underlying UTXO store that this cache wraps; provides persistence
+	cache                         cacheBackend   // Storage primitive (ImprovedCache or PointerCache) chosen by BucketType at construction
+	metrics                       metrics        // Performance metrics for monitoring cache efficiency and throughput
+	logger                        ulogger.Logger // Logger for operational logging and diagnostic information
+	noOfBlocksToKeepInTxMetaCache uint32         // Cache retention horizon (blocks); kept for compatibility with the height-based expiration plumbing in ImprovedCache
 }
 
 // CacheStats provides statistical information about the current state of the cache.
@@ -224,11 +228,22 @@ func NewTxMetaCache(
 		cache = &improvedCacheBackend{cache: c, logger: logger}
 	}
 
+	const percentageOfGlobalBlockHeightRetentionToKeep = 10
+
+	var noOfBlocksToKeepInTxMetaCache uint32
+
+	if tSettings.GlobalBlockHeightRetention < percentageOfGlobalBlockHeightRetentionToKeep {
+		noOfBlocksToKeepInTxMetaCache = 1
+	} else {
+		noOfBlocksToKeepInTxMetaCache = tSettings.GlobalBlockHeightRetention / percentageOfGlobalBlockHeightRetentionToKeep
+	}
+
 	m := &TxMetaCache{
-		utxoStore: utxoStore,
-		cache:     cache,
-		metrics:   metrics{},
-		logger:    logger,
+		utxoStore:                     utxoStore,
+		cache:                         cache,
+		metrics:                       metrics{},
+		logger:                        logger,
+		noOfBlocksToKeepInTxMetaCache: noOfBlocksToKeepInTxMetaCache,
 	}
 
 	if bucketType == Pointer {
@@ -275,7 +290,7 @@ func (t *TxMetaCache) SetCache(hash *chainhash.Hash, txMeta *meta.Data) error {
 // Returns:
 // - Error if the cache operation fails
 func (t *TxMetaCache) SetCacheFromBytes(key, txMetaBytes []byte) error {
-	if err := t.cache.SetFromBytes(key, txMetaBytes); err != nil {
+	if err := t.cache.SetFromBytes(key, t.appendHeightToValue(txMetaBytes)); err != nil {
 		return err
 	}
 
@@ -295,7 +310,12 @@ func (t *TxMetaCache) SetCacheFromBytes(key, txMetaBytes []byte) error {
 // Returns:
 // - Error if the batch cache operation fails
 func (t *TxMetaCache) SetCacheMulti(keys [][]byte, values [][]byte) error {
-	if err := t.cache.SetMultiFromBytes(keys, values); err != nil {
+	valuesWithHeight := make([][]byte, len(values))
+	for i, value := range values {
+		valuesWithHeight[i] = t.appendHeightToValue(value)
+	}
+
+	if err := t.cache.SetMultiFromBytes(keys, valuesWithHeight); err != nil {
 		return err
 	}
 
@@ -738,6 +758,22 @@ func (t *TxMetaCache) Delete(_ context.Context, hash *chainhash.Hash) error {
 	t.metrics.evictions.Add(1)
 
 	return nil
+}
+
+// appendHeightToValue appends the current block height to the end of the
+// txMetaBytes. Kept for compatibility with the existing ImprovedCache plumbing
+// (the v2 receiver in #912 uses the same pattern). PointerCache's bridge
+// tolerates the trailing 4 bytes — NewMetaDataFromBytes reads forward by
+// declared lengths and ignores the suffix.
+//
+// The height is encoded as a big-endian uint32 in the last 4 bytes.
+func (t *TxMetaCache) appendHeightToValue(txMetaBytes []byte) []byte {
+	height := t.utxoStore.GetBlockHeight()
+	valueWithHeight := make([]byte, len(txMetaBytes)+4)
+	copy(valueWithHeight, txMetaBytes)
+	binary.BigEndian.PutUint32(valueWithHeight[len(txMetaBytes):], height)
+
+	return valueWithHeight
 }
 
 // GetCacheStats retrieves current operational statistics from the underlying cache.

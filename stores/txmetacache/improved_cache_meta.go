@@ -57,6 +57,18 @@ func (b *improvedCacheBackend) SetMultiFromBytes(keys, values [][]byte) error {
 	return b.cache.SetMulti(keys, values)
 }
 
+// SetMultiSequential delegates to the underlying ImprovedCache's partition-
+// aware twin, which skips the per-bucket goroutine fan-out.
+func (b *improvedCacheBackend) SetMultiSequential(keys, values [][]byte) error {
+	return b.cache.SetMultiSequential(keys, values)
+}
+
+// SetMultiSequentialWithHashes delegates to the underlying ImprovedCache,
+// allowing the caller-supplied xxhash values to be reused.
+func (b *improvedCacheBackend) SetMultiSequentialWithHashes(keys, values [][]byte, hashes []uint64) error {
+	return b.cache.SetMultiSequentialWithHashes(keys, values, hashes)
+}
+
 // Set serialises data via MetaBytes and forwards to the underlying byte Set.
 // Bridge cost: one MetaBytes() call per insert.
 func (b *improvedCacheBackend) Set(hash *chainhash.Hash, data *meta.Data) error {

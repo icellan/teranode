@@ -205,6 +205,23 @@ func (c *PointerCache) SetMultiFromBytes(keys, values [][]byte) error {
 	return nil
 }
 
+// SetMultiSequential is identical to SetMultiFromBytes for the pointer
+// backend: there is no per-bucket goroutine fan-out to skip, so the
+// "sequential" and "default" forms share an implementation.
+// Implements cacheBackend.
+func (c *PointerCache) SetMultiSequential(keys, values [][]byte) error {
+	return c.SetMultiFromBytes(keys, values)
+}
+
+// SetMultiSequentialWithHashes ignores the supplied xxhash values — the
+// pointer backend keys by the full chainhash.Hash, not xxhash, so a
+// caller-supplied uint64 hash carries no information the backend can use.
+// Falls through to SetMultiFromBytes.
+// Implements cacheBackend.
+func (c *PointerCache) SetMultiSequentialWithHashes(keys, values [][]byte, _ []uint64) error {
+	return c.SetMultiFromBytes(keys, values)
+}
+
 // Del removes the entry under key. The ring slot is not reclaimed eagerly —
 // it will be passed over on its next eviction turn (bounded by ring size).
 // Implements cacheBackend.
