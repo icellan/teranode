@@ -68,11 +68,14 @@ var (
 	// at least one ADD entry, regardless of how many entries the batch held.
 	prometheusSubtreeValidationSetTXMetaCacheKafkaBatch prometheus.Histogram
 
-	// prometheusSubtreeValidationSetTXMetaCacheKafkaCount counts individual ADD entries written
-	// to the txmeta cache from Kafka. Pre-batching this was the auto-emitted
-	// "set_tx_meta_cache_kafka_count" of the duration histogram; the batched dispatch path
-	// emits one histogram observation per Kafka message, so the per-entry rate moved to this
-	// explicit counter to keep `rate(set_tx_meta_cache_kafka_count[…])` reading entries/sec.
+	// prometheusSubtreeValidationSetTXMetaCacheKafkaCount counts individual ADD entries
+	// processed from Kafka (attempts, not successes — failures are tracked separately by
+	// prometheusSubtreeValidationSetTXMetaCacheKafkaErrors, matching the pre-batching
+	// behaviour where the histogram was observed regardless of cache write outcome).
+	// Pre-batching this was the auto-emitted "set_tx_meta_cache_kafka_count" of the
+	// duration histogram; the batched dispatch path emits one histogram observation per
+	// Kafka message, so the per-entry rate moved to this explicit counter to keep
+	// `rate(set_tx_meta_cache_kafka_count[…])` reading entries/sec.
 	prometheusSubtreeValidationSetTXMetaCacheKafkaCount prometheus.Counter
 
 	// prometheusSubtreeValidationDelTXMetaCacheKafka tracks the duration of deleting tx meta cache from kafka operations.
@@ -186,7 +189,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "subtreevalidation",
 			Name:      "set_tx_meta_cache_kafka_count",
-			Help:      "Number of ADD entries written to the txmeta cache from Kafka (per-entry counter; mirrors the pre-batching histogram count)",
+			Help:      "Number of ADD entries processed from Kafka (per-entry; attempts, not successes — failures separately in *_errors)",
 		},
 	)
 
