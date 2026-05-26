@@ -141,6 +141,8 @@ type Server struct {
 	peerMapTTL               time.Duration // Time-to-live for peer map entries
 	registryCacheSaveTicker  *time.Ticker  // Ticker for periodic saving of peer registry cache
 	peerRegistryCleanupTimer *time.Ticker  // Ticker for periodic eviction of stale peer registry entries
+
+	invalidPolicyWarnOnce sync.Once // Emits the invalid-fee-policy warning at most once per process to avoid log spam
 }
 
 // NewServer creates a new P2P server instance with the provided configuration and dependencies.
@@ -1285,7 +1287,12 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 			minMiningTxFee = &fee
 			s.logger.Debugf("[getNodeStatusMessage] MinMiningTxFee from settings: %f", fee)
 		} else {
-			s.logger.Warnf("[getNodeStatusMessage] policy settings invalid (NaN/Inf or negative); omitting fee fields from node_status")
+			// Warn once per process — this is published every status tick (~10s),
+			// so without the gate a bad config would spam the logs.
+			s.invalidPolicyWarnOnce.Do(func() {
+				s.logger.Warnf("[getNodeStatusMessage] policy settings invalid (NaN/Inf, negative, or out of uint64 range); omitting fee fields from node_status until config is corrected")
+			})
+			s.logger.Debugf("[getNodeStatusMessage] policy still invalid; fee fields remain omitted")
 		}
 	} else {
 		// For our own node, we always know the fee (even if it's 0)

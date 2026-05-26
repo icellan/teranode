@@ -595,11 +595,18 @@ func TestGetNodeStatusMessage(t *testing.T) {
 			peerRegistry:        NewPeerRegistry(),
 		}
 
+		// Call twice to exercise the sync.Once warn gate — both calls must
+		// still omit the fee fields, only the first call should log Warnf.
 		msg := server.getNodeStatusMessage(context.Background())
 		require.NotNil(t, msg)
 		// Legacy and new fields must agree: both omitted when policy is invalid.
 		assert.Nil(t, msg.FeePolicy)
 		assert.Nil(t, msg.MinMiningTxFee)
+
+		msg2 := server.getNodeStatusMessage(context.Background())
+		require.NotNil(t, msg2)
+		assert.Nil(t, msg2.FeePolicy)
+		assert.Nil(t, msg2.MinMiningTxFee)
 	})
 
 	t.Run("FeePolicy is nil when policy settings are absent", func(t *testing.T) {
