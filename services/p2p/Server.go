@@ -1014,6 +1014,7 @@ func (s *Server) handleNodeStatusTopic(_ context.Context, m []byte, peerID strin
 		SyncPeerBlockHash:   nodeStatusMessage.SyncPeerBlockHash,
 		SyncConnectedAt:     nodeStatusMessage.SyncConnectedAt,
 		MinMiningTxFee:      nodeStatusMessage.MinMiningTxFee,
+		FeePolicy:           nodeStatusMessage.FeePolicy,
 		ConnectedPeersCount: nodeStatusMessage.ConnectedPeersCount,
 		Storage:             nodeStatusMessage.Storage,
 	}:
@@ -1274,9 +1275,11 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 	// Get minimum mining transaction fee from settings
 	// Use a pointer to distinguish between nil (unknown) and 0 (no fee)
 	var minMiningTxFee *float64
+	var feePolicy *FeePolicy
 	if s.settings != nil && s.settings.Policy != nil {
 		fee := s.settings.Policy.GetMinMiningTxFee()
 		minMiningTxFee = &fee
+		feePolicy = policyFromSettings(s.settings.Policy)
 		s.logger.Debugf("[getNodeStatusMessage] MinMiningTxFee from settings: %f", fee)
 	} else {
 		// For our own node, we always know the fee (even if it's 0)
@@ -1353,6 +1356,7 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 		SyncPeerBlockHash:   syncPeerBlockHash,
 		SyncConnectedAt:     syncConnectedAt,
 		MinMiningTxFee:      minMiningTxFee,
+		FeePolicy:           feePolicy,
 		ConnectedPeersCount: connectedPeersCount,
 		Storage:             storage,
 	}
@@ -1389,6 +1393,7 @@ func (s *Server) handleNodeStatusNotification(ctx context.Context) error {
 		SyncPeerBlockHash:   msg.SyncPeerBlockHash,
 		SyncConnectedAt:     msg.SyncConnectedAt,
 		MinMiningTxFee:      msg.MinMiningTxFee,
+		FeePolicy:           msg.FeePolicy,
 		ConnectedPeersCount: msg.ConnectedPeersCount,
 		Storage:             msg.Storage,
 	}
