@@ -514,7 +514,7 @@ func TestWebsocketTransport_Methods(t *testing.T) {
 		assert.Equal(t, "websocket", transport.Name())
 		assert.Equal(t, centrifuge.ProtocolTypeJSON, transport.Protocol())
 		assert.Equal(t, centrifuge.ProtocolVersion2, transport.ProtocolVersion())
-		assert.True(t, transport.Unidirectional()) // Unidirectional returns true
+		assert.False(t, transport.Unidirectional()) // WebSocket is bidirectional
 		assert.False(t, transport.Emulation())
 	})
 }
@@ -1420,6 +1420,66 @@ func TestWebsocketHandler_ServeHTTP(t *testing.T) {
 		// Should not panic with custom configs
 		handler.ServeHTTP(w, req)
 	})
+}
+
+// TestWebsocketHandler_BidirectionalConnect exercises the full bidirectional
+// centrifuge handshake against the real handler. This is the path that issue
+// #938 reported broken: under the previous Unidirectional()=true the server
+// emitted the connect reply as a Push envelope (no id) and bidirectional
+// clients could not parse it. Under a naive "just flip the boolean" fix the
+// path through Client.Connect → unidirectionalConnect → connectCmd would
+// panic at writeEncodedCommandReply because cmd is nil.
+//
+// The handler must accept a real Command envelope ({id, connect}) and return
+// a command-reply envelope ({id, connect:{client,subs,…}}) — id-matched.
+func TestWebsocketHandler_BidirectionalConnect(t *testing.T) {
+	node, err := centrifuge.New(centrifuge.Config{LogLevel: centrifuge.LogLevelError})
+	require.NoError(t, err)
+
+	// Mirror centrifuge.go: auto-subscribe to a known channel so we can also
+	// confirm OnConnecting subscriptions land in the reply. Production wires
+	// Credentials via authMiddleware; for the unit test we return them from
+	// OnConnecting directly.
+	node.OnConnecting(func(_ context.Context, _ centrifuge.ConnectEvent) (centrifuge.ConnectReply, error) {
+		return centrifuge.ConnectReply{
+			Credentials: &centrifuge.Credentials{UserID: "test-user"},
+			Subscriptions: map[string]centrifuge.SubscribeOptions{
+				"node_status": {},
+			},
+		}, nil
+	})
+
+	require.NoError(t, node.Run())
+	defer func() { _ = node.Shutdown(context.Background()) }()
+
+	handler := NewWebsocketHandler(node, WebsocketConfig{
+		CheckOrigin: func(_ *http.Request) bool { return true },
+	})
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	require.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte(`{"id":1,"connect":{}}`)))
+
+	_, data, err := conn.ReadMessage()
+	require.NoError(t, err, "expected a centrifuge connect reply")
+
+	var reply map[string]any
+	require.NoError(t, json.Unmarshal(data, &reply), "raw reply: %s", string(data))
+
+	require.EqualValues(t, 1, reply["id"], "reply must echo the command id; got %s", string(data))
+	connectResult, ok := reply["connect"].(map[string]any)
+	require.True(t, ok, "reply must carry a connect result; got %s", string(data))
+	require.NotEmpty(t, connectResult["client"], "connect result must include a non-empty client id")
+
+	subs, _ := connectResult["subs"].(map[string]any)
+	require.NotNil(t, subs["node_status"], "OnConnecting subscriptions must appear in the connect reply; got %s", string(data))
 }
 
 // TestCentrifuge_Init_comprehensive_callbacks tests Init function's callback functionality
