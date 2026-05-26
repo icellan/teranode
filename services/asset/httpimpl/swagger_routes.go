@@ -374,6 +374,20 @@ package httpimpl
 //   400: errorResponse
 //   404: errorResponse
 
+// swagger:route POST /api/v1/utxos utxo getUTXOsBulk
+// Bulk UTXO spend-status lookup.
+// Request body: concatenated 36-byte records, each [32 bytes txid][4 bytes vout little-endian].
+// Response body: concatenated fixed-length 48-byte records in input order, each
+// [8 bytes status LE][4 bytes lockTime LE][4 bytes spendingVin LE][32 bytes spendingTxID].
+// Unspent UTXOs have the trailing 36 bytes zero-filled; not-found records report
+// status utxo.Status_NOT_FOUND and the remaining bytes are zero. Body size is
+// capped by the asset_httpBodyLimit setting (default 4MB).
+// responses:
+//   200: binaryResponse
+//   400: errorResponse
+//   413: errorResponse
+//   500: errorResponse
+
 // ========== Merkle Proofs ==========
 
 // swagger:route GET /api/v1/merkle_proof/{hash} proof getMerkleProof

@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"io"
 	"net/http"
-	"strings"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -126,13 +125,17 @@ func (h *HTTP) GetUTXOs() func(c echo.Context) error {
 					UTXOHash:     nil,
 					SpendingData: nil,
 				})
+
+				slotStart := i * utxosResponseRecordSize
+				slot := responseBytes[slotStart : slotStart+utxosResponseRecordSize]
+
 				if err != nil {
-					// Treat per-record not-found as Status_NOT_FOUND; surface
-					// anything else as a request-level failure (one bad store
-					// call shouldn't return zero-padded "not found" for all
-					// other records).
-					if errors.Is(err, errors.ErrNotFound) || strings.Contains(err.Error(), "not found") {
-						writeUTXOsRecord(responseBytes[i*utxosResponseRecordSize:], &utxo.SpendResponse{
+					// Per-record not-found becomes Status_NOT_FOUND in the slot;
+					// any other store error fails the whole request (we don't
+					// want to silently report zero-padded "not found" for every
+					// record when the store is unreachable).
+					if errors.Is(err, errors.ErrNotFound) {
+						writeUTXOsRecord(slot, &utxo.SpendResponse{
 							Status: int(utxo.Status_NOT_FOUND),
 						})
 
@@ -146,7 +149,7 @@ func (h *HTTP) GetUTXOs() func(c echo.Context) error {
 					resp = &utxo.SpendResponse{Status: int(utxo.Status_NOT_FOUND)}
 				}
 
-				writeUTXOsRecord(responseBytes[i*utxosResponseRecordSize:], resp)
+				writeUTXOsRecord(slot, resp)
 
 				return nil
 			})

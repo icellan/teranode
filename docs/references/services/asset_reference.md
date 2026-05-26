@@ -778,6 +778,13 @@ Error responses include a JSON object with an error message:
     - Parameters: `hash` - Transaction hash
     - Returns: UTXO data array (JSON)
 
+- **POST `/api/v1/utxos`**
+    - Purpose: Bulk UTXO spend-status lookup (binary). Avoids per-record HTTP overhead and the redundant transaction fetch that would otherwise be paid per `GET /api/v1/utxo/:hash` request.
+    - Request body: concatenated 36-byte records, each `[32 bytes txid][4 bytes vout LE]`. Body length must be a multiple of 36.
+    - Response body: concatenated fixed-length 48-byte records in input order, each `[8 bytes status LE][4 bytes lockTime LE][4 bytes spendingVin LE][32 bytes spendingTxID]`. Unspent UTXOs have the trailing 36 bytes zero-filled; not-found records report status `utxo.Status_NOT_FOUND`. Clients can index by `i*48`.
+    - Limits: body size capped by the `asset_httpBodyLimit` setting (default 4MB ≈ 116k records per request).
+    - Error responses: `400` (body length not a multiple of 36), `413` (body exceeds the cap), `500` (transport or store failure).
+
 ### Subtree Endpoints
 
 - **GET `/api/v1/subtree/:hash`**
