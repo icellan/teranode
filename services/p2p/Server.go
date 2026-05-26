@@ -1277,10 +1277,16 @@ func (s *Server) getNodeStatusMessage(ctx context.Context) *notificationMsg {
 	var minMiningTxFee *float64
 	var feePolicy *FeePolicy
 	if s.settings != nil && s.settings.Policy != nil {
-		fee := s.settings.Policy.GetMinMiningTxFee()
-		minMiningTxFee = &fee
 		feePolicy = policyFromSettings(s.settings.Policy)
-		s.logger.Debugf("[getNodeStatusMessage] MinMiningTxFee from settings: %f", fee)
+		if feePolicy != nil {
+			// Keep legacy and new fields consistent: only advertise the
+			// scalar fee when the full policy is valid.
+			fee := s.settings.Policy.GetMinMiningTxFee()
+			minMiningTxFee = &fee
+			s.logger.Debugf("[getNodeStatusMessage] MinMiningTxFee from settings: %f", fee)
+		} else {
+			s.logger.Warnf("[getNodeStatusMessage] policy settings invalid (NaN/Inf or negative); omitting fee fields from node_status")
+		}
 	} else {
 		// For our own node, we always know the fee (even if it's 0)
 		// Only leave nil for messages from other peers

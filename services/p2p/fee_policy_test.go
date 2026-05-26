@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/settings"
@@ -42,6 +43,36 @@ func TestPolicyFromSettings(t *testing.T) {
 		require.NotNil(t, fp)
 		assert.Equal(t, uint64(0), fp.MiningFee.Satoshis)
 		assert.Equal(t, uint64(1000), fp.MiningFee.Bytes)
+	})
+
+	t.Run("NaN fee yields nil", func(t *testing.T) {
+		p := &settings.PolicySettings{MinMiningTxFee: math.NaN()}
+		assert.Nil(t, policyFromSettings(p))
+	})
+
+	t.Run("+Inf fee yields nil", func(t *testing.T) {
+		p := &settings.PolicySettings{MinMiningTxFee: math.Inf(1)}
+		assert.Nil(t, policyFromSettings(p))
+	})
+
+	t.Run("-Inf fee yields nil", func(t *testing.T) {
+		p := &settings.PolicySettings{MinMiningTxFee: math.Inf(-1)}
+		assert.Nil(t, policyFromSettings(p))
+	})
+
+	t.Run("negative MaxScriptSizePolicy yields nil", func(t *testing.T) {
+		p := &settings.PolicySettings{MaxScriptSizePolicy: -1}
+		assert.Nil(t, policyFromSettings(p))
+	})
+
+	t.Run("negative MaxTxSizePolicy yields nil", func(t *testing.T) {
+		p := &settings.PolicySettings{MaxTxSizePolicy: -1}
+		assert.Nil(t, policyFromSettings(p))
+	})
+
+	t.Run("negative MaxTxSigopsCountsPolicy yields nil", func(t *testing.T) {
+		p := &settings.PolicySettings{MaxTxSigopsCountsPolicy: -1}
+		assert.Nil(t, policyFromSettings(p))
 	})
 }
 

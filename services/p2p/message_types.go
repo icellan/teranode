@@ -25,16 +25,26 @@ type FeePolicy struct {
 }
 
 // policyFromSettings builds a FeePolicy from local policy settings. Returns nil
-// when settings are unavailable or the configured fee cannot be safely cast to
-// satoshis/kB (negative or out of uint64 range) — status liveness is more
-// valuable than this one field.
+// when settings are unavailable or any value cannot be safely advertised:
+// non-finite or out-of-uint64-range MinMiningTxFee, or a negative size/sigops
+// knob (which would wrap to a huge uint64 on cast). Status liveness is more
+// valuable than this one field, so we drop the policy rather than abort.
 func policyFromSettings(p *settings.PolicySettings) *FeePolicy {
 	if p == nil {
 		return nil
 	}
 
-	feeInSatoshis := p.MinMiningTxFee * 100_000_000
+	fee := p.MinMiningTxFee
+	if math.IsNaN(fee) || math.IsInf(fee, 0) {
+		return nil
+	}
+
+	feeInSatoshis := fee * 100_000_000
 	if feeInSatoshis < 0 || feeInSatoshis > float64(math.MaxUint64) {
+		return nil
+	}
+
+	if p.MaxScriptSizePolicy < 0 || p.MaxTxSizePolicy < 0 || p.MaxTxSigopsCountsPolicy < 0 {
 		return nil
 	}
 

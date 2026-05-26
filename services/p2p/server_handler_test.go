@@ -564,6 +564,44 @@ func TestGetNodeStatusMessage(t *testing.T) {
 		assert.Equal(t, uint64(4000), msg.FeePolicy.MaxTxSigopsCountsPolicy)
 	})
 
+	t.Run("invalid policy omits both FeePolicy and MinMiningTxFee", func(t *testing.T) {
+		_, pub, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+		require.NoError(t, err)
+		testPeerID, err := peer.IDFromPublicKey(pub)
+		require.NoError(t, err)
+
+		mockP2P := new(MockServerP2PClient)
+		mockP2P.peerID = testPeerID
+
+		mockBC := new(blockchain.Mock)
+		mockBC.On("GetBestBlockHeader", mock.Anything).Return(model.GenesisBlockHeader, model.GenesisBlockHeaderMeta, nil)
+		fsmState := blockchain_api.FSMStateType_RUNNING
+		mockBC.On("GetFSMCurrentState", mock.Anything).Return(&fsmState, nil)
+		blockPersisterData := make([]byte, 4)
+		mockBC.On("GetState", mock.Anything, "BlockPersisterHeight").Return(blockPersisterData, nil)
+
+		tSettings := createBaseTestSettings()
+		tSettings.P2P.ListenMode = settings.ListenModeFull
+		// Negative MaxTxSizePolicy makes policyFromSettings reject the policy.
+		tSettings.Policy.MaxTxSizePolicy = -1
+
+		server := &Server{
+			logger:              ulogger.New("test"),
+			P2PClient:           mockP2P,
+			blockchainClient:    mockBC,
+			settings:            tSettings,
+			startTime:           time.Now(),
+			syncConnectionTimes: sync.Map{},
+			peerRegistry:        NewPeerRegistry(),
+		}
+
+		msg := server.getNodeStatusMessage(context.Background())
+		require.NotNil(t, msg)
+		// Legacy and new fields must agree: both omitted when policy is invalid.
+		assert.Nil(t, msg.FeePolicy)
+		assert.Nil(t, msg.MinMiningTxFee)
+	})
+
 	t.Run("FeePolicy is nil when policy settings are absent", func(t *testing.T) {
 		_, pub, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
 		require.NoError(t, err)
