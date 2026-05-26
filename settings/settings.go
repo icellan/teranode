@@ -211,6 +211,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			// Streaming configuration
 			SubtreeDataStreamingChunkSize:   getInt("asset_subtreeDataStreamingChunkSize", 10000, alternativeContext...),
 			SubtreeDataStreamingConcurrency: getInt("asset_subtreeDataStreamingConcurrency", 2, alternativeContext...),
+
+			HTTPBodyLimit: getString("asset_httpBodyLimit", "4MB", alternativeContext...),
 		},
 		Block: BlockSettings{
 			MinedCacheMaxMB:                       getInt("blockMinedCacheMaxMB", 256, alternativeContext...),

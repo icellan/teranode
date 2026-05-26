@@ -286,6 +286,14 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 
 	apiGroup.GET("/utxos/:hash/json", h.GetUTXOsByTxID(JSON))
 
+	// Bulk UTXO spend-status lookup. Body cap is enforced per-route so the rest
+	// of the asset HTTP surface keeps its existing (larger) defaults.
+	if limit := tSettings.Asset.HTTPBodyLimit; limit != "" {
+		apiGroup.POST("/utxos", h.GetUTXOs(), middleware.BodyLimit(limit))
+	} else {
+		apiGroup.POST("/utxos", h.GetUTXOs())
+	}
+
 	apiGroup.GET("/bestblockheader", h.GetBestBlockHeader(BINARY_STREAM))
 	apiGroup.GET("/bestblockheader/hex", h.GetBestBlockHeader(HEX))
 	apiGroup.GET("/bestblockheader/json", h.GetBestBlockHeader(JSON))

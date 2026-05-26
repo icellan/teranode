@@ -189,10 +189,16 @@ func (s *Store) GetSpend(_ context.Context, spend *utxo.Spend) (*utxo.SpendRespo
 					return nil, errors.NewProcessingError("invalid utxo hash length", nil)
 				}
 
-				// check utxoHash is the same as the one we expect
-				utxoHash := chainhash.Hash(b[:32])
-				if !utxoHash.IsEqual(spend.UTXOHash) {
-					return nil, errors.NewProcessingError("utxo hash mismatch", nil)
+				// Verify the caller-supplied hash matches the stored one. When the
+				// caller passes nil (e.g. the bulk /api/v1/utxos endpoint, which
+				// intentionally avoids fetching the full transaction to recompute
+				// it) we trust the stored hash — the record was located by primary
+				// key (txid, vout) and the stored hash is canonical.
+				if spend.UTXOHash != nil {
+					utxoHash := chainhash.Hash(b[:32])
+					if !utxoHash.IsEqual(spend.UTXOHash) {
+						return nil, errors.NewProcessingError("utxo hash mismatch", nil)
+					}
 				}
 
 				if len(b) == 68 {

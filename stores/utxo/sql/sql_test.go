@@ -362,6 +362,42 @@ func TestGetSpend(t *testing.T) {
 	assert.Equal(t, int(utxo.Status_OK), res.Status)
 }
 
+// TestGetSpendNilUTXOHash verifies that GetSpend works without a caller-supplied
+// UTXOHash. The HTTP /api/v1/utxo and /api/v1/utxos endpoints rely on this
+// behaviour to avoid fetching the full transaction (and possibly its blob from
+// the tx store) just to recompute a hash that the store already has.
+func TestGetSpendNilUTXOHash(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	utxoStore, tx := setup(ctx, t)
+
+	_, err := utxoStore.Create(ctx, tx, 0)
+	require.NoError(t, err)
+
+	t.Run("nil UTXOHash skips the mismatch check", func(t *testing.T) {
+		res, err := utxoStore.GetSpend(ctx, &utxo.Spend{
+			TxID:     tx.TxIDChainHash(),
+			Vout:     0,
+			UTXOHash: nil,
+		})
+		require.NoError(t, err)
+		require.Equal(t, int(utxo.Status_OK), res.Status)
+	})
+
+	t.Run("non-nil wrong UTXOHash still fails the mismatch check", func(t *testing.T) {
+		var wrong chainhash.Hash
+		wrong[0] = 0xff
+
+		_, err := utxoStore.GetSpend(ctx, &utxo.Spend{
+			TxID:     tx.TxIDChainHash(),
+			Vout:     0,
+			UTXOHash: &wrong,
+		})
+		require.Error(t, err)
+	})
+}
+
 func TestSetMinedMulti(t *testing.T) {
 	t.Run("single block", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())

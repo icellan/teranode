@@ -42,6 +42,10 @@ var (
 	// prometheusAssetHTTPGetUTXO tracks UTXO retrievals
 	prometheusAssetHTTPGetUTXO *prometheus.CounterVec
 
+	// prometheusAssetHTTPGetUTXOs tracks bulk UTXO retrievals (POST /api/v1/utxos).
+	// The counter is incremented by the number of UTXO records processed per request.
+	prometheusAssetHTTPGetUTXOs *prometheus.CounterVec
+
 	// prometheusAssetHTTPGetMerkleProof tracks merkle proof retrievals
 	prometheusAssetHTTPGetMerkleProof *prometheus.CounterVec
 
@@ -215,6 +219,19 @@ func _initPrometheusMetrics() {
 		[]string{
 			"function",  // function tracking the operation
 			"operation", // type of operation achieved
+		},
+	)
+
+	prometheusAssetHTTPGetUTXOs = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "asset",
+			Name:      "http_get_utxos",
+			Help:      "Number of bulk Get UTXO records served via POST /api/v1/utxos",
+		},
+		[]string{
+			"function",
+			"operation",
 		},
 	)
 
