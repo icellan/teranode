@@ -945,6 +945,31 @@ func Test_TxMetaCache_MiningOperations(t *testing.T) {
 		}
 	})
 
+	t.Run("SetMinedMultiParallel_EvictsCache", func(t *testing.T) {
+		// Pin the contract that SetMinedMultiParallel evicts cache entries
+		// rather than trying (and silently failing) to update BlockIDs in a
+		// cache format that doesn't carry them. After this call, GetMetaCached
+		// must miss on the hash; the next read goes to the underlying store
+		// which has the up-to-date BlockIDs.
+		evictHash := chainhash.HashH([]byte("setminedmultiparallel-evict"))
+
+		seed := &meta.Data{
+			Fee:         42,
+			SizeInBytes: 100,
+			TxInpoints:  subtree.TxInpoints{ParentTxHashes: []chainhash.Hash{}},
+			BlockIDs:    make([]uint32, 0),
+		}
+		require.NoError(t, cache.SetCache(&evictHash, seed))
+
+		_, found := cache.GetMetaCached(ctx, evictHash)
+		require.True(t, found, "test precondition: entry must be in cache before SetMinedMultiParallel")
+
+		require.NoError(t, cache.SetMinedMultiParallel(ctx, []*chainhash.Hash{&evictHash}, 9))
+
+		_, found = cache.GetMetaCached(ctx, evictHash)
+		require.False(t, found, "SetMinedMultiParallel must evict cache entries; stale BlockIDs would otherwise survive")
+	})
+
 	t.Run("GetUnminedTxIterator", func(t *testing.T) {
 		// Test GetUnminedTxIterator
 		iterator, err := cache.GetUnminedTxIterator()

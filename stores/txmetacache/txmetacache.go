@@ -720,19 +720,22 @@ func (t *TxMetaCache) RemoveBlockIDs(ctx context.Context, removals []utxo.BlockI
 	return t.utxoStore.RemoveBlockIDs(ctx, removals)
 }
 
-// setMinedInCacheParallel is an internal helper method that updates the mined status
-// of multiple transactions in parallel, using goroutines to improve performance.
+// setMinedInCacheParallel evicts the cache entries for a batch of newly-mined
+// transactions, in parallel. Eviction is the only safe response — neither
+// backend can round-trip BlockIDs through the cached format (ImprovedCache's
+// MetaBytes wire format omits the field, and PointerCache's metadataOnly
+// strips it to match), so any SetCache here would silently drop the new
+// blockID. After eviction the next read on each hash falls through to the
+// underlying store which has the up-to-date BlockIDs.
 //
-// Parameters:
-// - ctx: Context for the operation
-// - hashes: List of transaction hashes to mark as mined
-// - blockID: ID of the block where the transactions were mined
-//
-// Returns:
-// - Error if updating the cache for any transaction fails
-//
-// The method uses an errgroup to manage concurrent updates while properly handling errors.
-func (t *TxMetaCache) setMinedInCacheParallel(ctx context.Context, hashes []*chainhash.Hash, blockID uint32) error {
+// Matches the eviction pattern used by SetMinedMulti above. Parameters:
+//   - ctx:     used for tracing; not currently consulted for cancellation
+//     because Delete is a fast in-memory op and the errgroup's semantics
+//     handle early-return naturally.
+//   - hashes:  the mined transactions to evict.
+//   - blockID: accepted for API symmetry with the byte path; not consulted —
+//     the actual store update happens before this method is invoked.
+func (t *TxMetaCache) setMinedInCacheParallel(ctx context.Context, hashes []*chainhash.Hash, _ uint32) error {
 	g := new(errgroup.Group)
 	util.SafeSetLimit(g, 100)
 
@@ -740,24 +743,7 @@ func (t *TxMetaCache) setMinedInCacheParallel(ctx context.Context, hashes []*cha
 		hash := hash
 
 		g.Go(func() error {
-			txMeta, err := t.Get(ctx, hash)
-			if err != nil {
-				txMeta, err = t.utxoStore.Get(ctx, hash)
-			}
-
-			if err != nil {
-				return err
-			}
-
-			if txMeta.BlockIDs == nil {
-				txMeta.BlockIDs = []uint32{
-					blockID,
-				}
-			} else {
-				txMeta.BlockIDs = append(txMeta.BlockIDs, blockID)
-			}
-
-			return t.SetCache(hash, txMeta)
+			return t.Delete(ctx, hash)
 		})
 	}
 
