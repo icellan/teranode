@@ -3,6 +3,8 @@ package httpimpl
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"testing"
 
@@ -82,7 +84,7 @@ func TestGetUTXOs(t *testing.T) {
 		httpServer, _, echoContext, rec := GetMockHTTP(t, bytes.NewReader(nil))
 		echoContext.Request().Method = http.MethodPost
 
-		require.NoError(t, httpServer.GetUTXOs()(echoContext))
+		require.NoError(t, httpServer.GetUTXOs(BINARY_STREAM)(echoContext))
 		require.Equal(t, http.StatusOK, rec.Code)
 		require.Empty(t, rec.Body.Bytes())
 	})
@@ -93,7 +95,7 @@ func TestGetUTXOs(t *testing.T) {
 		httpServer, _, echoContext, _ := GetMockHTTP(t, bytes.NewReader(body))
 		echoContext.Request().Method = http.MethodPost
 
-		err := httpServer.GetUTXOs()(echoContext)
+		err := httpServer.GetUTXOs(BINARY_STREAM)(echoContext)
 		echoErr := &echo.HTTPError{}
 		require.True(t, errors.As(err, &echoErr))
 		assert.Equal(t, http.StatusBadRequest, echoErr.Code)
@@ -142,7 +144,7 @@ func TestGetUTXOs(t *testing.T) {
 		echoContext.Request().Method = http.MethodPost
 		echoContext.Request().Body = mustBody(body)
 
-		require.NoError(t, httpServer.GetUTXOs()(echoContext))
+		require.NoError(t, httpServer.GetUTXOs(BINARY_STREAM)(echoContext))
 		require.Equal(t, http.StatusOK, rec.Code)
 
 		got := parseUTXOsResponse(t, rec.Body.Bytes())
@@ -183,7 +185,7 @@ func TestGetUTXOs(t *testing.T) {
 		echoContext.Request().Method = http.MethodPost
 		echoContext.Request().Body = mustBody(body)
 
-		require.NoError(t, httpServer.GetUTXOs()(echoContext))
+		require.NoError(t, httpServer.GetUTXOs(BINARY_STREAM)(echoContext))
 		require.Equal(t, http.StatusOK, rec.Code)
 
 		mockRepo.AssertCalled(t, "GetUtxo", mock.MatchedBy(func(s *utxo.Spend) bool {
@@ -220,7 +222,7 @@ func TestGetUTXOs(t *testing.T) {
 		echoContext.Request().Method = http.MethodPost
 		echoContext.Request().Body = mustBody(body)
 
-		require.NoError(t, httpServer.GetUTXOs()(echoContext))
+		require.NoError(t, httpServer.GetUTXOs(BINARY_STREAM)(echoContext))
 		require.Equal(t, http.StatusOK, rec.Code)
 
 		got := parseUTXOsResponse(t, rec.Body.Bytes())
@@ -246,10 +248,120 @@ func TestGetUTXOs(t *testing.T) {
 		echoContext.Request().Method = http.MethodPost
 		echoContext.Request().Body = mustBody(body)
 
-		err := httpServer.GetUTXOs()(echoContext)
+		err := httpServer.GetUTXOs(BINARY_STREAM)(echoContext)
 		echoErr := &echo.HTTPError{}
 		require.True(t, errors.As(err, &echoErr))
 		assert.Equal(t, http.StatusInternalServerError, echoErr.Code)
+	})
+
+	t.Run("HEX mode returns hex-encoded binary payload", func(t *testing.T) {
+		httpServer, mockRepo, echoContext, rec := GetMockHTTP(t, nil)
+
+		txA := mkTxID(0xa1)
+		spendingTx := mkTxID(0xee)
+
+		mockRepo.On("GetUtxo", mock.MatchedBy(func(s *utxo.Spend) bool {
+			return s.TxID != nil && *s.TxID == txA
+		})).Return(&utxo.SpendResponse{
+			Status:       int(utxo.Status_SPENT),
+			LockTime:     99,
+			SpendingData: spendpkg.NewSpendingData(&spendingTx, 5),
+		}, nil)
+
+		body := buildUTXOsRequest([]struct {
+			TxID chainhash.Hash
+			Vout uint32
+		}{
+			{TxID: txA, Vout: 0},
+		})
+
+		echoContext.Request().Method = http.MethodPost
+		echoContext.Request().Body = mustBody(body)
+
+		require.NoError(t, httpServer.GetUTXOs(HEX)(echoContext))
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, "text/plain; charset=UTF-8", rec.Header().Get("Content-Type"))
+
+		decoded, err := hex.DecodeString(rec.Body.String())
+		require.NoError(t, err)
+
+		got := parseUTXOsResponse(t, decoded)
+		require.Len(t, got, 1)
+		assert.Equal(t, int(utxo.Status_SPENT), got[0].Status)
+		assert.Equal(t, uint32(99), got[0].LockTime)
+		require.NotNil(t, got[0].SpendingData)
+		assert.Equal(t, spendingTx, *got[0].SpendingData.TxID)
+		assert.Equal(t, 5, got[0].SpendingData.Vin)
+	})
+
+	t.Run("JSON mode returns array of SpendResponse objects in input order", func(t *testing.T) {
+		httpServer, mockRepo, echoContext, rec := GetMockHTTP(t, nil)
+
+		txA := mkTxID(0xa1)
+		txB := mkTxID(0xb2)
+		txC := mkTxID(0xc3)
+		spendingTx := mkTxID(0xee)
+
+		mockRepo.On("GetUtxo", mock.MatchedBy(func(s *utxo.Spend) bool {
+			return s.TxID != nil && *s.TxID == txA
+		})).Return(&utxo.SpendResponse{
+			Status:   int(utxo.Status_OK),
+			LockTime: 1234567,
+		}, nil)
+
+		mockRepo.On("GetUtxo", mock.MatchedBy(func(s *utxo.Spend) bool {
+			return s.TxID != nil && *s.TxID == txB
+		})).Return(&utxo.SpendResponse{
+			Status:       int(utxo.Status_SPENT),
+			SpendingData: spendpkg.NewSpendingData(&spendingTx, 11),
+		}, nil)
+
+		mockRepo.On("GetUtxo", mock.MatchedBy(func(s *utxo.Spend) bool {
+			return s.TxID != nil && *s.TxID == txC
+		})).Return(&utxo.SpendResponse{
+			Status: int(utxo.Status_NOT_FOUND),
+		}, nil)
+
+		body := buildUTXOsRequest([]struct {
+			TxID chainhash.Hash
+			Vout uint32
+		}{
+			{TxID: txA, Vout: 0},
+			{TxID: txB, Vout: 1},
+			{TxID: txC, Vout: 2},
+		})
+
+		echoContext.Request().Method = http.MethodPost
+		echoContext.Request().Body = mustBody(body)
+
+		require.NoError(t, httpServer.GetUTXOs(JSON)(echoContext))
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+
+		var got []*utxo.SpendResponse
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+		require.Len(t, got, 3)
+
+		assert.Equal(t, int(utxo.Status_OK), got[0].Status)
+		assert.Equal(t, uint32(1234567), got[0].LockTime)
+		assert.Nil(t, got[0].SpendingData)
+
+		assert.Equal(t, int(utxo.Status_SPENT), got[1].Status)
+		require.NotNil(t, got[1].SpendingData)
+		assert.Equal(t, spendingTx, *got[1].SpendingData.TxID)
+		assert.Equal(t, 11, got[1].SpendingData.Vin)
+
+		assert.Equal(t, int(utxo.Status_NOT_FOUND), got[2].Status)
+		assert.Nil(t, got[2].SpendingData)
+	})
+
+	t.Run("JSON mode on empty body returns empty array", func(t *testing.T) {
+		httpServer, _, echoContext, rec := GetMockHTTP(t, bytes.NewReader(nil))
+		echoContext.Request().Method = http.MethodPost
+
+		require.NoError(t, httpServer.GetUTXOs(JSON)(echoContext))
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.JSONEq(t, "[]", rec.Body.String())
 	})
 }
 

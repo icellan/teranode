@@ -288,12 +288,16 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 
 	// Bulk UTXO spend-status lookup. The body cap is per-route — other asset
 	// routes have no application-level body limit and are not affected by
-	// asset_httpBodyLimit.
+	// asset_httpBodyLimit. All three modes accept the same 36-byte binary
+	// request body; only the response format differs.
+	var utxosMiddlewares []echo.MiddlewareFunc
 	if limit := tSettings.Asset.HTTPBodyLimit; limit != "" {
-		apiGroup.POST("/utxos", h.GetUTXOs(), middleware.BodyLimit(limit))
-	} else {
-		apiGroup.POST("/utxos", h.GetUTXOs())
+		utxosMiddlewares = append(utxosMiddlewares, middleware.BodyLimit(limit))
 	}
+
+	apiGroup.POST("/utxos", h.GetUTXOs(BINARY_STREAM), utxosMiddlewares...)
+	apiGroup.POST("/utxos/hex", h.GetUTXOs(HEX), utxosMiddlewares...)
+	apiGroup.POST("/utxos/json", h.GetUTXOs(JSON), utxosMiddlewares...)
 
 	apiGroup.GET("/bestblockheader", h.GetBestBlockHeader(BINARY_STREAM))
 	apiGroup.GET("/bestblockheader/hex", h.GetBestBlockHeader(HEX))

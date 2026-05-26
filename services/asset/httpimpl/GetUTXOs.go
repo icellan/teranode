@@ -2,6 +2,7 @@ package httpimpl
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"io"
 	"net/http"
 
@@ -20,7 +21,8 @@ const (
 	utxosRequestRecordSize = 36 // 32 bytes txid + 4 bytes vout (little-endian)
 
 	// utxosResponseRecordSize is the on-wire size of one fixed-length response
-	// record. Clients index into the response by `i*utxosResponseRecordSize`.
+	// record in the binary and hex output modes. Binary clients can index by
+	// `i*utxosResponseRecordSize`.
 	utxosResponseRecordSize = 48 // 8 bytes status + 4 bytes lockTime + 4 bytes vin + 32 bytes txid
 
 	// utxosFanoutLimit caps in-flight per-record store lookups. Mirrors the
@@ -33,27 +35,40 @@ const (
 // HTTP Method:
 //   - POST
 //
-// Request:
+// Request (identical for all three response modes):
 //
 //	Content-Type: application/octet-stream
 //	Body: Concatenated 36-byte records, each containing
 //	      [32 bytes txid][4 bytes vout (little-endian)].
 //	      The body length must be a multiple of 36.
 //
-// Returns:
-//   - func(c echo.Context) error: Echo handler function
+// Response modes (selected by the route, mirroring GetUTXO):
 //
-// HTTP Response:
+//  1. BINARY_STREAM (POST /api/v1/utxos)
+//     Status: 200 OK
+//     Content-Type: application/octet-stream
+//     Body: Concatenated fixed-length 48-byte records in input order:
+//     [8 bytes status LE][4 bytes lockTime LE][4 bytes vin LE][32 bytes spendingTxID].
+//     For unspent UTXOs the trailing 36 bytes (vin + spendingTxID) are zero-filled.
+//     For records not found in the store, status is utxo.Status_NOT_FOUND and
+//     the remaining bytes are zero.
 //
-//	Status: 200 OK on any well-formed request, regardless of per-record outcomes.
-//	Content-Type: application/octet-stream
-//	Body: Concatenated 48-byte records in input order:
-//	      [8 bytes status LE][4 bytes lockTime LE][4 bytes vin LE][32 bytes spendingTxID]
-//	      For unspent UTXOs the trailing 36 bytes (vin + spendingTxID) are zero-filled.
-//	      For records not found in the store, status is utxo.Status_NOT_FOUND and the
-//	      remaining bytes are zero. The whole-request HTTP status is unchanged.
+//  2. HEX (POST /api/v1/utxos/hex)
+//     Status: 200 OK
+//     Content-Type: text/plain
+//     Body: Lowercase hex-encoding of the BINARY_STREAM body. Decoded length is
+//     numRecords * 48 bytes; clients can decode then index as above.
 //
-// Error Responses:
+//  3. JSON (POST /api/v1/utxos/json)
+//     Status: 200 OK
+//     Content-Type: application/json
+//     Body: JSON array of utxo.SpendResponse objects, in input order, e.g.
+//     [{"status":1,"spendingData":{"txId":"...","vin":0},"lockTime":1234567},
+//     {"status":3}, ...]
+//
+// The whole-request HTTP status is unchanged by per-record outcomes.
+//
+// Error Responses (all modes):
 //
 //   - 400 Bad Request: body length is not a multiple of 36 bytes.
 //   - 413 Request Entity Too Large: body exceeds the asset_httpBodyLimit setting.
@@ -64,17 +79,17 @@ const (
 //   - Bypasses the per-record full-transaction fetch that GET /api/v1/utxo/:hash
 //     used to do (see GetUTXO.go). Each lookup is a single Aerospike record read.
 //   - Concurrent lookups are bounded by utxosFanoutLimit.
-//   - Response buffer is preallocated; each goroutine writes its own slot, so no
-//     mutex is needed (unlike GetTransactions, where response length is variable).
+//   - Each goroutine writes its own slot in a preallocated []*SpendResponse, so
+//     no mutex is needed.
 //
 // Monitoring:
 //   - Execution time recorded under "GetUTXOs_http" via the asset tracer.
 //   - prometheusAssetHTTPGetUTXOs is incremented by the number of records served.
-func (h *HTTP) GetUTXOs() func(c echo.Context) error {
+func (h *HTTP) GetUTXOs(mode ReadMode) func(c echo.Context) error {
 	return func(c echo.Context) error {
 		ctx, _, deferFn := tracing.Tracer("asset").Start(c.Request().Context(), "GetUTXOs_http",
 			tracing.WithParentStat(AssetStat),
-			tracing.WithLogMessage(h.logger, "[Asset_http:GetUTXOs] for %s", c.Request().RemoteAddr),
+			tracing.WithLogMessage(h.logger, "[Asset_http:GetUTXOs] in %s for %s", mode, c.Request().RemoteAddr),
 		)
 
 		defer deferFn()
@@ -98,13 +113,13 @@ func (h *HTTP) GetUTXOs() func(c echo.Context) error {
 
 		numRecords := len(reqBytes) / utxosRequestRecordSize
 
-		c.Response().Header().Set(echo.HeaderContentType, echo.MIMEOctetStream)
-
 		if numRecords == 0 {
-			return c.Blob(http.StatusOK, echo.MIMEOctetStream, nil)
+			return writeUTXOsResponse(c, mode, nil)
 		}
 
-		responseBytes := make([]byte, numRecords*utxosResponseRecordSize)
+		// Each goroutine writes its own slot — slice indexing is the
+		// happens-before barrier, no mutex required.
+		results := make([]*utxo.SpendResponse, numRecords)
 
 		g, gCtx := errgroup.WithContext(ctx)
 		util.SafeSetLimit(g, utxosFanoutLimit)
@@ -126,19 +141,13 @@ func (h *HTTP) GetUTXOs() func(c echo.Context) error {
 					SpendingData: nil,
 				})
 
-				slotStart := i * utxosResponseRecordSize
-				slot := responseBytes[slotStart : slotStart+utxosResponseRecordSize]
-
 				if err != nil {
 					// Per-record not-found becomes Status_NOT_FOUND in the slot;
 					// any other store error fails the whole request (we don't
 					// want to silently report zero-padded "not found" for every
 					// record when the store is unreachable).
 					if errors.Is(err, errors.ErrNotFound) {
-						writeUTXOsRecord(slot, &utxo.SpendResponse{
-							Status: int(utxo.Status_NOT_FOUND),
-						})
-
+						results[i] = &utxo.SpendResponse{Status: int(utxo.Status_NOT_FOUND)}
 						return nil
 					}
 
@@ -149,7 +158,7 @@ func (h *HTTP) GetUTXOs() func(c echo.Context) error {
 					resp = &utxo.SpendResponse{Status: int(utxo.Status_NOT_FOUND)}
 				}
 
-				writeUTXOsRecord(slot, resp)
+				results[i] = resp
 
 				return nil
 			})
@@ -163,10 +172,51 @@ func (h *HTTP) GetUTXOs() func(c echo.Context) error {
 
 		prometheusAssetHTTPGetUTXOs.WithLabelValues("OK", "200").Add(float64(numRecords))
 
-		h.logger.Infof("[Asset_http:GetUTXOs] served %d records (%d bytes)", numRecords, len(responseBytes))
+		h.logger.Infof("[Asset_http:GetUTXOs] served %d records in %s", numRecords, mode)
 
-		return c.Blob(http.StatusOK, echo.MIMEOctetStream, responseBytes)
+		return writeUTXOsResponse(c, mode, results)
 	}
+}
+
+// writeUTXOsResponse serializes results in the requested mode and writes the
+// HTTP response. nil results means zero records (empty body).
+func writeUTXOsResponse(c echo.Context, mode ReadMode, results []*utxo.SpendResponse) error {
+	switch mode {
+	case JSON:
+		// nil is fine — echo writes "null", which is the natural JSON for an
+		// absent payload. Tests prefer an empty array; use that.
+		if results == nil {
+			results = []*utxo.SpendResponse{}
+		}
+
+		return c.JSON(http.StatusOK, results)
+
+	case HEX:
+		buf := encodeUTXOsBinary(results)
+
+		return c.String(http.StatusOK, hex.EncodeToString(buf))
+
+	case BINARY_STREAM:
+		buf := encodeUTXOsBinary(results)
+
+		return c.Blob(http.StatusOK, echo.MIMEOctetStream, buf)
+
+	default:
+		return echo.NewHTTPError(http.StatusInternalServerError, errors.NewInvalidArgumentError("bad read mode").Error())
+	}
+}
+
+// encodeUTXOsBinary serializes results into the on-wire fixed-length binary
+// format: each record is utxosResponseRecordSize bytes, in input order.
+func encodeUTXOsBinary(results []*utxo.SpendResponse) []byte {
+	buf := make([]byte, len(results)*utxosResponseRecordSize)
+
+	for i, r := range results {
+		slotStart := i * utxosResponseRecordSize
+		writeUTXOsRecord(buf[slotStart:slotStart+utxosResponseRecordSize], r)
+	}
+
+	return buf
 }
 
 // writeUTXOsRecord encodes a SpendResponse into dst as a fixed 48-byte record.
