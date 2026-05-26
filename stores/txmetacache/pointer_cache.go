@@ -143,50 +143,53 @@ func (c *PointerCache) insert(hash chainhash.Hash, data *meta.Data) {
 	b.mu.Unlock()
 }
 
+// cloneTxInpoints deep-clones src so it shares no backing arrays with the
+// caller. Serialize + NewTxInpointsFromBytes is the only public path through
+// subtree's API that produces fresh slices (voutIdxs is unexported), so the
+// round-trip is required even though it's somewhat costly.
+//
+// Returns an error on serialize/deserialize failure. The previous fallback
+// silently returned a struct sharing ParentTxHashes with the caller, which
+// recreated the very aliasing risk this clone exists to prevent.
+func cloneTxInpoints(src subtree.TxInpoints) (subtree.TxInpoints, error) {
+	if len(src.ParentTxHashes) == 0 {
+		// Nothing to alias — empty TxInpoints has no backing array.
+		return src, nil
+	}
+
+	bts, err := src.Serialize()
+	if err != nil {
+		return subtree.TxInpoints{}, err
+	}
+
+	return subtree.NewTxInpointsFromBytes(bts)
+}
+
 // metadataOnly returns a fresh *meta.Data populated with only the fields the
 // byte backend would have round-tripped via MetaBytes — explicitly excluding
 // Tx, BlockIDs, BlockHeights, SubtreeIdxs, ConflictingChildren, SpendingDatas,
 // and timestamps. Without this strip, pointer mode would retain full
 // transactions in the cache and diverge in semantics from the byte path.
 //
-// TxInpoints is deep-cloned via Serialize + NewTxInpointsFromBytes — a
-// struct copy alone would alias the caller's ParentTxHashes / voutIdxs
-// backing arrays, which the cache hands out concurrently to every reader.
-// A caller doing `append(ParentTxHashes, …)` could otherwise corrupt the
-// cached entry observed by other readers. The round-trip is the only public
-// path through subtree's API that produces fresh backing slices (voutIdxs
-// is unexported).
-//
-// On the rare serialize/deserialize failure the original TxInpoints is
-// reused as a shallow copy — preferable to dropping the entry entirely.
-func metadataOnly(data *meta.Data) *meta.Data {
-	cloned := &meta.Data{
+// TxInpoints is deep-cloned via cloneTxInpoints — a struct copy alone would
+// alias the caller's ParentTxHashes / voutIdxs backing arrays. Returning
+// (nil, err) on clone failure is preferable to caching an aliased entry: a
+// failed insert is detectable upstream; silent corruption is not.
+func metadataOnly(data *meta.Data) (*meta.Data, error) {
+	inpoints, err := cloneTxInpoints(data.TxInpoints)
+	if err != nil {
+		return nil, err
+	}
+
+	return &meta.Data{
 		Fee:         data.Fee,
 		SizeInBytes: data.SizeInBytes,
 		IsCoinbase:  data.IsCoinbase,
 		Frozen:      data.Frozen,
 		Conflicting: data.Conflicting,
 		Locked:      data.Locked,
-		TxInpoints:  data.TxInpoints,
-	}
-
-	if len(data.TxInpoints.ParentTxHashes) == 0 {
-		return cloned
-	}
-
-	bts, err := data.TxInpoints.Serialize()
-	if err != nil {
-		return cloned
-	}
-
-	fresh, err := subtree.NewTxInpointsFromBytes(bts)
-	if err != nil {
-		return cloned
-	}
-
-	cloned.TxInpoints = fresh
-
-	return cloned
+		TxInpoints:  inpoints,
+	}, nil
 }
 
 // Set is the pointer-native insert. The caller's *meta.Data may carry fields
@@ -195,7 +198,13 @@ func metadataOnly(data *meta.Data) *meta.Data {
 // across backends and full transactions are never retained.
 // Implements cacheBackend.
 func (c *PointerCache) Set(hash *chainhash.Hash, data *meta.Data) error {
-	c.insert(*hash, metadataOnly(data))
+	stripped, err := metadataOnly(data)
+	if err != nil {
+		return errors.NewProcessingError("failed to clone TxInpoints for pointer cache", err)
+	}
+
+	c.insert(*hash, stripped)
+
 	return nil
 }
 
@@ -292,21 +301,41 @@ func (c *PointerCache) SetMultiFromBytes(keys, values [][]byte) error {
 	return g.Wait()
 }
 
-// SetMultiSequential is identical to SetMultiFromBytes for the pointer
-// backend: there is no per-bucket goroutine fan-out to skip, so the
-// "sequential" and "default" forms share an implementation.
+// SetMultiSequential is the partition-aware insert path: a flat serial loop
+// with no goroutine fan-out. The caller (typically a per-Kafka-partition
+// receiver) already has goroutine-level parallelism, and the cacheBackend
+// contract reserves SetMultiFromBytes for the fan-out form; conflating the
+// two here would multiply goroutines under the v2 partition-aligned
+// receiver (N partition workers × M non-empty buckets each).
 // Implements cacheBackend.
 func (c *PointerCache) SetMultiSequential(keys, values [][]byte) error {
-	return c.SetMultiFromBytes(keys, values)
+	if len(keys) != len(values) {
+		return errors.NewProcessingError("keys and values length mismatch; got %d keys and %d values", len(keys), len(values))
+	}
+
+	for i := range keys {
+		if err := c.SetFromBytes(keys[i], values[i]); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // SetMultiSequentialWithHashes ignores the supplied xxhash values — the
-// pointer backend keys by the full chainhash.Hash, not xxhash, so a
-// caller-supplied uint64 hash carries no information the backend can use.
-// Falls through to SetMultiFromBytes.
+// pointer backend keys by the full chainhash.Hash and re-derives bucket
+// selection from the key bytes inside SetFromBytes, so a caller-supplied
+// uint64 carries no information the backend can use. Behaviour is identical
+// to SetMultiSequential; the hashes parameter exists only to satisfy the
+// shared interface that the byte backend (ImprovedCache) uses to skip its
+// own xxhash recomputation.
+//
+// Callers that depend on cross-backend identical semantics should treat
+// hashes as advisory only — both backends produce the same end state, but
+// the work distribution is keyed differently.
 // Implements cacheBackend.
 func (c *PointerCache) SetMultiSequentialWithHashes(keys, values [][]byte, _ []uint64) error {
-	return c.SetMultiFromBytes(keys, values)
+	return c.SetMultiSequential(keys, values)
 }
 
 // Del removes the entry under key. The ring slot is not reclaimed eagerly —

@@ -426,12 +426,38 @@ func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash) (*me
 // with a caching layer in between for improved performance.
 func (t *TxMetaCache) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Data) error {
 	if cached, ok := t.cache.Get(*hash); ok {
+		// In pointer mode the cache hands out the same *meta.Data to every
+		// concurrent reader. *data = *cached copies the struct but
+		// ParentTxHashes still points at the cache's backing slice — a
+		// caller doing append(data.TxInpoints.ParentTxHashes, …) would
+		// corrupt every other reader. Deep-clone TxInpoints to break the
+		// aliasing. Byte mode is unaffected (its Get returns a freshly
+		// allocated *meta.Data already), and the hot validator path uses
+		// GetMetaCached which keeps the shared-pointer read-only contract.
+		if _, isPointer := t.cache.(*PointerCache); isPointer {
+			inpoints, err := cloneTxInpoints(cached.TxInpoints)
+			if err != nil {
+				// Clone failure is pathological (the cached entry was
+				// already cloned on insert). Treat as a cache miss so the
+				// caller gets a fresh copy from the underlying store
+				// instead of aliased data.
+				t.metrics.misses.Add(1)
+				goto fromStore
+			}
+
+			*data = *cached
+			data.TxInpoints = inpoints
+		} else {
+			*data = *cached
+		}
+
 		t.metrics.hits.Add(1)
-		*data = *cached
 		data.BlockIDs = make([]uint32, 0) // expected behavior, needs to be non-nil
 
 		return nil
 	}
+
+fromStore:
 
 	t.metrics.misses.Add(1)
 	t.logger.Warnf("txMetaCache GetMeta miss for %s", hash.String())
