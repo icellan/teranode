@@ -216,9 +216,9 @@ func createKafkaMessage(t *testing.T, delete bool, content []byte) *kafka.KafkaM
 	t.Helper()
 
 	hash := chainhash.Hash{1, 2, 3}
-	action := txmetaActionADD
+	action := txmetacache.WireActionADD
 	if delete {
-		action = txmetaActionDELETE
+		action = txmetacache.WireActionDELETE
 	}
 
 	// Calculate total size: 4 (count) + 32 (hash) + 1 (action) + 4 (length) + len(content)
@@ -260,7 +260,7 @@ func createKafkaMessageForHash(t *testing.T, hash chainhash.Hash, action byte, c
 	t.Helper()
 
 	contentLen := uint32(len(content))
-	if action == txmetaActionDELETE {
+	if action == txmetacache.WireActionDELETE {
 		contentLen = 0
 	}
 
@@ -388,8 +388,8 @@ func TestServer_txmetaHandler_PreservesPerKeyOrdering(t *testing.T) {
 	}
 
 	hash := chainhash.Hash{42}
-	addMessage := createKafkaMessageForHash(t, hash, txmetaActionADD, []byte("payload"))
-	deleteMessage := createKafkaMessageForHash(t, hash, txmetaActionDELETE, nil)
+	addMessage := createKafkaMessageForHash(t, hash, txmetacache.WireActionADD, []byte("payload"))
+	deleteMessage := createKafkaMessageForHash(t, hash, txmetacache.WireActionDELETE, nil)
 
 	err := server.txmetaHandler(context.Background(), addMessage)
 	assert.NoError(t, err)
@@ -423,8 +423,8 @@ func TestServer_txmetaHandler_V2_Parses(t *testing.T) {
 	payload := []byte("test-meta")
 	totalSize := 8 + 8 + 32 + 1 + 4 + len(payload)
 	data := make([]byte, totalSize)
-	data[0] = txmetaWireV2Magic
-	data[1] = txmetaWireV2Version
+	data[0] = txmetacache.WireV2Magic
+	data[1] = txmetacache.WireV2Version
 	binary.LittleEndian.PutUint32(data[4:], 1)
 
 	off := 8
@@ -433,7 +433,7 @@ func TestServer_txmetaHandler_V2_Parses(t *testing.T) {
 	hash := chainhash.Hash{42}
 	copy(data[off:], hash[:])
 	off += 32
-	data[off] = txmetaActionADD
+	data[off] = txmetacache.WireActionADD
 	off++
 	binary.LittleEndian.PutUint32(data[off:], uint32(len(payload)))
 	off += 4
@@ -453,7 +453,7 @@ func TestServer_txmetaHandler_V2_UnknownVersion(t *testing.T) {
 	server := &Server{logger: mLogger}
 
 	data := make([]byte, 8)
-	data[0] = txmetaWireV2Magic
+	data[0] = txmetacache.WireV2Magic
 	data[1] = 0x99
 
 	err := server.txmetaHandler(context.Background(), &kafka.KafkaMessage{Value: data})
@@ -479,7 +479,7 @@ func TestServer_txmetaHandler_V2_MixedAddDelete(t *testing.T) {
 
 	hashes := []chainhash.Hash{{1}, {2}, {3}}
 	payloads := [][]byte{[]byte("a"), nil, []byte("ccc")}
-	actions := []byte{txmetaActionADD, txmetaActionDELETE, txmetaActionADD}
+	actions := []byte{txmetacache.WireActionADD, txmetacache.WireActionDELETE, txmetacache.WireActionADD}
 	pseudoHashes := []uint64{0x11, 0x22, 0x33}
 
 	size := 8 // header
@@ -487,8 +487,8 @@ func TestServer_txmetaHandler_V2_MixedAddDelete(t *testing.T) {
 		size += 8 + 32 + 1 + 4 + len(payloads[i])
 	}
 	data := make([]byte, size)
-	data[0] = txmetaWireV2Magic
-	data[1] = txmetaWireV2Version
+	data[0] = txmetacache.WireV2Magic
+	data[1] = txmetacache.WireV2Version
 	binary.LittleEndian.PutUint32(data[4:], uint32(len(hashes)))
 	off := 8
 
@@ -508,4 +508,85 @@ func TestServer_txmetaHandler_V2_MixedAddDelete(t *testing.T) {
 	err := server.txmetaHandler(context.Background(), &kafka.KafkaMessage{Value: data})
 	assert.NoError(t, err)
 	mCache.AssertExpectations(t)
+}
+
+// buildV1TxmetaMessage builds a v1-format batch message with the requested
+// number of entries: one ADD followed by (count-1) DELETEs. Used to exercise
+// the v1/v2 discriminator collision cases below.
+func buildV1TxmetaMessage(t *testing.T, count int, addHash chainhash.Hash, addPayload []byte) []byte {
+	t.Helper()
+
+	size := 4 + 32 + 1 + 4 + len(addPayload) + (count-1)*(32+1+4)
+	buf := make([]byte, 0, size)
+
+	hdr := make([]byte, 4)
+	binary.LittleEndian.PutUint32(hdr, uint32(count))
+	buf = append(buf, hdr...)
+
+	// ADD entry.
+	buf = append(buf, addHash[:]...)
+	buf = append(buf, txmetacache.WireActionADD)
+	lenBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(lenBuf, uint32(len(addPayload)))
+	buf = append(buf, lenBuf...)
+	buf = append(buf, addPayload...)
+
+	// DELETE entries.
+	deleteHash := chainhash.Hash{99}
+	for i := 0; i < count-1; i++ {
+		buf = append(buf, deleteHash[:]...)
+		buf = append(buf, txmetacache.WireActionDELETE)
+		buf = append(buf, 0, 0, 0, 0)
+	}
+
+	return buf
+}
+
+// TestServer_txmetaHandler_V1_CollidesWithV2Magic verifies that v1 messages
+// whose entry count has a low byte of 0xFF (counts 255, 511, 767, ...) are
+// still parsed as v1 instead of being misclassified as v2 and dropped/garbled.
+func TestServer_txmetaHandler_V1_CollidesWithV2Magic(t *testing.T) {
+	cases := []struct {
+		name         string
+		count        int
+		headerPrefix []byte
+	}{
+		{
+			name:         "count 255 (LE low byte 0xFF, version byte 0x00)",
+			count:        255,
+			headerPrefix: []byte{0xFF, 0x00, 0x00, 0x00},
+		},
+		{
+			name:         "count 767 (full v2 header alias 0xFF 0x02 0x00 0x00)",
+			count:        767,
+			headerPrefix: []byte{0xFF, 0x02, 0x00, 0x00},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mLogger := &mockLogger{}
+			mLogger.On("Errorf", mock.Anything, mock.Anything).Maybe().Return()
+			mCache := &mockCache{}
+			// Must take the v1-shaped Set path (no on-wire xxhash).
+			// SetCacheMultiSequential takes (keys, values); WithHashes takes (keys, values, hashes).
+			mCache.On("SetCacheMultiSequential", mock.Anything, mock.Anything).Return(nil)
+			mCache.On("Delete", mock.Anything, mock.AnythingOfType("*chainhash.Hash")).Return(nil).Maybe()
+
+			server := &Server{logger: mLogger, utxoStore: mCache}
+
+			addHash := chainhash.Hash{1, 2, 3}
+			payload := []byte("v1-payload")
+			data := buildV1TxmetaMessage(t, tc.count, addHash, payload)
+			assert.Equal(t, tc.headerPrefix, data[:4],
+				"v1 length-prefix must alias the v2 header bytes for this regression")
+
+			err := server.txmetaHandler(context.Background(), &kafka.KafkaMessage{Value: data})
+			assert.NoError(t, err)
+			mCache.AssertCalled(t, "SetCacheMultiSequential",
+				mock.Anything, mock.Anything)
+			mCache.AssertNotCalled(t, "SetCacheMultiSequentialWithHashes",
+				mock.Anything, mock.Anything, mock.Anything)
+		})
+	}
 }
