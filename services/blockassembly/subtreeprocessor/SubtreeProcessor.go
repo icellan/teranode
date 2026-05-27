@@ -15,7 +15,6 @@
 package subtreeprocessor
 
 import (
-	"bufio"
 	"container/ring"
 	"context"
 	"encoding/binary"
@@ -5303,7 +5302,13 @@ func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubt
 			conflictingNodes := make([]chainhash.Hash, 0, 32)
 
 			// read leaves
-			if err = DeserializeHashesFromReaderIntoBuckets(subtreeReader, nBuckets, &txHashBuckets, &conflictingNodes); err != nil {
+			if err = DeserializeHashesFromReaderIntoBuckets(
+				subtreeReader,
+				nBuckets,
+				stp.settings.SubtreeValidation.MaxIncomingSubtreeBytes,
+				&txHashBuckets,
+				&conflictingNodes,
+			); err != nil {
 				return errors.NewProcessingError("error deserializing subtree: %s", st.String(), err)
 			}
 
@@ -5511,66 +5516,157 @@ func (stp *SubtreeProcessor) getBLockIDsMap(ctx context.Context, losingTxHashesM
 	return blockIdsMap, nil
 }
 
-// DeserializeHashesFromReaderIntoBuckets deserializes transaction hashes from a reader into buckets.
+// On-disk subtree layout, replicated here so reads stay independent of the
+// writer's struct definitions:
 //
-// Parameters:
-//   - reader: Source reader containing hash data
-//   - nBuckets: Number of buckets to distribute hashes into
+//	[ 48-byte file header ]
+//	[ 8-byte little-endian leaf count          ]   numLeaves
+//	[ numLeaves * 48-byte leaf records         ]   (32-byte hash + 8B fee + 8B size)
+//	[ 8-byte little-endian conflicting count   ]   numConflicting
+//	[ numConflicting * 32-byte conflicting hashes ]
+const (
+	subtreeHeaderBytes        = 48
+	subtreeLeafBytes          = 48
+	subtreeHashBytes          = 32
+	subtreeCountFieldBytes    = 8
+	subtreeHeaderAndCountSize = subtreeHeaderBytes + subtreeCountFieldBytes
+)
+
+// leafDataPool reuses the leaf-data scratch slice across DeserializeHashes...
+// calls. The pool's New is intentionally nil — first use allocates at the
+// exact size requested (so we don't waste maxLeafDataBytes when subtrees
+// are smaller), and the high-water-mark grows naturally as larger subtrees
+// arrive. Steady-state memory is bounded by
 //
-// Returns:
-//   - map[uint16][][32]byte: Map of bucketed hash arrays
-//   - error: Any error encountered during deserialization
-func DeserializeHashesFromReaderIntoBuckets(reader io.Reader, nBuckets uint16, hashes *map[uint16][]chainhash.Hash, conflictingNodes *[]chainhash.Hash) (err error) {
+//	concurrent_callers * max_observed_subtree_leaf_bytes
+//
+// where the second factor is itself bounded by the caller-supplied DoS cap.
+var leafDataPool sync.Pool
+
+func acquireLeafBuf(size int) []byte {
+	if v := leafDataPool.Get(); v != nil {
+		b := v.([]byte)
+		if cap(b) >= size {
+			return b[:size]
+		}
+		// Pooled buffer is smaller than required for this subtree. Drop it
+		// on the floor — the next Put will replace it with the bigger one we
+		// allocate below, which is the desired high-water-mark behaviour.
+	}
+
+	return make([]byte, size)
+}
+
+func releaseLeafBuf(b []byte) {
+	// Reset to zero length, keep capacity. The next acquirer reslices
+	// via [:size] up to the existing capacity.
+	//nolint:staticcheck // SA6002: slice header copy into Pool is intentional;
+	// using *[]byte would add a pointer indirection in the hot path. The 24-byte
+	// header cost is dominated by the multi-MiB backing array we're reusing.
+	leafDataPool.Put(b[:0])
+}
+
+// DeserializeHashesFromReaderIntoBuckets reads a subtree's leaf hashes from
+// reader, sorts them into nBuckets per-bucket slices keyed by the high bits
+// of the hash, and returns any conflicting-node hashes in the trailer.
+//
+// maxLeafDataBytes bounds the total bytes the function will allocate and
+// read for the leaf-data section. It is intended to be wired from the
+// caller's DoS cap (e.g. settings.SubtreeValidation.MaxIncomingSubtreeBytes)
+// so that a peer claiming an impossibly large numLeaves in the header is
+// rejected before any allocation.
+func DeserializeHashesFromReaderIntoBuckets(
+	reader io.Reader,
+	nBuckets uint16,
+	maxLeafDataBytes int64,
+	hashes *map[uint16][]chainhash.Hash,
+	conflictingNodes *[]chainhash.Hash,
+) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = errors.NewProcessingError("recovered in DeserializeHashesFromReaderIntoBuckets: %v", r)
 		}
 	}()
 
-	// skip headers
-	bytes48 := make([]byte, 48)
-	if _, err = reader.Read(bytes48); err != nil { // skip headers
-		return errors.NewProcessingError("unable to read header", err)
+	// Read the 48-byte header + 8-byte numLeaves in one shot. The header is
+	// not parsed here — readers of this format treat it as opaque — but it
+	// is consumed off the stream so the leaf records align.
+	var hdr [subtreeHeaderAndCountSize]byte
+	if _, err = io.ReadFull(reader, hdr[:]); err != nil {
+		return errors.NewProcessingError("unable to read header+leaf count", err)
 	}
 
-	// read number of leaves
-	bytes8 := make([]byte, 8)
-	if _, err = io.ReadFull(reader, bytes8); err != nil {
-		return errors.NewProcessingError("unable to read number of leaves", err)
+	numLeaves := binary.LittleEndian.Uint64(hdr[subtreeHeaderBytes:])
+
+	// Bound numLeaves against the DoS cap before allocating. The check uses
+	// the supplied cap divided by the per-record size; doing it this way
+	// (instead of computing numLeaves*subtreeLeafBytes first) makes the
+	// comparison overflow-safe regardless of how large numLeaves is.
+	maxLeaves := uint64(maxLeafDataBytes) / uint64(subtreeLeafBytes)
+	if numLeaves > maxLeaves {
+		return errors.NewProcessingError(
+			"subtree header claims %d leaves (%d bytes), exceeds max %d bytes",
+			numLeaves, numLeaves*subtreeLeafBytes, maxLeafDataBytes,
+		)
 	}
 
-	numLeaves := binary.LittleEndian.Uint64(bytes8)
+	leafBytes := int(numLeaves) * subtreeLeafBytes
 
-	buf := bufio.NewReaderSize(reader, int(numLeaves*48))
+	if leafBytes > 0 {
+		// Single-shot read of the entire leaf-data section into a pooled
+		// buffer, then parse from memory. Previously this path wrapped the
+		// reader in a bufio.NewReaderSize of numLeaves*48 bytes — a fresh
+		// ~48 MiB allocation per subtree, multiplied by the concurrency
+		// in CreateTransactionMap. The pool reuses that backing array.
+		buf := acquireLeafBuf(leafBytes)
+		defer releaseLeafBuf(buf)
 
-	var bucket uint16
-
-	for i := uint64(0); i < numLeaves; i++ {
-		// read all the node data in 1 go
-		if _, err = io.ReadFull(buf, bytes48); err != nil {
-			return errors.NewProcessingError("unable to read node", err)
+		if _, err = io.ReadFull(reader, buf); err != nil {
+			return errors.NewProcessingError("unable to read leaves", err)
 		}
 
-		bucket = txmap.Bytes2Uint16Buckets(chainhash.Hash(bytes48[:32]), nBuckets)
-		(*hashes)[bucket] = append((*hashes)[bucket], chainhash.Hash(bytes48[:32]))
+		for i := 0; i < int(numLeaves); i++ {
+			off := i * subtreeLeafBytes
+			// Hash occupies the first 32 bytes of each 48-byte leaf record;
+			// the trailing 16 bytes (fee + size) are not needed for the
+			// transaction-map build and are skipped via the slice index.
+			h := chainhash.Hash(buf[off : off+subtreeHashBytes])
+			bucket := txmap.Bytes2Uint16Buckets(h, nBuckets)
+			(*hashes)[bucket] = append((*hashes)[bucket], h)
+		}
 	}
 
-	// read conflicting txs
-	if _, err = io.ReadFull(buf, bytes8); err != nil {
+	// Conflicting trailer: 8-byte count + count*32-byte hashes. Bounded by
+	// the same DoS cap (divided by per-record size). Typically empty or a
+	// handful, so no pooling here.
+	var cntBuf [subtreeCountFieldBytes]byte
+	if _, err = io.ReadFull(reader, cntBuf[:]); err != nil {
 		return errors.NewProcessingError("unable to read number of conflicting txs", err)
 	}
 
-	numConflicting := binary.LittleEndian.Uint64(bytes8)
+	numConflicting := binary.LittleEndian.Uint64(cntBuf[:])
 
-	// Pre-allocate exact size for conflicting nodes to avoid reallocation
+	maxConflicting := uint64(maxLeafDataBytes) / uint64(subtreeHashBytes)
+	if numConflicting > maxConflicting {
+		return errors.NewProcessingError(
+			"subtree trailer claims %d conflicting txs, exceeds max",
+			numConflicting,
+		)
+	}
+
 	if numConflicting > 0 {
-		bytes32 := make([]byte, 32)
+		if cap(*conflictingNodes) < int(numConflicting) {
+			*conflictingNodes = make([]chainhash.Hash, 0, numConflicting)
+		}
+
+		var node [subtreeHashBytes]byte
+
 		for i := uint64(0); i < numConflicting; i++ {
-			if _, err = io.ReadFull(buf, bytes32); err != nil {
-				return errors.NewProcessingError("unable to read node", err)
+			if _, err = io.ReadFull(reader, node[:]); err != nil {
+				return errors.NewProcessingError("unable to read conflicting node", err)
 			}
 
-			*conflictingNodes = append(*conflictingNodes, chainhash.Hash(bytes32))
+			*conflictingNodes = append(*conflictingNodes, chainhash.Hash(node))
 		}
 	}
 
