@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
+	"runtime/debug"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -23,7 +24,7 @@ const (
 	// utxosResponseRecordSize is the on-wire size of one fixed-length response
 	// record in the binary and hex output modes. Binary clients can index by
 	// `i*utxosResponseRecordSize`.
-	utxosResponseRecordSize = 48 // 8 bytes status + 4 bytes lockTime + 4 bytes vin + 32 bytes txid
+	utxosResponseRecordSize = 48 // 8 bytes status + 4 bytes lockTime + 4 bytes spendingVin + 32 bytes spendingTxID
 
 	// utxosFanoutLimit caps in-flight per-record store lookups. Mirrors the
 	// limit used by GetTransactions (POST /api/v1/subtree/:hash/txs).
@@ -101,9 +102,17 @@ func (h *HTTP) GetUTXOs(mode ReadMode) func(c echo.Context) error {
 
 		// Read the whole body up front so we can validate its length and index
 		// into it without holding the connection open across the fan-out. The
-		// asset_httpBodyLimit middleware has already capped this.
+		// asset_httpBodyLimit middleware has already capped this for clients
+		// that send Content-Length up-front. Clients that stream without an
+		// accurate Content-Length trip the cap mid-Read and surface as
+		// echo.ErrStatusRequestEntityTooLarge — map that to 413 explicitly so
+		// the documented contract holds for both shapes of client.
 		reqBytes, err := io.ReadAll(body)
 		if err != nil {
+			if errors.Is(err, echo.ErrStatusRequestEntityTooLarge) {
+				return echo.NewHTTPError(http.StatusRequestEntityTooLarge, errors.NewInvalidArgumentError("request body exceeds asset_httpBodyLimit").Error())
+			}
+
 			return echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error reading request body", err).Error())
 		}
 
@@ -125,7 +134,6 @@ func (h *HTTP) GetUTXOs(mode ReadMode) func(c echo.Context) error {
 		util.SafeSetLimit(g, utxosFanoutLimit)
 
 		for i := 0; i < numRecords; i++ {
-			i := i
 			recOffset := i * utxosRequestRecordSize
 
 			var txHash chainhash.Hash
@@ -133,7 +141,20 @@ func (h *HTTP) GetUTXOs(mode ReadMode) func(c echo.Context) error {
 
 			vout := binary.LittleEndian.Uint32(reqBytes[recOffset+32 : recOffset+36])
 
-			g.Go(func() error {
+			g.Go(func() (retErr error) {
+				// Echo's middleware.Recover only protects the request goroutine —
+				// not the ones errgroup spawns. Without this defer, a per-record
+				// panic (e.g. an index-out-of-range deep in a store driver) would
+				// crash the asset process. Convert any panic into an errgroup
+				// error so the request fails with 500 instead of taking the
+				// service down.
+				defer func() {
+					if r := recover(); r != nil {
+						h.logger.Errorf("[Asset_http:GetUTXOs] recovered panic on %s:%d: %v\n%s", txHash.String(), vout, r, debug.Stack())
+						retErr = echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("internal error getting utxo %s:%d", txHash.String(), vout).Error())
+					}
+				}()
+
 				resp, err := h.repository.GetUtxo(gCtx, &utxo.Spend{
 					TxID:         &txHash,
 					Vout:         vout,
@@ -220,7 +241,7 @@ func encodeUTXOsBinary(results []*utxo.SpendResponse) []byte {
 }
 
 // writeUTXOsRecord encodes a SpendResponse into dst as a fixed 48-byte record.
-// Layout: [8 bytes status LE][4 bytes lockTime LE][4 bytes vin LE][32 bytes spendingTxID].
+// Layout: [8 bytes status LE][4 bytes lockTime LE][4 bytes spendingVin LE][32 bytes spendingTxID].
 // dst must have len >= utxosResponseRecordSize. Caller-zeroed slots stay zero
 // when SpendingData is nil.
 func writeUTXOsRecord(dst []byte, resp *utxo.SpendResponse) {

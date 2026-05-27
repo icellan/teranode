@@ -396,6 +396,23 @@ func TestGetSpendNilUTXOHash(t *testing.T) {
 		})
 		require.Error(t, err)
 	})
+
+	// Regression guard for the cross-store contract: an out-of-range vout must
+	// report Status_NOT_FOUND, NOT panic and NOT return an error. The bulk
+	// /api/v1/utxos endpoint and the simplified GET /api/v1/utxo path no longer
+	// pre-validate vout against the tx output count — they delegate that check
+	// to the store. The aerospike store previously index-panicked here, which
+	// would crash the asset process via an errgroup goroutine.
+	t.Run("out-of-range vout returns NOT_FOUND, not error or panic", func(t *testing.T) {
+		// tx fixture from setup() has 2 outputs (indices 0 and 1).
+		res, err := utxoStore.GetSpend(ctx, &utxo.Spend{
+			TxID:     tx.TxIDChainHash(),
+			Vout:     99,
+			UTXOHash: nil,
+		})
+		require.NoError(t, err)
+		require.Equal(t, int(utxo.Status_NOT_FOUND), res.Status)
+	})
 }
 
 func TestSetMinedMulti(t *testing.T) {

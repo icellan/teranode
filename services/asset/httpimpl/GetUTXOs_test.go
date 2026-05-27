@@ -254,6 +254,34 @@ func TestGetUTXOs(t *testing.T) {
 		assert.Equal(t, http.StatusInternalServerError, echoErr.Code)
 	})
 
+	t.Run("panic in goroutine becomes 500 instead of crashing the process", func(t *testing.T) {
+		// Regression guard for the issue identified on PR #950: echo's
+		// middleware.Recover does NOT cover errgroup goroutines. Without our
+		// per-goroutine recover, a panic deep in the store driver (e.g. the
+		// pre-existing index-out-of-range in stores/utxo/aerospike/get.go when
+		// vout exceeds the actual output count) would crash the asset process.
+		httpServer, mockRepo, echoContext, _ := GetMockHTTP(t, nil)
+
+		mockRepo.On("GetUtxo", mock.Anything).Run(func(args mock.Arguments) {
+			panic("simulated store panic")
+		}).Return(nil, nil)
+
+		body := buildUTXOsRequest([]struct {
+			TxID chainhash.Hash
+			Vout uint32
+		}{
+			{TxID: mkTxID(0x01), Vout: 0},
+		})
+
+		echoContext.Request().Method = http.MethodPost
+		echoContext.Request().Body = mustBody(body)
+
+		err := httpServer.GetUTXOs(BINARY_STREAM)(echoContext)
+		echoErr := &echo.HTTPError{}
+		require.True(t, errors.As(err, &echoErr), "expected echo.HTTPError, got %T: %v", err, err)
+		assert.Equal(t, http.StatusInternalServerError, echoErr.Code)
+	})
+
 	t.Run("HEX mode returns hex-encoded binary payload", func(t *testing.T) {
 		httpServer, mockRepo, echoContext, rec := GetMockHTTP(t, nil)
 

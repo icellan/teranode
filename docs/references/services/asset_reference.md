@@ -787,6 +787,7 @@ Error responses include a JSON object with an error message:
         - **`POST /api/v1/utxos/json`** — JSON array of `utxo.SpendResponse` objects in input order, e.g. `[{"status":1,"spendingData":{"txId":"...","vin":0},"lockTime":1234567}, ...]`. Use this when client tooling prefers JSON; for highest throughput, prefer the binary route.
     - Limits: body size capped by the `asset_httpBodyLimit` setting (default 4MB ≈ 116k records per request).
     - Error responses: `400` (body length not a multiple of 36), `413` (body exceeds the cap), `500` (transport or store failure).
+    - Known gap: the `lockTime` field in the response carries different semantics by backend (SQL: coinbase maturity height; Aerospike: the transaction's `nLockTime`). Pre-existing in `GET /api/v1/utxo`; surfaced more visibly here. Treat `lockTime == 0` as "not coinbase / unlocked" until the divergence is reconciled in a follow-up.
 
 ### Subtree Endpoints
 
