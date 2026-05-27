@@ -55,9 +55,65 @@
 package aerospike
 
 import (
+	"context"
+	"net"
 	"sync"
 	"time"
+
+	"github.com/aerospike/aerospike-client-go/v8"
+	"github.com/aerospike/aerospike-client-go/v8/types"
+	"github.com/bsv-blockchain/teranode/errors"
 )
+
+// isInfrastructureFailure reports whether err represents an Aerospike
+// infrastructure failure that should count toward the spend circuit breaker.
+//
+// Data-state codes (KEY_NOT_FOUND_ERROR for a missing parent during catch-up
+// sync, FILTERED_OUT for a business-rule rejection from the spend Lua, etc.)
+// MUST return false — those are handled by the orphanage and the Lua error
+// paths, not by this breaker. Counting them here causes the breaker to trip
+// during normal IBD and defeat orphanage entirely (issue #953).
+//
+// Non-Aerospike errors are only treated as infrastructure when they are
+// stdlib timeout signals (context.DeadlineExceeded or a net.Error with
+// Timeout()=true). Anything else defaults to non-infrastructure: the bias
+// is against false positives because a false trip stalls sync, while a
+// missed signal is recoverable by higher-level timeouts and health checks.
+func isInfrastructureFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var aErr *aerospike.AerospikeError
+	if errors.As(err, &aErr) {
+		switch aErr.ResultCode {
+		case types.TIMEOUT,
+			types.NETWORK_ERROR,
+			types.NO_RESPONSE,
+			types.MAX_RETRIES_EXCEEDED,
+			types.NO_AVAILABLE_CONNECTIONS_TO_NODE,
+			types.SERVER_NOT_AVAILABLE,
+			types.SERVER_MEM_ERROR,
+			types.SERVER_ERROR,
+			types.DEVICE_OVERLOAD,
+			types.BATCH_FAILED:
+			return true
+		default:
+			return false
+		}
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	return false
+}
 
 type cbState string
 

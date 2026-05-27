@@ -1,13 +1,53 @@
 package aerospike
 
 import (
+	"context"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/aerospike/aerospike-client-go/v8"
+	"github.com/aerospike/aerospike-client-go/v8/types"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// fakeTimeoutNetErr satisfies net.Error with Timeout()=true for classifier tests.
+type fakeTimeoutNetErr struct{}
+
+func (fakeTimeoutNetErr) Error() string   { return "fake net timeout" }
+func (fakeTimeoutNetErr) Timeout() bool   { return true }
+func (fakeTimeoutNetErr) Temporary() bool { return false }
+
+// fakeNonTimeoutNetErr satisfies net.Error with Timeout()=false.
+type fakeNonTimeoutNetErr struct{}
+
+func (fakeNonTimeoutNetErr) Error() string   { return "fake net non-timeout" }
+func (fakeNonTimeoutNetErr) Timeout() bool   { return false }
+func (fakeNonTimeoutNetErr) Temporary() bool { return false }
+
+func aErrWithCode(code types.ResultCode) error {
+	return &aerospike.AerospikeError{ResultCode: code}
+}
+
+// plainErr is a non-Aerospike, non-timeout error used to exercise the
+// classifier's default branch without tripping the forbidigo lint on fmt.Errorf.
+type plainErr struct{ msg string }
+
+func (p plainErr) Error() string { return p.msg }
+
+// wrapErr wraps an inner error and exposes it via Unwrap so the classifier's
+// errors.As call can reach the underlying AerospikeError or context.DeadlineExceeded.
+// Used in place of fmt.Errorf %w (forbidden by project lint policy).
+type wrapErr struct {
+	msg   string
+	inner error
+}
+
+func (w wrapErr) Error() string { return w.msg + ": " + w.inner.Error() }
+func (w wrapErr) Unwrap() error { return w.inner }
 
 func TestNewCircuitBreaker(t *testing.T) {
 	t.Run("ValidConfiguration", func(t *testing.T) {
@@ -424,3 +464,115 @@ func TestCircuitBreakerEdgeCases(t *testing.T) {
 		assert.Equal(t, cbStateOpen, cb.state)
 	})
 }
+
+func TestIsInfrastructureFailure(t *testing.T) {
+	t.Run("NilIsNotInfra", func(t *testing.T) {
+		require.False(t, isInfrastructureFailure(nil))
+	})
+
+	t.Run("DataStateCodesNotInfra", func(t *testing.T) {
+		dataStateCodes := []types.ResultCode{
+			types.KEY_NOT_FOUND_ERROR,
+			types.FILTERED_OUT,
+			types.GENERATION_ERROR,
+			types.KEY_EXISTS_ERROR,
+			types.PARAMETER_ERROR,
+			types.BIN_EXISTS_ERROR,
+		}
+		for _, code := range dataStateCodes {
+			require.False(t, isInfrastructureFailure(aErrWithCode(code)),
+				"ResultCode %d (%s) must not count as infrastructure failure", code, types.ResultCodeToString(code))
+		}
+	})
+
+	t.Run("InfraCodesAreInfra", func(t *testing.T) {
+		infraCodes := []types.ResultCode{
+			types.TIMEOUT,
+			types.NETWORK_ERROR,
+			types.NO_RESPONSE,
+			types.MAX_RETRIES_EXCEEDED,
+			types.NO_AVAILABLE_CONNECTIONS_TO_NODE,
+			types.SERVER_NOT_AVAILABLE,
+			types.SERVER_MEM_ERROR,
+			types.SERVER_ERROR,
+			types.DEVICE_OVERLOAD,
+			types.BATCH_FAILED,
+		}
+		for _, code := range infraCodes {
+			require.True(t, isInfrastructureFailure(aErrWithCode(code)),
+				"ResultCode %d (%s) must count as infrastructure failure", code, types.ResultCodeToString(code))
+		}
+	})
+
+	t.Run("StdlibTimeoutErrors", func(t *testing.T) {
+		require.True(t, isInfrastructureFailure(context.DeadlineExceeded))
+		require.True(t, isInfrastructureFailure(fakeTimeoutNetErr{}))
+		require.False(t, isInfrastructureFailure(fakeNonTimeoutNetErr{}))
+	})
+
+	t.Run("PlainErrorIsNotInfra", func(t *testing.T) {
+		require.False(t, isInfrastructureFailure(plainErr{msg: "some random failure"}))
+	})
+
+	t.Run("WrappedAerospikeError", func(t *testing.T) {
+		// Wrapping via a type with Unwrap() preserves the AerospikeError so
+		// errors.As inside the classifier can still find it.
+		require.True(t, isInfrastructureFailure(wrapErr{msg: "outer", inner: aErrWithCode(types.TIMEOUT)}))
+		require.False(t, isInfrastructureFailure(wrapErr{msg: "outer", inner: aErrWithCode(types.KEY_NOT_FOUND_ERROR)}))
+
+		// Note: teranode/errors.New() flattens non-*Error wrapped errors to
+		// just a message string (errors.go:335) — so the original
+		// *aerospike.AerospikeError is unrecoverable once wrapped that way.
+		// The classifier is intentionally called on the raw batch error
+		// before any such wrapping (see spend.go handleBatchError and
+		// spend_expressions.go processSpendBatchResultsExpressions).
+		_ = errors.NewStorageError // keep import live for documentation
+	})
+
+	t.Run("WrappedContextDeadline", func(t *testing.T) {
+		require.True(t, isInfrastructureFailure(wrapErr{msg: "outer", inner: context.DeadlineExceeded}))
+	})
+}
+
+// TestCircuitBreaker_KeyNotFoundDoesNotTrip is the regression test for issue #953.
+// Per-record KEY_NOT_FOUND_ERROR results from aerospike batch spends represent
+// data state (missing parents during catch-up sync), not infrastructure failure,
+// and must not trip the breaker even at high volume.
+func TestCircuitBreaker_KeyNotFoundDoesNotTrip(t *testing.T) {
+	cb := newCircuitBreaker(3, 1, 30*time.Second)
+	require.NotNil(t, cb)
+
+	keyNotFound := aErrWithCode(types.KEY_NOT_FOUND_ERROR)
+
+	// Simulate the gated call site: only record failure if the error is infra.
+	for i := 0; i < 1000; i++ {
+		if isInfrastructureFailure(keyNotFound) {
+			cb.RecordFailure()
+		}
+	}
+
+	require.Equal(t, cbStateClosed, cb.state, "breaker must stay closed under KEY_NOT_FOUND flood")
+	require.True(t, cb.Allow(), "breaker must still allow requests")
+}
+
+// TestCircuitBreaker_InfraErrorStillTrips ensures the safety net still works:
+// real infrastructure failures continue to open the breaker after threshold.
+func TestCircuitBreaker_InfraErrorStillTrips(t *testing.T) {
+	cb := newCircuitBreaker(3, 1, 30*time.Second)
+	require.NotNil(t, cb)
+
+	timeout := aErrWithCode(types.TIMEOUT)
+
+	for i := 0; i < 3; i++ {
+		if isInfrastructureFailure(timeout) {
+			cb.RecordFailure()
+		}
+	}
+
+	require.Equal(t, cbStateOpen, cb.state, "breaker must trip on 3 consecutive infra failures")
+	require.False(t, cb.Allow(), "breaker must reject while open")
+}
+
+// ensure net.Error interface assertions compile (linter hint).
+var _ net.Error = fakeTimeoutNetErr{}
+var _ net.Error = fakeNonTimeoutNetErr{}
