@@ -444,13 +444,18 @@ func TestServer_txmetaHandler_V2_Parses(t *testing.T) {
 	mCache.AssertExpectations(t)
 }
 
-// TestServer_txmetaHandler_V2_UnknownVersion confirms that an unknown v2
-// sub-version is logged and acked rather than triggering a redelivery loop.
-func TestServer_txmetaHandler_V2_UnknownVersion(t *testing.T) {
+// TestServer_txmetaHandler_V2Shaped_UnknownVersion_FallsBackToV1 confirms
+// that a v2-shaped message with an unknown sub-version is treated as v1
+// (rather than dropped silently), so a legitimate v1 message with a count
+// whose LE low byte is 0xFF is never misclassified. The 8-byte buffer is
+// too small to hold a single v1 entry, so the v1 path logs a truncation
+// error and acks — but crucially it does NOT call the v2 dispatch path.
+func TestServer_txmetaHandler_V2Shaped_UnknownVersion_FallsBackToV1(t *testing.T) {
 	mLogger := &mockLogger{}
 	mLogger.On("Errorf", mock.Anything, mock.Anything).Return()
+	mCache := &mockCache{}
 
-	server := &Server{logger: mLogger}
+	server := &Server{logger: mLogger, utxoStore: mCache}
 
 	data := make([]byte, 8)
 	data[0] = txmetacache.WireV2Magic
@@ -458,7 +463,10 @@ func TestServer_txmetaHandler_V2_UnknownVersion(t *testing.T) {
 
 	err := server.txmetaHandler(context.Background(), &kafka.KafkaMessage{Value: data})
 	assert.NoError(t, err)
-	mLogger.AssertCalled(t, "Errorf", mock.Anything, mock.Anything)
+	// Must NOT take the v2 dispatch path — the v2-shaped-but-invalid
+	// header must fall through to v1 parsing.
+	mCache.AssertNotCalled(t, "SetCacheMultiSequentialWithHashes",
+		mock.Anything, mock.Anything, mock.Anything)
 }
 
 // TestServer_txmetaHandler_V2_MixedAddDelete verifies the receiver handles a
@@ -540,6 +548,36 @@ func buildV1TxmetaMessage(t *testing.T, count int, addHash chainhash.Hash, addPa
 	}
 
 	return buf
+}
+
+// TestServer_txmetaHandler_V1_ImplausibleEntryCount_IsRejected verifies
+// that a v1 message claiming far more entries than the buffer can hold is
+// logged and acked rather than triggering an oversized pre-loop allocation.
+// The wire claims max-uint32 entries (~4B) with only enough buffer for a
+// few; without the plausibility bound, the pool would try to allocate
+// ~128GB for keysBuf alone.
+func TestServer_txmetaHandler_V1_ImplausibleEntryCount_IsRejected(t *testing.T) {
+	mLogger := &mockLogger{}
+	mLogger.On("Errorf", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
+	mCache := &mockCache{}
+
+	server := &Server{logger: mLogger, utxoStore: mCache}
+
+	// 4-byte header claiming 0xFFFFFFFE entries (just under max-uint32,
+	// chosen so the first byte is 0xFE — not a v2 magic alias — to force
+	// the v1 detection path), with no entry payload at all.
+	data := make([]byte, 4)
+	binary.LittleEndian.PutUint32(data, 0xFFFFFFFE)
+
+	err := server.txmetaHandler(context.Background(), &kafka.KafkaMessage{Value: data})
+	assert.NoError(t, err)
+	// Neither dispatch path should be reached — the message is rejected
+	// before any entries are parsed.
+	mCache.AssertNotCalled(t, "SetCacheMultiSequential", mock.Anything, mock.Anything)
+	mCache.AssertNotCalled(t, "SetCacheMultiSequentialWithHashes",
+		mock.Anything, mock.Anything, mock.Anything)
+	mLogger.AssertCalled(t, "Errorf",
+		mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }
 
 // TestServer_txmetaHandler_V1_CollidesWithV2Magic verifies that v1 messages

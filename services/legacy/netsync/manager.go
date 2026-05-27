@@ -2596,11 +2596,12 @@ func (sm *SyncManager) processTXmetaBatchMessage(data []byte) error {
 		offset = 4
 	}
 
-	// Per-entry header size (excluding content): 32-byte hash + 1-byte action
-	// + 4-byte content length, plus 8 bytes of xxhash on the wire in v2.
-	entryHeaderSize := 32 + 1 + 4
+	// Per-entry header size (excluding content). The shared constants in
+	// stores/txmetacache encode the same numbers; using them here keeps
+	// the producer and the receiver pinned to one source of truth.
+	entryHeaderSize := txmetacache.WireV1MinEntrySize
 	if isV2 {
-		entryHeaderSize += 8
+		entryHeaderSize = txmetacache.WireV2MinEntrySize
 	}
 
 	// Process each entry

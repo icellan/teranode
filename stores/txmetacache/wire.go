@@ -45,4 +45,11 @@ const (
 	// (content length = 0 for a DELETE). Used by detectors to bound the
 	// entry count against buffer size.
 	WireV2MinEntrySize = 8 + 32 + 1 + 4
+
+	// WireV1MinEntrySize is the smallest possible v1 entry on the wire:
+	// 32-byte hash + 1-byte action + 4-byte content length (content length
+	// = 0 for a DELETE). Used to clamp a wire-side entry count against the
+	// remaining buffer so a malformed or malicious count cannot trigger an
+	// oversized pre-loop allocation.
+	WireV1MinEntrySize = 32 + 1 + 4
 )

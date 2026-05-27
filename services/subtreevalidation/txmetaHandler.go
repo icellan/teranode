@@ -132,10 +132,28 @@ func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) err
 		offset = 4
 	}
 
-	// Per-entry sizes (excluding content).
-	entryHeaderSize := 32 + 1 + 4
+	// Per-entry sizes (excluding content). The shared constants in
+	// stores/txmetacache encode the same numbers; using them here keeps
+	// the producer and the receiver pinned to one source of truth.
+	entryHeaderSize := txmetacache.WireV1MinEntrySize
 	if isV2 {
-		entryHeaderSize += 8
+		entryHeaderSize = txmetacache.WireV2MinEntrySize
+	}
+
+	// Reject implausibly large entry counts before sizing the pool buffers.
+	// The pool pre-allocates `entries * 32` bytes for keysBuf plus `entries`
+	// slice slots, so an unbounded count read straight from the wire is a
+	// DoS surface. The plausibility bound is the same shape as the v2
+	// detection check: each entry needs at least `entryHeaderSize` bytes
+	// excluding content, so a count larger than the remaining buffer can
+	// fit is malformed. The v2 path is already guarded by the detection-
+	// time check above; the guard here matters for the v1 fallback path.
+	remainingForEntries := uint64(len(data) - offset)
+	maxEntries := remainingForEntries / uint64(entryHeaderSize)
+	if uint64(entries) > maxEntries {
+		u.logger.Errorf("[txmetaHandler] entry count %d exceeds buffer capacity (%d max for %d-byte payload)",
+			entries, maxEntries, remainingForEntries)
+		return nil
 	}
 
 	// Pool-backed scratch. Sized to upper bounds derived from the wire:
