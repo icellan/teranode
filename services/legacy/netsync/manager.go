@@ -2541,29 +2541,81 @@ func (sm *SyncManager) kafkaTXmetaListener(ctx context.Context, kafkaURL *url.UR
 const (
 	txmetaActionADD    = byte(0)
 	txmetaActionDELETE = byte(1)
+
+	// txmetaWireV2Magic marks a v2 txmeta Kafka message. v1 messages start
+	// with the low byte of a uint32 entry count, which can never be 0xFF for
+	// any realistic batch size. Kept in sync with the producer (Validator)
+	// and the subtreevalidation consumer (services/subtreevalidation/txmetaHandler.go).
+	txmetaWireV2Magic = byte(0xFF)
+	// txmetaWireV2Version is the only v2 sub-version defined today.
+	txmetaWireV2Version = byte(0x02)
 )
 
 // processTXmetaBatchMessage processes a binary batch message from the txmeta Kafka topic.
 // It parses the batch format, deserializes metadata for ADD entries, and announces
 // non-coinbase transactions to peers via the txAnnounceBatcher.
 // Coinbase transactions are intentionally skipped to avoid peer bans.
+//
+// Two wire formats are accepted, distinguished by the first byte (mirrors
+// services/subtreevalidation/txmetaHandler.go):
+//
+//	v1 (legacy)
+//	  [4 bytes] entry count (uint32 LE)
+//	  per entry: [32 hash][1 action][4 contentLen][N content]
+//
+//	v2 (partition-aware)
+//	  [1 byte magic=0xFF][1 byte version=0x02][2 reserved][4 entry count LE]
+//	  per entry: [8 xxhash][32 hash][1 action][4 contentLen][N content]
+//
+// The xxhash prefix in v2 is read and discarded — netsync only needs the
+// 32-byte tx hash to announce; partition-aligned cache writes are a
+// subtreevalidation concern.
 func (sm *SyncManager) processTXmetaBatchMessage(data []byte) error {
 	if len(data) < 4 {
 		return nil
 	}
 
-	offset := 0
+	var (
+		offset     int
+		entryCount uint32
+		isV2       bool
+	)
 
-	// Read entry count
-	entryCount := binary.LittleEndian.Uint32(data[offset:])
-	offset += 4
+	if data[0] == txmetaWireV2Magic {
+		if len(data) < 8 {
+			sm.logger.Errorf("[kafkaTXmetaListener] truncated v2 header (%d bytes)", len(data))
+			return nil
+		}
+		if data[1] != txmetaWireV2Version {
+			sm.logger.Errorf("[kafkaTXmetaListener] unknown v2 wire version %d", data[1])
+			return nil
+		}
+		// data[2:4] reserved.
+		entryCount = binary.LittleEndian.Uint32(data[4:])
+		offset = 8
+		isV2 = true
+	} else {
+		entryCount = binary.LittleEndian.Uint32(data[:4])
+		offset = 4
+	}
+
+	// Per-entry header size (excluding content): 32-byte hash + 1-byte action
+	// + 4-byte content length, plus 8 bytes of xxhash on the wire in v2.
+	entryHeaderSize := 32 + 1 + 4
+	if isV2 {
+		entryHeaderSize += 8
+	}
 
 	// Process each entry
 	for i := uint32(0); i < entryCount; i++ {
-		// Check minimum bytes for hash + action + length
-		if offset+32+1+4 > len(data) {
+		if offset+entryHeaderSize > len(data) {
 			sm.logger.Errorf("[kafkaTXmetaListener] truncated message at entry %d", i)
 			return nil
+		}
+
+		// v2: skip the 8-byte xxhash prefix; netsync doesn't use it.
+		if isV2 {
+			offset += 8
 		}
 
 		// Read hash (32 bytes)
