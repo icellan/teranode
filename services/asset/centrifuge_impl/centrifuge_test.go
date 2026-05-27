@@ -1482,6 +1482,63 @@ func TestWebsocketHandler_BidirectionalConnect(t *testing.T) {
 	require.NotNil(t, subs["node_status"], "OnConnecting subscriptions must appear in the connect reply; got %s", string(data))
 }
 
+// TestWebsocketHandler_BidirectionalConnectThroughAuthMiddleware exercises the
+// full handshake through the production `authMiddleware`, which is the exact
+// path that depends on `context.WithoutCancel(r.Context())` in the handler.
+//
+// `authMiddleware` calls `centrifuge.SetCredentials(ctx, …)` on the request
+// context and then returns from `ServeHTTP` once the upgrade goroutine has
+// launched — at which point `net/http` cancels the request context. If the
+// handler ever stops detaching cancellation, centrifuge's `HandleCommand`
+// observes `<-c.ctx.Done()` on every subsequent frame and silently aborts
+// the connect (no reply ever reaches the client). This test catches that
+// regression.
+func TestWebsocketHandler_BidirectionalConnectThroughAuthMiddleware(t *testing.T) {
+	logger := ulogger.TestLogger{}
+	tSettings := &settings.Settings{
+		Asset: settings.AssetSettings{HTTPAddress: "http://localhost:8080"},
+	}
+	mockHTTP, err := createTestHTTP(logger, &repository.Repository{})
+	require.NoError(t, err)
+
+	c, err := New(logger, tSettings, nil, mockHTTP)
+	require.NoError(t, err)
+	require.NoError(t, c.Init(context.Background()))
+	defer func() { _ = c.centrifugeNode.Shutdown(context.Background()) }()
+
+	// authMiddleware short-circuits with 503 until current node status is
+	// cached; populate it so the handshake can proceed.
+	c.statusMutex.Lock()
+	c.cachedCurrentNodeStatus = &notificationMsg{Type: "node_status", PeerID: "test"}
+	c.currentNodePeerID = "test"
+	c.statusMutex.Unlock()
+
+	wsHandler := NewWebsocketHandler(c.centrifugeNode, WebsocketConfig{
+		CheckOrigin: func(_ *http.Request) bool { return true },
+	})
+	server := httptest.NewServer(c.authMiddleware(wsHandler))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	require.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte(`{"id":1,"connect":{}}`)))
+
+	_, data, err := conn.ReadMessage()
+	require.NoError(t, err, "expected a centrifuge connect reply via authMiddleware")
+
+	var reply map[string]any
+	require.NoError(t, json.Unmarshal(data, &reply), "raw reply: %s", string(data))
+
+	require.EqualValues(t, 1, reply["id"], "reply must echo the command id; got %s", string(data))
+	connectResult, ok := reply["connect"].(map[string]any)
+	require.True(t, ok, "reply must carry a connect result; got %s", string(data))
+	require.NotEmpty(t, connectResult["client"], "connect result must include a non-empty client id")
+}
+
 // TestCentrifuge_Init_comprehensive_callbacks tests Init function's callback functionality
 func TestCentrifuge_Init_comprehensive_callbacks(t *testing.T) {
 	logger := ulogger.TestLogger{}
