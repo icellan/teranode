@@ -28,6 +28,10 @@
 //   - Batch operation errors
 //   - Timeout errors at the database level
 //
+// Data-state result codes (KEY_NOT_FOUND_ERROR, FILTERED_OUT, etc.) are
+// explicitly excluded from the failure counter — see isInfrastructureFailure
+// for the exact allow-list. Issue #953.
+//
 // # Circuit Breaker States
 //
 // 1. CLOSED: Normal operation, requests flow through
@@ -96,7 +100,8 @@ func isInfrastructureFailure(err error) bool {
 			types.SERVER_MEM_ERROR,
 			types.SERVER_ERROR,
 			types.DEVICE_OVERLOAD,
-			types.BATCH_FAILED:
+			types.BATCH_FAILED,
+			types.GRPC_ERROR:
 			return true
 		default:
 			return false

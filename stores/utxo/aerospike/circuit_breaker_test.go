@@ -9,7 +9,6 @@ import (
 
 	"github.com/aerospike/aerospike-client-go/v8"
 	"github.com/aerospike/aerospike-client-go/v8/types"
-	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -497,6 +496,7 @@ func TestIsInfrastructureFailure(t *testing.T) {
 			types.SERVER_ERROR,
 			types.DEVICE_OVERLOAD,
 			types.BATCH_FAILED,
+			types.GRPC_ERROR,
 		}
 		for _, code := range infraCodes {
 			require.True(t, isInfrastructureFailure(aErrWithCode(code)),
@@ -519,14 +519,6 @@ func TestIsInfrastructureFailure(t *testing.T) {
 		// errors.As inside the classifier can still find it.
 		require.True(t, isInfrastructureFailure(wrapErr{msg: "outer", inner: aErrWithCode(types.TIMEOUT)}))
 		require.False(t, isInfrastructureFailure(wrapErr{msg: "outer", inner: aErrWithCode(types.KEY_NOT_FOUND_ERROR)}))
-
-		// Note: teranode/errors.New() flattens non-*Error wrapped errors to
-		// just a message string (errors.go:335) — so the original
-		// *aerospike.AerospikeError is unrecoverable once wrapped that way.
-		// The classifier is intentionally called on the raw batch error
-		// before any such wrapping (see spend.go handleBatchError and
-		// spend_expressions.go processSpendBatchResultsExpressions).
-		_ = errors.NewStorageError // keep import live for documentation
 	})
 
 	t.Run("WrappedContextDeadline", func(t *testing.T) {
