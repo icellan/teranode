@@ -381,7 +381,7 @@ package httpimpl
 // [8 bytes status LE][4 bytes lockTime LE][4 bytes spendingVin LE][32 bytes spendingTxID].
 // Unspent UTXOs have the trailing 36 bytes zero-filled; not-found records report
 // status utxo.Status_NOT_FOUND and the remaining bytes are zero. Body size is
-// capped by the asset_httpBodyLimit setting (default 4MB).
+// capped by the global asset_httpBodyLimit setting (default 100MB).
 // responses:
 //   200: binaryResponse
 //   400: errorResponse

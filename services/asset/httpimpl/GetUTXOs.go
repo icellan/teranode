@@ -1,6 +1,7 @@
 package httpimpl
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"io"
@@ -98,33 +99,12 @@ func (h *HTTP) GetUTXOs(mode ReadMode) func(c echo.Context) error {
 
 		defer deferFn()
 
-		body := c.Request().Body
-		defer func() {
-			_ = body.Close()
-		}()
-
-		// Read the whole body up front so we can validate its length and index
-		// into it without holding the connection open across the fan-out. The
-		// asset_httpBodyLimit middleware has already capped this for clients
-		// that send Content-Length up-front. Clients that stream without an
-		// accurate Content-Length trip the cap mid-Read and surface as
-		// echo.ErrStatusRequestEntityTooLarge — map that to 413 explicitly so
-		// the documented contract holds for both shapes of client.
-		reqBytes, err := io.ReadAll(body)
+		reqBytes, err := readUTXOsBody(c)
 		if err != nil {
-			if errors.Is(err, echo.ErrStatusRequestEntityTooLarge) {
-				return echo.NewHTTPError(http.StatusRequestEntityTooLarge, errors.NewInvalidArgumentError("request body exceeds asset_httpBodyLimit").Error())
-			}
-
-			return echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error reading request body", err).Error())
-		}
-
-		if len(reqBytes)%utxosRequestRecordSize != 0 {
-			return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("body length %d is not a multiple of %d bytes", len(reqBytes), utxosRequestRecordSize).Error())
+			return err
 		}
 
 		numRecords := len(reqBytes) / utxosRequestRecordSize
-
 		if numRecords == 0 {
 			return writeUTXOsResponse(c, mode, nil)
 		}
@@ -148,9 +128,7 @@ func (h *HTTP) GetUTXOs(mode ReadMode) func(c echo.Context) error {
 				// Echo's middleware.Recover only protects the request goroutine —
 				// not the ones errgroup spawns. Without this defer, a per-record
 				// panic (e.g. an index-out-of-range deep in a store driver) would
-				// crash the asset process. Convert any panic into an errgroup
-				// error so the request fails with 500 instead of taking the
-				// service down.
+				// crash the asset process.
 				defer func() {
 					if r := recover(); r != nil {
 						h.logger.Errorf("[Asset_http:GetUTXOs] recovered panic on %s:%d: %v", txHash.String(), vout, r)
@@ -158,28 +136,9 @@ func (h *HTTP) GetUTXOs(mode ReadMode) func(c echo.Context) error {
 					}
 				}()
 
-				resp, err := h.repository.GetUtxo(gCtx, &utxo.Spend{
-					TxID:         &txHash,
-					Vout:         vout,
-					UTXOHash:     nil,
-					SpendingData: nil,
-				})
-
+				resp, err := h.fetchOneUTXO(gCtx, &txHash, vout)
 				if err != nil {
-					// Per-record not-found becomes Status_NOT_FOUND in the slot;
-					// any other store error fails the whole request (we don't
-					// want to silently report zero-padded "not found" for every
-					// record when the store is unreachable).
-					if errors.Is(err, errors.ErrNotFound) {
-						results[i] = &utxo.SpendResponse{Status: int(utxo.Status_NOT_FOUND)}
-						return nil
-					}
-
-					return echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error getting utxo %s:%d", txHash.String(), vout, err).Error())
-				}
-
-				if resp == nil {
-					resp = &utxo.SpendResponse{Status: int(utxo.Status_NOT_FOUND)}
+					return err
 				}
 
 				results[i] = resp
@@ -200,6 +159,59 @@ func (h *HTTP) GetUTXOs(mode ReadMode) func(c echo.Context) error {
 
 		return writeUTXOsResponse(c, mode, results)
 	}
+}
+
+// readUTXOsBody consumes the request body, maps the body-limit-exceeded error
+// to 413 (so streaming clients without Content-Length get the documented
+// status), and validates that the body length is a non-negative multiple of
+// utxosRequestRecordSize. Returns the raw bytes or an echo.HTTPError ready to
+// be returned from the handler.
+func readUTXOsBody(c echo.Context) ([]byte, error) {
+	body := c.Request().Body
+	defer func() { _ = body.Close() }()
+
+	reqBytes, err := io.ReadAll(body)
+	if err != nil {
+		if errors.Is(err, echo.ErrStatusRequestEntityTooLarge) {
+			return nil, echo.NewHTTPError(http.StatusRequestEntityTooLarge, errors.NewInvalidArgumentError("request body exceeds asset_httpBodyLimit").Error())
+		}
+
+		return nil, echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error reading request body", err).Error())
+	}
+
+	if len(reqBytes)%utxosRequestRecordSize != 0 {
+		return nil, echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("body length %d is not a multiple of %d bytes", len(reqBytes), utxosRequestRecordSize).Error())
+	}
+
+	return reqBytes, nil
+}
+
+// fetchOneUTXO performs the bulk endpoint's per-record store lookup.
+// ErrNotFound (and a nil resp) become a per-record Status_NOT_FOUND; any
+// other store error is wrapped as an echo HTTPError so the whole request
+// fails (preferred over silently zero-padding every other record when the
+// store is unreachable). Panics are NOT recovered here — the caller's
+// goroutine wrapper handles that.
+func (h *HTTP) fetchOneUTXO(ctx context.Context, txHash *chainhash.Hash, vout uint32) (*utxo.SpendResponse, error) {
+	resp, err := h.repository.GetUtxo(ctx, &utxo.Spend{
+		TxID:         txHash,
+		Vout:         vout,
+		UTXOHash:     nil,
+		SpendingData: nil,
+	})
+	if err != nil {
+		if errors.Is(err, errors.ErrNotFound) {
+			return &utxo.SpendResponse{Status: int(utxo.Status_NOT_FOUND)}, nil
+		}
+
+		return nil, echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error getting utxo %s:%d", txHash.String(), vout, err).Error())
+	}
+
+	if resp == nil {
+		return &utxo.SpendResponse{Status: int(utxo.Status_NOT_FOUND)}, nil
+	}
+
+	return resp, nil
 }
 
 // writeUTXOsResponse serializes results in the requested mode and writes the
