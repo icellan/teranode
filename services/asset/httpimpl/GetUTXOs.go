@@ -71,7 +71,9 @@ const (
 // Error Responses (all modes):
 //
 //   - 400 Bad Request: body length is not a multiple of 36 bytes.
-//   - 413 Request Entity Too Large: body exceeds the asset_httpBodyLimit setting.
+//   - 413 Request Entity Too Large: body exceeds the global asset_httpBodyLimit setting.
+//   - 429 Too Many Requests: heavy-route tiered rate limiter rejected the request
+//     (shared with /subtree/:hash/txs and other fan-out endpoints).
 //   - 500 Internal Server Error: transport error reading the body, an unrecoverable
 //     repository error from at least one record, or a per-record panic recovered
 //     inside the fan-out (the panic is logged but the response body does not
