@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
-	"runtime/debug"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -73,8 +72,10 @@ const (
 //
 //   - 400 Bad Request: body length is not a multiple of 36 bytes.
 //   - 413 Request Entity Too Large: body exceeds the asset_httpBodyLimit setting.
-//   - 500 Internal Server Error: transport error reading the body, or unrecoverable
-//     repository error from at least one record.
+//   - 500 Internal Server Error: transport error reading the body, an unrecoverable
+//     repository error from at least one record, or a per-record panic recovered
+//     inside the fan-out (the panic is logged but the response body does not
+//     include the panic value, to avoid leaking internal driver details).
 //
 // Performance notes:
 //   - Bypasses the per-record full-transaction fetch that GET /api/v1/utxo/:hash
@@ -150,7 +151,7 @@ func (h *HTTP) GetUTXOs(mode ReadMode) func(c echo.Context) error {
 				// service down.
 				defer func() {
 					if r := recover(); r != nil {
-						h.logger.Errorf("[Asset_http:GetUTXOs] recovered panic on %s:%d: %v\n%s", txHash.String(), vout, r, debug.Stack())
+						h.logger.Errorf("[Asset_http:GetUTXOs] recovered panic on %s:%d: %v", txHash.String(), vout, r)
 						retErr = echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("internal error getting utxo %s:%d", txHash.String(), vout).Error())
 					}
 				}()
