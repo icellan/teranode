@@ -5570,15 +5570,29 @@ func releaseLeafBuf(b []byte) {
 // reader, sorts them into nBuckets per-bucket slices keyed by the high bits
 // of the hash, and returns any conflicting-node hashes in the trailer.
 //
-// maxLeafDataBytes bounds the total bytes the function will allocate and
-// read for the leaf-data section. It is intended to be wired from the
-// caller's DoS cap (e.g. settings.SubtreeValidation.MaxIncomingSubtreeBytes)
-// so that a peer claiming an impossibly large numLeaves in the header is
-// rejected before any allocation.
+// maxSubtreeBodyBytes bounds the total bytes of the on-disk subtree body —
+// header + leaf-count + leaves + conflicting-count + conflicting-hashes.
+// It is intended to be wired from the caller's DoS cap (e.g.
+// settings.SubtreeValidation.MaxIncomingSubtreeBytes), which is documented
+// as a whole-body cap. The function rejects any combination of numLeaves
+// and numConflicting whose serialized size would exceed it, so a peer
+// cannot pass by claiming `cap` bytes of leaves plus another `cap` bytes
+// of conflicting hashes.
+//
+// A non-positive maxSubtreeBodyBytes is rejected before any read or
+// allocation: the bound must be a real value, not a misconfigured 0 or a
+// negative that would wrap to ~2^63 under unsigned conversion.
+//
+// conflictingNodes precondition: callers should pass either a nil/empty
+// slice or one whose existing contents they are willing to lose. When the
+// trailer count exceeds the slice's capacity, the function reallocates
+// the backing array (length is reset to 0 before appending), which
+// silently drops any prior contents. Both current callers (CreateTransactionMap
+// and the long-test) pass freshly-created empty slices.
 func DeserializeHashesFromReaderIntoBuckets(
 	reader io.Reader,
 	nBuckets uint16,
-	maxLeafDataBytes int64,
+	maxSubtreeBodyBytes int64,
 	hashes *map[uint16][]chainhash.Hash,
 	conflictingNodes *[]chainhash.Hash,
 ) (err error) {
@@ -5587,6 +5601,16 @@ func DeserializeHashesFromReaderIntoBuckets(
 			err = errors.NewProcessingError("recovered in DeserializeHashesFromReaderIntoBuckets: %v", r)
 		}
 	}()
+
+	// Reject misconfigured caps up front. A 0 or negative would wrap into
+	// a huge uint64 below and disable every subsequent bound. This matches
+	// the fail-closed behaviour of the existing io.LimitReader-based path
+	// elsewhere in the subtree fetch surface.
+	if maxSubtreeBodyBytes <= 0 {
+		return errors.NewProcessingError(
+			"invalid maxSubtreeBodyBytes %d: must be positive", maxSubtreeBodyBytes,
+		)
+	}
 
 	// Read the 48-byte header + 8-byte numLeaves in one shot. The header is
 	// not parsed here — readers of this format treat it as opaque — but it
@@ -5598,15 +5622,32 @@ func DeserializeHashesFromReaderIntoBuckets(
 
 	numLeaves := binary.LittleEndian.Uint64(hdr[subtreeHeaderBytes:])
 
-	// Bound numLeaves against the DoS cap before allocating. The check uses
-	// the supplied cap divided by the per-record size; doing it this way
-	// (instead of computing numLeaves*subtreeLeafBytes first) makes the
-	// comparison overflow-safe regardless of how large numLeaves is.
-	maxLeaves := uint64(maxLeafDataBytes) / uint64(subtreeLeafBytes)
+	// Compute the remaining budget for variable-size sections (leaves +
+	// conflicting trailer), excluding what's already been read off the
+	// stream (header + leaf-count) and reserving the conflicting-count
+	// field that follows the leaves. Reserving the trailer-count field
+	// here means an over-large numLeaves can't crowd it out.
+	maxSubtreeBodyBytesU := uint64(maxSubtreeBodyBytes) // safe: > 0 verified above
+	minFixedBytes := uint64(subtreeHeaderAndCountSize + subtreeCountFieldBytes)
+	if maxSubtreeBodyBytesU < minFixedBytes {
+		return errors.NewProcessingError(
+			"maxSubtreeBodyBytes %d too small to hold even an empty subtree (need >= %d)",
+			maxSubtreeBodyBytes, minFixedBytes,
+		)
+	}
+
+	remainingBudget := maxSubtreeBodyBytesU - minFixedBytes
+
+	// Bound numLeaves against the remaining budget before allocating. The
+	// check uses the supplied budget divided by the per-record size;
+	// doing it this way (instead of computing numLeaves*subtreeLeafBytes
+	// first) makes the comparison overflow-safe regardless of how large
+	// numLeaves is.
+	maxLeaves := remainingBudget / uint64(subtreeLeafBytes)
 	if numLeaves > maxLeaves {
 		return errors.NewProcessingError(
-			"subtree header claims %d leaves (%d bytes), exceeds max %d bytes",
-			numLeaves, numLeaves*subtreeLeafBytes, maxLeafDataBytes,
+			"subtree header claims %d leaves (%d bytes), exceeds max body %d bytes",
+			numLeaves, numLeaves*subtreeLeafBytes, maxSubtreeBodyBytes,
 		)
 	}
 
@@ -5637,8 +5678,9 @@ func DeserializeHashesFromReaderIntoBuckets(
 	}
 
 	// Conflicting trailer: 8-byte count + count*32-byte hashes. Bounded by
-	// the same DoS cap (divided by per-record size). Typically empty or a
-	// handful, so no pooling here.
+	// the *remaining* budget after the leaves section, so a subtree cannot
+	// pass by claiming cap bytes of leaves plus another cap bytes of
+	// conflicting hashes.
 	var cntBuf [subtreeCountFieldBytes]byte
 	if _, err = io.ReadFull(reader, cntBuf[:]); err != nil {
 		return errors.NewProcessingError("unable to read number of conflicting txs", err)
@@ -5646,11 +5688,12 @@ func DeserializeHashesFromReaderIntoBuckets(
 
 	numConflicting := binary.LittleEndian.Uint64(cntBuf[:])
 
-	maxConflicting := uint64(maxLeafDataBytes) / uint64(subtreeHashBytes)
+	remainingForConflicting := remainingBudget - uint64(leafBytes)
+	maxConflicting := remainingForConflicting / uint64(subtreeHashBytes)
 	if numConflicting > maxConflicting {
 		return errors.NewProcessingError(
-			"subtree trailer claims %d conflicting txs, exceeds max",
-			numConflicting,
+			"subtree trailer claims %d conflicting txs (%d bytes), exceeds remaining body budget %d bytes",
+			numConflicting, numConflicting*subtreeHashBytes, remainingForConflicting,
 		)
 	}
 

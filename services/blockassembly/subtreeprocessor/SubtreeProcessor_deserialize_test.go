@@ -217,7 +217,11 @@ func TestDeserializeHashesFromReaderIntoBuckets_PoolReuse(t *testing.T) {
 	// reuse the pool buffer (high-water mark) — we can't observe pool
 	// internals directly but we can verify both calls succeed and the
 	// data parses correctly with no cross-contamination from the first
-	// call's bytes.
+	// call's bytes. ElementsMatch (not just length) locks the invariant
+	// in: a pool-corruption bug that preserved length but altered bytes
+	// would otherwise slip through, because io.ReadFull only overwrites
+	// the requested range and any prior bytes in the pooled backing
+	// array would survive a length-only check.
 	first := []chainhash.Hash{
 		chainhash.HashH([]byte("first-a")),
 		chainhash.HashH([]byte("first-b")),
@@ -247,8 +251,28 @@ func TestDeserializeHashesFromReaderIntoBuckets_PoolReuse(t *testing.T) {
 	}
 
 	got1 := run(first)
-	require.Len(t, got1, len(first))
+	require.ElementsMatch(t, first, got1)
 
 	got2 := run(second)
-	require.Len(t, got2, len(second), "second call must not leak entries from the first")
+	require.ElementsMatch(t, second, got2, "second call must not leak entries from the first")
+}
+
+func TestDeserializeHashesFromReaderIntoBuckets_NonPositiveCapRejected(t *testing.T) {
+	// A 0 or negative cap (misconfigured setting) must be rejected before
+	// any read or allocation. Without this check, uint64(int64(-1)) wraps
+	// to ^uint64(0) and disables every subsequent bound.
+	cases := []int64{0, -1, -128 * 1024 * 1024}
+	for _, cap := range cases {
+		buckets := make(map[uint16][]chainhash.Hash, 8)
+		conflictingOut := make([]chainhash.Hash, 0)
+		err := DeserializeHashesFromReaderIntoBuckets(
+			bytes.NewReader(buildSubtreeBytes(nil, nil)),
+			8,
+			cap,
+			&buckets,
+			&conflictingOut,
+		)
+		require.Error(t, err, "cap=%d must be rejected", cap)
+		require.Contains(t, err.Error(), "must be positive")
+	}
 }
