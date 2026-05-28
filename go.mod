@@ -4,15 +4,17 @@ go 1.26.0
 
 replace github.com/in-toto/in-toto-golang => github.com/in-toto/in-toto-golang v0.9.0
 
-replace github.com/aerospike/aerospike-client-go/v8 => github.com/aerospike/aerospike-client-go/v8 v8.2.0
-
 require (
 	github.com/IBM/sarama v1.45.1
-	github.com/aerospike/aerospike-client-go/v8 v8.7.0
 	github.com/aws/aws-sdk-go-v2 v1.41.4
 	github.com/aws/aws-sdk-go-v2/config v1.32.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.4
 	github.com/bitcoin-sv/bdk/module/gobdk v1.2.5-0.20260518042519-1ca0c6519af9
+	// BSV fork of aerospike-client-go-v8 (adds TeranodeModifyOp /
+	// TeranodeReadOp wire opcodes 200/201 — see
+	// github.com/bsv-blockchain/aerospike-server-private feat/
+	// teranode-native-op for the matching server-side dispatcher).
+	github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv3
 	github.com/bsv-blockchain/go-bt/v2 v2.6.4
 	github.com/bsv-blockchain/go-chaincfg v1.5.8
 	github.com/bsv-blockchain/go-sdk v1.2.23
@@ -77,6 +79,7 @@ require (
 	filippo.io/keygen v0.0.0-20260114151900-8e2790ea4c5b // indirect
 	github.com/DefangLabs/secret-detector v0.0.0-20250403165618-22662109213e // indirect
 	github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d // indirect
+	github.com/aerospike/aerospike-client-go/v8 v8.7.0 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aws/aws-sdk-go-v2/service/signin v1.0.8 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
@@ -149,8 +152,6 @@ require (
 	github.com/muesli/termenv v0.16.0 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/nxadm/tail v1.4.11 // indirect
-	github.com/onsi/ginkgo/v2 v2.27.5 // indirect
-	github.com/onsi/gomega v1.39.0 // indirect
 	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
 	github.com/pion/datachannel v1.6.0 // indirect
 	github.com/pion/dtls/v3 v3.1.2 // indirect

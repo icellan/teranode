@@ -92,8 +92,8 @@ github.com/ProtonMail/go-crypto v1.3.0 h1:ILq8+Sf5If5DCpHQp4PbZdS1J7HDFRXz/+xKBi
 github.com/ProtonMail/go-crypto v1.3.0/go.mod h1:9whxjD8Rbs29b4XWbB8irEcE8KHMqaR2e7GWU1R+/PE=
 github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d h1:licZJFw2RwpHMqeKTCYkitsPqHNxTmd4SNR5r94FGM8=
 github.com/acarl005/stripansi v0.0.0-20180116102854-5a71ef0e047d/go.mod h1:asat636LX7Bqt5lYEZ27JNDcqxfjdBQuJ/MM4CN/Lzo=
-github.com/aerospike/aerospike-client-go/v8 v8.2.0 h1:6w3X+w5LnmBvQ1X1m4zJH40IWgxZxfMfGhEZxuQlCYo=
-github.com/aerospike/aerospike-client-go/v8 v8.2.0/go.mod h1:JmVOIqacquBd0ZjlZ5Dz6bRMSC3LrZCCNojZ/9NS4R0=
+github.com/aerospike/aerospike-client-go/v8 v8.7.0 h1:ihcad2ekboqRsP5Rd6wvVRjBz4i+bOFXksAgMZarbAo=
+github.com/aerospike/aerospike-client-go/v8 v8.7.0/go.mod h1:H6RYZ7CMLH8Qt9Zj0Zsk5ynnEc/kfXm6z2J6tA81jH8=
 github.com/agnivade/levenshtein v1.2.1 h1:EHBY3UOn1gwdy/VbFwgo4cxecRznFk7fKWN1KOX7eoM=
 github.com/agnivade/levenshtein v1.2.1/go.mod h1:QVVI16kDrtSuwcpd0p1+xMC6Z/VfhtCyDIjcwga4/DU=
 github.com/anchore/go-struct-converter v0.1.0 h1:2rDRssAl6mgKBSLNiVCMADgZRhoqtw9dedlWa0OhD30=
@@ -168,6 +168,8 @@ github.com/bitcoinsv/bsvutil v0.0.0-20181216182056-1d77cf353ea9/go.mod h1:p44KuN
 github.com/bketelsen/crypt v0.0.4/go.mod h1:aI6NrJ0pMGgvZKL1iVgXLnfIFJtfV+bKCoqOes/6LfM=
 github.com/blang/semver v3.5.1+incompatible h1:cQNTCjp13qL8KC3Nbxr/y2Bqb63oX6wdnnjpJbkM4JQ=
 github.com/blang/semver v3.5.1+incompatible/go.mod h1:kRBLl5iJ+tD4TcOOxsy/0fnwebNt5EWlYSAyrTnjyyk=
+github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv3 h1:gMqILIz4FPInYy/CYBxAYy/nU0seVPx2jvnfwy14K9E=
+github.com/bsv-blockchain/aerospike-client-go/v8 v8.7.1-bsv3/go.mod h1:t4MjZ6nitI84mr/KhpPGFCCeCT4+y4hq0di8qOHIIGk=
 github.com/bsv-blockchain/go-alert-system v0.1.6 h1:pXJqJZVJw4ha46CircxOhcV0iNzohf2nt1l4O3TNtSI=
 github.com/bsv-blockchain/go-alert-system v0.1.6/go.mod h1:3Pwm4O0GcGiYFuofRml7UEWBWt0a4kKLCsvisyOpQps=
 github.com/bsv-blockchain/go-batcher/v2 v2.0.0 h1:A97RDYPqjS+jp9fe585H6squUSTuZRdhRnwJKCkK8rk=
