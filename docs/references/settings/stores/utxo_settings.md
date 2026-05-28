@@ -16,22 +16,9 @@
 | SpendBatcherSize | int | 100 | utxostore_spendBatcherSize | Spend operation batch size |
 | SpendBatcherConcurrency | int | 32 | utxostore_spendBatcherConcurrency | Spend batch concurrency |
 | SpendWaitTimeout | time.Duration | 30s | utxostore_spendWaitTimeout | Spend operation wait timeout |
-| SpendCircuitBreakerFailureCount | int | 10 | utxostore_spendCircuitBreakerFailureCount | Circuit breaker failure threshold (infrastructure-level errors only — see note below) |
+| SpendCircuitBreakerFailureCount | int | 10 | utxostore_spendCircuitBreakerFailureCount | Circuit breaker failure threshold (infrastructure-level errors only — see "Spend Circuit Breaker Trigger Set" below) |
 | SpendCircuitBreakerCooldown | time.Duration | 30s | utxostore_spendCircuitBreakerCooldown | Circuit breaker cooldown period |
 | SpendCircuitBreakerHalfOpenMax | int | 4 | utxostore_spendCircuitBreakerHalfOpenMax | Circuit breaker half-open max |
-
-### Spend Circuit Breaker Trigger Set
-
-The spend circuit breaker counts only **infrastructure-level** aerospike errors toward `SpendCircuitBreakerFailureCount`. Data-state errors (e.g. `KEY_NOT_FOUND_ERROR` for a missing parent during catch-up sync, `FILTERED_OUT` for a Lua business-rule rejection) are handled by the orphanage and the per-record error paths and never increment the failure counter.
-
-Counted as infrastructure failure:
-
-- `TIMEOUT`, `NETWORK_ERROR`, `NO_RESPONSE`, `MAX_RETRIES_EXCEEDED`
-- `NO_AVAILABLE_CONNECTIONS_TO_NODE`, `SERVER_NOT_AVAILABLE`
-- `SERVER_MEM_ERROR`, `SERVER_ERROR`, `DEVICE_OVERLOAD`, `BATCH_FAILED`, `GRPC_ERROR`
-- stdlib `context.DeadlineExceeded`; `net.Error` with `Timeout() == true`
-
-Anything else — including unknown / non-aerospike errors — is treated as non-infrastructure. The bias is intentional: a false trip during IBD stalls sync (issue #953), while a missed infrastructure signal is recoverable by the higher-level `SpendWaitTimeout` and health checks.
 | StoreBatcherDurationMillis | int | 100 | utxostore_storeBatcherDurationMillis | Store batch duration |
 | StoreBatcherSize | int | 100 | utxostore_storeBatcherSize | Store operation batch size |
 | UtxoBatchSize | int | 128 | utxostore_utxoBatchSize | UTXO operation batch size |
@@ -67,6 +54,19 @@ Anything else — including unknown / non-aerospike errors — is treated as non
 | Parameter | Type | Default | Usage | Impact |
 |-----------|------|---------|-------|--------|
 | logging | bool | false | `storeURL.Query().Get("logging") == "true"` | **CRITICAL** - Enables operation logging wrapper |
+
+## Spend Circuit Breaker Trigger Set
+
+The spend circuit breaker counts only **infrastructure-level** aerospike errors toward `SpendCircuitBreakerFailureCount`. Data-state errors (e.g. `KEY_NOT_FOUND_ERROR` for a missing parent during catch-up sync, `FILTERED_OUT` for a Lua business-rule rejection) are handled by the orphanage and per-record error paths and never increment the failure counter.
+
+Counted as infrastructure failure:
+
+- `TIMEOUT`, `NETWORK_ERROR`, `NO_RESPONSE`, `MAX_RETRIES_EXCEEDED`, `MAX_ERROR_RATE`
+- `NO_AVAILABLE_CONNECTIONS_TO_NODE`, `SERVER_NOT_AVAILABLE`, `INVALID_NODE_ERROR`, `PARTITION_UNAVAILABLE`
+- `SERVER_MEM_ERROR`, `SERVER_ERROR`, `DEVICE_OVERLOAD`, `BATCH_FAILED`, `GRPC_ERROR`
+- stdlib `context.DeadlineExceeded`; `net.Error` with `Timeout() == true`
+
+Anything else — including unknown / non-aerospike errors — is treated as non-infrastructure. The bias is intentional: a false trip during IBD stalls sync (issue #953), while a missed infrastructure signal is recoverable by the higher-level `SpendWaitTimeout` and health checks.
 
 ## Configuration Dependencies
 

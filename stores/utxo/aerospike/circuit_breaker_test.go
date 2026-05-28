@@ -490,8 +490,11 @@ func TestIsInfrastructureFailure(t *testing.T) {
 			types.NETWORK_ERROR,
 			types.NO_RESPONSE,
 			types.MAX_RETRIES_EXCEEDED,
+			types.MAX_ERROR_RATE,
 			types.NO_AVAILABLE_CONNECTIONS_TO_NODE,
 			types.SERVER_NOT_AVAILABLE,
+			types.INVALID_NODE_ERROR,
+			types.PARTITION_UNAVAILABLE,
 			types.SERVER_MEM_ERROR,
 			types.SERVER_ERROR,
 			types.DEVICE_OVERLOAD,
@@ -502,6 +505,26 @@ func TestIsInfrastructureFailure(t *testing.T) {
 			require.True(t, isInfrastructureFailure(aErrWithCode(code)),
 				"ResultCode %d (%s) must count as infrastructure failure", code, types.ResultCodeToString(code))
 		}
+	})
+
+	t.Run("ConstSentinelErrorsAreClassified", func(t *testing.T) {
+		// The aerospike client exposes some errors as package-level constants
+		// of concrete type *constAerospikeError, not *AerospikeError. They must
+		// still be classified by ResultCode — otherwise infra-grade sentinels
+		// returned per-record fall through and the breaker never trips.
+		require.True(t, isInfrastructureFailure(aerospike.ErrTimeout),
+			"aerospike.ErrTimeout (const sentinel) must be infra")
+		require.True(t, isInfrastructureFailure(aerospike.ErrNetwork),
+			"aerospike.ErrNetwork (const sentinel) must be infra")
+		require.True(t, isInfrastructureFailure(aerospike.ErrMaxRetriesExceeded),
+			"aerospike.ErrMaxRetriesExceeded (const sentinel) must be infra")
+		require.True(t, isInfrastructureFailure(aerospike.ErrConnectionPoolEmpty),
+			"aerospike.ErrConnectionPoolEmpty (const sentinel) must be infra")
+		// Data-state const sentinels must NOT be infra.
+		require.False(t, isInfrastructureFailure(aerospike.ErrKeyNotFound),
+			"aerospike.ErrKeyNotFound (const sentinel) must not be infra")
+		require.False(t, isInfrastructureFailure(aerospike.ErrFilteredOut),
+			"aerospike.ErrFilteredOut (const sentinel) must not be infra")
 	})
 
 	t.Run("StdlibTimeoutErrors", func(t *testing.T) {
