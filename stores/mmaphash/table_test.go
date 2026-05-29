@@ -84,15 +84,30 @@ func TestTableCreateClose(t *testing.T) {
 		require.Truef(t, e.IsDir(), "unexpected leftover file: %s", filepath.Join(dir, e.Name()))
 	}
 
+	require.Equal(t, int64(0), tbl.Len())
+
 	// mmap region is writable for the whole capacity
 	require.Greater(t, len(tbl.data), tbl.slotSize)
 	tbl.data[0] = 1
 	tbl.data[len(tbl.data)-1] = 1
 
 	require.NoError(t, tbl.Close())
+	// idempotent second close must not error
+	require.NoError(t, tbl.Close())
 }
 
-func TestTableNewRejectsBadKeySize(t *testing.T) {
-	_, err := New(Options{Dir: t.TempDir(), KeySize: 8, ValueSize: 0, Expected: 10})
-	require.Error(t, err) // keySize must be >= 16 (we read key[8:16] for segment selection)
+func TestTableNewKeySizeBoundary(t *testing.T) {
+	// keySize must be >= 16 (we read key[8:16] for segment selection)
+	_, err := New(Options{Dir: t.TempDir(), Prefix: "k", KeySize: 8, ValueSize: 0, Expected: 10})
+	require.Error(t, err)
+	_, err = New(Options{Dir: t.TempDir(), Prefix: "k", KeySize: 15, ValueSize: 0, Expected: 10})
+	require.Error(t, err, "15 is below the minimum")
+	tbl, err := New(Options{Dir: t.TempDir(), Prefix: "k", KeySize: 16, ValueSize: 0, Expected: 10})
+	require.NoError(t, err, "16 is the valid boundary")
+	require.NoError(t, tbl.Close())
+}
+
+func TestTableNewRejectsNegativeValueSize(t *testing.T) {
+	_, err := New(Options{Dir: t.TempDir(), Prefix: "v", KeySize: 32, ValueSize: -1, Expected: 10})
+	require.Error(t, err)
 }

@@ -93,7 +93,9 @@ type Table struct {
 }
 
 // ErrTableFull is returned when a segment has no empty slot (capacity exceeded).
-var ErrTableFull = errors.NewProcessingError("mmaphash: table segment full")
+// Uses the threshold-exceeded code so callers and tests can discriminate it via
+// errors.Is from generic processing errors.
+var ErrTableFull = errors.NewThresholdExceededError("mmaphash: table segment full")
 
 // New creates a Table backed by a sparse, immediately-unlinked mmap file.
 func New(opts Options) (*Table, error) {
@@ -115,7 +117,11 @@ func New(opts Options) (*Table, error) {
 	}
 	// Unlink now: the open fd and mmap keep the inode alive; space is reclaimed
 	// on Close (munmap + last fd close) or on process exit, even after a crash.
-	_ = os.Remove(f.Name())
+	// If unlink fails we cannot honour the ephemeral/crash-safe contract, so fail.
+	if rmErr := os.Remove(f.Name()); rmErr != nil {
+		_ = f.Close()
+		return nil, errors.NewStorageError("mmaphash: unlink temp file %s", f.Name(), rmErr)
+	}
 
 	if err = f.Truncate(fileBytes); err != nil {
 		_ = f.Close()
