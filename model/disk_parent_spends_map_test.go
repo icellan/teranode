@@ -144,6 +144,18 @@ func TestDiskParentSpendsMap_MultiDisk(t *testing.T) {
 		require.NoError(t, err)
 		require.False(t, got)
 	}
+
+	// verify routing actually spread entries across disks (not all on disk 0)
+	var nonEmpty int
+	var total int64
+	for _, tbl := range m.tables {
+		if tbl.Len() > 0 {
+			nonEmpty++
+		}
+		total += tbl.Len()
+	}
+	require.Equal(t, int64(n), total, "every entry must be accounted for across disk tables")
+	require.GreaterOrEqual(t, nonEmpty, 2, "entries should be distributed across multiple disks")
 }
 
 func TestDiskParentSpendsMap_ImplementsInterface(t *testing.T) {

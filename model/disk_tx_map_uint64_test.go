@@ -31,6 +31,11 @@ func makeHash(i int) chainhash.Hash {
 	h[1] = byte(i >> 8)
 	h[2] = byte(i >> 16)
 	h[3] = byte(i >> 24)
+	// also vary the disk-routing window (bytes 16-17) so multi-disk tests
+	// actually distribute across disks; bytes [8:16] (segment window) stay zero
+	// so these small-capacity tests keep numSeg=1.
+	h[16] = byte(i)
+	h[17] = byte(i >> 8)
 	return h
 }
 
@@ -169,6 +174,18 @@ func TestDiskTxMapUint64_MultiDisk(t *testing.T) {
 		require.True(t, ok, "missing hash at index %d", i)
 		require.Equal(t, uint64(i), val)
 	}
+
+	// verify routing actually spread entries across disks (not all on disk 0)
+	var nonEmpty int
+	var total int64
+	for _, tbl := range m.tables {
+		if tbl.Len() > 0 {
+			nonEmpty++
+		}
+		total += tbl.Len()
+	}
+	require.Equal(t, int64(n), total, "every entry must be accounted for across disk tables")
+	require.GreaterOrEqual(t, nonEmpty, 2, "entries should be distributed across multiple disks")
 }
 
 func TestDiskTxMapUint64_ImplementsTxMap(t *testing.T) {
