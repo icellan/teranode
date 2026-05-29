@@ -12,7 +12,7 @@ const (
 	defaultLoadFactor = 0.5
 )
 
-// nextPow2 returns the smallest power of two >= n (and >= 1).
+// nextPow2 returns the smallest power of two >= n (and >= 1). Inputs must be <= 2^63; above that the shift loop never terminates (inputs here are bounded by transaction counts).
 func nextPow2(n uint64) uint64 {
 	if n <= 1 {
 		return 1
@@ -50,7 +50,7 @@ func computeLayout(expected uint64, loadFactor float64) layout {
 	numSeg := clampU64(nextPow2(expected/segTarget), 1, maxSeg)
 	// slots needed across all segments to hold expected at loadFactor
 	needed := uint64(float64(expected)/loadFactor) + 1
-	perSeg := nextPow2(needed / numSeg)
+	perSeg := nextPow2((needed + numSeg - 1) / numSeg)
 	if perSeg < minSegSlots {
 		perSeg = minSegSlots
 	}
