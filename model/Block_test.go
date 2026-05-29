@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -4734,11 +4735,16 @@ func buildBlockForValidOrderBench(tb testing.TB, leaves, parentsPerTx int) (*Blo
 	require.NoError(tb, err)
 	require.NoError(tb, subtree.AddCoinbaseNode())
 
-	// Deterministic node hashes via a seeded byte counter — keeps the bench
-	// stable across runs and avoids paying for crypto/rand inside the loop.
+	// Uniformly-distributed node hashes derived via SHA-256 — mirrors real
+	// production tx hashes so the mmap hash table's segment/bucket selection
+	// spreads keys across the table. Synthetic sequential keys (only bytes
+	// [0:8] set, rest zero) would cluster every key into one segment, forcing
+	// pathological linear-probe chains that don't occur with real tx hashes.
 	hashes := make([]chainhash.Hash, leaves)
 	for i := 0; i < leaves-1; i++ { // -1: coinbase placeholder occupies index 0
-		binary.LittleEndian.PutUint64(hashes[i][:], uint64(i+1))
+		var seedBuf [8]byte
+		binary.LittleEndian.PutUint64(seedBuf[:], uint64(i+1))
+		hashes[i] = chainhash.Hash(sha256.Sum256(seedBuf[:]))
 		require.NoError(tb, subtree.AddNode(hashes[i], 1, 0))
 	}
 
@@ -4833,8 +4839,9 @@ func buildBlockForValidOrderBench(tb testing.TB, leaves, parentsPerTx int) (*Blo
 // BenchmarkBlock_ValidOrderAndBlessed_DiskVsMemory compares the per-block cost
 // of validOrderAndBlessed between the in-memory SplitSyncedParentMap and the
 // disk-backed DiskParentSpendsMap (single-disk and multi-disk). The disk
-// variants include the full BadgerDB open + writer-loop spin-up + close cost
-// per block, which is the realistic per-block-validation overhead.
+// variants include the full mmap-backed map (mmaphash) open + writer-loop
+// spin-up + close cost per block, which is the realistic per-block-validation
+// overhead.
 //
 // Run with:
 //
