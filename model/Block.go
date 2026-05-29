@@ -1007,7 +1007,12 @@ func (b *Block) checkDuplicateInputs(subtreeMetaSlice *subtreepkg.Meta, validati
 	}
 
 	for _, txInpoint := range txInpoints {
-		if valueSet := validationCtx.parentSpendsMap.SetIfNotExists(txInpoint); !valueSet {
+		valueSet, err := validationCtx.parentSpendsMap.SetIfNotExists(txInpoint)
+		if err != nil {
+			return errors.NewProcessingError("[validOrderAndBlessed][%s][%s:%d]:%d parent-spends map error",
+				b.String(), subtreeHash.String(), sIdx, snIdx, err)
+		}
+		if !valueSet {
 			return errors.NewBlockInvalidError("[validOrderAndBlessed][%s][%s:%d]:%d transaction %s has duplicate inputs",
 				b.String(), subtreeHash.String(), sIdx, snIdx, subtreeNode.Hash.String())
 		}

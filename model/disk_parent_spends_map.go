@@ -2,7 +2,6 @@ package model
 
 import (
 	"encoding/binary"
-	"sync/atomic"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
@@ -21,7 +20,6 @@ var _ ParentSpendsMap = (*DiskParentSpendsMap)(nil)
 type DiskParentSpendsMap struct {
 	tables   []*mmaphash.Table
 	numDisks int
-	count    atomic.Int64
 }
 
 // DiskParentSpendsMapOptions configures the DiskParentSpendsMap.
@@ -71,22 +69,18 @@ func inpointKey(inpoint subtreepkg.Inpoint) []byte {
 	return key[:]
 }
 
-// SetIfNotExists returns true if the inpoint was newly inserted, false if it
-// already existed. The backing table is sized from FilterCapacity, so the
-// only error path (segment full) is unreachable under correct sizing; if it
-// ever fires we return false (treat as "already present") so the duplicate
-// detector fails closed rather than silently accepting a double-spend.
-func (m *DiskParentSpendsMap) SetIfNotExists(inpoint subtreepkg.Inpoint) bool {
+// SetIfNotExists returns inserted=true if the inpoint was newly recorded,
+// inserted=false if it already existed. A non-nil error (e.g. the backing
+// table is full) is a storage failure that must halt validation — it is never
+// reclassified as a duplicate.
+func (m *DiskParentSpendsMap) SetIfNotExists(inpoint subtreepkg.Inpoint) (bool, error) {
 	key := inpointKey(inpoint)
 	disk := int(binary.LittleEndian.Uint16(key[0:2])) % m.numDisks
 	_, inserted, err := m.tables[disk].Upsert(key, 0)
 	if err != nil {
-		return false
+		return false, errors.NewStorageError("DiskParentSpendsMap: inpoint insert failed (table capacity exceeded?)", err)
 	}
-	if inserted {
-		m.count.Add(1)
-	}
-	return inserted
+	return inserted, nil
 }
 
 // Close releases all tables.
@@ -102,7 +96,10 @@ func (m *DiskParentSpendsMap) Close() error {
 
 // Stats returns current metrics for prometheus reporters.
 func (m *DiskParentSpendsMap) Stats() DiskMapStats {
-	entries := m.count.Load()
+	var entries int64
+	for _, tbl := range m.tables {
+		entries += int64(tbl.Len())
+	}
 	return DiskMapStats{
 		Entries:          entries,
 		FilterMemBytes:   0, // no in-RAM filter in the mmap implementation

@@ -32,7 +32,8 @@ func TestDiskParentSpendsMap_SetIfNotExists_New(t *testing.T) {
 	m := newTestDiskParentSpendsMap(t)
 
 	ip := makeInpoint(1, 0)
-	inserted := m.SetIfNotExists(ip)
+	inserted, err := m.SetIfNotExists(ip)
+	require.NoError(t, err)
 	require.True(t, inserted)
 }
 
@@ -40,8 +41,12 @@ func TestDiskParentSpendsMap_SetIfNotExists_Duplicate(t *testing.T) {
 	m := newTestDiskParentSpendsMap(t)
 
 	ip := makeInpoint(1, 0)
-	require.True(t, m.SetIfNotExists(ip))
-	require.False(t, m.SetIfNotExists(ip))
+	got1, err := m.SetIfNotExists(ip)
+	require.NoError(t, err)
+	require.True(t, got1)
+	got2, err := m.SetIfNotExists(ip)
+	require.NoError(t, err)
+	require.False(t, got2)
 }
 
 func TestDiskParentSpendsMap_DifferentIndexes(t *testing.T) {
@@ -50,10 +55,18 @@ func TestDiskParentSpendsMap_DifferentIndexes(t *testing.T) {
 	ip0 := makeInpoint(1, 0)
 	ip1 := makeInpoint(1, 1)
 
-	require.True(t, m.SetIfNotExists(ip0))
-	require.True(t, m.SetIfNotExists(ip1))
-	require.False(t, m.SetIfNotExists(ip0))
-	require.False(t, m.SetIfNotExists(ip1))
+	got, err := m.SetIfNotExists(ip0)
+	require.NoError(t, err)
+	require.True(t, got)
+	got, err = m.SetIfNotExists(ip1)
+	require.NoError(t, err)
+	require.True(t, got)
+	got, err = m.SetIfNotExists(ip0)
+	require.NoError(t, err)
+	require.False(t, got)
+	got, err = m.SetIfNotExists(ip1)
+	require.NoError(t, err)
+	require.False(t, got)
 }
 
 func TestDiskParentSpendsMap_ConcurrentSetIfNotExists(t *testing.T) {
@@ -67,7 +80,9 @@ func TestDiskParentSpendsMap_ConcurrentSetIfNotExists(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			results[idx] = m.SetIfNotExists(makeInpoint(idx, 0))
+			inserted, err := m.SetIfNotExists(makeInpoint(idx, 0))
+			require.NoError(t, err)
+			results[idx] = inserted
 		}(i)
 	}
 	wg.Wait()
@@ -89,7 +104,9 @@ func TestDiskParentSpendsMap_ConcurrentDuplicateDetection(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			results[idx] = m.SetIfNotExists(ip)
+			inserted, err := m.SetIfNotExists(ip)
+			require.NoError(t, err)
+			results[idx] = inserted
 		}(i)
 	}
 	wg.Wait()
@@ -115,12 +132,16 @@ func TestDiskParentSpendsMap_MultiDisk(t *testing.T) {
 
 	const n = 500
 	for i := 0; i < n; i++ {
-		require.True(t, m.SetIfNotExists(makeInpoint(i, 0)))
+		got, err := m.SetIfNotExists(makeInpoint(i, 0))
+		require.NoError(t, err)
+		require.True(t, got)
 	}
 
 	// all duplicates should be detected
 	for i := 0; i < n; i++ {
-		require.False(t, m.SetIfNotExists(makeInpoint(i, 0)))
+		got, err := m.SetIfNotExists(makeInpoint(i, 0))
+		require.NoError(t, err)
+		require.False(t, got)
 	}
 }
 
@@ -149,11 +170,13 @@ func TestDiskParentSpendsMap_ManyEntries(t *testing.T) {
 		h[4] = byte(i >> 12) // extra entropy
 
 		ip := subtreepkg.Inpoint{Hash: h, Index: uint32(i % 10)}
-		require.True(t, m.SetIfNotExists(ip), "insert failed at %d", i)
+		got, err := m.SetIfNotExists(ip)
+		require.NoError(t, err)
+		require.True(t, got, "insert failed at %d", i)
 	}
 
 	// verify count
-	require.Equal(t, int64(n), m.count.Load())
+	require.Equal(t, int64(n), m.Stats().Entries)
 }
 
 func TestDiskParentSpendsMap_Stats(t *testing.T) {
@@ -171,7 +194,9 @@ func TestDiskParentSpendsMap_Stats(t *testing.T) {
 
 	const n = 500
 	for i := 0; i < n; i++ {
-		require.True(t, m.SetIfNotExists(makeInpoint(i, 0)))
+		got, err := m.SetIfNotExists(makeInpoint(i, 0))
+		require.NoError(t, err)
+		require.True(t, got)
 	}
 
 	// Close is still valid to call; mmap tables flush on close.
