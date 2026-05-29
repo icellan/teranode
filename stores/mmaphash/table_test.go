@@ -113,6 +113,19 @@ func TestTableNewRejectsNegativeValueSize(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestTableNewRejectsUnsupportedValueSize(t *testing.T) {
+	for _, vs := range []int{1, 4, 7, 9, 16, -1} {
+		_, err := New(Options{Dir: t.TempDir(), Prefix: "vs", KeySize: 32, ValueSize: vs, Expected: 10})
+		require.Errorf(t, err, "ValueSize %d must be rejected", vs)
+	}
+	// 0 and 8 are the only valid sizes
+	for _, vs := range []int{0, 8} {
+		tbl, err := New(Options{Dir: t.TempDir(), Prefix: "vs", KeySize: 32, ValueSize: vs, Expected: 10})
+		require.NoErrorf(t, err, "ValueSize %d must be accepted", vs)
+		require.NoError(t, tbl.Close())
+	}
+}
+
 func mkKey(keySize int, seed uint64) []byte {
 	k := make([]byte, keySize)
 	binary.LittleEndian.PutUint64(k[0:8], seed)

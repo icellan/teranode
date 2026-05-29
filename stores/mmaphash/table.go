@@ -104,8 +104,8 @@ func New(opts Options) (*Table, error) {
 	if opts.KeySize < 16 {
 		return nil, errors.NewProcessingError("mmaphash: KeySize must be >= 16, got %d", opts.KeySize)
 	}
-	if opts.ValueSize < 0 {
-		return nil, errors.NewProcessingError("mmaphash: ValueSize must be >= 0, got %d", opts.ValueSize)
+	if opts.ValueSize != 0 && opts.ValueSize != 8 {
+		return nil, errors.NewProcessingError("mmaphash: ValueSize must be 0 or 8, got %d", opts.ValueSize)
 	}
 
 	l := computeLayout(opts.Expected, opts.LoadFactor)
@@ -244,6 +244,8 @@ func (t *Table) Lookup(key []byte) (uint64, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	// full is irrelevant for Lookup: if the segment is full but the key isn't
+	// present, the key genuinely isn't in the table. ErrTableFull is write-only.
 	off, found, _ := t.probe(segIdx, start, key)
 	if !found {
 		return 0, false, nil
