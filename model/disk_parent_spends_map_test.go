@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/binary"
 	"sync"
 	"testing"
 
@@ -177,6 +178,28 @@ func TestDiskParentSpendsMap_ManyEntries(t *testing.T) {
 
 	// verify count
 	require.Equal(t, int64(n), m.Stats().Entries)
+}
+
+func TestDiskParentSpendsMap_SetIfNotExists_Overflow(t *testing.T) {
+	// FilterCapacity 1 -> a single minimal segment (minSegSlots slots). Inserting
+	// many unique inpoints (all in the single segment) must eventually overflow,
+	// and that overflow MUST surface as a non-nil error -- never a silent false.
+	m, err := NewDiskParentSpendsMap(DiskParentSpendsMapOptions{
+		BasePaths:      []string{t.TempDir()},
+		FilterCapacity: 1,
+	})
+	require.NoError(t, err)
+	defer m.Close()
+
+	var gotErr error
+	for i := uint64(0); i < 100000 && gotErr == nil; i++ {
+		var h chainhash.Hash
+		binary.LittleEndian.PutUint64(h[0:8], i)
+		binary.LittleEndian.PutUint64(h[8:16], i*0x9e3779b97f4a7c15)
+		_, e := m.SetIfNotExists(subtreepkg.Inpoint{Hash: h, Index: uint32(i)})
+		gotErr = e
+	}
+	require.Error(t, gotErr, "filling beyond capacity must surface an error, not a silent false")
 }
 
 func TestDiskParentSpendsMap_Stats(t *testing.T) {

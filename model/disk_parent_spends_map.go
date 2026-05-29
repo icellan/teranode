@@ -61,12 +61,13 @@ func NewDiskParentSpendsMap(opts DiskParentSpendsMapOptions) (*DiskParentSpendsM
 	return m, nil
 }
 
-// inpointKey serializes an Inpoint to a fixed-size key.
-func inpointKey(inpoint subtreepkg.Inpoint) []byte {
+// inpointKey serializes an Inpoint to a fixed-size key array. Returning an
+// array (not a slice) keeps it on the caller's stack — no per-call heap alloc.
+func inpointKey(inpoint subtreepkg.Inpoint) [dpsInpointKeySize]byte {
 	var key [dpsInpointKeySize]byte
 	copy(key[:chainhash.HashSize], inpoint.Hash[:])
 	binary.BigEndian.PutUint32(key[chainhash.HashSize:], inpoint.Index)
-	return key[:]
+	return key
 }
 
 // SetIfNotExists returns inserted=true if the inpoint was newly recorded,
@@ -75,8 +76,11 @@ func inpointKey(inpoint subtreepkg.Inpoint) []byte {
 // reclassified as a duplicate.
 func (m *DiskParentSpendsMap) SetIfNotExists(inpoint subtreepkg.Inpoint) (bool, error) {
 	key := inpointKey(inpoint)
-	disk := int(binary.LittleEndian.Uint16(key[0:2])) % m.numDisks
-	_, inserted, err := m.tables[disk].Upsert(key, 0)
+	// Route to a disk using bytes disjoint from the table's bucket window
+	// (key[0:8]) and segment window (key[8:16]) so disk selection does not
+	// correlate with intra-table slot placement.
+	disk := int(binary.LittleEndian.Uint16(key[16:18])) % m.numDisks
+	_, inserted, err := m.tables[disk].Upsert(key[:], 0)
 	if err != nil {
 		return false, errors.NewStorageError("DiskParentSpendsMap: inpoint insert failed (table capacity exceeded?)", err)
 	}
