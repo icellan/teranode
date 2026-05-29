@@ -1,12 +1,14 @@
 package model
 
 import (
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	txmap "github.com/bsv-blockchain/go-tx-map"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -54,7 +56,7 @@ func TestDiskTxMapUint64_PutDuplicate(t *testing.T) {
 
 	err := m.Put(h, 20)
 	require.Error(t, err)
-	require.ErrorIs(t, err, txmap.ErrHashAlreadyExists)
+	require.ErrorIs(t, err, errors.ErrTxExists)
 }
 
 func TestDiskTxMapUint64_PutDuplicateAfterFlush(t *testing.T) {
@@ -66,7 +68,7 @@ func TestDiskTxMapUint64_PutDuplicateAfterFlush(t *testing.T) {
 
 	err := m.Put(h, 20)
 	require.Error(t, err)
-	require.ErrorIs(t, err, txmap.ErrHashAlreadyExists)
+	require.ErrorIs(t, err, errors.ErrTxExists)
 }
 
 func TestDiskTxMapUint64_GetNonexistent(t *testing.T) {
@@ -193,7 +195,14 @@ func TestDiskTxMapUint64_LargeValues(t *testing.T) {
 }
 
 func TestDiskTxMapUint64_ManyEntries(t *testing.T) {
-	m := newTestDiskTxMapUint64(t)
+	// Needs FilterCapacity large enough for 50K entries (mmaphash is hard-capacity bounded).
+	m, err := NewDiskTxMapUint64(DiskTxMapUint64Options{
+		BasePaths:      []string{t.TempDir()},
+		Prefix:         "test-txmap-many",
+		FilterCapacity: 100_000,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
 
 	const n = 50_000
 	for i := 0; i < n; i++ {
@@ -216,7 +225,8 @@ func TestDiskTxMapUint64_Stats(t *testing.T) {
 
 	stats := m.Stats()
 	require.Equal(t, int64(0), stats.Entries)
-	require.Greater(t, stats.FilterMemBytes, int64(0), "filter memory should be non-zero at construction")
+	// mmaphash has no separate filter; FilterMemBytes is 0
+	require.Equal(t, int64(0), stats.FilterMemBytes)
 	require.Equal(t, int64(0), stats.DiskBytesWritten)
 
 	const n = 1000
@@ -228,7 +238,49 @@ func TestDiskTxMapUint64_Stats(t *testing.T) {
 
 	stats = m.Stats()
 	require.Equal(t, int64(n), stats.Entries)
-	require.Greater(t, stats.FilterMemBytes, int64(0))
-	// Each entry = 32B hash key + 8B uint64 value = 40B
-	require.Equal(t, int64(n*40), stats.DiskBytesWritten)
+	require.Equal(t, int64(0), stats.FilterMemBytes)
+	// Each entry = 1B occupied flag + 32B hash key + 8B uint64 value = 41B
+	require.Equal(t, int64(n*41), stats.DiskBytesWritten)
+}
+
+func txHashSeed(i uint64) chainhash.Hash {
+	var h chainhash.Hash
+	binary.LittleEndian.PutUint64(h[0:8], i)
+	binary.LittleEndian.PutUint64(h[8:16], i*0x9e3779b97f4a7c15)
+	binary.LittleEndian.PutUint64(h[16:24], i*2654435761)
+	return h
+}
+
+// TestDiskTxMapUint64_ParityWithSwiss compares Put/Get/Exists against the
+// in-memory txmap.SplitSwissMapUint64.
+func TestDiskTxMapUint64_ParityWithSwiss(t *testing.T) {
+	mem := txmap.NewSplitSwissMapUint64(20000)
+	disk, err := NewDiskTxMapUint64(DiskTxMapUint64Options{
+		BasePaths:      []string{t.TempDir(), t.TempDir()},
+		FilterCapacity: 20000,
+	})
+	require.NoError(t, err)
+	defer disk.Close()
+
+	for i := uint64(0); i < 10000; i++ {
+		h := txHashSeed(i)
+		memErr := mem.Put(h, i)
+		diskErr := disk.Put(h, i)
+		require.Equal(t, memErr == nil, diskErr == nil, "Put divergence at %d", i)
+	}
+	// duplicate Puts must both error
+	for i := uint64(0); i < 100; i++ {
+		h := txHashSeed(i)
+		require.Error(t, mem.Put(h, i))
+		require.Error(t, disk.Put(h, i))
+	}
+	// Get parity
+	for i := uint64(0); i < 10000; i++ {
+		h := txHashSeed(i)
+		mv, mok := mem.Get(h)
+		dv, dok := disk.Get(h)
+		require.Equal(t, mok, dok)
+		require.Equal(t, mv, dv)
+	}
+	require.Equal(t, mem.Length(), disk.Length())
 }
