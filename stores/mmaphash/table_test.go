@@ -1,6 +1,7 @@
 package mmaphash
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -110,4 +111,81 @@ func TestTableNewKeySizeBoundary(t *testing.T) {
 func TestTableNewRejectsNegativeValueSize(t *testing.T) {
 	_, err := New(Options{Dir: t.TempDir(), Prefix: "v", KeySize: 32, ValueSize: -1, Expected: 10})
 	require.Error(t, err)
+}
+
+func mkKey(keySize int, seed uint64) []byte {
+	k := make([]byte, keySize)
+	binary.LittleEndian.PutUint64(k[0:8], seed)
+	binary.LittleEndian.PutUint64(k[8:16], seed*0x9e3779b97f4a7c15)
+	if keySize >= 24 {
+		binary.LittleEndian.PutUint64(k[16:24], seed*2654435761)
+	}
+	return k
+}
+
+func TestUpsertSetSemantics(t *testing.T) {
+	tbl, err := New(Options{Dir: t.TempDir(), Prefix: "set", KeySize: 36, ValueSize: 0, Expected: 10000})
+	require.NoError(t, err)
+	defer tbl.Close()
+
+	for i := uint64(0); i < 5000; i++ {
+		_, inserted, err := tbl.Upsert(mkKey(36, i), 0)
+		require.NoError(t, err)
+		require.True(t, inserted, "first insert of %d should be new", i)
+	}
+	for i := uint64(0); i < 5000; i++ {
+		_, inserted, err := tbl.Upsert(mkKey(36, i), 0)
+		require.NoError(t, err)
+		require.False(t, inserted, "second insert of %d should be duplicate", i)
+	}
+	require.Equal(t, int64(5000), tbl.Len())
+}
+
+func TestUpsertKeyValueSemantics(t *testing.T) {
+	tbl, err := New(Options{Dir: t.TempDir(), Prefix: "kv", KeySize: 32, ValueSize: 8, Expected: 10000})
+	require.NoError(t, err)
+	defer tbl.Close()
+
+	for i := uint64(0); i < 5000; i++ {
+		v, inserted, err := tbl.Upsert(mkKey(32, i), i*7)
+		require.NoError(t, err)
+		require.True(t, inserted)
+		require.Equal(t, i*7, v)
+	}
+	for i := uint64(0); i < 5000; i++ {
+		got, found, err := tbl.Lookup(mkKey(32, i))
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, i*7, got)
+	}
+	// duplicate Upsert returns existing value, inserted=false
+	existing, inserted, err := tbl.Upsert(mkKey(32, 3), 999)
+	require.NoError(t, err)
+	require.False(t, inserted)
+	require.Equal(t, uint64(21), existing) // 3*7
+
+	_, found, err := tbl.Lookup(mkKey(32, 999999))
+	require.NoError(t, err)
+	require.False(t, found)
+}
+
+func TestUpsertAllZeroKeyAndZeroValue(t *testing.T) {
+	tbl, err := New(Options{Dir: t.TempDir(), Prefix: "z", KeySize: 32, ValueSize: 8, Expected: 100})
+	require.NoError(t, err)
+	defer tbl.Close()
+
+	zero := make([]byte, 32) // all-zero key
+	v, inserted, err := tbl.Upsert(zero, 0)
+	require.NoError(t, err)
+	require.True(t, inserted)
+	require.Equal(t, uint64(0), v)
+
+	got, found, err := tbl.Lookup(zero)
+	require.NoError(t, err)
+	require.True(t, found, "all-zero key with value 0 must be found (state byte disambiguates)")
+	require.Equal(t, uint64(0), got)
+
+	_, inserted, err = tbl.Upsert(zero, 0)
+	require.NoError(t, err)
+	require.False(t, inserted, "all-zero key second insert is a duplicate")
 }

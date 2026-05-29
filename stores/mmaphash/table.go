@@ -6,6 +6,8 @@
 package mmaphash
 
 import (
+	"bytes"
+	"encoding/binary"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -164,3 +166,87 @@ func (t *Table) Close() error {
 
 // Len returns the number of entries inserted.
 func (t *Table) Len() int64 { return t.count.Load() }
+
+// locate derives the segment index and the in-segment start bucket from the
+// key. Keys are uniformly-random hash output, so raw bytes are used as the
+// hash. Disjoint byte windows avoid correlation between disk routing (done by
+// the caller on key[0:2]), segment selection (key[8:16]), and bucket selection
+// (key[0:8]).
+func (t *Table) locate(key []byte) (segIdx, bucket uint64) {
+	segHash := binary.LittleEndian.Uint64(key[8:16])
+	bucketHash := binary.LittleEndian.Uint64(key[0:8])
+	segIdx = segHash & t.segMask
+	bucket = bucketHash & (t.slotsPerSeg - 1)
+	return segIdx, bucket
+}
+
+// probe scans segment segIdx starting at the start bucket. It returns the byte
+// offset of the matching slot (found=true) or the first empty slot
+// (found=false). full=true means the whole segment was scanned with no empty
+// slot. Probing wraps within the segment only.
+func (t *Table) probe(segIdx, start uint64, key []byte) (off int, found, full bool) {
+	base := segIdx * t.slotsPerSeg
+	mask := t.slotsPerSeg - 1
+	for i := uint64(0); i < t.slotsPerSeg; i++ {
+		local := (start + i) & mask
+		o := int(base+local) * t.slotSize
+		if t.data[o] == 0 { // empty
+			return o, false, false
+		}
+		if bytes.Equal(t.data[o+1:o+1+t.keySize], key) {
+			return o, true, false
+		}
+	}
+	return 0, false, true
+}
+
+func (t *Table) readValue(off int) uint64 {
+	if t.valueSize == 0 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(t.data[off+1+t.keySize : off+1+t.keySize+8])
+}
+
+func (t *Table) writeSlot(off int, key []byte, value uint64) {
+	copy(t.data[off+1:off+1+t.keySize], key)
+	if t.valueSize >= 8 {
+		binary.LittleEndian.PutUint64(t.data[off+1+t.keySize:off+1+t.keySize+8], value)
+	}
+	t.data[off] = 1 // publish occupied state last
+}
+
+// Upsert inserts key (with value) if absent. Returns (existingOrNewValue,
+// inserted, error). inserted=false with no error means the key was already
+// present and the returned value is the stored one. ErrTableFull means the
+// segment is full.
+func (t *Table) Upsert(key []byte, value uint64) (uint64, bool, error) {
+	segIdx, start := t.locate(key)
+	s := &t.segs[segIdx]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	off, found, full := t.probe(segIdx, start, key)
+	if full {
+		return 0, false, ErrTableFull
+	}
+	if found {
+		return t.readValue(off), false, nil
+	}
+	t.writeSlot(off, key, value)
+	t.count.Add(1)
+	return value, true, nil
+}
+
+// Lookup returns (value, found).
+func (t *Table) Lookup(key []byte) (uint64, bool, error) {
+	segIdx, start := t.locate(key)
+	s := &t.segs[segIdx]
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	off, found, _ := t.probe(segIdx, start, key)
+	if !found {
+		return 0, false, nil
+	}
+	return t.readValue(off), true, nil
+}
