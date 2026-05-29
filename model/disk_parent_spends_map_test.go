@@ -14,7 +14,7 @@ func newTestDiskParentSpendsMap(t *testing.T) *DiskParentSpendsMap {
 	m, err := NewDiskParentSpendsMap(DiskParentSpendsMapOptions{
 		BasePaths:      []string{t.TempDir()},
 		Prefix:         "test-parentspends",
-		FilterCapacity: 10_000,
+		FilterCapacity: 100_000, // sized for TestDiskParentSpendsMap_ManyEntries (50K inserts)
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
@@ -166,7 +166,7 @@ func TestDiskParentSpendsMap_Stats(t *testing.T) {
 
 	stats := m.Stats()
 	require.Equal(t, int64(0), stats.Entries)
-	require.Greater(t, stats.FilterMemBytes, int64(0), "filter memory should be non-zero at construction")
+	require.Equal(t, int64(0), stats.FilterMemBytes, "mmap impl has no in-RAM filter")
 	require.Equal(t, int64(0), stats.DiskBytesWritten)
 
 	const n = 500
@@ -174,12 +174,12 @@ func TestDiskParentSpendsMap_Stats(t *testing.T) {
 		require.True(t, m.SetIfNotExists(makeInpoint(i, 0)))
 	}
 
-	// Close flushes all writer goroutines, making bytesWritten final
+	// Close is still valid to call; mmap tables flush on close.
 	require.NoError(t, m.Close())
 
 	stats = m.Stats()
 	require.Equal(t, int64(n), stats.Entries)
-	require.Greater(t, stats.FilterMemBytes, int64(0))
-	// Each entry = 36B inpoint key + 1B marker = 37B
+	require.Equal(t, int64(0), stats.FilterMemBytes, "mmap impl has no in-RAM filter")
+	// Each entry = 36B inpoint key + 1B slot marker = 37B
 	require.Equal(t, int64(n*37), stats.DiskBytesWritten)
 }
