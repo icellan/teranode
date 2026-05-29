@@ -202,3 +202,55 @@ func TestUpsertAllZeroKeyAndZeroValue(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, inserted, "all-zero key second insert is a duplicate")
 }
+
+// collidingKey makes keys that all land in the same segment and same start
+// bucket (low 8 and second 8 bytes equal), differing only in bytes [24:32],
+// forcing linear probing within one segment.
+func collidingKey(n uint64) []byte {
+	k := make([]byte, 32)
+	// key[0:8] and key[8:16] identical across all n -> same segment+start bucket
+	binary.LittleEndian.PutUint64(k[0:8], 0xAAAAAAAA)
+	binary.LittleEndian.PutUint64(k[8:16], 0xBBBBBBBB)
+	binary.LittleEndian.PutUint64(k[24:32], n) // distinguishes the keys
+	return k
+}
+
+func TestProbingHandlesCollisions(t *testing.T) {
+	tbl, err := New(Options{Dir: t.TempDir(), Prefix: "c", KeySize: 32, ValueSize: 8, Expected: 100})
+	require.NoError(t, err)
+	defer tbl.Close()
+
+	const n = 40 // < minSegSlots (64); all collide on one segment+bucket
+	for i := uint64(0); i < n; i++ {
+		_, inserted, err := tbl.Upsert(collidingKey(i), i)
+		require.NoError(t, err)
+		require.True(t, inserted)
+	}
+	for i := uint64(0); i < n; i++ {
+		v, found, err := tbl.Lookup(collidingKey(i))
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, i, v)
+	}
+}
+
+func TestSegmentFullReturnsError(t *testing.T) {
+	// Expected tiny -> 1 segment of minSegSlots (64). Fill the segment with
+	// colliding keys until it overflows.
+	tbl, err := New(Options{Dir: t.TempDir(), Prefix: "f", KeySize: 32, ValueSize: 8, Expected: 1})
+	require.NoError(t, err)
+	defer tbl.Close()
+	require.Equal(t, uint64(minSegSlots), tbl.slotsPerSeg)
+	require.Equal(t, uint64(0), tbl.segMask) // single segment
+
+	var gotFull bool
+	for i := uint64(0); i < minSegSlots+5; i++ {
+		_, _, err := tbl.Upsert(collidingKey(i), i)
+		if err != nil {
+			require.ErrorIs(t, err, ErrTableFull)
+			gotFull = true
+			break
+		}
+	}
+	require.True(t, gotFull, "expected ErrTableFull when segment overflows")
+}
