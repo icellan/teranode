@@ -231,3 +231,65 @@ func TestDiskParentSpendsMap_Stats(t *testing.T) {
 	// Each entry = 36B inpoint key + 1B slot marker = 37B
 	require.Equal(t, int64(n*37), stats.DiskBytesWritten)
 }
+
+func inpointSeed(i uint64) subtreepkg.Inpoint {
+	var h chainhash.Hash
+	binary.LittleEndian.PutUint64(h[0:8], i)
+	binary.LittleEndian.PutUint64(h[8:16], i*0x9e3779b97f4a7c15)
+	binary.LittleEndian.PutUint64(h[16:24], i*2654435761)
+	return subtreepkg.Inpoint{Hash: h, Index: uint32(i % 5)}
+}
+
+// TestDiskParentSpendsMap_ParityWithInMemory drives the same op sequence
+// through the in-memory SplitSyncedParentMap and the disk-backed map and
+// asserts identical SetIfNotExists return sequences.
+func TestDiskParentSpendsMap_ParityWithInMemory(t *testing.T) {
+	mem := NewSplitSyncedParentMap(256, 20000)
+	disk, err := NewDiskParentSpendsMap(DiskParentSpendsMapOptions{
+		BasePaths:      []string{t.TempDir(), t.TempDir()},
+		FilterCapacity: 20000,
+	})
+	require.NoError(t, err)
+	defer disk.Close()
+
+	// include deliberate duplicates: seeds 0..9999 once, then 0..4999 again
+	seq := make([]uint64, 0, 15000)
+	for i := uint64(0); i < 10000; i++ {
+		seq = append(seq, i)
+	}
+	for i := uint64(0); i < 5000; i++ {
+		seq = append(seq, i) // duplicates
+	}
+
+	for _, i := range seq {
+		ip := inpointSeed(i)
+		gotMem, errMem := mem.SetIfNotExists(ip)
+		require.NoError(t, errMem)
+		gotDisk, errDisk := disk.SetIfNotExists(ip)
+		require.NoError(t, errDisk)
+		require.Equalf(t, gotMem, gotDisk, "divergence at seed %d", i)
+	}
+}
+
+func FuzzDiskParentSpendsMap_Parity(f *testing.F) {
+	f.Add([]byte{1, 2, 3, 1, 2, 3})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		mem := NewSplitSyncedParentMap(16, 256)
+		disk, err := NewDiskParentSpendsMap(DiskParentSpendsMapOptions{
+			BasePaths:      []string{t.TempDir()},
+			FilterCapacity: 1024,
+		})
+		if err != nil {
+			t.Skip()
+		}
+		defer disk.Close()
+		for _, b := range data {
+			ip := inpointSeed(uint64(b))
+			gotMem, errMem := mem.SetIfNotExists(ip)
+			require.NoError(t, errMem)
+			gotDisk, errDisk := disk.SetIfNotExists(ip)
+			require.NoError(t, errDisk)
+			require.Equal(t, gotMem, gotDisk)
+		}
+	})
+}
