@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -253,4 +255,36 @@ func TestSegmentFullReturnsError(t *testing.T) {
 		}
 	}
 	require.True(t, gotFull, "expected ErrTableFull when segment overflows")
+}
+
+func TestConcurrentUpsertExactlyOnce(t *testing.T) {
+	tbl, err := New(Options{Dir: t.TempDir(), Prefix: "conc", KeySize: 32, ValueSize: 8, Expected: 200000})
+	require.NoError(t, err)
+	defer tbl.Close()
+
+	const keys = 50000
+	const writersPerKey = 4
+	var insertedCount atomic.Int64
+	var wg sync.WaitGroup
+
+	for w := 0; w < writersPerKey; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := uint64(0); i < keys; i++ {
+				_, inserted, err := tbl.Upsert(mkKey(32, i), i)
+				if err != nil {
+					t.Errorf("upsert: %v", err)
+					return
+				}
+				if inserted {
+					insertedCount.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	require.Equal(t, int64(keys), insertedCount.Load(), "each key inserted exactly once across all goroutines")
+	require.Equal(t, int64(keys), tbl.Len())
 }
