@@ -288,3 +288,26 @@ func TestConcurrentUpsertExactlyOnce(t *testing.T) {
 	require.Equal(t, int64(keys), insertedCount.Load(), "each key inserted exactly once across all goroutines")
 	require.Equal(t, int64(keys), tbl.Len())
 }
+
+func TestTableScale(t *testing.T) {
+	if testing.Short() {
+		t.Skip("scale test skipped under -short")
+	}
+	const n = 50_000_000
+	tbl, err := New(Options{Dir: t.TempDir(), Prefix: "scale", KeySize: 36, ValueSize: 0, Expected: n})
+	require.NoError(t, err)
+	defer tbl.Close()
+
+	for i := uint64(0); i < n; i++ {
+		_, _, err := tbl.Upsert(mkKey(36, i), 0)
+		require.NoError(t, err) // must never overflow at correct sizing
+	}
+	require.Equal(t, int64(n), tbl.Len())
+
+	// spot-check membership
+	for _, i := range []uint64{0, 1, n / 2, n - 1} {
+		_, found, err := tbl.Lookup(mkKey(36, i))
+		require.NoError(t, err)
+		require.True(t, found)
+	}
+}
