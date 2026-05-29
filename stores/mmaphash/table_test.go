@@ -1,6 +1,12 @@
 package mmaphash
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 func TestNextPow2(t *testing.T) {
 	cases := []struct{ in, want uint64 }{
@@ -64,4 +70,29 @@ func TestComputeLayoutMinSegSlotsFloor(t *testing.T) {
 	if l.slotsPerSeg != minSegSlots {
 		t.Fatalf("slotsPerSeg=%d want minSegSlots=%d (floor not applied)", l.slotsPerSeg, minSegSlots)
 	}
+}
+
+func TestTableCreateClose(t *testing.T) {
+	dir := t.TempDir()
+	tbl, err := New(Options{Dir: dir, Prefix: "t", KeySize: 32, ValueSize: 8, Expected: 1000})
+	require.NoError(t, err)
+
+	// backing file was unlinked at creation: the dir should contain no regular files
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	for _, e := range entries {
+		require.Truef(t, e.IsDir(), "unexpected leftover file: %s", filepath.Join(dir, e.Name()))
+	}
+
+	// mmap region is writable for the whole capacity
+	require.Greater(t, len(tbl.data), tbl.slotSize)
+	tbl.data[0] = 1
+	tbl.data[len(tbl.data)-1] = 1
+
+	require.NoError(t, tbl.Close())
+}
+
+func TestTableNewRejectsBadKeySize(t *testing.T) {
+	_, err := New(Options{Dir: t.TempDir(), KeySize: 8, ValueSize: 0, Expected: 10})
+	require.Error(t, err) // keySize must be >= 16 (we read key[8:16] for segment selection)
 }
