@@ -129,6 +129,22 @@ type IgnoreFlags struct {
 	IgnoreLocked      bool
 }
 
+// ConflictingChildRemoval identifies one (parent, child) pair that should be
+// scrubbed from the parent's conflictingChildren list.
+// Used with utxo.Store.RemoveFromConflictingChildren.
+type ConflictingChildRemoval struct {
+	ParentHash *chainhash.Hash
+	ChildHash  *chainhash.Hash
+}
+
+// BlockIDsRemoval identifies the set of block IDs to strip from one
+// transaction's blockIDs membership.
+// Used with utxo.Store.RemoveBlockIDs.
+type BlockIDsRemoval struct {
+	TxHash   *chainhash.Hash
+	BlockIDs []uint32
+}
+
 var (
 	// MetaFields defines the standard set of metadata fields that can be queried.
 	MetaFields = []fields.FieldName{fields.LockTime, fields.Fee, fields.SizeInBytes, fields.TxInpoints, fields.BlockIDs, fields.IsCoinbase, fields.Conflicting, fields.Locked, fields.Creating}
@@ -231,6 +247,26 @@ type Store interface {
 	// Returns status code, status message and any error encountered.
 	Health(ctx context.Context, checkLiveness bool) (int, string, error)
 
+	// Close drains any in-flight batched writes (Create, Spend, Get, Unlock,
+	// or any other batched operations the implementation owns) and releases
+	// backing resources (connection pools, file handles, batcher workers).
+	//
+	// After Close returns, no further Store operations are valid.
+	//
+	// Unless the supplied context expires first, implementations MUST wait
+	// for outstanding batched writes to complete before returning. Returning
+	// before pending writes have committed risks silently losing UTXO state:
+	// callers (block validation, legacy sync) will have already received
+	// successful responses for those writes and will have committed the
+	// parent block, but on restart the UTXOs will be missing — breaking
+	// subsequent blocks that spend them.
+	//
+	// The context bounds the drain. If it expires before the drain completes,
+	// implementations should return its error; the underlying drain and
+	// resource release may continue best-effort in the background, but the
+	// caller must treat a context error as "drain not confirmed complete".
+	Close(ctx context.Context) error
+
 	// Create stores a new transaction's outputs as UTXOs and returns associated metadata.
 	// The blockHeight parameter is used to determine coinbase maturity.
 	// Additional options can be specified using CreateOption functions.
@@ -256,7 +292,15 @@ type Store interface {
 	// This is used during blockchain reorganizations.
 	Unspend(ctx context.Context, spends []*Spend, flagAsLocked ...bool) error
 
-	// SetMinedMulti updates the block ID for multiple transactions that have been mined.
+	// SetMinedMulti marks transactions as mined in the block described by minedBlockInfo.
+	//
+	// Postcondition (when minedBlockInfo.UnsetMined is false and a nil error is returned):
+	//   - Every hash in `hashes` MUST appear as a key in the returned map.
+	//   - Every returned slice MUST contain minedBlockInfo.BlockID.
+	// Implementations that cannot prove this MUST return a non-nil error.
+	//
+	// When minedBlockInfo.UnsetMined is true, missing or empty entries are tolerated:
+	// the call may no-op for transactions that no longer exist.
 	SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo MinedBlockInfo) (map[chainhash.Hash][]uint32, error)
 
 	// GetUnminedTxIterator returns an iterator for unmined transactions in the store.
@@ -327,6 +371,29 @@ type Store interface {
 
 	// SetConflicting marks transactions as conflicting or not conflicting and returns the affected spends.
 	SetConflicting(ctx context.Context, txHashes []chainhash.Hash, value bool) ([]*Spend, []chainhash.Hash, error)
+
+	// RemoveFromConflictingChildren removes each child hash from its parent's
+	// conflictingChildren list. Used by repair tooling when child transactions
+	// are deleted and must no longer appear in any surviving parent's
+	// conflictingChildren field. The call is idempotent — missing parents,
+	// missing list bins, and missing list entries are silently tolerated.
+	// Implementations must use the backend's batch API (e.g. Aerospike
+	// BatchOperate) so large removals stay fast.
+	RemoveFromConflictingChildren(ctx context.Context, removals []ConflictingChildRemoval) error
+
+	// RemoveBlockIDs trims the supplied block IDs from each transaction's
+	// blockIDs membership without deleting the transaction record. Used by
+	// repair tooling when transactions are referenced by multiple blocks and
+	// only a subset is being removed. Idempotent.
+	// Implementations must batch across removals using the backend's batch
+	// API.
+	RemoveBlockIDs(ctx context.Context, removals []BlockIDsRemoval) error
+
+	// GetConflictingTxIterator returns an iterator over transactions currently
+	// marked conflicting=true. Complements GetUnminedTxIterator, which filters
+	// out conflicting records. Used by repair tooling to purge losing-side
+	// transactions during a rewind.
+	GetConflictingTxIterator() (UnminedTxIterator, error)
 
 	// SetLocked marks transactions as locked for spending.
 	SetLocked(ctx context.Context, txHashes []chainhash.Hash, value bool) error

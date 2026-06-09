@@ -1,3 +1,5 @@
+<svelte:options runes={true} />
+
 <script lang="ts">
   import PageWithMenu from '$internal/components/page/template/menu/index.svelte'
   import { onMount, onDestroy } from 'svelte'
@@ -12,41 +14,41 @@
   import RenderHashWithMiner from '$lib/components/table/renderers/render-hash-with-miner/index.svelte'
 
   // FSM State Management
-  let fsmState: FSMState | null = null
-  let fsmEvents: FSMEvent[] = []
-  let fsmStates: string[] = []
-  let fsmLoading = true
-  let fsmError: string | null = null
-  let apiBaseUrl = ''
+  let fsmState: FSMState | null = $state(null)
+  let fsmEvents: FSMEvent[] = $state([])
+  let fsmStates: string[] = $state([])
+  let fsmLoading = $state(true)
+  let fsmError: string | null = $state(null)
+  let apiBaseUrl = $state('')
   let pollingInterval: any = null
-  let selectedEvent: string | null = null
+  let selectedEvent: string | null = $state(null)
   const POLLING_INTERVAL_MS = 5000 // 5 seconds
 
   // Block invalidation
-  let blockHash = ''
-  let blockActionLoading = false
-  let blockActionResult: { success: boolean; message: string } | null = null
+  let blockHash = $state('')
+  let blockActionLoading = $state(false)
+  let blockActionResult: { success: boolean; message: string } | null = $state(null)
   // Create regex pattern for hash validation
   const hashRegex = /^[0-9a-fA-F]{64}$/
 
   // Invalid blocks list
-  let invalidBlocks: any[] = []
-  let invalidBlocksLoading = false
-  let invalidBlocksError: string | null = null
-  let lastInvalidBlocksRefresh: Date | null = null
-  let invalidBlocksOffset = 0
+  let invalidBlocks: any[] = $state([])
+  let invalidBlocksLoading = $state(false)
+  let invalidBlocksError: string | null = $state(null)
+  let lastInvalidBlocksRefresh: Date | null = $state(null)
+  let invalidBlocksOffset = $state(0)
   const INVALID_BLOCKS_PAGE_SIZE = 5
-  let invalidBlocksHasMore = false
+  let invalidBlocksHasMore = $state(false)
 
-  $: invalidBlocksShowingFrom = invalidBlocks.length > 0 ? invalidBlocksOffset + 1 : 0
-  $: invalidBlocksShowingTo = invalidBlocksOffset + invalidBlocks.length
+  const invalidBlocksShowingFrom = $derived(invalidBlocks.length > 0 ? invalidBlocksOffset + 1 : 0)
+  const invalidBlocksShowingTo = $derived(invalidBlocksOffset + invalidBlocks.length)
 
   // Re-validate block state
-  let revalidatingBlock = false
-  let revalidatingBlockHash = ''
+  let revalidatingBlock = $state(false)
+  let revalidatingBlockHash = $state('')
 
   // Reset peer reputations
-  let resettingReputations = false
+  let resettingReputations = $state(false)
 
   // Subscribe to the API base URL
   const unsubscribe = api.assetHTTPAddress.subscribe((value) => {
@@ -59,25 +61,6 @@
 
   function getErrorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error)
-  }
-
-  // duplicates the FSM transition logic from the backend (fsm_handler.go 
-  // If the backend state machine changes, the UI will become out of sync. 
-  function isEventAllowedForState(state: string | undefined, eventName: string): boolean {
-    if (!state || !eventName) return false
-
-    switch (state) {
-      case 'IDLE':
-        return eventName === 'RUN' || eventName === 'LEGACYSYNC'
-      case 'RUNNING':
-        return eventName === 'STOP' || eventName === 'CATCHUPBLOCKS'
-      case 'LEGACYSYNCING':
-        return eventName === 'RUN' || eventName === 'STOP'
-      case 'CATCHINGBLOCKS':
-        return eventName === 'RUN'
-      default:
-        return false
-    }
   }
 
   async function delay(ms: number): Promise<void> {
@@ -106,14 +89,6 @@
     if (invalidBlocksLoading || !invalidBlocksHasMore) return
     const nextOffset = invalidBlocksOffset + INVALID_BLOCKS_PAGE_SIZE
     fetchInvalidBlocks(nextOffset)
-  }
-
-  function getEventDisabledReason(state: string | undefined, eventName: string): string {
-    if (!state) return 'FSM state not available'
-    if (state === 'CATCHINGBLOCKS' && eventName !== 'RUN') {
-      return 'Catchup must complete first'
-    }
-    return `Not allowed from ${state}`
   }
 
   function formatTimeAgo(timestamp: number): string {
@@ -629,7 +604,7 @@
   }
 </script>
 
-<PageWithMenu>
+<PageWithMenu testId="page-root">
   <div class="admin-container">
     <header class="admin-header">
       <h1>{t('admin.title', 'Admin Dashboard')}</h1>
@@ -654,7 +629,7 @@
               <div class="error-message">
                 <p><i class="fas fa-exclamation-triangle"></i> {fsmError}</p>
               </div>
-              <button class="btn btn-primary" on:click={handleRefreshClick}>
+              <button class="btn btn-primary" onclick={handleRefreshClick}>
                 <i class="fas fa-sync-alt"></i> Retry
               </button>
             </div>
@@ -678,14 +653,12 @@
                   <div class="action-buttons">
                     {#each fsmEvents.sort((a, b) => a.value - b.value) as event}
                       {#if event && event.name}
-                        {@const allowed = isEventAllowedForState(fsmState?.state, event.name)}
                         <button
-                          on:click={() => sendFSMEvent(event.name)}
-                          disabled={fsmLoading || !allowed}
+                          onclick={() => sendFSMEvent(event.name)}
+                          disabled={fsmLoading}
                           class="action-button"
                           data-event={event.name.toLowerCase()}
                           data-event-id={event.value}
-                          title={!allowed ? getEventDisabledReason(fsmState?.state, event.name) : ''}
                         >
                           {#if fsmLoading}
                             <div class="spinner"></div>
@@ -703,7 +676,7 @@
           {:else}
             <div class="no-state">
               <p>No state information available.</p>
-              <button class="btn btn-primary" on:click={handleRefreshClick}>
+              <button class="btn btn-primary" onclick={handleRefreshClick}>
                 <i class="fas fa-sync-alt"></i> Refresh
               </button>
             </div>
@@ -751,7 +724,7 @@
           <div class="block-actions">
             <button
               class="block-action-button"
-              on:click={() => performBlockAction(api.invalidateBlock, 'invalidate')}
+              onclick={() => performBlockAction(api.invalidateBlock, 'invalidate')}
               disabled={!hashRegex.test(blockHash) || blockActionLoading}
             >
               <i class="fas fa-ban"></i> Invalidate Block
@@ -759,7 +732,7 @@
 
             <button
               class="block-action-button"
-              on:click={() => performBlockAction(api.revalidateBlock, 'revalidate')}
+              onclick={() => performBlockAction(api.revalidateBlock, 'revalidate')}
               disabled={!hashRegex.test(blockHash) || blockActionLoading}
             >
               <i class="fas fa-check-circle"></i> Revalidate Block
@@ -782,7 +755,7 @@
         <div class="refresh-container">
           <button
             class="icon-button with-text"
-            on:click={goToPrevInvalidBlocksPage}
+            onclick={goToPrevInvalidBlocksPage}
             disabled={invalidBlocksLoading || invalidBlocksOffset === 0}
             title="Previous page"
           >
@@ -793,7 +766,7 @@
           </span>
           <button
             class="icon-button with-text"
-            on:click={goToNextInvalidBlocksPage}
+            onclick={goToNextInvalidBlocksPage}
             disabled={invalidBlocksLoading || !invalidBlocksHasMore}
             title="Next page"
           >
@@ -806,7 +779,7 @@
           {/if}
           <button
             class="icon-button"
-            on:click={() => fetchInvalidBlocks()}
+            onclick={() => fetchInvalidBlocks()}
             disabled={invalidBlocksLoading}
             title="Refresh invalidated blocks list"
           >
@@ -832,7 +805,7 @@
               <i class="fas fa-exclamation-circle"></i>
               <p>Error loading invalidated blocks</p>
               <p class="error-message">{invalidBlocksError}</p>
-              <button class="icon-button with-text" on:click={() => fetchInvalidBlocks()}>
+              <button class="icon-button with-text" onclick={() => fetchInvalidBlocks()}>
                 <Icon name="icon-refresh-line" size={16} />
                 <span>Try again</span>
               </button>
@@ -874,7 +847,7 @@
                       <td class="actions-cell">
                         <button
                           class="revalidate-button"
-                          on:click={() => revalidateBlock(block.hash)}
+                          onclick={() => revalidateBlock(block.hash)}
                           disabled={revalidatingBlock}
                         >
                           {#if revalidatingBlock && revalidatingBlockHash === block.hash}
@@ -908,7 +881,7 @@
         <div class="action-buttons">
           <button
             class="action-button neutral"
-            on:click={resetPeerReputations}
+            onclick={resetPeerReputations}
             disabled={resettingReputations}
           >
             {#if resettingReputations}
@@ -930,12 +903,12 @@
     padding: 2rem;
     max-width: 1200px;
     margin: 0 auto;
-    color: #e9ecef;
+    color: var(--app-color);
   }
 
   .admin-section {
     margin-bottom: 3rem;
-    background-color: rgba(33, 37, 41, 0.6);
+    background-color: var(--comp-bg-color);
     border-radius: 0.75rem;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
     overflow: hidden;
@@ -947,20 +920,20 @@
     justify-content: space-between;
     margin-bottom: 0;
     padding: 1.25rem 1.5rem;
-    background-color: rgba(33, 37, 41, 0.8);
-    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    background-color: var(--comp-bg-color);
+    border-bottom: 1px solid var(--app-border-color);
   }
 
   .section-header h2 {
     font-size: 1.5rem;
     font-weight: 600;
-    color: #f8f9fa;
+    color: var(--app-color);
     margin: 0;
     letter-spacing: 0.01em;
   }
 
   .admin-card {
-    background-color: #111827;
+    background-color: var(--comp-bg-color);
     border-radius: 0.5rem;
     padding: 1.5rem;
     margin-bottom: 1.5rem;
@@ -988,7 +961,7 @@
     justify-content: space-between;
     align-items: stretch;
     min-height: 200px;
-    background-color: rgba(30, 30, 30, 0.5);
+    background-color: var(--comp-bg-color);
     border-radius: 0.75rem;
     padding: 1rem;
   }
@@ -1002,7 +975,7 @@
     display: flex;
     justify-content: center;
     align-items: center;
-    background-color: rgba(20, 20, 20, 0.2);
+    background-color: var(--comp-bg-color);
     border-radius: 0.75rem;
     min-height: 200px;
   }
@@ -1010,7 +983,7 @@
   .fsm-state-info {
     padding: 1.5rem 2rem;
     flex: 1;
-    border-right: 1px solid rgba(255, 255, 255, 0.1);
+    border-right: 1px solid var(--app-border-color);
     display: flex;
     flex-direction: column;
   }
@@ -1019,7 +992,7 @@
     font-size: 1.25rem;
     font-weight: 500;
     margin-bottom: 1.25rem;
-    color: #ced4da;
+    color: var(--comp-label-color);
   }
 
   .state-indicator {
@@ -1044,14 +1017,14 @@
     left: 0;
     right: 0;
     height: 4px;
-    background: rgba(255, 255, 255, 0.3);
+    background: var(--app-subtle-bg-color);
   }
 
   .state-name {
     font-size: 2.25rem;
     font-weight: 700;
     margin: 0;
-    color: #fff;
+    color: #ffffff;
     text-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
     letter-spacing: 0.02em;
   }
@@ -1067,7 +1040,7 @@
     font-size: 1.25rem;
     font-weight: 500;
     margin-bottom: 1.25rem;
-    color: #ced4da;
+    color: var(--comp-label-color);
   }
 
   .action-buttons {
@@ -1176,7 +1149,7 @@
   .error-message {
     color: #ef4444;
     font-size: 1.125rem;
-    background-color: rgba(239, 68, 68, 0.1);
+    background-color: var(--comp-bg-color);
     border: 1px solid rgba(239, 68, 68, 0.2);
     padding: 1rem 1.5rem;
     border-radius: 0.5rem;
@@ -1190,11 +1163,11 @@
   }
 
   .no-events {
-    color: #9ca3af;
+    color: var(--comp-label-color);
     font-style: italic;
     padding: 1rem;
     text-align: center;
-    background-color: rgba(156, 163, 175, 0.1);
+    background-color: var(--comp-bg-color);
     border-radius: 0.5rem;
   }
 
@@ -1205,7 +1178,7 @@
     gap: 1.5rem;
     padding: 3rem 2rem;
     text-align: center;
-    color: #9ca3af;
+    color: var(--comp-label-color);
   }
 
   .btn {
@@ -1275,13 +1248,13 @@
   }
 
   .block-operation-result.success {
-    background-color: rgba(46, 204, 113, 0.1);
+    background-color: var(--comp-bg-color);
     color: #2ecc71;
     border: 1px solid rgba(46, 204, 113, 0.3);
   }
 
   .block-operation-result.error {
-    background-color: rgba(231, 76, 60, 0.1);
+    background-color: var(--comp-bg-color);
     color: #e74c3c;
     border: 1px solid rgba(231, 76, 60, 0.3);
   }
@@ -1292,13 +1265,13 @@
     align-items: center;
     margin-bottom: 2.5rem;
     padding-bottom: 1.5rem;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    border-bottom: 1px solid var(--app-border-color);
   }
 
   .admin-header h1 {
     font-size: 2rem;
     font-weight: 700;
-    color: #f8f9fa;
+    color: var(--app-color);
     margin: 0;
     letter-spacing: 0.01em;
   }
@@ -1314,8 +1287,8 @@
   }
 
   .logout-button {
-    background-color: rgba(107, 114, 128, 0.1);
-    color: #e5e7eb;
+    background-color: var(--comp-bg-color);
+    color: var(--app-color);
     border: 1px solid rgba(209, 213, 219, 0.2);
     border-radius: 0.5rem;
     padding: 0.625rem 1.25rem;
@@ -1329,8 +1302,8 @@
   }
 
   .logout-button:hover {
-    background-color: rgba(107, 114, 128, 0.2);
-    color: #f3f4f6;
+    background-color: var(--comp-bg-color);
+    color: var(--app-color);
     border-color: rgba(209, 213, 219, 0.3);
   }
 
@@ -1340,7 +1313,7 @@
 
   .block-operations-description {
     margin-bottom: 1.5rem;
-    color: #ced4da;
+    color: var(--comp-label-color);
     line-height: 1.6;
     font-size: 1rem;
   }
@@ -1353,16 +1326,16 @@
     display: block;
     margin-bottom: 0.5rem;
     font-weight: 500;
-    color: #e9ecef;
+    color: var(--app-color);
   }
 
   .block-hash-input {
     padding: 0.75rem 1rem;
     border-radius: 0.5rem;
     font-size: 1rem;
-    border: 1px solid #4b5563;
-    background-color: rgba(30, 30, 30, 0.6);
-    color: #e9ecef;
+    border: 1px solid var(--app-border-color);
+    background-color: var(--comp-bg-color);
+    color: var(--app-color);
     width: 100%;
     transition: all 0.2s ease;
   }
@@ -1383,7 +1356,7 @@
     justify-content: flex-end;
     margin-top: 1rem;
     padding-top: 0.75rem;
-    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    border-top: 1px solid var(--app-border-color);
   }
 
   .text-button {
@@ -1409,7 +1382,7 @@
     overflow-y: auto;
     padding: 0;
     width: 100%;
-    background-color: #111827;
+    background-color: var(--comp-bg-color);
     border-radius: 0.5rem;
   }
 
@@ -1418,23 +1391,23 @@
   }
 
   .invalid-blocks-list::-webkit-scrollbar-track {
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--app-subtle-bg-color);
     border-radius: 4px;
   }
 
   .invalid-blocks-list::-webkit-scrollbar-thumb {
-    background-color: rgba(255, 255, 255, 0.2);
+    background-color: var(--app-overlay-strong-color);
     border-radius: 4px;
   }
 
   .invalid-blocks-list::-webkit-scrollbar-thumb:hover {
-    background-color: rgba(255, 255, 255, 0.3);
+    background-color: var(--comp-label-color);
   }
 
   .invalid-blocks-list table {
     width: 100%;
     border-collapse: collapse;
-    color: #e5e7eb;
+    color: var(--app-color);
     font-size: 0.9rem;
     table-layout: fixed;
     border-spacing: 0;
@@ -1445,7 +1418,7 @@
     padding: 0.75rem 1rem;
     font-weight: 600;
     color: var(--table-th-color, #232d7c);
-    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    border-bottom: 1px solid var(--app-border-color);
     white-space: nowrap;
     font-size: 0.85rem;
     /* Removed text-transform: uppercase; */
@@ -1507,7 +1480,7 @@
 
   .error-message {
     font-weight: normal !important;
-    color: #6b7280 !important;
+    color: var(--comp-label-color) !important;
     font-size: 0.9rem;
     max-width: 80%;
     word-break: break-word;
@@ -1532,12 +1505,12 @@
   .invalid-blocks-empty p {
     margin: 0.25rem 0;
     font-weight: 600;
-    color: #4b5563;
+    color: var(--comp-label-color);
   }
 
   .empty-description {
     font-weight: normal !important;
-    color: #6b7280 !important;
+    color: var(--comp-label-color) !important;
     font-size: 0.9rem;
   }
 
@@ -1566,14 +1539,14 @@
   }
 
   .revalidate-button:disabled {
-    background-color: #6b7280;
+    background-color: var(--comp-label-color);
     cursor: not-allowed;
   }
 
   .button-spinner {
     width: 1rem;
     height: 1rem;
-    border: 2px solid rgba(255, 255, 255, 0.3);
+    border: 2px solid var(--app-border-color);
     border-top-color: white;
     border-radius: 50%;
     animation: spin 1s linear infinite;
@@ -1581,20 +1554,20 @@
 
   .detail-label {
     font-weight: 600;
-    color: #1f2937;
+    color: var(--app-color);
     margin-right: 0.25rem;
   }
 
   .timestamp {
-    color: #6b7280;
+    color: var(--comp-label-color);
   }
 
   .reason {
-    color: #6b7280;
+    color: var(--comp-label-color);
   }
 
   .reason-text {
-    color: #4b5563;
+    color: var(--comp-label-color);
   }
 
   /* Add responsive behavior for smaller screens */
@@ -1605,14 +1578,14 @@
 
     .fsm-state-info {
       border-right: none;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      border-bottom: 1px solid var(--app-border-color);
     }
   }
 
   .refresh-button {
-    background-color: #f3f4f6;
-    border: 1px solid #e5e7eb;
-    color: #4b5563;
+    background-color: var(--comp-bg-color);
+    border: 1px solid var(--app-border-color);
+    color: var(--comp-label-color);
     cursor: pointer;
     padding: 0.5rem 0.75rem;
     border-radius: 0.375rem;
@@ -1626,7 +1599,7 @@
 
   .refresh-button:hover {
     color: #3b82f6;
-    background-color: rgba(59, 130, 246, 0.1);
+    background-color: var(--comp-bg-color);
     border-color: #3b82f6;
   }
 
@@ -1690,7 +1663,7 @@
   }
 
   .spinner {
-    border: 4px solid rgba(0, 0, 0, 0.1);
+    border: 4px solid var(--app-overlay-color);
     width: 36px;
     height: 36px;
     border-radius: 50%;
@@ -1707,7 +1680,7 @@
 
   .spinner-container p {
     margin-top: 1rem;
-    color: #6b7280;
+    color: var(--comp-label-color);
     font-size: 0.9rem;
   }
 
@@ -1719,14 +1692,14 @@
 
   .last-refresh {
     font-size: 0.875rem;
-    color: #6b7280;
+    color: var(--comp-label-color);
     white-space: nowrap;
   }
 
   .icon-button {
     background-color: transparent;
     border: none;
-    color: #6b7280;
+    color: var(--comp-label-color);
     cursor: pointer;
     padding: 0.5rem;
     border-radius: 0.25rem;
@@ -1743,7 +1716,7 @@
 
   .icon-button:hover {
     color: #3b82f6;
-    background-color: rgba(59, 130, 246, 0.1);
+    background-color: var(--comp-bg-color);
   }
 
   .icon-button:disabled {

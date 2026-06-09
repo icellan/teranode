@@ -101,16 +101,16 @@ func (m *MockSubtreeProcessor) GetChainedSubtrees() []*subtree.Subtree {
 	return args.Get(0).([]*subtree.Subtree)
 }
 
-func (m *MockSubtreeProcessor) GetSubtreeHashes() []chainhash.Hash {
-	args := m.Called()
+func (m *MockSubtreeProcessor) GetSubtreeHashes(ctx context.Context) []chainhash.Hash {
+	args := m.Called(ctx)
 	if args.Get(0) == nil {
 		return nil
 	}
 	return args.Get(0).([]chainhash.Hash)
 }
 
-func (m *MockSubtreeProcessor) GetTransactionHashes() []chainhash.Hash {
-	args := m.Called()
+func (m *MockSubtreeProcessor) GetTransactionHashes(ctx context.Context) []chainhash.Hash {
+	args := m.Called(ctx)
 	if args.Get(0) == nil {
 		return nil
 	}

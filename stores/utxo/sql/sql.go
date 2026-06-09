@@ -214,6 +214,11 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	if tSettings.BatcherDrainMode {
 		s.spendBatcher.SetDrainMode(true)
 	}
+	// Tick interval applied after drain so go-batcher's drain-wins guard sees the
+	// final state (no-op + warning under drain). Default 0 = disabled.
+	if ms := tSettings.UtxoStore.SpendBatcherTickerIntervalMillis; ms > 0 {
+		s.spendBatcher.SetTickInterval(time.Duration(ms) * time.Millisecond)
+	}
 
 	// Initialize get batcher — mirrors aerospike/get.go batcher setup.
 	// Batches individual Get() calls into bulk SQL queries via BatchDecorate,
@@ -224,6 +229,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		s.getBatcher = batcher.NewWithPool(getBatchSize, getBatchDuration, s.sendGetBatch, true, batcherOpts("sql_get")...)
 		if tSettings.BatcherDrainMode {
 			s.getBatcher.SetDrainMode(true)
+		}
+		if ms := tSettings.UtxoStore.GetBatcherTickerIntervalMillis; ms > 0 {
+			s.getBatcher.SetTickInterval(time.Duration(ms) * time.Millisecond)
 		}
 	}
 
@@ -238,6 +246,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		if tSettings.BatcherDrainMode {
 			s.createBatcher.SetDrainMode(true)
 		}
+		if ms := tSettings.UtxoStore.StoreBatcherTickerIntervalMillis; ms > 0 {
+			s.createBatcher.SetTickInterval(time.Duration(ms) * time.Millisecond)
+		}
 	}
 
 	// Initialize unlock batcher for Postgres — batches single-hash SetLocked(false) calls.
@@ -247,6 +258,9 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		s.unlockBatcher = batcher.NewWithPool(unlockBatchSize, unlockBatchDuration, s.sendUnlockBatch, true, batcherOpts("sql_unlock")...)
 		if tSettings.BatcherDrainMode {
 			s.unlockBatcher.SetDrainMode(true)
+		}
+		if ms := tSettings.UtxoStore.LockedBatcherTickerIntervalMillis; ms > 0 {
+			s.unlockBatcher.SetTickInterval(time.Duration(ms) * time.Millisecond)
 		}
 	}
 
@@ -283,6 +297,65 @@ func (s *Store) GetBlockState() utxo.BlockState {
 	return utxo.BlockState{
 		Height:     s.blockHeight.Load(),
 		MedianTime: s.medianBlockTime.Load(),
+	}
+}
+
+// Close drains the batched-write workers and closes the underlying SQL
+// connection.
+//
+// The create/get/unlock batchers run in background=true mode — their Put
+// returns to the caller before the underlying SQL write commits, so a
+// SIGTERM mid-flight would silently lose queued writes without this drain.
+// The spend batcher runs in background=false mode: its Put already blocks
+// until the batch callback finishes, so no spend can be lost on the input
+// channel, but draining it here still flushes any partially filled batch
+// and releases its worker. Closing each batcher invokes go-batcher's
+// shutdown drain (see batcher.go:Close), which closes the input channel,
+// pulls any pending items out, and dispatches them through the registered
+// callback. Without this, a lost create/unlock write means the parent block
+// has already been acked elsewhere but the UTXO state never reaches the DB;
+// on restart, dependent blocks fail with missing-parent errors.
+//
+// The drain (and the subsequent db.Close) runs in a goroutine. The
+// underlying SQL connection is always closed once the batchers have
+// drained, even if ctx has already expired, so the connection pool is not
+// leaked. If the context expires before the drain completes, the function
+// returns ctx.Err() while the drain and db.Close continue best-effort; the
+// db.Close error is only surfaced when the drain finishes within the
+// deadline.
+func (s *Store) Close(ctx context.Context) error {
+	done := make(chan struct{})
+
+	var dbErr error
+
+	go func() {
+		defer close(done)
+		// Drain in dependency order: state-mutating writers last so they
+		// have the best chance of committing before the deadline.
+		if s.unlockBatcher != nil {
+			s.unlockBatcher.Close()
+		}
+		if s.getBatcher != nil {
+			s.getBatcher.Close()
+		}
+		if s.spendBatcher != nil {
+			s.spendBatcher.Close()
+		}
+		if s.createBatcher != nil {
+			s.createBatcher.Close()
+		}
+		// Always close the DB after the batchers drain, even if ctx has
+		// already expired, so the connection pool is not leaked.
+		if s.db != nil {
+			dbErr = s.db.Close()
+		}
+	}()
+
+	select {
+	case <-done:
+		return dbErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -1897,6 +1970,21 @@ func isDeadlock(err error) bool {
 // Aerospike doesn't need this because it uses optimistic single-key operations
 // without DB-level row locking.
 func (s *Store) sendSpendBatch(batch []*batchSpend) {
+	batch = utxo.FilterConflictingDuplicateSpendClaims(batch,
+		func(item *batchSpend) *utxo.Spend {
+			if item == nil {
+				return nil
+			}
+			return item.spend
+		},
+		func(item *batchSpend, err error) {
+			item.errCh <- err
+		},
+	)
+	if len(batch) == 0 {
+		return
+	}
+
 	const maxRetries = 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		retryable := s.trySendSpendBatch(batch)
@@ -2095,22 +2183,37 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 
 	// Phase 3: Deduplicate toUpdate entries targeting the same (transactionID, vout).
 	// Within a single UPDATE statement, PostgreSQL can only affect each row once.
-	// Duplicate entries (from parallel processing of the same tx) would cause the
-	// second entry to be missing from RETURNING, triggering a false UtxoSpentError.
+	// Duplicate entries fall into two categories:
+	//   1. Same spending data (same tx, idempotent re-spend): drop duplicate, mark successful after UPDATE.
+	//   2. Different spending data (two competing txs, double-spend): the first arrival wins; record
+	//      the second as UTXO_SPENT immediately — do NOT let it silently succeed.
 	type utxoKey struct {
 		transactionID int
 		vout          uint32
 	}
-	seenKeys := make(map[utxoKey]int, len(toUpdate)) // key -> first batchIdx
+	type seenEntry struct {
+		batchIdx     int
+		spendingData []byte
+	}
+	seenKeys := make(map[utxoKey]seenEntry, len(toUpdate)) // key -> first entry
 	var dedupedUpdate []updateItem
 	for _, u := range toUpdate {
 		key := utxoKey{u.transactionID, u.vout}
-		if firstIdx, seen := seenKeys[key]; seen {
-			// Duplicate: same UTXO being spent by the same tx — link to first entry
-			// The first entry will be updated; this duplicate is idempotent
-			_ = firstIdx // tracked via updatedSet after UPDATE
+		if entry, seen := seenKeys[key]; seen {
+			if !bytes.Equal(entry.spendingData, u.spendingData) {
+				// Two different transactions competing for the same UTXO in this batch.
+				// First arrival wins; record the second as a double-spend now.
+				spend := batch[u.batchIdx].spend
+				existingSpendData, parseErr := spendpkg.NewSpendingDataFromBytes(entry.spendingData)
+				if parseErr != nil {
+					validationErrors[u.batchIdx] = errors.NewProcessingError("failed to create spending data from bytes", parseErr)
+				} else {
+					validationErrors[u.batchIdx] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, existingSpendData)
+				}
+			}
+			// else: same spending data — idempotent re-spend, will be marked successful after UPDATE
 		} else {
-			seenKeys[key] = u.batchIdx
+			seenKeys[key] = seenEntry{batchIdx: u.batchIdx, spendingData: u.spendingData}
 			dedupedUpdate = append(dedupedUpdate, u)
 		}
 	}
@@ -2346,11 +2449,12 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 				validationErrors[u.batchIdx] = errors.NewUtxoSpentError(*spend.TxID, spend.Vout, *spend.UTXOHash, spend.SpendingData)
 			}
 		}
-		// Mark duplicate batch entries as successful (same UTXO, same spending data — idempotent)
+		// Mark idempotent duplicate batch entries as successful (same UTXO, same spending data).
+		// Double-spend duplicates (different spending data) are already in validationErrors — skip them.
 		for _, u := range toUpdate {
 			key := utxoKey{u.transactionID, u.vout}
-			if firstIdx, ok := seenKeys[key]; ok && firstIdx != u.batchIdx {
-				if updatedSet[firstIdx] {
+			if entry, ok := seenKeys[key]; ok && entry.batchIdx != u.batchIdx {
+				if bytes.Equal(entry.spendingData, u.spendingData) && updatedSet[entry.batchIdx] {
 					updatedSet[u.batchIdx] = true
 				}
 			}
@@ -2797,6 +2901,11 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 		_ = txn.Rollback()
 	}()
 
+	// Match-on-spending_data is the safety guarantee: we only clear spending_data
+	// when the caller's expected value matches what's stored. This prevents a stale
+	// or wrong Spend record from silently wiping the legitimate spend.
+	// SpendingData is mandatory: every production caller derives spends from
+	// Spend()/SetConflicting()/GetSpends(), all of which populate it.
 	q1 := `
 		UPDATE outputs
 		SET spending_data = NULL
@@ -2804,7 +2913,25 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 			SELECT id FROM transactions WHERE hash = $1
 		)
 		AND idx = $2
+		AND spending_data = $3
 		RETURNING transaction_id
+	`
+
+	// qFindTxID runs after q1 returns 0 rows. Unspend is idempotent: if the output
+	// row exists but our caller doesn't own the spend (stored data is NULL or
+	// belongs to someone else), we no-op on spending_data but still need the
+	// transaction_id to apply the locked/DAH housekeeping below — callers like
+	// ProcessConflicting rely on the parent transaction's locked state being
+	// updated regardless of whether the spend was the loser's. Only a missing
+	// row is a real error (NotFound). Mirrors stores/utxo/aerospike/teranode.lua
+	// where the unspend UDF returns STATUS_OK with no bin mutation for the same
+	// non-owning cases.
+	qFindTxID := `
+		SELECT transaction_id FROM outputs
+		WHERE transaction_id IN (
+			SELECT id FROM transactions WHERE hash = $1
+		)
+		AND idx = $2
 	`
 
 	locked := false
@@ -2829,15 +2956,28 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 				continue
 			}
 
+			if spend.SpendingData == nil {
+				return errors.NewProcessingError("[Unspend] SpendingData is required for %s:%d", spend.TxID, spend.Vout)
+			}
+
 			var transactionID int
 
-			err = txn.QueryRowContext(ctx, q1, spend.TxID[:], spend.Vout).Scan(&transactionID)
+			err = txn.QueryRowContext(ctx, q1, spend.TxID[:], spend.Vout, spend.SpendingData.Bytes()).Scan(&transactionID)
 			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					return errors.NewNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+				if !errors.Is(err, sql.ErrNoRows) {
+					return err
 				}
 
-				return err
+				// q1 declined to clear — caller isn't the spend's current owner.
+				// Look up the transaction_id directly so the housekeeping below
+				// still runs; the only real error here is a missing row.
+				if err = txn.QueryRowContext(ctx, qFindTxID, spend.TxID[:], spend.Vout).Scan(&transactionID); err != nil {
+					if errors.Is(err, sql.ErrNoRows) {
+						return errors.NewNotFoundError("output %s:%d not found", spend.TxID, spend.Vout)
+					}
+
+					return err
+				}
 			}
 
 			if _, err = txn.ExecContext(ctx, q2, transactionID, locked); err != nil {
@@ -3013,6 +3153,19 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 		existingHashes[h] = true
 	}
 	rows.Close()
+
+	// Postcondition (see stores/utxo/Interface.go SetMinedMulti docstring): when
+	// !UnsetMined every submitted hash MUST exist in the transactions table.
+	// A missing hash means the tx was never persisted (or was pruned) — mirrors
+	// the Aerospike KEY_NOT_FOUND handling so all backends fail closed identically.
+	// UnsetMined tolerates missing rows (the tx is already gone).
+	if !minedBlockInfo.UnsetMined && len(existingHashes) != len(hashes) {
+		for _, h := range hashes {
+			if !existingHashes[*h] {
+				return nil, errors.NewTxNotFoundError("transaction not found: %s", h.String())
+			}
+		}
+	}
 
 	if len(existingHashes) == 0 {
 		if err = txn.Commit(); err != nil {
@@ -3248,8 +3401,12 @@ func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendRes
 		return nil, err
 	}
 
-	// check utxoHash is the same as expected
-	if !bytes.Equal(utxoHash, spend.UTXOHash[:]) {
+	// Verify the caller-supplied hash matches the stored one. When the caller
+	// passes nil (e.g. the bulk /api/v1/utxos endpoint, which intentionally
+	// avoids fetching the full transaction to recompute it) we trust the
+	// stored hash — the row was located by primary key (txid, vout) and the
+	// stored hash is canonical.
+	if spend.UTXOHash != nil && !bytes.Equal(utxoHash, spend.UTXOHash[:]) {
 		return nil, errors.NewUtxoHashMismatchError("utxo hash mismatch for %s:%d", spend.TxID, spend.Vout)
 	}
 

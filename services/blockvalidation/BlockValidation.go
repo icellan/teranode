@@ -86,6 +86,37 @@ type validationResult struct {
 	mu   sync.RWMutex  // Protects err
 }
 
+const (
+	// setMinedMaxRetries caps consecutive setTxMined retries for the same block
+	// hash before the worker bails out with a manual_intervention_required log
+	// marker. Sized so the total backoff (1s+2s+4s+8s + 6×16s = 111s) gives a
+	// transient I/O blip room to recover but doesn't burn a CPU forever on an
+	// unrecoverable coverage-postcondition violation (e.g. historical-corrupt
+	// block_ids state from pre-PR-850 bugs).
+	setMinedMaxRetries = 10
+
+	// setMinedBaseBackoff is the first sleep before the second attempt.
+	setMinedBaseBackoff = 1 * time.Second
+
+	// setMinedMaxBackoff caps the per-retry sleep once exponential doubling
+	// would exceed it (after attempt 5).
+	setMinedMaxBackoff = 16 * time.Second
+)
+
+// setMinedRetryBackoff computes the exponential-with-cap backoff for the
+// (attempt)th retry. attempt is 1-indexed (1 = first retry after the initial
+// failure). 1s, 2s, 4s, 8s, 16s, 16s, ...
+func setMinedRetryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		return setMinedBaseBackoff
+	}
+	d := setMinedBaseBackoff << (attempt - 1)
+	if d <= 0 || d > setMinedMaxBackoff {
+		return setMinedMaxBackoff
+	}
+	return d
+}
+
 // revalidateBlockData contains information needed to revalidate a block
 // that previously failed validation or requires additional verification.
 type revalidateBlockData struct {
@@ -161,6 +192,14 @@ type BlockValidation struct {
 
 	// setMinedChan receives block hashes that need to be marked as mined
 	setMinedChan chan *chainhash.Hash
+
+	// setMinedRetries tracks consecutive setTxMined failures per block hash so
+	// the retry loop can apply exponential backoff and bail out with a
+	// manual_intervention_required marker instead of spinning forever on a
+	// block whose historical state can never satisfy the new coverage
+	// postcondition. Keyed by chainhash.Hash, value is the attempt counter
+	// (uint64 stored as any). Reset on success / MinedSet shortcut.
+	setMinedRetries sync.Map
 
 	// revalidateBlockChan receives blocks that need revalidation
 	revalidateBlockChan chan revalidateBlockData
@@ -284,6 +323,13 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		subtreeDeDuplicator:         NewDeDuplicator(tSettings.GetSubtreeValidationBlockHeightRetention()),
 		lastValidatedBlocks: expiringmap.New[chainhash.Hash, *model.Block](2 * time.Minute).
 			WithEvictionFunction(func(_ chainhash.Hash, block *model.Block) bool {
+				// Return pooled []Node backing slices to the per-class pool
+				// BEFORE closing the subtree. PutNodeSlice is cap-classified, so
+				// mmap-backed subtrees (whose nodes are not pool-sourced) are
+				// silently discarded — safe but ineffective, which is what we
+				// want.
+				releaseBlockNodes(block)
+
 				// Close mmap-backed subtrees when block expires from cache
 				for _, st := range block.SubtreeSlices {
 					if st != nil {
@@ -532,6 +578,7 @@ func (u *BlockValidation) start(ctx context.Context) error {
 
 				if blockHeaderMeta.MinedSet {
 					u.logger.Infof("[BlockValidation:start][%s] block already has mined_set true, skipping setTxMined", blockHash.String())
+					u.setMinedRetries.Delete(*blockHash)
 					continue
 				}
 
@@ -560,12 +607,49 @@ func (u *BlockValidation) start(ctx context.Context) error {
 
 						u.logger.Errorf("[BlockValidation:start][%s] failed setTxMined: %s", blockHash.String(), err)
 
-						if !errors.Is(err, errors.ErrBlockNotFound) {
-							time.Sleep(1 * time.Second)
-							// put the block back in the setMinedChan for retry
-							u.setMinedChan <- blockHash
+						if errors.Is(err, errors.ErrBlockNotFound) {
+							// Block is gone; nothing to retry. Drop the counter
+							// so a future notification for this hash starts fresh.
+							u.setMinedRetries.Delete(*blockHash)
+							return
 						}
+
+						// Bounded exponential-backoff retry. Track per-block
+						// attempts so a block whose historical state can never
+						// satisfy the coverage postcondition stops burning the
+						// worker (and operator log volume) and instead surfaces
+						// as a manual_intervention_required signal.
+						prev, _ := u.setMinedRetries.LoadOrStore(*blockHash, uint64(0))
+						attempt := prev.(uint64) + 1
+						u.setMinedRetries.Store(*blockHash, attempt)
+
+						prometheusBlockValidationSetMinedRetries.WithLabelValues(blockHash.String()).Inc()
+
+						if attempt >= setMinedMaxRetries {
+							u.logger.Errorf("[BlockValidation:start][%s] manual_intervention_required: setTxMined exceeded %d retries; dropping from setMinedChan. Last error: %s", blockHash.String(), setMinedMaxRetries, err)
+							prometheusBlockValidationSetMinedDrops.WithLabelValues(blockHash.String()).Inc()
+							u.setMinedRetries.Delete(*blockHash)
+							return
+						}
+
+						backoff := setMinedRetryBackoff(int(attempt))
+						u.logger.Warnf("[BlockValidation:start][%s] setTxMined retry %d/%d in %s", blockHash.String(), attempt, setMinedMaxRetries, backoff)
+						time.Sleep(backoff)
+
+						select {
+						case <-ctx.Done():
+							return
+						default:
+						}
+
+						// put the block back in the setMinedChan for retry
+						u.setMinedChan <- blockHash
+						return
 					}
+
+					// Success: reset the retry counter so the next failure (if
+					// any) starts a fresh backoff sequence.
+					u.setMinedRetries.Delete(*blockHash)
 				}()
 
 				u.logger.Debugf("[BlockValidation:start][%s] block setTxMined DONE in %s", blockHash.String(), time.Since(startTime))
@@ -677,6 +761,7 @@ func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context, g *errgro
 							u.logger.Errorf("[BlockValidation:start] failed to set block mined: %s", err)
 						}
 						u.setMinedChan <- blockHash
+						return nil
 					}
 
 					u.logger.Infof("[BlockValidation:start] processed block mined and set mined_set: %s", blockHash.String())
@@ -1160,6 +1245,12 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 	)
 	defer deferFn()
 
+	// Install the pooled NodeAllocator so each subtree's []Node is drawn from
+	// the size-class pool defined in pools.go. Only the heap-backed
+	// (non-mmap) deserialize path consults the allocator; mmap subtrees are
+	// loaded outside GetAndValidateSubtrees and bypass the pool.
+	block.SetNodeAllocator(NodeAllocFromPool)
+
 	// Use helper to ensure block is validated only once
 	blockHash := block.Hash()
 	return u.runOncePerBlock(blockHash, opts, func(opts *ValidateBlockOptions) error {
@@ -1312,13 +1403,24 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		ctxLogger.Infof("[ValidateBlock][%s] validating %d subtrees", block.Hash().String(), len(block.Subtrees))
 
 		if err = u.validateBlockSubtrees(ctx, block, opts.PeerID, baseURL); err != nil {
-			if errors.Is(err, errors.ErrTxInvalid) || errors.Is(err, errors.ErrTxMissingParent) || errors.Is(err, errors.ErrTxNotFound) {
+			// Genuine consensus violation — a transaction in the block is invalid. Persist invalid.
+			if errors.Is(err, errors.ErrTxInvalid) {
 				ctxLogger.Warnf("[ValidateBlock][%s] block contains invalid transactions, marking as invalid: %s", block.Hash().String(), err)
 				reason := fmt.Sprintf("block contains invalid transactions: %s", err.Error())
 				if !opts.IsRevalidation {
 					u.storeInvalidBlock(ctx, block, opts.PeerID, reason)
 				}
 				return errors.NewBlockInvalidError("[ValidateBlock][%s] block contains invalid transactions: %s", block.Hash().String(), err)
+			}
+
+			// Catchup-state errors: a parent transaction is not yet in our store because we
+			// have not yet absorbed the block that contains it. This is a transient ordering
+			// problem, NOT a consensus violation. Do NOT persist the block as invalid (that
+			// poisons the DB permanently and stalls sync); signal incomplete so catchup
+			// retries another peer. See issue #1031.
+			if errors.Is(err, errors.ErrTxMissingParent) || errors.Is(err, errors.ErrTxNotFound) {
+				ctxLogger.Warnf("[ValidateBlock][%s] transient missing-data during subtree validation, will retry: %s", block.Hash().String(), err)
+				return errors.NewBlockIncompleteError("[ValidateBlock][%s] transient missing-data during subtree validation: %s", block.Hash().String(), err)
 			}
 
 			return err
@@ -1428,6 +1530,10 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				if ok, err := block.Valid(decoupledCtx, u.logger, u.subtreeStore, u.utxoStore, oldBlockIDsMap, blockHeaders, blockHeaderIDs, u.settings, metaRegenerator); !ok {
 					u.logger.Errorf("[ValidateBlock][%s] InvalidateBlock block is not valid in background: %v", block.String(), err)
 
+					// Block will not be cached on the optimistic-mining failure path —
+					// return pooled []Node slices before re-validation or invalidation.
+					releaseBlockNodes(block)
+
 					if errors.Is(err, errors.ErrBlockInvalid) {
 						reason := p2pconstants.ReasonInvalidBlock.String()
 						if err = u.markBlockAsInvalid(decoupledCtx, block, reason); err != nil {
@@ -1446,6 +1552,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// check the old block IDs and invalidate the block if needed
 				if err = u.checkOldBlockIDs(decoupledCtx, oldBlockIDsMap, block); err != nil {
 					u.logger.Errorf("[ValidateBlock][%s] failed to check old block IDs: %s", block.String(), err)
+
+					// Block will not be cached on the optimistic-mining failure path.
+					releaseBlockNodes(block)
 
 					if errors.Is(err, errors.ErrBlockInvalid) {
 						if _, invalidateBlockErr := u.blockchainClient.InvalidateBlock(decoupledCtx, block.Header.Hash()); invalidateBlockErr != nil {
@@ -1469,8 +1578,11 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				// This sends the BlockSubtreesSet notification which triggers setMined
 				if err := u.updateSubtreesDAH(decoupledCtx, block); err != nil {
 					u.logger.Errorf("[ValidateBlock][%s] failed to update subtrees DAH [%s]", block.Hash().String(), err)
-					// Clean up cache since DAH update failed
+					// Clean up cache since DAH update failed. Delete bypasses the
+					// eviction function so we must release pooled []Node slices
+					// explicitly here.
 					u.lastValidatedBlocks.Delete(*block.Hash())
+					releaseBlockNodes(block)
 					// Trigger revalidation to ensure block is retried
 					// This is consistent with other error handling in this goroutine
 					u.ReValidateBlock(block, baseURL)
@@ -1507,12 +1619,23 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 					reason = err.Error()
 				}
 
+				// Block will not be cached — return pooled []Node slices now so
+				// the next block can reuse the same backing storage.
+				releaseBlockNodes(block)
+
 				// Check if we had an infrastructure error (storage, service, or processing);
 				// if so do not mark the block as invalid - these are transient issues
 				if errors.Is(err, errors.ErrStorageError) ||
 					errors.Is(err, errors.ErrServiceError) ||
 					errors.Is(err, errors.ErrProcessing) {
 					return err
+				}
+
+				// Transient catchup-state surfaced from block.Valid (e.g. a parent transaction
+				// not yet in our store). Don't poison the DB; signal incomplete so catchup
+				// retries another peer. See issue #1031.
+				if errors.Is(err, errors.ErrBlockIncomplete) {
+					return errors.NewBlockIncompleteError("[ValidateBlock][%s] block validation hit transient missing-data state: %s", block.Hash().String(), err)
 				}
 
 				if !opts.IsRevalidation {
@@ -1523,6 +1646,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			}
 
 			if iterationError := u.checkOldBlockIDs(ctx, oldBlockIDsMap, block); iterationError != nil {
+				// Block will not be cached on this path either.
+				releaseBlockNodes(block)
+
 				if errors.Is(iterationError, errors.ErrBlockInvalid) && !opts.IsRevalidation {
 					reason := iterationError.Error()
 					u.storeInvalidBlock(ctx, block, opts.PeerID, reason)
@@ -1548,6 +1674,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				defer storeCancel()
 
 				if err = u.blockchainClient.RevalidateBlock(storeCtx, block.Header.Hash()); err != nil {
+					releaseBlockNodes(block)
 					return errors.NewServiceError("[ValidateBlock][%s] failed to clear invalid flag after successful revalidation", block.Hash().String(), err)
 				}
 			} else {
@@ -1564,6 +1691,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 				addBlockOpts := u.buildAddBlockOpts(block)
 				if err = u.blockchainClient.AddBlock(storeCtx, block, opts.PeerID, addBlockOpts...); err != nil {
+					releaseBlockNodes(block)
 					return errors.NewServiceError("[ValidateBlock][%s] failed to store block", block.Hash().String(), err)
 				}
 			}
@@ -1607,8 +1735,11 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			// it's critical that we call updateSubtreesDAH() only when we know the block is valid
 			// This sends the BlockSubtreesSet notification which triggers setMined
 			if err := u.updateSubtreesDAH(decoupledCtx, block); err != nil {
-				// Clean up cache since DAH update failed
+				// Clean up cache since DAH update failed. Delete bypasses the
+				// eviction function so we must release pooled []Node slices
+				// explicitly here.
 				u.lastValidatedBlocks.Delete(*block.Hash())
+				releaseBlockNodes(block)
 				return errors.NewProcessingError("[ValidateBlock][%s] failed to update subtrees DAH", block.Hash().String(), err)
 			}
 		}
@@ -1654,6 +1785,14 @@ func (u *BlockValidation) storeInvalidBlock(ctx context.Context, block *model.Bl
 
 // checkParentInvalid checks if the parent block is invalid. This is an optimization
 // to skip expensive validation when the parent is already invalid.
+//
+// NOTE (#1031): this deliberately cascades on the bare Invalid flag without inspecting
+// WHY the parent is invalid. That is correct because transient catchup-state errors no
+// longer persist invalid=true (see the validateBlockSubtrees and block.Valid handlers and
+// model.getParentTxMetaBlockIDs) — a parent marked invalid is invalid for a genuine
+// consensus reason, so a child built on it is genuinely invalid too. Reason-based
+// classification is not possible here anyway: BlockHeaderMeta carries no invalid-reason
+// field. Do not "fix" this to suppress cascades without first re-checking that invariant.
 //
 // Parameters:
 //   - parentMeta: Metadata of the parent block (can be nil)
@@ -1916,13 +2055,64 @@ func (u *BlockValidation) computeAndSetCoinbaseBUMP(ctx context.Context, block *
 		subtree0.ReplaceRootNode(coinbaseTxID, 0, uint64(block.CoinbaseTx.Size()))
 	}
 
-	bumpBytes, err := bump.ComputeCoinbaseBUMP(subtree0, block.Subtrees, block.Height)
+	// The block's top-level merkle tree (model.Block.CheckMerkleRoot) lifts the final
+	// subtree's root to the first subtree's height when the final subtree is shorter,
+	// and blockassembly.createMerkleTreeFromSubtrees does the same before computing the
+	// coinbase BUMP. The BUMP's block-level proof MUST be built from those same lifted
+	// roots; otherwise it does not reconcile to the header merkle root for peer-received
+	// multi-subtree blocks whose final subtree is smaller than the first.
+	subtreeHashes := block.Subtrees
+	if len(block.Subtrees) > 1 {
+		subtreeHashes, err = u.liftFinalSubtreeRootForBUMP(ctx, block, subtree0)
+		if err != nil {
+			return err
+		}
+	}
+
+	bumpBytes, err := bump.ComputeCoinbaseBUMP(subtree0, subtreeHashes, block.Height)
 	if err != nil {
 		return errors.NewProcessingError("failed to compute coinbase BUMP", err)
 	}
 
 	block.CoinbaseBUMP = bumpBytes
 	return nil
+}
+
+// liftFinalSubtreeRootForBUMP returns a copy of block.Subtrees in which the final
+// subtree's root is lifted (padded) to the first subtree's height when the final
+// subtree holds fewer leaves than the first. This mirrors the top-tree composition
+// in model.Block.CheckMerkleRoot and blockassembly.createMerkleTreeFromSubtrees, so
+// the coinbase BUMP's block-level proof matches the block-header merkle root. The
+// already-loaded first subtree is passed in as subtree0.
+func (u *BlockValidation) liftFinalSubtreeRootForBUMP(ctx context.Context, block *model.Block, subtree0 *subtreepkg.Subtree) ([]*chainhash.Hash, error) {
+	lastIdx := len(block.Subtrees) - 1
+
+	reader, err := u.subtreeStore.GetIoReader(ctx, block.Subtrees[lastIdx][:], fileformat.FileTypeSubtree)
+	if err != nil {
+		return nil, errors.NewProcessingError("failed to load final subtree for coinbase BUMP", err)
+	}
+	defer reader.Close()
+
+	finalSubtree, err := subtreepkg.NewSubtreeFromReader(reader)
+	if err != nil {
+		return nil, errors.NewProcessingError("failed to parse final subtree for coinbase BUMP", err)
+	}
+
+	subtreeHashes := make([]*chainhash.Hash, len(block.Subtrees))
+	copy(subtreeHashes, block.Subtrees)
+
+	// Only the final subtree may be shorter than the first; non-final subtrees are
+	// always full-size, so their roots already sit at the first subtree's height.
+	if finalSubtree.Length() < subtree0.Length() {
+		liftedRoot, err := finalSubtree.RootHashPadded(subtree0.Height)
+		if err != nil {
+			return nil, errors.NewProcessingError("failed to lift final subtree root for coinbase BUMP", err)
+		}
+
+		subtreeHashes[lastIdx] = liftedRoot
+	}
+
+	return subtreeHashes, nil
 }
 
 // checkOldBlockIDs verifies that referenced blocks are in the current chain.
@@ -1937,21 +2127,63 @@ func (u *BlockValidation) computeAndSetCoinbaseBUMP(ctx context.Context, block *
 func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
 	block *model.Block,
 ) (iterationError error) {
+	// Both routes below dereference block.Header and (transitively, via
+	// block.Hash() inside logging/tracing) require a usable header — guard
+	// once up-front, before any tracing or logging touches the block, so
+	// each route can assume a valid block and we never panic dereferencing
+	// a nil header.
+	//
+	// The prefetch route additionally needs HashPrevBlock as the anchor
+	// for GetBlockHeaderIDs. The two call sites of checkOldBlockIDs
+	// differ in whether the block has been committed yet — normal path:
+	// block is NOT in the chain yet (AddBlock runs after this); optimistic
+	// path: block IS in the chain. HashPrevBlock works in both cases. An
+	// earlier version used block.Hash(), which returned empty in the
+	// normal path and defeated the fast-path map.
+	//
+	// Avoid block.String() / block.Hash() in this guard: both dereference
+	// block.Header, so calling them here would panic on the very nil
+	// header we are reporting.
+	if block.Header == nil || block.Header.HashPrevBlock == nil {
+		return errors.NewServiceError("[Block Validation][checkOldBlockIDs] block header or HashPrevBlock is nil")
+	}
+
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(ctx, "BlockValidation:checkOldBlockIDs",
-		tracing.WithDebugLogMessage(u.logger, "[checkOldBlockIDs][%s] checking %d old block IDs", oldBlockIDsMap.Length(), block.Hash().String()),
+		tracing.WithDebugLogMessage(u.logger, "[checkOldBlockIDs][%s] checking %d old block IDs", block.Hash().String(), oldBlockIDsMap.Length()),
 	)
 
 	defer deferFn()
 
-	// Use the parent block hash to get the ancestor chain for validation.
-	// - Normal path: block not yet committed (AddBlock runs after checkOldBlockIDs)
-	// - Optimistic path: block already committed (AddBlock at line 1361)
-	// HashPrevBlock works correctly in both cases. The old code used block.Hash()
-	// which returned empty in the normal path, defeating the fast-path map and
-	// forcing every entry through individual CheckBlockIsInCurrentChain gRPC calls.
-	if block.Header == nil || block.Header.HashPrevBlock == nil {
-		return errors.NewServiceError("[Block Validation][checkOldBlockIDs][%s] block header or HashPrevBlock is nil", block.String())
+	// Two strategies, identical result. For every tx in the block we
+	// need to answer "is at least one of this tx's parent block IDs on
+	// the current main chain?".
+	//
+	//   ON-CHAIN PREFETCH (this function, default):
+	//     - Fetch the 10,000 most-recent main-chain block IDs via
+	//       GetBlockHeaderIDs.
+	//     - Build a local map and check each tx's parent block IDs
+	//       against it (present ⇒ on chain).
+	//     - The window is truncated, so on a miss fall back to a per-tx
+	//       CheckBlockIsInCurrentChain RPC.
+	//
+	//   OFF-CHAIN PREFETCH (checkOldBlockIDsOffChainPrefetch, gated by toggle):
+	//     - Fetch the *complete* off-chain (forked) block ID set once via
+	//       OffChainBlockIDs and check non-membership (absent ⇒ on chain).
+	//     - The set is complete, not a recent window, so one prefetch
+	//       resolves every tx locally with no "too old" miss.
+	//
+	// The on-chain prefetch fetches an unbounded, ever-growing positive set
+	// and was a sensible amortisation when CheckBlockIsInCurrentChain was a
+	// recursive SQL CTE per call. When blockchain_use_in_memory_chain_check is
+	// true, the store maintains the small off-chain set in memory, so the
+	// off-chain prefetch fetches a tiny negative set and answers locally —
+	// one round-trip per block on any client topology. Live profiling on
+	// betfair-pc mainnet showed the on-chain prefetch holding ~35% of inuse
+	// heap (464 MB) and ~16% of CPU on its own.
+	if u.settings != nil && u.settings.BlockChain.UseInMemoryChainCheck {
+		return u.checkOldBlockIDsOffChainPrefetch(ctx, oldBlockIDsMap, block)
 	}
+
 	lookupHash := block.Header.HashPrevBlock
 
 	currentChainBlockIDs, err := u.blockchainClient.GetBlockHeaderIDs(ctx, lookupHash, 10_000)
@@ -1965,68 +2197,236 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 	}
 
 	if u.logger != nil {
-		u.logger.Infof("[checkOldBlockIDs][%s] loaded %d chain block IDs for fast lookup, checking %d old block ID entries", block.Hash().String(), len(currentChainBlockIDs), oldBlockIDsMap.Length())
+		u.logger.Infof("[checkOldBlockIDs][%s] prefetch route: loaded %d chain block IDs, checking %d old block ID entries", block.Hash().String(), len(currentChainBlockIDs), oldBlockIDsMap.Length())
 	}
 
-	currentChainLookupCache := make(map[string]bool, len(currentChainBlockIDs))
+	// Fast pre-check: parent block IDs that appear in the freshly-fetched
+	// main-chain set short-circuit before the dedupe cache and the RPC.
+	fastPath := func(blockIDs []uint32) bool {
+		for _, blockID := range blockIDs {
+			if _, ok := currentChainBlockIDsMap[blockID]; ok {
+				return true
+			}
+		}
+		return false
+	}
 
+	iterationError, fastPathCount, lookupCount, cacheHitCount :=
+		u.iterateOldBlockIDsWithCachedLookup(ctx, oldBlockIDsMap, block, fastPath, u.blockchainClient.CheckBlockIsInCurrentChain)
+
+	if u.logger != nil {
+		// "lookup" is the per-tx CheckBlockIsInCurrentChain reached on a fast-path
+		// miss. Both routes use the same label for this counter so logs are
+		// directly comparable across the on-chain and off-chain prefetch paths.
+		u.logger.Infof("[checkOldBlockIDs][%s] prefetch route done: fastPath=%d, lookup=%d, cacheHit=%d", block.Hash().String(), fastPathCount, lookupCount, cacheHitCount)
+	}
+
+	return
+}
+
+// checkOldBlockIDsOffChainPrefetch is the off-chain-prefetch variant of
+// checkOldBlockIDs (see checkOldBlockIDs for the strategy comparison).
+//
+// It answers the same per-tx question — "is at least one of this tx's
+// parent block IDs on the current main chain?" — but mirrors the on-chain
+// prefetch route with the set inverted:
+//
+//   - The on-chain route fetches the 10,000 most-recent *main-chain* block
+//     IDs and checks membership (parent ID present ⇒ on chain). Because that
+//     window is truncated, a miss may still be on an older part of the chain
+//     and forces a per-tx CheckBlockIsInCurrentChain RPC.
+//   - This route fetches the *complete* off-chain (forked) set once via
+//     OffChainBlockIDs and checks non-membership. The set is complete, not a
+//     recent window, so there is no "too old" miss: one prefetch resolves
+//     every tx locally.
+//
+// To stay consensus-equivalent with CheckBlockIsInCurrentChain, the local
+// check applies BOTH of the rules the authoritative path applies
+// (CheckBlockIsInCurrentChain.go): a block ID is on the main chain iff
+// (id <= maxBlockID) AND (id is not in the off-chain set). The id > maxBlockID
+// guard is essential — an ID can be allocated (GetNextBlockID) and written into
+// a tx's BlockIDs before AddBlock bumps maxBlockID, so without the guard a
+// fastPath that treated such an id as on-chain would accept a tx the
+// authoritative RPC rejects, a chain-split risk between toggled and untoggled
+// nodes. With the guard, an above-max id is skipped here and falls through to
+// the RPC, which rejects it identically.
+//
+// This costs exactly one round-trip per block regardless of client topology
+// (in-process LocalClient or gRPC), which is the whole point — calling
+// CheckBlockIsInCurrentChain per candidate set is free in-process but a
+// network round-trip per set under a gRPC client. The off-chain set is small
+// (bounded by fork activity, near-empty on a healthy chain), so the prefetch
+// payload and the local map stay tiny.
+//
+// When the store reports rebuilding (in-memory check disabled, or a
+// reorg/startup rebuild in progress) the off-chain set is stale, so we fall
+// back to the per-tx CheckBlockIsInCurrentChain path (which has its own
+// authoritative SQL fallback). CheckBlockIsInCurrentChain also remains the
+// lookup authority on a fast-path miss, so a block is only rejected after the
+// store confirms none of a tx's parents are on chain.
+//
+// The string-keyed dedupe cache from the original is kept because identical
+// blockIDs slices are common (sibling txs spending outputs from the same
+// parent block).
+func (u *BlockValidation) checkOldBlockIDsOffChainPrefetch(ctx context.Context,
+	oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
+	block *model.Block,
+) (iterationError error) {
+	offChainIDs, maxBlockID, rebuilding, err := u.blockchainClient.OffChainBlockIDs(ctx)
+	if err != nil {
+		return errors.NewServiceError("[Block Validation][checkOldBlockIDs][%s] failed to get off-chain block IDs", block.String(), err)
+	}
+
+	if rebuilding {
+		// Off-chain set unavailable or stale — resolve each tx with the
+		// authoritative per-tx RPC (no local prefetch map).
+		if u.logger != nil {
+			u.logger.Infof("[checkOldBlockIDs][%s] off-chain-prefetch route (rebuilding fallback): per-tx lookup over %d old block ID entries", block.Hash().String(), oldBlockIDsMap.Length())
+		}
+
+		iterErr, _, lookupCount, cacheHitCount :=
+			u.iterateOldBlockIDsWithCachedLookup(ctx, oldBlockIDsMap, block, nil, u.blockchainClient.CheckBlockIsInCurrentChain)
+
+		if u.logger != nil {
+			u.logger.Infof("[checkOldBlockIDs][%s] off-chain-prefetch route (rebuilding fallback) done: lookup=%d, cacheHit=%d", block.Hash().String(), lookupCount, cacheHitCount)
+		}
+
+		return iterErr
+	}
+
+	offChain := make(map[uint32]struct{}, len(offChainIDs))
+	for _, id := range offChainIDs {
+		offChain[id] = struct{}{}
+	}
+
+	if u.logger != nil {
+		u.logger.Infof("[checkOldBlockIDs][%s] off-chain-prefetch route: prefetched %d off-chain block IDs (maxBlockID=%d), checking %d old block ID entries", block.Hash().String(), len(offChain), maxBlockID, oldBlockIDsMap.Length())
+	}
+
+	// NOTE (Option C / consensus): this local fast path treats a candidate absent
+	// from the off-chain set as on-chain. That is UNSOUND for a non-existent
+	// (phantom / id-sequence gap) id <= maxBlockID, which is absent from the
+	// off-chain set yet has no on_main_chain row — the authoritative store route
+	// (CheckBlockIsInCurrentChain, now fixed) rejects it. This toggle-on
+	// optimization therefore still carries the latent split for dangling ids.
+	// Making it sound removes the positive short-circuit (every survivor would
+	// need an authoritative confirm), which obsoletes this profiled prefetch — a
+	// perf/design call left for the team. Phantom CREATION is already prevented by
+	// the idempotent AssignBlockID fix, so this is latent, not reachable in normal
+	// operation.
+	fastPath := func(blockIDs []uint32) bool {
+		for _, blockID := range blockIDs {
+			if blockID > maxBlockID {
+				continue
+			}
+
+			if _, isOffChain := offChain[blockID]; !isOffChain {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	iterationError, fastPathCount, lookupCount, cacheHitCount :=
+		u.iterateOldBlockIDsWithCachedLookup(ctx, oldBlockIDsMap, block, fastPath, u.blockchainClient.CheckBlockIsInCurrentChain)
+
+	if u.logger != nil {
+		u.logger.Infof("[checkOldBlockIDs][%s] off-chain-prefetch route done: fastPath=%d, lookup=%d, cacheHit=%d", block.Hash().String(), fastPathCount, lookupCount, cacheHitCount)
+	}
+
+	return iterationError
+}
+
+// iterateOldBlockIDsWithCachedLookup is the shared per-tx iterator used by
+// both checkOldBlockIDs (on-chain prefetch route) and
+// checkOldBlockIDsOffChainPrefetch (off-chain prefetch route). For each
+// (txID, blockIDs) entry it:
+//
+//  1. Rejects an empty blockIDs slice as a processing error.
+//  2. (prefetch only) invokes fastPath(blockIDs) and short-circuits true if
+//     a parent is already known on-chain. fastPath may be nil to skip this
+//     step (the no-prefetch route passes nil).
+//  3. Builds a sorted string key from blockIDs and consults a per-call
+//     dedupe cache. Identical blockIDs slices across sibling txs (a parent
+//     block referenced by many children) hit the cache and skip the lookup.
+//  4. On cache miss, calls lookup(ctx, blockIDs) (typically the
+//     CheckBlockIsInCurrentChain RPC), caches the result, and either
+//     continues iteration on hit or records a BlockInvalidError on miss.
+//
+// Returns the iteration error (or nil) plus counters. lookupCount counts
+// how many times the lookup callback was actually invoked (i.e. cache
+// misses that weren't short-circuited by fastPath); both routes report it
+// under the same "lookup" log label so their logs are directly comparable.
+//
+// oldBlockIDsCacheHintCap bounds the up-front size hint for the dedupe
+// cache so a block with a very high tx count cannot force a large map
+// allocation. It matches the prefetch route's historical implicit cap
+// (len(currentChainBlockIDs) <= 10_000).
+const oldBlockIDsCacheHintCap = 10_000
+
+func (u *BlockValidation) iterateOldBlockIDsWithCachedLookup(
+	ctx context.Context,
+	oldBlockIDsMap *txmap.SyncedMap[chainhash.Hash, []uint32],
+	block *model.Block,
+	fastPath func(blockIDs []uint32) bool,
+	lookup func(ctx context.Context, blockIDs []uint32) (bool, error),
+) (iterationError error, fastPathCount, lookupCount, cacheHitCount int) {
+	// The dedupe cache is keyed by the sorted parent-block-ID slice, so it
+	// only ever holds as many entries as there are *distinct* parent-block
+	// sets referenced by the block's txs — typically a handful, bounded by
+	// the number of recent blocks, not by the tx count. Sizing the hint to
+	// oldBlockIDsMap.Length() (which scales with tx count, up to millions on
+	// large blocks) would reserve a large map up-front for almost no
+	// occupancy. Cap the hint to keep per-block heap pressure bounded; the
+	// map still grows if more distinct sets actually appear.
+	cacheHint := oldBlockIDsMap.Length()
+	if cacheHint > oldBlockIDsCacheHintCap {
+		cacheHint = oldBlockIDsCacheHintCap
+	}
+
+	cache := make(map[string]bool, cacheHint)
 	var builder strings.Builder
-	var fastPathCount, slowPathCount, cacheHitCount int
 
-	// range over the oldBlockIDsMap to get txID - oldBlockID pairs
 	oldBlockIDsMap.Iterate(func(txID chainhash.Hash, blockIDs []uint32) bool {
 		if len(blockIDs) == 0 {
 			iterationError = errors.NewProcessingError("[Block Validation][checkOldBlockIDs][%s] blockIDs is empty for txID: %v", block.String(), txID)
 			return false
 		}
 
-		// check whether the blockIDs are in the current chain we just fetched
-		for _, blockID := range blockIDs {
-			if _, ok := currentChainBlockIDsMap[blockID]; ok {
-				// all good, continue
-				fastPathCount++
-				return true
-			}
+		if fastPath != nil && fastPath(blockIDs) {
+			fastPathCount++
+			return true
 		}
 
 		slices.Sort(blockIDs)
-
 		builder.Reset()
-
 		for i, id := range blockIDs {
 			if i > 0 {
-				builder.WriteString(",") // Add a separator
+				builder.WriteString(",")
 			}
-
 			builder.WriteString(strconv.Itoa(int(id)))
 		}
-
 		blockIDsString := builder.String()
 
-		// check whether we already checked exactly the same blockIDs and can use a cache
-		if blocksPartOfCurrentChain, ok := currentChainLookupCache[blockIDsString]; ok {
+		if blocksPartOfCurrentChain, ok := cache[blockIDsString]; ok {
 			cacheHitCount++
 			if !blocksPartOfCurrentChain {
 				iterationError = errors.NewBlockInvalidError("[Block Validation][checkOldBlockIDs][%s] block is not valid. Transaction's (%v) parent blocks (%v) are not from current chain using cache", block.String(), txID, blockIDs)
 				return false
 			}
-
 			return true
 		}
 
-		// Flag to check if the old blocks are part of the current chain
-		slowPathCount++
-		blocksPartOfCurrentChain, err := u.blockchainClient.CheckBlockIsInCurrentChain(ctx, blockIDs)
-		// if err is not nil, log the error and continue iterating for the next transaction
+		lookupCount++
+		blocksPartOfCurrentChain, err := lookup(ctx, blockIDs)
 		if err != nil {
 			iterationError = errors.NewProcessingError("[Block Validation][checkOldBlockIDs][%s] failed to check if old blocks are part of the current chain", block.String(), err)
 			return false
 		}
 
-		// set the cache for the blockIDs
-		currentChainLookupCache[blockIDsString] = blocksPartOfCurrentChain
+		cache[blockIDsString] = blocksPartOfCurrentChain
 
-		// if the blocks are not part of the current chain, stop iteration, set the iterationError and return false
 		if !blocksPartOfCurrentChain {
 			iterationError = errors.NewBlockInvalidError("[Block Validation][checkOldBlockIDs][%s] block is not valid. Transaction's (%v) parent blocks (%v) are not from current chain", block.String(), txID, blockIDs)
 			return false
@@ -2034,10 +2434,6 @@ func (u *BlockValidation) checkOldBlockIDs(ctx context.Context, oldBlockIDsMap *
 
 		return true
 	})
-
-	if u.logger != nil {
-		u.logger.Infof("[checkOldBlockIDs][%s] done: fastPath=%d, slowPath=%d, cacheHit=%d", block.Hash().String(), fastPathCount, slowPathCount, cacheHitCount)
-	}
 
 	return
 }

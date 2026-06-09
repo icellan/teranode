@@ -128,6 +128,11 @@ func (s *Store) Health(ctx context.Context, checkLiveness bool) (int, string, er
 	return s.store.Health(ctx, checkLiveness)
 }
 
+func (s *Store) Close(ctx context.Context) error {
+	s.logger.Debugf("[UTXOStore][logger][Close] : %s", caller())
+	return s.store.Close(ctx)
+}
+
 func (s *Store) Create(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, error) {
 	data, err := s.store.Create(ctx, tx, blockHeight, opts...)
 	inputDetails := make([]string, len(tx.Inputs))
@@ -233,6 +238,24 @@ func (s *Store) ScanInconsistentUnminedTxs() (utxo.ConsistencyScanIterator, erro
 
 func (s *Store) GetPrunableUnminedTxIterator(cutoffBlockHeight uint32) (utxo.UnminedTxIterator, error) {
 	return s.store.GetPrunableUnminedTxIterator(cutoffBlockHeight)
+}
+
+func (s *Store) GetConflictingTxIterator() (utxo.UnminedTxIterator, error) {
+	return s.store.GetConflictingTxIterator()
+}
+
+func (s *Store) RemoveFromConflictingChildren(ctx context.Context, removals []utxo.ConflictingChildRemoval) error {
+	err := s.store.RemoveFromConflictingChildren(ctx, removals)
+	s.logger.Debugf("[UTXOStore][logger][RemoveFromConflictingChildren] count %d err %v : %s", len(removals), err, caller())
+
+	return err
+}
+
+func (s *Store) RemoveBlockIDs(ctx context.Context, removals []utxo.BlockIDsRemoval) error {
+	err := s.store.RemoveBlockIDs(ctx, removals)
+	s.logger.Debugf("[UTXOStore][logger][RemoveBlockIDs] count %d err %v : %s", len(removals), err, caller())
+
+	return err
 }
 
 func (s *Store) GetSpend(ctx context.Context, spend *utxo.Spend) (*utxo.SpendResponse, error) {

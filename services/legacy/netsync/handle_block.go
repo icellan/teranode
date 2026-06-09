@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/blockassemblyutil"
 	"github.com/bsv-blockchain/teranode/util/retry"
@@ -53,6 +55,16 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	if blockExists {
 		sm.logger.Warnf("[HandleBlockDirect][%s] block already exists", blockHash.String())
 		return nil
+	}
+
+	// The sync peer's association just delivered a full block. Refresh its
+	// last-block time now, at receipt, so the minutes-long validation that
+	// follows (extend/createUtxos/validate/subtree writes for a multi-GB block)
+	// is not mistaken for a stall — which would rotate the sync peer
+	// mid-processing. Association-aware: the block arrives on the DATA1 stream,
+	// a different Peer from the GENERAL sync peer.
+	if sps, ok := sm.syncPeerStateFor(peer); ok {
+		sps.updateLastBlockTime()
 	}
 
 	block := bsvutil.NewBlock(msgBlock)
@@ -143,6 +155,12 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 		return errors.NewProcessingError("failed to serialize coinbase", err)
 	}
 
+	// Single coinbase decode per block, retained into the teranodeBlock model
+	// for downstream use; stays on the standard heap path. The arena variant
+	// would require Put before return, at which point coinbaseTx's scripts
+	// would alias soon-to-be-reused memory. Per-block tx loops in legacy
+	// ingestion live in bsvutil/subtree-assembly, which works with
+	// bsvutil.Tx (not bt.Tx) and never round-trips through go-bt decode.
 	coinbaseTx, err := bt.NewTxFromBytes(coinbase.Bytes())
 	if err != nil {
 		return errors.NewProcessingError("failed to create bt.Tx for coinbase", err)
@@ -181,15 +199,28 @@ func (sm *SyncManager) HandleBlockDirect(ctx context.Context, peer *peer.Peer, b
 	}
 
 	// process any orphan transactions that are now valid in background
-	// this will also remove the transactions from the orphan pool
+	// this will also remove the transactions from the orphan pool.
+	//
+	// Pre-extract the tx hashes here, before launching the goroutine, so the
+	// background work does not keep `block` (and therefore the wire.MsgBlock
+	// + its decode arena) reachable for the lifetime of orphan processing.
+	// Copy the hash *values* (not the *chainhash.Hash pointers returned by
+	// tx.Hash(), which alias into the bsvutil.Tx wrapper and would pin it).
+	wireTxs := block.Transactions()
+	txHashes := make([]chainhash.Hash, len(wireTxs))
+	for i, tx := range wireTxs {
+		txHashes[i] = *tx.Hash()
+	}
+	blockHashStr := block.Hash().String()
+
 	go func() {
 		acceptedTxs := make([]*TxHashAndFee, 0)
-		for _, tx := range block.Transactions() {
-			sm.processOrphanTransactions(ctx, tx.Hash(), &acceptedTxs)
+		for i := range txHashes {
+			sm.processOrphanTransactions(ctx, &txHashes[i], &acceptedTxs)
 		}
 
 		if len(acceptedTxs) > 0 {
-			sm.logger.Infof("[HandleBlockDirect][%s %d] accepted %d orphan transactions", block.Hash().String(), blockHeight, len(acceptedTxs))
+			sm.logger.Infof("[HandleBlockDirect][%s %d] accepted %d orphan transactions", blockHashStr, blockHeight, len(acceptedTxs))
 			sm.peerNotifier.AnnounceNewTransactions(acceptedTxs)
 		}
 	}()
@@ -282,91 +313,129 @@ func (sm *SyncManager) prepareSubtrees(ctx context.Context, block *bsvutil.Block
 
 	subtrees = make([]*chainhash.Hash, 0)
 
-	var subtree *subtreepkg.Subtree
+	txCount := len(block.Transactions())
+	if txCount <= 1 {
+		return subtrees, blockID, nil
+	}
 
-	// create 1 subtree + subtree.subtreeData
-	// then validate the subtree through the subtreeValidation service
-	if len(block.Transactions()) > 1 {
-		if subtree, err = subtreepkg.NewIncompleteTreeByLeafCount(len(block.Transactions())); err != nil {
-			return nil, 0, errors.NewSubtreeError("[prepareSubtrees] failed to create subtree", err)
+	// Partition the block's transactions into K subtrees so each non-final subtree
+	// is exactly subtreeSize leaves and the final subtree's leaf count is in
+	// [1, subtreeSize] — matching model.Block.CheckMerkleRoot's Length-based lift
+	// rules. The final subtree does not need to be a power of two: the
+	// duplicate-when-odd rule applied inside BuildMerkleTreeStoreFromBytes already
+	// pads its natural root to height ceil(log2(length)), which is what the lift
+	// in CheckMerkleRoot expects. For blocks where txCount ≤
+	// MaximumMerkleItemsPerSubtree the partition is the unchanged single-subtree
+	// case.
+	maxItems := sm.settings.BlockAssembly.MaximumMerkleItemsPerSubtree
+
+	subtreeSize, numSubtrees, finalLeafCount, err := partitionLegacyBlock(txCount, maxItems)
+	if err != nil {
+		return nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to partition block", err)
+	}
+
+	subtreeSlices := make([]*subtreepkg.Subtree, numSubtrees)
+	subtreeDatas := make([]*subtreepkg.Data, numSubtrees)
+	subtreeMetas := make([]*subtreepkg.Meta, numSubtrees)
+
+	for i := 0; i < numSubtrees; i++ {
+		capacity := subtreeSize
+		if i == numSubtrees-1 && numSubtrees > 1 && finalLeafCount < subtreeSize {
+			capacity = finalLeafCount
 		}
 
-		if err = subtree.AddCoinbaseNode(); err != nil {
-			return nil, 0, errors.NewSubtreeError("[prepareSubtrees] failed to add coinbase placeholder", err)
+		st, terr := subtreepkg.NewIncompleteTreeByLeafCount(capacity)
+		if terr != nil {
+			return nil, 0, errors.NewSubtreeError("[prepareSubtrees] failed to create subtree %d", i, terr)
 		}
 
-		// subtreeData contains the extended tx bytes of all transactions references in the subtree
-		// except the coinbase transaction
-		subtreeData := subtreepkg.NewSubtreeData(subtree)
-		subtreeMetaData := subtreepkg.NewSubtreeMeta(subtree)
-
-		// Create a map of all transactions in the block
-		txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](len(block.Transactions()))
-
-		if err = sm.createTxMap(ctx, block, txMap); err != nil {
-			return nil, 0, err
+		if i == 0 {
+			if err = st.AddCoinbaseNode(); err != nil {
+				return nil, 0, errors.NewSubtreeError("[prepareSubtrees] failed to add coinbase placeholder", err)
+			}
 		}
 
-		// extend all the transactions in the block
-		if err = sm.extendTransactions(ctx, block, txMap); err != nil {
-			return nil, 0, err
-		}
+		subtreeSlices[i] = st
+		subtreeDatas[i] = subtreepkg.NewSubtreeData(st)
+		subtreeMetas[i] = subtreepkg.NewSubtreeMeta(st)
+	}
 
-		// create the subtree and subtreeData for the block
-		if err = sm.createSubtree(ctx, block, txMap, subtree, subtreeData, subtreeMetaData); err != nil {
-			return nil, 0, err
-		}
+	txMap := txmap.NewSyncedMap[chainhash.Hash, *TxMapWrapper](txCount)
 
-		blockHeight32, convErr := safeconversion.Int32ToUint32(block.Height())
-		if convErr != nil {
-			return nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to convert block height", convErr)
-		}
+	if err = sm.createTxMap(ctx, block, txMap); err != nil {
+		return nil, 0, err
+	}
 
-		// Quick validation is safe whenever the block sits at/below the highest hard-coded
-		// checkpoint for the active network. POW (verified upstream by HasMetTargetDifficulty)
-		// plus checkpoint-anchored chain linkage make the block canonical regardless of which
-		// FSM state drove the catch-up. The checkpoint list is owned by go-chaincfg — see PR
-		// #844 for the matching FSM-RUN gate that relies on the same invariant.
-		quickValidationMode := sm.quickValidationAllowed(blockHeight32)
+	if err = sm.extendTransactions(ctx, block, txMap); err != nil {
+		return nil, 0, err
+	}
 
-		if quickValidationMode {
-			// Fetch block ID upfront so UTXOs carry mined info from creation. This ID is
-			// threaded through to blockvalidation via ProcessBlock so it can call
-			// AddBlock(WithID, WithMinedSet(true)) and cause the setMinedChan worker to
-			// skip setTxMinedStatus (MinedSet guard in BlockValidation.go).
-			//
-			// Note on ID gaps: GetNextBlockID advances the sequence atomically. If anything
-			// fails after this point (createUtxos error, network error, context cancellation),
-			// the ID is consumed and a gap appears in block IDs. This is acceptable — the
-			// blockchain store tolerates non-contiguous IDs; the sequence is used only as a
-			// monotonic counter, not a contiguous index.
-			id, idErr := sm.blockchainClient.GetNextBlockID(ctx)
+	if err = sm.createSubtrees(ctx, block, txMap, subtreeSlices, subtreeDatas, subtreeMetas); err != nil {
+		return nil, 0, err
+	}
+
+	blockHeight32, convErr := safeconversion.Int32ToUint32(block.Height())
+	if convErr != nil {
+		return nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to convert block height", convErr)
+	}
+
+	// Quick validation is safe whenever the block sits at/below the highest hard-coded
+	// checkpoint for the active network. POW (verified upstream by HasMetTargetDifficulty)
+	// plus checkpoint-anchored chain linkage make the block canonical regardless of which
+	// FSM state drove the catch-up. The checkpoint list is owned by go-chaincfg — see PR
+	// #844 for the matching FSM-RUN gate that relies on the same invariant.
+	quickValidationMode := sm.quickValidationAllowed(blockHeight32)
+
+	if quickValidationMode {
+		// Fetch block ID upfront so UTXOs carry mined info from creation. This ID is
+		// threaded through to blockvalidation via ProcessBlock so it can call
+		// AddBlock(WithID, WithMinedSet(true)) and cause the setMinedChan worker to
+		// skip setTxMinedStatus (MinedSet guard in BlockValidation.go).
+		//
+		// Restart-safety + cross-path consistency: if this block's transactions were
+		// already created in a prior attempt (or by the blockvalidation catchup path),
+		// reuse the block id recorded in the UTXO store so the committed block matches
+		// the existing UTXO mined-info. Otherwise fall back to the idempotent per-hash
+		// AssignBlockID. Both paths converging on one id is what prevents orphaned
+		// (phantom) block ids that wedge sync in checkOldBlockIDs.
+		if reused, ok := sm.reuseBlockIDFromUTXO(ctx, block); ok {
+			blockID = reused
+		} else {
+			id, idErr := sm.blockchainClient.AssignBlockID(ctx, block.Hash())
 			if idErr != nil {
-				return nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to get next block ID", idErr)
+				return nil, 0, errors.NewProcessingError("[prepareSubtrees] failed to assign block ID", idErr)
 			}
-			blockID = uint32(id) // nolint:gosec
-
-			// in quickValidationMode, we can process transactions in a block in parallel, but in reverse order
-			// first we create all the utxos, then we spend them
-			if err = sm.ValidateTransactionsLegacyMode(ctx, txMap, block, blockID); err != nil {
-				return nil, 0, err
+			blockID, idErr = safeconversion.Uint64ToUint32(id)
+			if idErr != nil {
+				return nil, 0, errors.NewProcessingError("[prepareSubtrees] assigned block id %d exceeds uint32", id, idErr)
 			}
 		}
 
-		// write all the subtree data to the subtree store
-		if err = sm.writeSubtree(ctx, block, subtree, subtreeData, subtreeMetaData, quickValidationMode); err != nil {
+		// in quickValidationMode, we can process transactions in a block in parallel, but in reverse order
+		// first we create all the utxos, then we spend them
+		if err = sm.ValidateTransactionsLegacyMode(ctx, txMap, block, blockID); err != nil {
 			return nil, 0, err
 		}
+	}
 
-		// In quickValidationMode the transactions and subtree files have already been
-		// produced locally, so we can skip the round-trip through subtreeValidation.
-		if !quickValidationMode {
-			if err = sm.checkSubtreeFromBlock(ctx, block, subtree); err != nil {
+	for i := 0; i < numSubtrees; i++ {
+		if err = sm.writeSubtree(ctx, block, subtreeSlices[i], subtreeDatas[i], subtreeMetas[i], quickValidationMode); err != nil {
+			return nil, 0, err
+		}
+	}
+
+	// In quickValidationMode the transactions and subtree files have already been
+	// produced locally, so we can skip the round-trip through subtreeValidation.
+	if !quickValidationMode {
+		for i := 0; i < numSubtrees; i++ {
+			if err = sm.checkSubtreeFromBlock(ctx, block, subtreeSlices[i]); err != nil {
 				return nil, 0, err
 			}
 		}
+	}
 
-		subtrees = append(subtrees, subtree.RootHash())
+	for i := 0; i < numSubtrees; i++ {
+		subtrees = append(subtrees, subtreeSlices[i].RootHash())
 	}
 
 	return subtrees, blockID, nil
@@ -605,11 +674,223 @@ func (sm *SyncManager) ValidateTransactionsLegacyMode(ctx context.Context, txMap
 		return err
 	}
 
-	if err = sm.PreValidateTransactions(ctx, txMap, *block.Hash(), blockHeightUint32); err != nil {
+	candidateBlockTime, candidateParentMedianTime, err := sm.candidateFinalityTimesForBlock(ctx, block, blockHeightUint32)
+	if err != nil {
+		return errors.NewProcessingError("[validateTransactionsLegacyMode] failed to select finality time sources", err)
+	}
+
+	if err = sm.PreValidateTransactions(ctx, txMap, *block.Hash(), blockHeightUint32, candidateBlockTime, candidateParentMedianTime); err != nil {
 		return errors.NewProcessingError("[validateTransactionsLegacyMode] failed to pre-validate transactions", err)
 	}
 
 	return nil
+}
+
+// candidateFinalityTimesForBlock picks the validator finality-time options
+// for the given block based on its CSV era. Exactly one return value is
+// non-zero on success:
+//
+//   - Pre-CSV (blockHeight < CSVHeight): returns (block header timestamp, 0).
+//     The validator consumes Options.CandidateBlockTime in this era.
+//   - Post-CSV (blockHeight >= CSVHeight): returns (0, candidate-parent MTP).
+//     The validator consumes Options.CandidateParentMedianTime in this era,
+//     and the parent-chain-walk sourcing rule + chain re-anchor + walk
+//     fallback live inside candidateParentMedianTimeForBlock.
+//
+// The other field stays zero so candidateBlockTimePtr /
+// candidateParentMedianTimePtr in services/validator can drop it from the
+// proto wire. Extracted as a separate method so the era-selection branch
+// can be table-tested at the package level without standing up the full
+// SyncManager pipeline.
+func (sm *SyncManager) candidateFinalityTimesForBlock(ctx context.Context, block *bsvutil.Block, blockHeight uint32) (candidateBlockTime uint32, candidateParentMedianTime uint32, err error) {
+	if blockHeight < uint32(sm.chainParams.CSVHeight) {
+		candidateBlockTime, err = safeconversion.Int64ToUint32(block.MsgBlock().Header.Timestamp.Unix())
+		if err != nil {
+			return 0, 0, err
+		}
+
+		return candidateBlockTime, 0, nil
+	}
+
+	candidateParentMedianTime, err = sm.candidateParentMedianTimeForBlock(ctx, &block.MsgBlock().Header.PrevBlock)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return 0, candidateParentMedianTime, nil
+}
+
+// candidateParentMedianTimeForBlock returns the candidate-parent MTP for the
+// post-CSV consensus path, i.e. the equivalent of bitcoin-sv's
+// pindexPrev->GetMedianTimePast() for a candidate whose parent is parentHash.
+//
+// The MTP is computed by fetching 11 block headers walking back from
+// parentHash via the blockchain's GetBlockHeaders API and taking the median of
+// their timestamps. GetBlockHeaders is fork-aware: its SQL fallback path
+// recursively walks parent_id when the start hash is not on the main chain,
+// so a candidate building on a side-chain parent receives the MTP of THAT
+// parent chain — not the main-chain MTP at the same height (which is what a
+// height-based lookup like GetMedianTimePastForHeights would return).
+//
+// The value is computed and returned unconditionally because the validator's
+// post-CSV consensus path now hard-errors on a missing
+// Options.CandidateParentMedianTime (no tip-MTP soft-fall). The earlier
+// parent==tip optimisation was unsound — the validator reads
+// blockState.MedianTime later than the caller's tip check, and the utxo
+// store updates that field asynchronously from blockchain notifications, so
+// a tip advance / reorg between the two reads would silently swap the
+// comparison time source.
+func (sm *SyncManager) candidateParentMedianTimeForBlock(ctx context.Context, parentHash *chainhash.Hash) (uint32, error) {
+	if parentHash == nil {
+		return 0, errors.NewProcessingError("nil parent hash")
+	}
+
+	// Try the batched API first — it is cache-friendly and resolves in a
+	// single round-trip on the steady-state path. The SQL implementation
+	// runs an on_main_chain probe and a SELECT in two statements; if a reorg
+	// lands between them, the returned headers may not anchor to parentHash.
+	// candidateParentMedianTimeFromHeaders re-anchors the result and returns
+	// an error in that case.
+	headers, _, err := sm.blockchainClient.GetBlockHeaders(ctx, parentHash, blockchain.MedianTimeBlocks)
+	if err != nil {
+		return 0, errors.NewProcessingError("parent hash %s: failed to fetch parent-chain headers", parentHash.String(), err)
+	}
+
+	mtp, anchorErr := candidateParentMedianTimeFromHeaders(parentHash, headers)
+	if anchorErr == nil {
+		return mtp, nil
+	}
+
+	// Re-anchor failure on the batched path. Retrying the batched API does
+	// not help because GetBlockHeaders caches the (parentHash, 11) result —
+	// the next call replays the same headers from cache. Fall back to a
+	// hash-keyed parent-chain walk: GetBlockHeader's cache is keyed by hash,
+	// so each header is uniquely identified and the same race cannot poison
+	// this path. Cost on a cold cache is N round-trips (N=11) instead of 1,
+	// taken only on the rare reorg-race event.
+	walked, walkErr := sm.walkParentChain(ctx, parentHash, blockchain.MedianTimeBlocks)
+	if walkErr != nil {
+		return 0, errors.NewProcessingError("parent hash %s: batched-API re-anchor failed (%v); fallback walk failed", parentHash.String(), anchorErr, walkErr)
+	}
+
+	mtp, err = candidateParentMedianTimeFromHeaders(parentHash, walked)
+	if err != nil {
+		return 0, errors.NewProcessingError("parent hash %s: re-anchor failed on both batched fetch (%v) and hash-walk fallback", parentHash.String(), anchorErr, err)
+	}
+
+	return mtp, nil
+}
+
+// walkParentChain fetches exactly depth block headers starting at startHash and
+// walking backwards via HashPrevBlock. Each hop uses blockchainClient.GetBlockHeader
+// which is keyed by hash in the in-memory cache — so its results are
+// deterministic regardless of which block is canonical at any given height
+// (block contents are immutable once stored). This makes the walk
+// race-safe under reorg, at the cost of N round-trips on a cold cache.
+//
+// Returned headers are ordered newest-first, matching the contract of
+// blockchainClient.GetBlockHeaders' return order so candidateParentMedianTimeFromHeaders
+// can re-anchor them with the same logic.
+//
+// A nil pointer (cur == nil) or a nil header response (header == nil) is
+// treated as a hard error. Production callers only invoke this when the
+// candidate height is at or above CSVHeight, which is well past the first
+// `depth` blocks of the chain — so we never legitimately walk off the
+// beginning of the chain. Tolerating short returns would silently produce
+// an incomplete MTP on a transient cache miss mid-chain; raising loudly
+// instead forces the caller to surface the underlying issue.
+func (sm *SyncManager) walkParentChain(ctx context.Context, startHash *chainhash.Hash, depth uint64) ([]*model.BlockHeader, error) {
+	headers := make([]*model.BlockHeader, 0, depth)
+	cur := startHash
+
+	for i := uint64(0); i < depth; i++ {
+		if cur == nil {
+			return nil, errors.NewProcessingError("walkParentChain: nil prev-block link at depth %d (walked off the chain)", i)
+		}
+
+		header, _, err := sm.blockchainClient.GetBlockHeader(ctx, cur)
+		if err != nil {
+			return nil, errors.NewProcessingError("walkParentChain: failed at depth %d (hash %s)", i, cur.String(), err)
+		}
+
+		if header == nil {
+			return nil, errors.NewProcessingError("walkParentChain: nil header at depth %d (hash %s) — possible transient cache miss", i, cur.String())
+		}
+
+		headers = append(headers, header)
+		cur = header.HashPrevBlock
+	}
+
+	return headers, nil
+}
+
+// candidateParentMedianTimeFromHeaders verifies that the supplied headers form
+// a contiguous chain ending at parentHash, then returns the median of their
+// timestamps.
+//
+// The verification closes a concurrency gap in blockchainClient.GetBlockHeaders:
+// its main-chain fast path probes the start hash's on_main_chain status in one
+// SQL statement and then runs the SELECT that returns the headers in a second
+// statement. A reorg fired between the two statements (READ COMMITTED isolation)
+// would return main-chain headers at the same height range that no longer
+// correspond to parentHash — silently swapping the timestamp set we compute
+// MTP over. Re-anchoring the result locally is O(11) and bulletproof: we check
+// that the newest returned header equals parentHash and that each consecutive
+// pair is linked via HashPrevBlock → Hash().
+//
+// Empty input and any verification failure surface as a hard error: silently
+// returning 0 would let the caller pass Options.CandidateParentMedianTime=0
+// to the validator, which now rejects post-CSV consensus requests with a
+// missing parent MTP (no tip-MTP soft-fall) — but the error here gives a
+// more precise diagnostic at the source rather than waiting for the
+// validator's downstream rejection.
+//
+// Mirrors bitcoin-sv's CBlockIndex::GetMedianTimePast() for the median
+// computation itself: sorts the gathered timestamps and returns
+// `pbegin[(pend - pbegin) / 2]` — the upper-middle on even counts.
+func candidateParentMedianTimeFromHeaders(parentHash *chainhash.Hash, headers []*model.BlockHeader) (uint32, error) {
+	if len(headers) == 0 {
+		return 0, errors.NewProcessingError("cannot compute median timestamp from zero headers")
+	}
+
+	if parentHash == nil {
+		return 0, errors.NewProcessingError("nil parent hash")
+	}
+
+	// headers are returned newest-first (ORDER BY height DESC). headers[0] must
+	// equal parentHash; each subsequent header must be the parent of the one
+	// before it. Each element is guarded against nil — production paths
+	// (SQL store, gRPC client) do not emit nil entries, but the helper is
+	// meant to hard-fail on bad header data rather than panic.
+	if headers[0] == nil {
+		return 0, errors.NewProcessingError("nil header at depth 0")
+	}
+
+	headHash := headers[0].Hash()
+	if headHash == nil || !headHash.IsEqual(parentHash) {
+		return 0, errors.NewProcessingError("returned chain head does not match requested parent hash (possible reorg between header probe and fetch)")
+	}
+
+	for i := 1; i < len(headers); i++ {
+		if headers[i] == nil {
+			return 0, errors.NewProcessingError("nil header at depth %d", i)
+		}
+
+		prev := headers[i-1].HashPrevBlock
+		cur := headers[i].Hash()
+		if prev == nil || cur == nil || !prev.IsEqual(cur) {
+			return 0, errors.NewProcessingError("parent-chain link broken at depth %d (possible reorg between header probe and fetch)", i)
+		}
+	}
+
+	timestamps := make([]uint32, len(headers))
+	for i, h := range headers {
+		timestamps[i] = h.Timestamp
+	}
+
+	sort.Slice(timestamps, func(i, j int) bool { return timestamps[i] < timestamps[j] })
+
+	return timestamps[len(timestamps)/2], nil
 }
 
 // createUtxos creates all the utxos for the transactions in the block in parallel
@@ -687,14 +968,56 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 	// Merge our blockID into any tx that already existed. Without this, those txs
 	// keep their stale (or empty) BlockIDs and the next block's validOrderAndBlessed
 	// check fails in model/Block.go getParentTxMetaBlockIDs.
+	//
+	// Chunk the merge across a worker pool (#936). A single SetMinedMulti call with
+	// every existing tx in the block overruns the aerospike client connection pool
+	// on fat blocks (e.g. mainnet 755880 = 2.87M txs). Pattern mirrors
+	// stores/utxo/aerospike/longest_chain.go:MarkTransactionsOnLongestChain.
 	if len(existingTxHashes) > 0 {
 		sm.logger.Debugf("[createUtxos] merging blockID %d into %d pre-existing tx(s)", blockID, len(existingTxHashes))
-		if _, err = sm.utxoStore.SetMinedMulti(ctx, existingTxHashes, utxo.MinedBlockInfo{
+
+		batchSize := sm.settings.UtxoStore.MaxMinedBatchSize
+		if batchSize < 1 {
+			batchSize = 1
+		}
+		numChunks := (len(existingTxHashes) + batchSize - 1) / batchSize
+		numWorkers := min(sm.settings.UtxoStore.MaxMinedRoutines, numChunks)
+		if numWorkers < 1 {
+			numWorkers = 1
+		}
+
+		minedBlockInfo := utxo.MinedBlockInfo{
 			BlockID:        blockID,
 			BlockHeight:    blockHeightUint32,
 			SubtreeIdx:     0,
 			OnLongestChain: true,
-		}); err != nil {
+		}
+
+		rangeSize := (len(existingTxHashes) + numWorkers - 1) / numWorkers
+
+		mergeG, mergeCtx := errgroup.WithContext(ctx)
+
+		for w := 0; w < numWorkers && w*rangeSize < len(existingTxHashes); w++ {
+			workerStart := w * rangeSize
+			workerEnd := min(workerStart+rangeSize, len(existingTxHashes))
+			workerHashes := existingTxHashes[workerStart:workerEnd]
+
+			mergeG.Go(func() error {
+				for i := 0; i < len(workerHashes); i += batchSize {
+					if mergeCtx.Err() != nil {
+						return mergeCtx.Err()
+					}
+					chunkEnd := min(i+batchSize, len(workerHashes))
+					chunk := workerHashes[i:chunkEnd]
+					if _, err := sm.utxoStore.SetMinedMulti(mergeCtx, chunk, minedBlockInfo); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		}
+
+		if err = mergeG.Wait(); err != nil {
 			return errors.NewProcessingError("failed to merge blockID into %d pre-existing txs", len(existingTxHashes), err)
 		}
 	}
@@ -702,10 +1025,53 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 	return nil
 }
 
+// reuseBlockIDFromUTXO returns an already-recorded block id for this block by
+// reading the BlockIDs of its first non-coinbase transaction from the UTXO
+// store. This recovers the id after a restart (when the blockchain service's
+// in-memory reservation is gone) or when another ingestion path created the
+// UTXOs first, keeping the committed block id consistent with the UTXO
+// mined-info. Returns ok=false when nothing is recorded yet.
+func (sm *SyncManager) reuseBlockIDFromUTXO(ctx context.Context, block *bsvutil.Block) (uint32, bool) {
+	txs := block.Transactions()
+	if len(txs) < 2 { // index 0 is the coinbase; need a real tx
+		return 0, false
+	}
+	// Use the same tx-hash key shape the UTXO store is keyed by. createUtxos
+	// creates entries from bt.Tx via its TxIDChainHash; bsvutil.Tx.Hash() and
+	// bt.Tx.TxIDChainHash() both resolve to the same 32-byte txid, and both
+	// return *chainhash.Hash from github.com/bsv-blockchain/go-bt/v2/chainhash
+	// — the type utxoStore.Get expects.
+	// We trust BlockIDs[0] as this block's id: the first non-coinbase tx of a
+	// block is created by that block during sync, so the first recorded mined-in
+	// id is this block's. (blockvalidation's quick path keys the same recovery on
+	// its first non-coinbase tx — keep the two in sync if this assumption changes.)
+	meta, err := sm.utxoStore.Get(ctx, txs[1].Hash(), fields.BlockIDs)
+	if err != nil || meta == nil || len(meta.BlockIDs) == 0 {
+		return 0, false
+	}
+	if len(meta.BlockIDs) > 1 {
+		// Normal sync records exactly one mined-in block per fresh tx. More than
+		// one means this tx is referenced by multiple blocks (reorg / re-mine), so
+		// BlockIDs[0] may not be THIS block — surface it loudly rather than risk a
+		// silent mis-assignment that could re-create the phantom-id wedge.
+		sm.logger.Warnf("[reuseBlockIDFromUTXO] tx %s has %d mined-in block ids %v; reusing [0] for block %s — verify if sync stalls",
+			txs[1].Hash().String(), len(meta.BlockIDs), meta.BlockIDs, block.Hash().String())
+	}
+	return meta.BlockIDs[0], true
+}
+
 // PreValidateTransactions pre-validates all the transactions in the block before
 // sending them to subtree validation.
+//
+// candidateBlockTime and candidateParentMedianTime are paired finality-time
+// sources for the consensus path inside the validator (SkipPolicyChecks=true):
+// the former is consumed only when blockHeight < CSVHeight (bitcoin-sv's pre-
+// BIP113 ContextualCheckBlock at src/validation.cpp:6020-6022), the latter
+// only when blockHeight >= CSVHeight (bitcoin-sv's post-BIP113 path at
+// src/validation.cpp:6001). The caller passes the one matching this block's
+// era and zeroes the other.
 func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper],
-	blockHash chainhash.Hash, blockHeight uint32) (err error) {
+	blockHash chainhash.Hash, blockHeight uint32, candidateBlockTime uint32, candidateParentMedianTime uint32) (err error) {
 	_, _, deferFn := tracing.Tracer("netsync").Start(ctx, "PreValidateTransactions",
 		tracing.WithLogMessage(sm.logger, "[PreValidateTransactions] called for block %s / height %d", blockHash, blockHeight),
 		tracing.WithHistogram(prometheusLegacyNetsyncPreValidateTransactions),
@@ -787,6 +1153,14 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 					validator.WithSkipPolicyChecks(true),
 					validator.WithSkipTxMetaPublishing(true),
 					validator.WithCreateConflicting(true),
+					// PreValidateTransactions is only reached via the quickValidationMode
+					// path (see prepareSubtrees → ValidateTransactionsLegacyMode), which
+					// runs only when the block height is at or below the highest
+					// hard-coded checkpoint. PoW + checkpoint linkage establish the chain
+					// as canonical, so re-running BDK scripts is pure overhead.
+					validator.WithSkipScriptValidation(true),
+					validator.WithCandidateBlockTime(candidateBlockTime),
+					validator.WithCandidateParentMedianTime(candidateParentMedianTime),
 				); validateErr != nil {
 					// ErrTxConflicting is expected during legacy catchup when the UTXO store
 					// has stale spending data. The block is confirmed, so its transactions
@@ -838,6 +1212,33 @@ func (sm *SyncManager) PreValidateTransactions(ctx context.Context, txMap *txmap
 		len(pendingTxHashes), totalTxCount, maxRetries)
 }
 
+// classifyAndCountPrewarmError routes a validator error from the pre-warm path
+// (validateTransactions) into the prometheusLegacyNetsyncPrewarmErrors counter
+// and emits a log line at the level appropriate for the class. Pre-warm errors
+// are intentionally dropped — real subtree validation runs later and catches
+// consensus violations on its own — so this helper exists purely to give ops
+// observability into a path that previously silently swallowed every error
+// (see issue #4590).
+func classifyAndCountPrewarmError(logger ulogger.Logger, err error) {
+	switch {
+	case errors.Is(err, errors.ErrTxInvalid):
+		prometheusLegacyNetsyncPrewarmErrors.WithLabelValues("tx_invalid").Inc()
+		logger.Errorf("[validateTransactions][prewarm] critical: tx invalid: %v", err)
+	case errors.Is(err, errors.ErrServiceError):
+		prometheusLegacyNetsyncPrewarmErrors.WithLabelValues("service").Inc()
+		logger.Warnf("[validateTransactions][prewarm] service error (transient): %v", err)
+	case errors.Is(err, errors.ErrTxConflicting), errors.Is(err, errors.ErrTxExists):
+		prometheusLegacyNetsyncPrewarmErrors.WithLabelValues("policy").Inc()
+		logger.Debugf("[validateTransactions][prewarm] expected: %v", err)
+	case errors.Is(err, errors.ErrProcessing):
+		prometheusLegacyNetsyncPrewarmErrors.WithLabelValues("processing").Inc()
+		logger.Warnf("[validateTransactions][prewarm] processing error: %v", err)
+	default:
+		prometheusLegacyNetsyncPrewarmErrors.WithLabelValues("other").Inc()
+		logger.Warnf("[validateTransactions][prewarm] unclassified: %v", err)
+	}
+}
+
 // validateTransactions validates all the transactions in the block in parallel
 // per level. This is done to speed up subtree validation later on.
 // The levels indicate the number of parents in the block.
@@ -846,6 +1247,21 @@ func (sm *SyncManager) validateTransactions(ctx context.Context, maxLevel uint32
 		tracing.WithLogMessage(sm.logger, "[validateTransactions] called for block %s / height %d", block.Hash(), block.Height()),
 		tracing.WithHistogram(prometheusLegacyNetsyncValidateTransactions),
 	)
+
+	// Convert block height once and propagate any failure immediately —
+	// silently dropping the candidate finality fields to zero would defeat
+	// the always-populate rule and hand the validator back to the tip-MTP
+	// race that this code is built to avoid. Mirrors the upfront conversion
+	// in ValidateTransactionsLegacyMode.
+	blockHeightUint32, err := safeconversion.Int32ToUint32(block.Height())
+	if err != nil {
+		return err
+	}
+
+	candidateBlockTime, candidateParentMedianTime, err := sm.candidateFinalityTimesForBlock(ctx, block, blockHeightUint32)
+	if err != nil {
+		return errors.NewProcessingError("[validateTransactions] failed to select finality time sources", err)
+	}
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -859,13 +1275,6 @@ func (sm *SyncManager) validateTransactions(ctx context.Context, maxLevel uint32
 	spendBatcherConcurrency := sm.settings.Legacy.SpendBatcherConcurrency
 
 	var timeStart time.Time
-
-	// Pre-warm the MTP store once before spawning per-transaction goroutines, so each goroutine
-	// can read mtpStore[h] without locking and without making gRPC calls.
-	blockHeightUint32, err := safeconversion.Int32ToUint32(block.Height())
-	if err != nil {
-		return err
-	}
 
 	if err = sm.validationClient.EnsureMTPLoaded(ctx, blockHeightUint32); err != nil {
 		return err
@@ -886,7 +1295,9 @@ func (sm *SyncManager) validateTransactions(ctx context.Context, maxLevel uint32
 
 				timeStart = time.Now()
 
-				_, _ = sm.validationClient.Validate(ctx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true))
+				if _, validateErr := sm.validationClient.Validate(ctx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true), validator.WithCandidateBlockTime(candidateBlockTime), validator.WithCandidateParentMedianTime(candidateParentMedianTime)); validateErr != nil {
+					classifyAndCountPrewarmError(sm.logger, validateErr)
+				}
 
 				prometheusLegacyNetsyncBlockTxValidate.Observe(float64(time.Since(timeStart).Microseconds()) / 1_000_000)
 			}
@@ -912,7 +1323,9 @@ func (sm *SyncManager) validateTransactions(ctx context.Context, maxLevel uint32
 					}
 
 					// send to validation, but only if the parent is not in the same block
-					_, _ = sm.validationClient.Validate(gCtx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true))
+					if _, validateErr := sm.validationClient.Validate(gCtx, blockTxsPerLevel[i][txIdx], blockHeightUint32, validator.WithSkipPolicyChecks(true), validator.WithCandidateBlockTime(candidateBlockTime), validator.WithCandidateParentMedianTime(candidateParentMedianTime)); validateErr != nil {
+						classifyAndCountPrewarmError(sm.logger, validateErr)
+					}
 
 					return nil
 				})
@@ -1058,9 +1471,23 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 		// goroutine.
 		txWrapper.SomeParentsInBlock = true
 
+		// A malformed/hostile block could carry a wrapper without a parsed
+		// parent transaction; fail with a TxInvalidError instead of panicking
+		// on the dereferences below.
+		if prevTxWrapper.Tx == nil {
+			return errors.NewTxInvalidError("tx %s input %d references missing previous transaction %s",
+				tx.TxIDChainHash(), i, prevTxHash)
+		}
+
 		if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
 			return errors.NewTxInvalidError("tx %s input %d references out-of-range output %d on parent %s (has %d outputs)",
 				tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
+		}
+
+		prevOutput := prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex]
+		if prevOutput == nil || prevOutput.LockingScript == nil {
+			return errors.NewTxInvalidError("tx %s input %d previous output %d is nil or has nil locking script (parent %s)",
+				tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash)
 		}
 
 		// Parent's Outputs are populated at wire-parse time and never mutated
@@ -1070,8 +1497,8 @@ func (sm *SyncManager) extendFromTxMap(ctx context.Context, tx *bt.Tx, txMap *tx
 		// (IsExtended checks the parent's *inputs*, not its outputs) and caused
 		// a deadlock under the two-phase flow in extendTransactions, where a
 		// pure-non-local-parent tx only becomes "extended" after phase 2 runs.
-		tx.Inputs[i].PreviousTxSatoshis = prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].Satoshis
-		tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].LockingScript)
+		tx.Inputs[i].PreviousTxSatoshis = prevOutput.Satoshis
+		tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevOutput.LockingScript)
 	}
 
 	return nil
@@ -1104,56 +1531,78 @@ func (sm *SyncManager) extendPerTxFallback(ctx context.Context, txs []*bt.Tx) er
 	return nil
 }
 
-func (sm *SyncManager) createSubtree(ctx context.Context, block *bsvutil.Block, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper],
-	subtree *subtreepkg.Subtree, subtreeData *subtreepkg.Data, subtreeMetaData *subtreepkg.Meta) (err error) {
-	_, _, deferFn := tracing.Tracer("netsync").Start(ctx, "createSubtree",
-		tracing.WithLogMessage(sm.logger, "[createSubtree] called for block %s / height %d", block.Hash(), block.Height()),
+// createSubtrees fills the supplied subtree slices in order with the block's
+// non-coinbase transactions, advancing to the next slice whenever the current
+// one is complete. Subtree 0's first node is the coinbase placeholder (added
+// by prepareSubtrees) so the per-slice fill count is subtreeSize-1 leaves for
+// subtree 0 and subtreeSize for subsequent subtrees (subject to the final
+// subtree's smaller capacity).
+func (sm *SyncManager) createSubtrees(ctx context.Context, block *bsvutil.Block, txMap *txmap.SyncedMap[chainhash.Hash, *TxMapWrapper],
+	subtreeSlices []*subtreepkg.Subtree, subtreeDatas []*subtreepkg.Data, subtreeMetas []*subtreepkg.Meta) (err error) {
+	_, _, deferFn := tracing.Tracer("netsync").Start(ctx, "createSubtrees",
+		tracing.WithLogMessage(sm.logger, "[createSubtrees] called for block %s / height %d", block.Hash(), block.Height()),
 	)
 
-	// Add a defer recover to catch any panics and log them
 	defer func() {
 		if r := recover(); r != nil {
-			err = errors.NewProcessingError("recovered in createSubtree: %v", r, err)
+			err = errors.NewProcessingError("recovered in createSubtrees: %v", r, err)
 		}
 
 		deferFn(err)
 	}()
 
+	currentSubtreeIdx := 0
+
 	for _, wireTx := range block.Transactions() {
 		txHash := *wireTx.Hash()
 
 		// the coinbase transaction is not part of the txMap
-		if txWrapper, found := txMap.Get(txHash); found {
-			tx := txWrapper.Tx
+		txWrapper, found := txMap.Get(txHash)
+		if !found {
+			continue
+		}
 
-			txSize, err := safeconversion.IntToUint64(tx.Size())
-			if err != nil {
-				return err
-			}
+		tx := txWrapper.Tx
 
-			fee, err := calculateTransactionFee(tx)
-			if err != nil {
-				return err
-			}
+		// Advance to the next subtree slot if the current one is full.
+		for currentSubtreeIdx < len(subtreeSlices) && subtreeSlices[currentSubtreeIdx].IsComplete() {
+			currentSubtreeIdx++
+		}
 
-			if err = subtree.AddNode(txHash, fee, txSize); err != nil {
-				return errors.NewTxError("failed to add node (%s) to subtree", txHash, err)
-			}
-			// we need to match the indexes of the subtree and the tx data in subtreeData
-			currentIdx := subtree.Length() - 1
+		if currentSubtreeIdx >= len(subtreeSlices) {
+			return errors.NewSubtreeError("[createSubtrees] no subtree slot remaining for tx %s", txHash.String())
+		}
 
-			// store the extended transaction in our subtree tx data file
-			if err = subtreeData.AddTx(tx, currentIdx); err != nil {
-				return errors.NewTxError("failed to add tx to subtree data", err)
-			}
+		subtree := subtreeSlices[currentSubtreeIdx]
+		subtreeData := subtreeDatas[currentSubtreeIdx]
+		subtreeMeta := subtreeMetas[currentSubtreeIdx]
 
-			if err = subtreeMetaData.SetTxInpointsFromTx(tx); err != nil {
-				return errors.NewTxError("failed to add tx to subtree meta data", err)
-			}
+		txSize, err := safeconversion.IntToUint64(tx.Size())
+		if err != nil {
+			return err
+		}
+
+		fee, err := calculateTransactionFee(tx)
+		if err != nil {
+			return err
+		}
+
+		if err = subtree.AddNode(txHash, fee, txSize); err != nil {
+			return errors.NewTxError("failed to add node (%s) to subtree", txHash, err)
+		}
+
+		nodeIdx := subtree.Length() - 1
+
+		if err = subtreeData.AddTx(tx, nodeIdx); err != nil {
+			return errors.NewTxError("failed to add tx to subtree data", err)
+		}
+
+		if err = subtreeMeta.SetTxInpointsFromTx(tx); err != nil {
+			return errors.NewTxError("failed to add tx to subtree meta data", err)
 		}
 	}
 
-	sm.logger.Infof("[createSubtree] created subtree %s for block %s / height %d", subtree.RootHash(), block.Hash(), block.Height())
+	sm.logger.Infof("[createSubtrees] created %d subtrees for block %s / height %d", len(subtreeSlices), block.Hash(), block.Height())
 
 	return nil
 }
@@ -1213,8 +1662,13 @@ func (sm *SyncManager) createTxMap(ctx context.Context, block *bsvutil.Block, tx
 
 		// don't add the coinbase to the txMap, we cannot process it anyway
 		if !tx.IsCoinbase() {
-			tx.SetTxHash(wireTx.Hash())
-			txMap.Set(*tx.TxIDChainHash(), &TxMapWrapper{Tx: tx})
+			// Copy the hash value out of the bsvutil.Tx wrapper. bt.Tx.SetTxHash
+			// stores the pointer, so passing wireTx.Hash() directly would keep
+			// the wrapping wire.MsgTx (and its decode arena) alive through this
+			// bt.Tx and the TxMapWrapper it lands in.
+			hashCopy := *wireTx.Hash()
+			tx.SetTxHash(&hashCopy)
+			txMap.Set(hashCopy, &TxMapWrapper{Tx: tx})
 		}
 	}
 
@@ -1300,12 +1754,26 @@ func (sm *SyncManager) ExtendTransaction(ctx context.Context, tx *bt.Tx, txMap *
 			g.Go(func() error {
 				txWrapper.SomeParentsInBlock = true
 
+				// A malformed/hostile block could carry a wrapper without a parsed
+				// parent transaction; fail fast instead of panicking on the
+				// dereferences below.
+				if prevTxWrapper.Tx == nil {
+					return errors.NewTxInvalidError("tx %s input %d references missing previous transaction %s",
+						tx.TxIDChainHash(), i, prevTxHash)
+				}
+
 				// Parent Outputs are populated at wire-parse time and never mutated afterwards,
 				// so the bounds check is safe to run before WaitForParent and lets us reject
 				// malformed peer blocks without burning up to 120s on the polling loop.
 				if input.PreviousTxOutIndex >= uint32(len(prevTxWrapper.Tx.Outputs)) {
 					return errors.NewTxInvalidError("tx %s input %d references out-of-range output %d on parent %s (has %d outputs)",
 						tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash, len(prevTxWrapper.Tx.Outputs))
+				}
+
+				prevOutput := prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex]
+				if prevOutput == nil || prevOutput.LockingScript == nil {
+					return errors.NewTxInvalidError("tx %s input %d previous output %d is nil or has nil locking script (parent %s)",
+						tx.TxIDChainHash(), i, input.PreviousTxOutIndex, prevTxHash)
 				}
 
 				// we do have a parent, but since everything is happening in parallel, we need to check if the parent has
@@ -1327,8 +1795,8 @@ func (sm *SyncManager) ExtendTransaction(ctx context.Context, tx *bt.Tx, txMap *
 				}
 
 				// No lock needed - each goroutine writes to a unique index
-				tx.Inputs[i].PreviousTxSatoshis = prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].Satoshis
-				tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevTxWrapper.Tx.Outputs[input.PreviousTxOutIndex].LockingScript)
+				tx.Inputs[i].PreviousTxSatoshis = prevOutput.Satoshis
+				tx.Inputs[i].PreviousTxScript = bscript.NewFromBytes(*prevOutput.LockingScript)
 
 				populatedInputs.Add(1)
 
@@ -1370,8 +1838,16 @@ func (sm *SyncManager) ExtendTransaction(ctx context.Context, tx *bt.Tx, txMap *
 	return nil
 }
 
-// WireTxToGoBtTx converts a wire.Tx to a bt.Tx
-// This does not use the bytes methods, but directly uses the fields of the wire.Tx
+// WireTxToGoBtTx converts a wire.Tx to a bt.Tx.
+//
+// Script bytes are *copied* (not aliased) so the resulting bt.Tx is fully
+// independent of the source wire.MsgBlock's decode arena. This is the
+// load-bearing fix for legacy-sync GC pressure: aliasing kept the arena's
+// 4 MiB chunks reachable for the entire downstream pipeline lifetime
+// (subtree prep, validation, persistence, the orphan goroutine below), so
+// arenas piled up across all in-flight blocks and dominated the live heap.
+// Copying lets the arena and its containing MsgBlock be reclaimed as soon
+// as this function (and any other consumers in HandleBlockDirect) returns.
 func WireTxToGoBtTx(wireTx *bsvutil.Tx, tx *bt.Tx) error {
 	wTx := wireTx.MsgTx()
 
@@ -1386,7 +1862,7 @@ func WireTxToGoBtTx(wireTx *bsvutil.Tx, tx *bt.Tx) error {
 			SequenceNumber:     in.Sequence,
 		}
 		_ = tx.Inputs[i].PreviousTxIDAdd(&in.PreviousOutPoint.Hash)
-		*tx.Inputs[i].UnlockingScript = in.SignatureScript
+		*tx.Inputs[i].UnlockingScript = bytes.Clone(in.SignatureScript)
 	}
 
 	tx.Outputs = make([]*bt.Output, len(wTx.TxOut))
@@ -1395,7 +1871,7 @@ func WireTxToGoBtTx(wireTx *bsvutil.Tx, tx *bt.Tx) error {
 			Satoshis:      uint64(out.Value),
 			LockingScript: &bscript.Script{},
 		}
-		*tx.Outputs[i].LockingScript = out.PkScript
+		*tx.Outputs[i].LockingScript = bytes.Clone(out.PkScript)
 	}
 
 	return nil

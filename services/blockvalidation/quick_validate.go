@@ -8,6 +8,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
@@ -162,6 +163,17 @@ func (u *BlockValidation) buildSubtreeAndQueueWrite(ctx context.Context, block *
 	}, nil
 }
 
+// blockIDToUint32 narrows an assigned (uint64) block id to the uint32 the model
+// uses, erroring instead of silently wrapping — a wrap would alias a different
+// block's id and break the one-id-per-hash idempotency AssignBlockID guarantees.
+func blockIDToUint32(id uint64, blockHash string) (uint32, error) {
+	v, err := safeconversion.Uint64ToUint32(id)
+	if err != nil {
+		return 0, errors.NewProcessingError("[%s] assigned block id %d exceeds uint32", blockHash, id, err)
+	}
+	return v, nil
+}
+
 // quickValidateBlock performs optimized validation for blocks below checkpoints.
 // This follows the legacy sync approach: create all UTXOs first, then validate later.
 // This is safe because checkpoints guarantee these blocks are valid.
@@ -204,12 +216,15 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 			return errors.NewProcessingError("[quickValidateBlock][%s] block ID was not assigned during subtree processing", block.Hash().String())
 		}
 	} else {
-		// No subtrees to process, get next block ID
-		id, err = u.blockchainClient.GetNextBlockID(ctx)
+		// No subtrees to process, assign block ID idempotently
+		id, err = u.blockchainClient.AssignBlockID(ctx, block.Hash())
 		if err != nil {
-			return errors.NewProcessingError("[quickValidateBlock][%s] failed to get next block ID", block.Hash().String(), err)
+			return errors.NewProcessingError("[quickValidateBlock][%s] failed to assign block ID", block.Hash().String(), err)
 		}
-		block.ID = uint32(id) // nolint:gosec
+		block.ID, err = blockIDToUint32(id, block.Hash().String())
+		if err != nil {
+			return err
+		}
 	}
 
 	// add block directly to blockchain
@@ -289,13 +304,16 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 		}
 	}
 
-	// If no block ID was assigned during processing, get next block ID
+	// If no block ID was assigned during processing, assign idempotently
 	if block.ID == 0 {
-		id, err = u.blockchainClient.GetNextBlockID(ctx)
+		id, err = u.blockchainClient.AssignBlockID(ctx, block.Hash())
 		if err != nil {
-			return errors.NewProcessingError("[quickValidateBlockAsync][%s] failed to get next block ID", block.Hash().String(), err)
+			return errors.NewProcessingError("[quickValidateBlockAsync][%s] failed to assign block ID", block.Hash().String(), err)
 		}
-		block.ID = uint32(id) // nolint:gosec
+		block.ID, err = blockIDToUint32(id, block.Hash().String())
+		if err != nil {
+			return err
+		}
 	}
 
 	// add block directly to blockchain
@@ -392,7 +410,10 @@ func (u *BlockValidation) processBlockSubtreesSequential(ctx context.Context, bl
 		}
 
 		// Phase 4: Check for retry and get block ID (only on first batch)
-		// This is specific to quick validation to handle retries gracefully
+		// This is specific to quick validation to handle retries gracefully.
+		// batchTxs[0] is the first non-coinbase tx; its recorded mined-in id is
+		// this block's. The legacy quick path (netsync reuseBlockIDFromUTXO) keys
+		// the same recovery on its first non-coinbase tx — keep them in sync.
 		if !blockIDSet && len(batch.batchTxs) > 0 {
 			existingMeta, err := u.utxoStore.Get(ctx, batch.batchTxs[0].TxIDChainHash(), fields.BlockIDs)
 			if err == nil && existingMeta != nil && len(existingMeta.BlockIDs) > 0 {
@@ -400,11 +421,14 @@ func (u *BlockValidation) processBlockSubtreesSequential(ctx context.Context, bl
 				block.ID = existingMeta.BlockIDs[0]
 				u.logger.Debugf("[processBlockSubtreesSequential][%s] reusing BlockID %d from retry", block.Hash().String(), existingBlockID)
 			} else if block.ID == 0 {
-				id, err := u.blockchainClient.GetNextBlockID(ctx)
+				id, err := u.blockchainClient.AssignBlockID(ctx, block.Hash())
 				if err != nil {
-					return 0, errors.NewProcessingError("[processBlockSubtreesSequential][%s] failed to get block ID", block.Hash().String(), err)
+					return 0, errors.NewProcessingError("[processBlockSubtreesSequential][%s] failed to assign block ID", block.Hash().String(), err)
 				}
-				block.ID = uint32(id) // nolint:gosec
+				block.ID, err = blockIDToUint32(id, block.Hash().String())
+				if err != nil {
+					return 0, err
+				}
 			}
 			blockIDSet = true
 		}
@@ -523,11 +547,14 @@ func (u *BlockValidation) processBlockSubtreesPipeline(ctx context.Context, bloc
 					block.ID = existingMeta.BlockIDs[0]
 					u.logger.Debugf("[processBlockSubtreesPipeline][%s] reusing BlockID %d from retry", block.Hash().String(), existingBlockID)
 				} else if block.ID == 0 {
-					id, err := u.blockchainClient.GetNextBlockID(gCtx)
+					id, err := u.blockchainClient.AssignBlockID(gCtx, block.Hash())
 					if err != nil {
-						return errors.NewProcessingError("[processBlockSubtreesPipeline][%s] failed to get block ID", block.Hash().String(), err)
+						return errors.NewProcessingError("[processBlockSubtreesPipeline][%s] failed to assign block ID", block.Hash().String(), err)
 					}
-					block.ID = uint32(id) // nolint:gosec
+					block.ID, err = blockIDToUint32(id, block.Hash().String())
+					if err != nil {
+						return err
+					}
 				}
 				blockIDSet = true
 			}
@@ -652,11 +679,14 @@ func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context,
 					block.ID = existingMeta.BlockIDs[0]
 					u.logger.Debugf("[processBlockSubtreesPipelineAsync][%s] reusing BlockID %d from retry", block.Hash().String(), existingBlockID)
 				} else if block.ID == 0 {
-					id, err := u.blockchainClient.GetNextBlockID(gCtx)
+					id, err := u.blockchainClient.AssignBlockID(gCtx, block.Hash())
 					if err != nil {
-						return errors.NewProcessingError("[processBlockSubtreesPipelineAsync][%s] failed to get block ID", block.Hash().String(), err)
+						return errors.NewProcessingError("[processBlockSubtreesPipelineAsync][%s] failed to assign block ID", block.Hash().String(), err)
 					}
-					block.ID = uint32(id) // nolint:gosec
+					block.ID, err = blockIDToUint32(id, block.Hash().String())
+					if err != nil {
+						return err
+					}
 				}
 				blockIDSet = true
 			}
@@ -720,8 +750,17 @@ func (u *BlockValidation) validateSubtrees(ctx context.Context, block *model.Blo
 
 // readSubtree reads a single subtree from disk and validates its transactions.
 func (u *BlockValidation) readSubtree(ctx context.Context, block *model.Block, subtreeIdx int, subtreeHash *chainhash.Hash) subtreeResult {
-	// get the subtree from disk, should be in .subtreeToCheck
-	subtreeReader, err := u.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+	// On retry the subtree may already be promoted to FileTypeSubtree (the
+	// "already validated" marker) and FileTypeSubtreeToCheck cleaned up, so
+	// consult both file types — see findLocalSubtreeFile.
+	localFileType, localExists, err := findLocalSubtreeFile(ctx, u.subtreeStore, *subtreeHash)
+	if err != nil {
+		return subtreeResult{err: errors.NewStorageError("[getBlockTransactions][%s] failed to locate subtree %s", block.Hash().String(), subtreeHash.String(), err)}
+	}
+	if !localExists {
+		return subtreeResult{err: errors.NewNotFoundError("[getBlockTransactions][%s] subtree %s not found locally", block.Hash().String(), subtreeHash.String())}
+	}
+	subtreeReader, err := u.subtreeStore.GetIoReader(ctx, subtreeHash[:], localFileType)
 	if err != nil {
 		return subtreeResult{err: errors.NewNotFoundError("[getBlockTransactions][%s] failed to get subtree %s", block.Hash().String(), subtreeHash.String(), err)}
 	}
@@ -783,9 +822,13 @@ func (u *BlockValidation) readSubtree(ctx context.Context, block *model.Block, s
 		}
 	}
 
-	// Check if full .subtree file already exists (for retry scenarios)
-	// This check is done here during prefetch I/O to avoid separate disk access during build phase
-	fullSubtreeExists, _ := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+	// Check if full .subtree file already exists (for retry scenarios). If the
+	// reader above already pulled from FileTypeSubtree we know it's present
+	// without another store round-trip.
+	fullSubtreeExists := localFileType == fileformat.FileTypeSubtree
+	if !fullSubtreeExists {
+		fullSubtreeExists, _ = u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+	}
 
 	return subtreeResult{
 		subtree:           subtree,

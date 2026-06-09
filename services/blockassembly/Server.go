@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -425,10 +426,27 @@ func (ba *BlockAssembly) subtreeStorageWorker(ctx context.Context, workChan <-ch
 			<-allDone
 		}
 
-		// Send error back to caller if channel exists
-		if work.request.ErrChan != nil {
-			work.request.ErrChan <- result.err
-		}
+		// Send error back to caller if channel exists.
+		sendCallerErr(ctx, work.request.ErrChan, result.err)
+	}
+}
+
+// sendCallerErr delivers err on the caller's ErrChan, if any, abandoning the
+// send when ctx is cancelled. ErrChan is unbuffered and its receiver (the
+// SubtreeProcessor) abandons the matching receive on its own context
+// cancellation, so a bare send here would block this worker forever during
+// shutdown — which would hang runNewSubtreeListener's wg.Wait() and deadlock
+// block-assembly shutdown. Dropping the result once ctx is cancelled is safe:
+// the caller is no longer waiting for it. Mirrors the ctx-guarded resultChan
+// send above.
+func sendCallerErr(ctx context.Context, errChan chan error, err error) {
+	if errChan == nil {
+		return
+	}
+
+	select {
+	case errChan <- err:
+	case <-ctx.Done():
 	}
 }
 
@@ -790,6 +808,12 @@ func (ba *BlockAssembly) Start(ctx context.Context, readyCh chan<- struct{}) (er
 
 		// grpcReady channel signals when the gRPC server is ready to accept requests
 		grpcReady = make(chan struct{})
+
+		// grpcStartErr receives startup errors that happen before readiness
+		grpcStartErr = make(chan error, 1)
+
+		// grpcReadyOnce ensures readiness is signaled exactly once
+		grpcReadyOnce sync.Once
 	)
 
 	// Defer closing readyCh to ensure it's always closed, even if startup fails
@@ -803,18 +827,35 @@ func (ba *BlockAssembly) Start(ctx context.Context, readyCh chan<- struct{}) (er
 	g.Go(func() error {
 		// StartGRPCServer blocks until the server shuts down or encounters an error
 		// The server setup includes registering the BlockAssemblyAPI service
-		return util.StartGRPCServer(gCtx, ba.logger, ba.settings, "blockassembly", ba.settings.BlockAssembly.GRPCListenAddress, func(server *grpc.Server) {
+		startErr := util.StartGRPCServer(gCtx, ba.logger, ba.settings, "blockassembly", ba.settings.BlockAssembly.GRPCListenAddress, func(server *grpc.Server) {
 			// Register the BlockAssembly service with the gRPC server
 			// This makes all BlockAssembly API methods available to clients
 			blockassembly_api.RegisterBlockAssemblyAPIServer(server, ba)
 
 			// Signal that the service is ready to accept requests
 			// This is called once the gRPC server is successfully listening
-			grpcReady <- struct{}{}
+			grpcReadyOnce.Do(func() { close(grpcReady) })
 		}, nil)
+		if startErr != nil {
+			// Surface early startup errors to the readiness gate to avoid
+			// hanging forever on <-grpcReady when StartGRPCServer exits
+			// before invoking the registration callback.
+			select {
+			case grpcStartErr <- startErr:
+			default:
+			}
+		}
+
+		return startErr
 	})
 
-	<-grpcReady
+	select {
+	case <-grpcReady:
+	case startErr := <-grpcStartErr:
+		return startErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 
 	// This must succeed for the service to be functional
 	if err = ba.blockAssembler.Start(ctx); err != nil {
@@ -979,22 +1020,18 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("no tx requests in batch"))
 	}
 
-	// Build batch arrays
+	// Build batch arrays — three allocations for the whole batch. Per-tx
+	// TxInpoints values live inline in txInpointsArr so the loop only takes
+	// a pointer (no per-tx heap escape for the TxInpoints struct itself).
 	nodes := make([]subtreepkg.Node, len(requests))
+	txInpointsArr := make([]subtreepkg.TxInpoints, len(requests))
 	txInpointsList := make([]*subtreepkg.TxInpoints, len(requests))
 
-	var err error
+	storeTxInpoints := ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta
 
 	for i, req := range requests {
-		var txInpoints subtreepkg.TxInpoints
-		if ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
-			txInpoints, err = subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
-			if err != nil {
-				return nil, errors.WrapGRPC(errors.NewProcessingError("unable to deserialize tx inpoints", err))
-			}
-		} else {
-			// Create empty TxInpoints if not storing for subtree meta
-			txInpoints = subtreepkg.TxInpoints{}
+		if len(req.Txid) != 32 {
+			return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("invalid txid length at index %d: %d", i, len(req.Txid)))
 		}
 
 		nodes[i] = subtreepkg.Node{
@@ -1002,7 +1039,19 @@ func (ba *BlockAssembly) AddTxBatch(ctx context.Context, batch *blockassembly_ap
 			Fee:         req.Fee,
 			SizeInBytes: req.Size,
 		}
-		txInpointsList[i] = &txInpoints
+
+		if storeTxInpoints {
+			ti, err := subtreepkg.NewTxInpointsFromBytes(req.TxInpoints)
+			if err != nil {
+				return nil, errors.WrapGRPC(errors.NewProcessingError("unable to deserialize tx inpoints", err))
+			}
+
+			txInpointsArr[i] = ti
+		}
+		// else: txInpointsArr[i] stays zero-valued — the empty TxInpoints
+		// behaviour for callers that do not need parent inpoints stored.
+
+		txInpointsList[i] = &txInpointsArr[i]
 	}
 
 	prometheusBlockAssemblyAddTxCounter.Add(float64(len(nodes))) // gosec:nolint
@@ -1077,73 +1126,117 @@ func (ba *BlockAssembly) AddTxBatchColumnar(ctx context.Context, req *blockassem
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("parent_tx_hashes_packed length must be divisible by 32"))
 	}
 
-	totalParentHashes := len(req.ParentTxHashesPacked) / 32
-	if len(req.VoutIdxOffsets) != totalParentHashes+1 {
-		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("vout_idx_offsets must have exactly (total_parent_hashes+1) elements (got %d, expected %d)", len(req.VoutIdxOffsets), totalParentHashes+1))
+	if len(req.VoutIdxsTxOffsets) != txCount+1 {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+			"vout_idxs_tx_offsets must have exactly txCount+1 elements (got %d, expected %d)",
+			len(req.VoutIdxsTxOffsets), txCount+1))
+	}
+
+	totalParents := len(req.ParentTxHashesPacked) / 32
+	voutIdxsLen := len(req.VoutIdxsPacked)
+
+	// Validate the two offset-array endpoints + monotonicity. Without this a
+	// malformed request triggers a slice-bounds-out-of-range panic inside
+	// the per-tx loop, and grpc-go does not recover handler panics — a
+	// single bad packet would crash the entire block-assembly process. The
+	// validator is trusted at the semantic layer, so we do NOT walk the
+	// packed voutIdxs to verify the count-prefix invariant (that walk would
+	// be O(B·P) at 1M+ TPS); we only do what is needed to make every slice
+	// expression in the per-tx loop bounds-safe.
+	//
+	// Cost: O(txCount) comparisons, ~0.1 % of a core at 1M TPS / batch 1000.
+	if req.ParentTxOffsets[0] != 0 {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+			"parent_tx_offsets[0] must be 0, got %d", req.ParentTxOffsets[0]))
+	}
+
+	if req.VoutIdxsTxOffsets[0] != 0 {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+			"vout_idxs_tx_offsets[0] must be 0, got %d", req.VoutIdxsTxOffsets[0]))
+	}
+
+	if int(req.ParentTxOffsets[txCount]) != totalParents {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+			"parent_tx_offsets[txCount]=%d must equal total parent count %d",
+			req.ParentTxOffsets[txCount], totalParents))
+	}
+
+	if int(req.VoutIdxsTxOffsets[txCount]) != voutIdxsLen {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+			"vout_idxs_tx_offsets[txCount]=%d must equal len(vout_idxs_packed)=%d",
+			req.VoutIdxsTxOffsets[txCount], voutIdxsLen))
+	}
+
+	for i := 1; i <= txCount; i++ {
+		if req.ParentTxOffsets[i] < req.ParentTxOffsets[i-1] {
+			return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+				"parent_tx_offsets must be monotonic non-decreasing at index %d (%d < %d)",
+				i, req.ParentTxOffsets[i], req.ParentTxOffsets[i-1]))
+		}
+
+		if req.VoutIdxsTxOffsets[i] < req.VoutIdxsTxOffsets[i-1] {
+			return nil, errors.WrapGRPC(errors.NewInvalidArgumentError(
+				"vout_idxs_tx_offsets must be monotonic non-decreasing at index %d (%d < %d)",
+				i, req.VoutIdxsTxOffsets[i], req.VoutIdxsTxOffsets[i-1]))
+		}
 	}
 
 	if ba.settings.BlockAssembly.Disabled {
 		return &blockassembly_api.AddTxBatchResponse{Ok: true}, nil
 	}
 
-	// Build batch arrays
+	// Build batch arrays — three allocations for the whole batch.
 	nodes := make([]subtreepkg.Node, txCount)
+	txInpointsArr := make([]subtreepkg.TxInpoints, txCount)
 	txInpointsList := make([]*subtreepkg.TxInpoints, txCount)
 
-	// Process each transaction using column-oriented access
+	// Reinterpret the packed parent-hash byte buffer as []chainhash.Hash once
+	// for the whole batch. chainhash.Hash is [32]byte with byte alignment, so
+	// a []byte backing is byte-aligned and safe to reinterpret. Each per-tx
+	// slice of `parents` below is just a slice header — zero allocation.
+	//
+	// Aliasing assumption: proto.Unmarshal decodes `bytes` fields into a fresh
+	// Go-heap allocation (verified for google.golang.org/protobuf v1.36.x's
+	// consumeBytes path). If a future zero-copy codec ever lands that aliases
+	// the gRPC receive buffer into `ParentTxHashesPacked`, this aliasing must
+	// be reconsidered — the receive buffer is freed after handler return,
+	// which would invalidate any TxInpoints we hand off downstream.
+	var parents []chainhash.Hash
+	if totalParents > 0 {
+		parents = unsafe.Slice(
+			(*chainhash.Hash)(unsafe.Pointer(&req.ParentTxHashesPacked[0])),
+			totalParents,
+		)
+	}
+
+	storeTxInpoints := ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta
+
 	for i := 0; i < txCount; i++ {
-		// Extract TXID (32 bytes) - no allocation, just slice reference
+		// Extract TXID (32 bytes) — no allocation, copy into the Node.
 		txidStart := i * 32
-		txid := req.TxidsPacked[txidStart : txidStart+32]
-
-		// Reconstruct TxInpoints from columnar data WITHOUT deserialization
-		// This is the key optimization - we build TxInpoints directly from pre-parsed data
-		parentHashStart := req.ParentTxOffsets[i]
-		parentHashEnd := req.ParentTxOffsets[i+1]
-		numParentHashes := parentHashEnd - parentHashStart
-
-		// Pre-allocate slices with exact capacity to avoid reallocation
-		parentTxHashes := make([]chainhash.Hash, numParentHashes)
-		idxs := make([][]uint32, numParentHashes)
-
-		for j := uint32(0); j < numParentHashes; j++ {
-			parentHashIdx := parentHashStart + j
-
-			// Extract parent hash (32 bytes) - no allocation, direct copy
-			hashOffset := parentHashIdx * 32
-			copy(parentTxHashes[j][:], req.ParentTxHashesPacked[hashOffset:hashOffset+32])
-
-			// Extract vout indices for this parent hash
-			voutIdxStart := req.VoutIdxOffsets[parentHashIdx]
-			voutIdxEnd := req.VoutIdxOffsets[parentHashIdx+1]
-
-			// Reference the vout indices slice directly - no allocation
-			idxs[j] = req.ParentVoutIndices[voutIdxStart:voutIdxEnd]
-		}
-
-		// Build node and txInpoints for this transaction
 		nodes[i] = subtreepkg.Node{
-			Hash:        chainhash.Hash(txid),
+			Hash:        chainhash.Hash(req.TxidsPacked[txidStart : txidStart+32]),
 			Fee:         req.Fees[i],
 			SizeInBytes: req.Sizes[i],
 		}
 
-		if ba.settings.BlockAssembly.StoreTxInpointsForSubtreeMeta {
-			txInpointsList[i] = &subtreepkg.TxInpoints{
-				ParentTxHashes: parentTxHashes,
-				Idxs:           idxs,
-			}
-		} else {
-			txInpointsList[i] = &subtreepkg.TxInpoints{}
+		if storeTxInpoints {
+			// Two slice operations per tx: parent hashes and packed voutIdxs.
+			// Bounds are guaranteed by the offset-array validation above, so
+			// these slice expressions cannot panic.
+			parentSlice := parents[req.ParentTxOffsets[i]:req.ParentTxOffsets[i+1]]
+			voutSlice := req.VoutIdxsPacked[req.VoutIdxsTxOffsets[i]:req.VoutIdxsTxOffsets[i+1]]
+			txInpointsArr[i] = subtreepkg.NewTxInpointsFromPacked(parentSlice, voutSlice)
 		}
+		// else: txInpointsArr[i] is the zero-value TxInpoints, which is the
+		// desired behaviour when not storing inpoints for subtree meta.
+
+		txInpointsList[i] = &txInpointsArr[i]
 	}
 
 	prometheusBlockAssemblyAddTxCounter.Add(float64(len(nodes))) // gosec:nolint
 
-	// Add entire batch in one call
-	if !ba.settings.BlockAssembly.Disabled {
-		ba.blockAssembler.AddTxBatch(nodes, txInpointsList)
-	}
+	ba.blockAssembler.AddTxBatch(nodes, txInpointsList)
 
 	return &blockassembly_api.AddTxBatchResponse{Ok: true}, nil
 }
@@ -1482,13 +1575,44 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 }
 
 func (ba *BlockAssembly) createMerkleTreeFromSubtrees(jobID string, subtreesInJob []*subtreepkg.Subtree, subtreeHashes []chainhash.Hash, coinbaseTxIDHash *chainhash.Hash) (*chainhash.Hash, error) {
+	// Mirror model.Block.CheckMerkleRoot's Length-based lift so blocks produced
+	// here validate after a disk round-trip. The first subtree's Length() is the
+	// canonical full size; if the final subtree is shorter, replace its hash
+	// with the lifted root computed against the first subtree's height.
+	// subtreeHashes is mutated in place because the downstream
+	// computeCoinbaseBUMP call must see the same hashes that the topTree was
+	// built from.
+	if len(subtreesInJob) > 1 {
+		first := subtreesInJob[0]
+		last := subtreesInJob[len(subtreesInJob)-1]
+
+		if last.Length() < first.Length() {
+			liftedRoot, err := last.RootHashPadded(first.Height)
+			if err != nil {
+				return nil, errors.NewProcessingError("[BlockAssembly][%s] failed lifting final subtree", jobID, err)
+			}
+
+			subtreeHashes[len(subtreeHashes)-1] = *liftedRoot
+		}
+	}
+
 	// Create a new subtree with the subtreeHashes of the subtrees
 	topTree, err := subtreepkg.NewTreeByLeafCount(subtreepkg.CeilPowerOfTwo(len(subtreesInJob)))
 	if err != nil {
 		return nil, errors.NewProcessingError("[BlockAssembly][%s] failed to create topTree", jobID, err)
 	}
 
+	// Mirror model.Block.CheckMerkleRoot's CVE-2012-2459-style duplicate detection
+	// so assembly cannot silently emit a block the validator will reject.
+	seen := make(map[chainhash.Hash]struct{}, len(subtreeHashes))
+
 	for _, hash := range subtreeHashes {
+		if _, dup := seen[hash]; dup {
+			return nil, errors.NewProcessingError("[BlockAssembly][%s] duplicate subtree root hash in top-level merkle tree: %s", jobID, hash.String())
+		}
+
+		seen[hash] = struct{}{}
+
 		if err = topTree.AddNode(hash, 1, 0); err != nil {
 			return nil, errors.NewProcessingError("[BlockAssembly][%s] failed to add node to topTree", jobID, err)
 		}
@@ -1767,19 +1891,18 @@ func (ba *BlockAssembly) GetBlockAssemblyState(ctx context.Context, _ *blockasse
 		return nil, errors.NewProcessingError("[GetBlockAssemblyState] error converting subtree count", err)
 	}
 
-	// this will block when the subtree processor is busy with someting else
-	// wait only 1 second for this and continue
-	subtreeHashesChan := make(chan []chainhash.Hash, 1)
-	go func() {
-		subtreeHashesChan <- ba.blockAssembler.subtreeProcessor.GetSubtreeHashes()
-	}()
-
-	var subtreeHashes []chainhash.Hash
-	select {
-	case subtreeHashes = <-subtreeHashesChan:
-		// Successfully retrieved subtree hashes
-	case <-time.After(1 * time.Second):
-		// Timeout occurred, continue with empty slice
+	// Block at most 1s waiting for the SubtreeProcessor main loop to
+	// service the request. GetSubtreeHashes is ctx-aware and uses a
+	// buffered response channel internally so cancellation here cannot
+	// leak a goroutine. Previously this was a `go func` + time.After
+	// pattern that left the spawned goroutine parked on an unbuffered
+	// channel send forever every time the main loop was busy (~224
+	// observed parked on the scaling-2 pod during a moveForwardBlock
+	// stall).
+	subtreeHashesCtx, subtreeHashesCancel := context.WithTimeout(ctx, 1*time.Second)
+	subtreeHashes := ba.blockAssembler.subtreeProcessor.GetSubtreeHashes(subtreeHashesCtx)
+	subtreeHashesCancel()
+	if subtreeHashes == nil {
 		subtreeHashes = []chainhash.Hash{}
 	}
 
@@ -1821,9 +1944,20 @@ func (ba *BlockAssembly) GetBlockAssemblyTxs(ctx context.Context, _ *blockassemb
 	)
 	defer deferFn()
 
-	txHashes := ba.blockAssembler.subtreeProcessor.GetTransactionHashes()
+	txHashes := ba.blockAssembler.subtreeProcessor.GetTransactionHashes(ctx)
+	if txHashes == nil && ctx.Err() != nil {
+		return nil, errors.WrapGRPC(ctx.Err())
+	}
+
 	txHashesStrings := make([]string, 0, len(txHashes))
-	for _, hash := range txHashes {
+	for i, hash := range txHashes {
+		if i%1024 == 0 {
+			select {
+			case <-ctx.Done():
+				return nil, errors.WrapGRPC(ctx.Err())
+			default:
+			}
+		}
 		txHashesStrings = append(txHashesStrings, hash.String())
 	}
 
