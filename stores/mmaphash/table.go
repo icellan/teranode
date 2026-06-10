@@ -21,6 +21,10 @@ const (
 	maxSeg            = 4096  // max independently-locked segments
 	segTarget         = 65536 // ~entries per segment used to pick segment count
 	defaultLoadFactor = 0.5
+	// maxExpected caps Options.Expected far below the ranges where nextPow2
+	// fails to terminate (n > 2^63) or totalSlots*slotSize overflows int64.
+	// 2^44 entries is orders of magnitude beyond any real block.
+	maxExpected = 1 << 44
 )
 
 // nextPow2 returns the smallest power of two >= n (and >= 1). Inputs must be <= 2^63; above that the shift loop never terminates (inputs here are bounded by transaction counts).
@@ -107,6 +111,12 @@ func New(opts Options) (*Table, error) {
 	if opts.ValueSize != 0 && opts.ValueSize != 8 {
 		return nil, errors.NewProcessingError("mmaphash: ValueSize must be 0 or 8, got %d", opts.ValueSize)
 	}
+	// Bound Expected well below the ranges where nextPow2 would not terminate
+	// (n > 2^63) or where totalSlots*slotSize would overflow int64. maxExpected
+	// is far larger than any real block, so this only rejects misconfiguration.
+	if opts.Expected > maxExpected {
+		return nil, errors.NewProcessingError("mmaphash: Expected %d exceeds maximum %d", opts.Expected, uint64(maxExpected))
+	}
 
 	l := computeLayout(opts.Expected, opts.LoadFactor)
 	slotSize := 1 + opts.KeySize + opts.ValueSize
@@ -152,15 +162,17 @@ func New(opts Options) (*Table, error) {
 }
 
 // Close unmaps the region, releasing RSS and reclaiming the file's blocks.
+// t.data is cleared only after a successful munmap, so a failed Close does not
+// lose the mapping reference (a caller could retry); a successful Close is
+// idempotent via the nil guard.
 func (t *Table) Close() error {
 	if t.data == nil {
 		return nil
 	}
-	err := unix.Munmap(t.data)
-	t.data = nil
-	if err != nil {
+	if err := unix.Munmap(t.data); err != nil {
 		return errors.NewStorageError("mmaphash: munmap", err)
 	}
+	t.data = nil
 	return nil
 }
 
@@ -169,9 +181,9 @@ func (t *Table) Len() int64 { return t.count.Load() }
 
 // locate derives the segment index and the in-segment start bucket from the
 // key. Keys are uniformly-random hash output, so raw bytes are used as the
-// hash. Disjoint byte windows avoid correlation between disk routing (done by
-// the caller on key[0:2]), segment selection (key[8:16]), and bucket selection
-// (key[0:8]).
+// hash. The bucket uses key[0:8] and the segment uses key[8:16]; the
+// disk-backed map wrappers route across disks using a further-disjoint window
+// (key[16:18]) so disk selection does not correlate with intra-table placement.
 func (t *Table) locate(key []byte) (segIdx, bucket uint64) {
 	segHash := binary.LittleEndian.Uint64(key[8:16])
 	bucketHash := binary.LittleEndian.Uint64(key[0:8])
@@ -220,6 +232,9 @@ func (t *Table) writeSlot(off int, key []byte, value uint64) {
 // present and the returned value is the stored one. ErrTableFull means the
 // segment is full.
 func (t *Table) Upsert(key []byte, value uint64) (uint64, bool, error) {
+	if len(key) != t.keySize {
+		return 0, false, errors.NewProcessingError("mmaphash: key length %d != table key size %d", len(key), t.keySize)
+	}
 	segIdx, start := t.locate(key)
 	s := &t.segs[segIdx]
 	s.mu.Lock()
@@ -239,6 +254,9 @@ func (t *Table) Upsert(key []byte, value uint64) (uint64, bool, error) {
 
 // Lookup returns (value, found).
 func (t *Table) Lookup(key []byte) (uint64, bool, error) {
+	if len(key) != t.keySize {
+		return 0, false, errors.NewProcessingError("mmaphash: key length %d != table key size %d", len(key), t.keySize)
+	}
 	segIdx, start := t.locate(key)
 	s := &t.segs[segIdx]
 	s.mu.RLock()

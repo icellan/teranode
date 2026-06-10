@@ -293,6 +293,14 @@ func TestTableScale(t *testing.T) {
 	if testing.Short() {
 		t.Skip("scale test skipped under -short")
 	}
+	// The default `make test` target runs every package with -race and a 10m
+	// per-package timeout and does NOT pass -short, so guarding on -short alone
+	// is not enough: 50M race-tracked Upserts blow the timeout (and starve
+	// neighbouring packages) on CI runners. Gate behind an explicit env var,
+	// matching the repo convention for long opt-in tests.
+	if os.Getenv("RUN_MMAPHASH_SCALE") != "true" {
+		t.Skip("scale test skipped; set RUN_MMAPHASH_SCALE=true to run (50M entries, minutes under -race)")
+	}
 	const n = 50_000_000
 	tbl, err := New(Options{Dir: t.TempDir(), Prefix: "scale", KeySize: 36, ValueSize: 0, Expected: n})
 	require.NoError(t, err)
@@ -310,4 +318,27 @@ func TestTableScale(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, found)
 	}
+}
+
+func TestTableRejectsWrongKeySize(t *testing.T) {
+	tbl, err := New(Options{Dir: t.TempDir(), Prefix: "ks", KeySize: 32, ValueSize: 8, Expected: 100})
+	require.NoError(t, err)
+	defer tbl.Close()
+
+	for _, n := range []int{0, 16, 31, 33, 64} {
+		_, _, uErr := tbl.Upsert(make([]byte, n), 0)
+		require.Errorf(t, uErr, "Upsert must reject key length %d", n)
+		_, _, lErr := tbl.Lookup(make([]byte, n))
+		require.Errorf(t, lErr, "Lookup must reject key length %d", n)
+	}
+
+	// exact key size is accepted
+	_, inserted, err := tbl.Upsert(make([]byte, 32), 7)
+	require.NoError(t, err)
+	require.True(t, inserted)
+}
+
+func TestNewRejectsExcessiveExpected(t *testing.T) {
+	_, err := New(Options{Dir: t.TempDir(), Prefix: "big", KeySize: 32, ValueSize: 0, Expected: maxExpected + 1})
+	require.Error(t, err)
 }

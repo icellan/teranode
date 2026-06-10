@@ -81,9 +81,15 @@ func (m *DiskTxMapUint64) Put(hash chainhash.Hash, value uint64) error {
 	return nil
 }
 
-// Get returns (value, found).
+// Get returns (value, found). The txmap.TxMap interface has no error return,
+// so a Lookup error (only possible on an internal misuse such as a wrong key
+// size, which cannot happen here since hash is always 32 bytes) is surfaced as
+// a miss rather than silently returning a bogus value.
 func (m *DiskTxMapUint64) Get(hash chainhash.Hash) (uint64, bool) {
-	v, found, _ := m.tableFor(hash).Lookup(hash[:])
+	v, found, err := m.tableFor(hash).Lookup(hash[:])
+	if err != nil {
+		return 0, false
+	}
 	return v, found
 }
 
