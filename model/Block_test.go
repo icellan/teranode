@@ -5032,6 +5032,7 @@ func TestBlock_ValidOrderAndBlessed_DiskMapDirs(t *testing.T) {
 		})
 	}
 }
+
 // TestCheckMerkleRoot_LiftsIncompleteFinalSubtree verifies that CheckMerkleRoot
 // accepts a block whose final subtree is incomplete by lifting its root to the
 // height of the preceding complete subtrees.
