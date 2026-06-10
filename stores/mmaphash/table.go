@@ -123,6 +123,16 @@ func New(opts Options) (*Table, error) {
 	totalSlots := l.numSeg * l.slotsPerSeg
 	fileBytes := int64(totalSlots) * int64(slotSize)
 
+	// os.CreateTemp does not create parent directories, so ensure Dir exists
+	// first. The Badger-backed implementation this replaced did the equivalent
+	// MkdirAll; without it, configuring block_diskMapDirs to a not-yet-created
+	// path makes every block fail validation. Empty Dir means os.TempDir().
+	if opts.Dir != "" {
+		if err := os.MkdirAll(opts.Dir, 0o700); err != nil {
+			return nil, errors.NewStorageError("mmaphash: create dir %s", opts.Dir, err)
+		}
+	}
+
 	f, err := os.CreateTemp(opts.Dir, opts.Prefix+"-*.mmh")
 	if err != nil {
 		return nil, errors.NewStorageError("mmaphash: create temp file in %s", opts.Dir, err)

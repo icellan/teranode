@@ -342,3 +342,22 @@ func TestNewRejectsExcessiveExpected(t *testing.T) {
 	_, err := New(Options{Dir: t.TempDir(), Prefix: "big", KeySize: 32, ValueSize: 0, Expected: maxExpected + 1})
 	require.Error(t, err)
 }
+
+// TestNewCreatesMissingDir ensures New creates the backing directory (including
+// missing parents) rather than failing — block_diskMapDirs may point at a path
+// that does not exist yet, and os.CreateTemp does not create parent dirs.
+func TestNewCreatesMissingDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "does", "not", "exist", "yet")
+	tbl, err := New(Options{Dir: dir, Prefix: "mk", KeySize: 32, ValueSize: 8, Expected: 100})
+	require.NoError(t, err)
+	defer tbl.Close()
+
+	info, statErr := os.Stat(dir)
+	require.NoError(t, statErr)
+	require.True(t, info.IsDir())
+
+	// table is usable
+	_, inserted, err := tbl.Upsert(mkKey(32, 1), 7)
+	require.NoError(t, err)
+	require.True(t, inserted)
+}
