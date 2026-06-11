@@ -301,3 +301,13 @@ func TestDiskTxMapUint64_ParityWithSwiss(t *testing.T) {
 	}
 	require.Equal(t, mem.Length(), disk.Length())
 }
+
+func TestNewDiskTxMapUint64_RejectsZeroCapacity(t *testing.T) {
+	// Fixed-capacity table: zero FilterCapacity must be rejected up-front, not
+	// silently produce a minimal table that overflows immediately.
+	_, err := NewDiskTxMapUint64(DiskTxMapUint64Options{
+		BasePaths:      []string{t.TempDir()},
+		FilterCapacity: 0,
+	})
+	require.Error(t, err)
+}

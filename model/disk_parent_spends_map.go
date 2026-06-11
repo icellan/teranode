@@ -34,6 +34,11 @@ func NewDiskParentSpendsMap(opts DiskParentSpendsMapOptions) (*DiskParentSpendsM
 	if len(opts.BasePaths) == 0 {
 		return nil, errors.NewProcessingError("DiskParentSpendsMap: at least one base path is required")
 	}
+	// The mmap table is fixed-capacity, so a zero FilterCapacity would build a
+	// minimal table that overflows almost immediately. Fail fast instead.
+	if opts.FilterCapacity == 0 {
+		return nil, errors.NewProcessingError("DiskParentSpendsMap: FilterCapacity must be > 0")
+	}
 	prefix := opts.Prefix
 	if prefix == "" {
 		prefix = "disk-parentspends"

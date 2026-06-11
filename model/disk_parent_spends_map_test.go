@@ -305,3 +305,13 @@ func FuzzDiskParentSpendsMap_Parity(f *testing.F) {
 		}
 	})
 }
+
+func TestNewDiskParentSpendsMap_RejectsZeroCapacity(t *testing.T) {
+	// Fixed-capacity table: zero FilterCapacity must be rejected up-front, not
+	// silently produce a minimal table that overflows immediately.
+	_, err := NewDiskParentSpendsMap(DiskParentSpendsMapOptions{
+		BasePaths:      []string{t.TempDir()},
+		FilterCapacity: 0,
+	})
+	require.Error(t, err)
+}

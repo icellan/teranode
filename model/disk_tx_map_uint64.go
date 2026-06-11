@@ -34,6 +34,11 @@ func NewDiskTxMapUint64(opts DiskTxMapUint64Options) (*DiskTxMapUint64, error) {
 	if len(opts.BasePaths) == 0 {
 		return nil, errors.NewProcessingError("DiskTxMapUint64: at least one base path is required")
 	}
+	// The mmap table is fixed-capacity, so a zero FilterCapacity would build a
+	// minimal table that overflows almost immediately. Fail fast instead.
+	if opts.FilterCapacity == 0 {
+		return nil, errors.NewProcessingError("DiskTxMapUint64: FilterCapacity must be > 0")
+	}
 	prefix := opts.Prefix
 	if prefix == "" {
 		prefix = "disk-txmap"

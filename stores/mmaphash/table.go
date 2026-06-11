@@ -59,7 +59,11 @@ type layout struct {
 // computeLayout picks segment count and per-segment slot count for the
 // expected number of entries and target load factor.
 func computeLayout(expected uint64, loadFactor float64) layout {
-	if loadFactor <= 0 {
+	// A valid load factor is in (0, 1]. Reject <=0, >1 (would undersize),
+	// and NaN/Inf (the !(...) form catches NaN since all comparisons with NaN
+	// are false). Fall back to the safe default rather than producing a table
+	// that overflows unexpectedly at runtime.
+	if !(loadFactor > 0 && loadFactor <= 1) {
 		loadFactor = defaultLoadFactor
 	}
 	numSeg := clampU64(nextPow2(expected/segTarget), 1, maxSeg)

@@ -2,6 +2,7 @@ package mmaphash
 
 import (
 	"encoding/binary"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -62,6 +63,19 @@ func TestComputeLayoutDefaultLoadFactor(t *testing.T) {
 	if c != b {
 		t.Fatalf("negative loadFactor default mismatch: got %+v want %+v", c, b)
 	}
+}
+
+func TestComputeLayoutClampsBadLoadFactor(t *testing.T) {
+	// Any loadFactor outside (0,1] — including NaN/Inf — must fall back to the
+	// default rather than producing an undersized or collapsed table.
+	want := computeLayout(100_000, defaultLoadFactor)
+	for _, lf := range []float64{0, -0.5, 1.0001, 2, math.NaN(), math.Inf(1), math.Inf(-1)} {
+		require.Equalf(t, want, computeLayout(100_000, lf), "loadFactor %v should fall back to default", lf)
+	}
+	// a valid in-range factor is honored (0.25 -> larger table than default 0.5)
+	denser := computeLayout(100_000, 0.25)
+	require.NotEqual(t, want, denser)
+	require.Greater(t, denser.numSeg*denser.slotsPerSeg, want.numSeg*want.slotsPerSeg)
 }
 
 func TestComputeLayoutMinSegSlotsFloor(t *testing.T) {
