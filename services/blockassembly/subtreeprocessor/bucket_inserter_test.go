@@ -43,7 +43,11 @@ func TestBucketInserter_AllHashesInserted(t *testing.T) {
 			defer wg.Done()
 
 			buckets := bucketizeForTest(all[s*perSubtree:(s+1)*perSubtree], m.Buckets())
-			require.NoError(t, ins.submit(buckets))
+			// t.Errorf, not require: this runs in a worker goroutine and
+			// require's FailNow is only safe on the test goroutine.
+			if err := ins.submit(buckets); err != nil {
+				t.Errorf("submit failed: %v", err)
+			}
 		}(s)
 	}
 
@@ -75,7 +79,9 @@ func TestBucketInserter_DuplicateHashesIdempotent(t *testing.T) {
 
 		go func() {
 			defer wg.Done()
-			require.NoError(t, ins.submit(buckets))
+			if err := ins.submit(buckets); err != nil {
+				t.Errorf("submit failed: %v", err)
+			}
 		}()
 	}
 

@@ -127,7 +127,11 @@ func TestSplitSwissMap_FrozenConcurrentReads(t *testing.T) {
 
 		go func(bucket uint16, bucketHashes []chainhash.Hash) {
 			defer buildWg.Done()
-			require.NoError(t, m.PutMultiBucket(bucket, bucketHashes))
+			// t.Errorf, not require: require's FailNow is only safe on the
+			// test goroutine (matches the read goroutines below).
+			if err := m.PutMultiBucket(bucket, bucketHashes); err != nil {
+				t.Errorf("PutMultiBucket failed: %v", err)
+			}
 		}(bucket, bucketHashes)
 	}
 

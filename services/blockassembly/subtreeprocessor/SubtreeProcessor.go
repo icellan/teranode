@@ -5512,7 +5512,11 @@ func (stp *SubtreeProcessor) CreateTransactionMap(ctx context.Context, blockSubt
 	// shape — every subtree goroutine spawning one goroutine per bucket —
 	// serialized on the 1024 bucket mutexes and plateaued at ~15M inserts/s
 	// on a 192-core node).
-	inserter := newBucketInserter(transactionMap, runtime.NumCPU())
+	// GOMAXPROCS(0), not NumCPU(): the inserter workers are CPU-bound, so size
+	// the pool to runnable parallelism. Under a cgroup CPU quota (the normal
+	// container/k8s deployment) NumCPU() reports host cores and would
+	// oversubscribe. Matches map.go and the errgroup limit at line ~2292.
+	inserter := newBucketInserter(transactionMap, runtime.GOMAXPROCS(0))
 
 	g, ctx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(stp.logger, g, concurrentSubtreeReads)
