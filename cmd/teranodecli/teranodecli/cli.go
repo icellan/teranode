@@ -55,6 +55,7 @@ var commandHelp = map[string]string{
 	"subtreebench":            "Benchmark SubtreeProcessor throughput with CPU and memory profiling",
 	"loadunminedbench":        "Benchmark loadUnminedTransactions with CPU and memory profiling",
 	"txmapbench":              "Benchmark CreateTransactionMap with CPU and memory profiling",
+	"foreignblockbench":       "Benchmark foreign-block moveForwardBlock phases (map build + remainder)",
 	"remainderbench":          "Benchmark processRemainderTransactionsAndDequeue with CPU and memory profiling",
 	"monitor":                 "Live TUI dashboard for monitoring node status",
 	"logs":                    "Interactive log viewer with filtering and search",
@@ -488,6 +489,18 @@ func Start(args []string, version, commit string) {
 
 		cmd.Execute = func(args []string) error {
 			return runCreateTxMapBenchmark(*numSubtrees, *txsPerSubtree, *cpuProfile, *memProfile)
+		}
+	case "foreignblockbench":
+		numSubtrees := cmd.FlagSet.Int("subtrees", 100, "Number of block subtrees")
+		txsPerSubtree := cmd.FlagSet.Int("txs-per-subtree", 1_048_576, "Transactions per subtree")
+		overlapPct := cmd.FlagSet.Int("overlap-pct", 95, "Percent of block txs present in the local pool")
+		overhangPct := cmd.FlagSet.Int("overhang-pct", 10, "Local-only txs as percent of block tx count")
+		seed := cmd.FlagSet.Uint64("seed", 42, "Deterministic data seed")
+		cpuProfile := cmd.FlagSet.String("cpu-profile", "foreignblockmove_cpu.prof", "CPU profile output")
+		memProfile := cmd.FlagSet.String("mem-profile", "foreignblockmove_mem.prof", "Memory profile output")
+
+		cmd.Execute = func(args []string) error {
+			return runForeignBlockBenchmark(*numSubtrees, *txsPerSubtree, *overlapPct, *overhangPct, *seed, *cpuProfile, *memProfile)
 		}
 	case "remainderbench":
 		numSubtrees := cmd.FlagSet.Int("subtrees", 100, "Number of subtrees")

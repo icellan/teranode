@@ -66,3 +66,39 @@ func runProcessRemainderBenchmark(numChainedSubtrees, txsPerSubtree int, cpuProf
 
 	return nil
 }
+
+func runForeignBlockBenchmark(numSubtrees, txsPerSubtree, overlapPct, overhangPct int, seed uint64, cpuProfile, memProfile string) error {
+	cfg := subtreeprocessor.ForeignBlockBenchConfig{
+		NumBlockSubtrees: numSubtrees,
+		TxsPerSubtree:    txsPerSubtree,
+		OverlapPct:       overlapPct,
+		PoolOverhangPct:  overhangPct,
+		Seed:             seed,
+	}
+
+	result, err := subtreeprocessor.RunForeignBlockMoveBenchmark(cfg, cpuProfile, memProfile)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("\nForeign Block Move Benchmark Results\n")
+	fmt.Printf("====================================\n")
+	fmt.Printf("Block Transactions:  %d\n", result.BlockTxCount)
+	fmt.Printf("Pool Transactions:   %d\n", result.PoolTxCount)
+	fmt.Printf("Map Build:           %.3fs\n", result.MapBuildElapsed.Seconds())
+	fmt.Printf("Remainder:           %.3fs\n", result.RemainderElapsed.Seconds())
+	fmt.Printf("Total:               %.3fs\n", result.TotalElapsed.Seconds())
+	fmt.Printf("Map Length:          %d\n", result.MapLength)
+	fmt.Printf("Remainder Nodes:     %d\n", result.RemainderCount)
+	fmt.Printf("Alloc Delta:         %d MB\n", result.AllocDeltaMB)
+	fmt.Println()
+	fmt.Printf("Profiles written to:\n")
+	fmt.Printf("  CPU:    %s\n", cpuProfile)
+	fmt.Printf("  Memory: %s\n", memProfile)
+
+	if result.BenchErr != nil {
+		fmt.Printf("\nNote: benchmark returned error: %v\n", result.BenchErr)
+	}
+
+	return nil
+}
