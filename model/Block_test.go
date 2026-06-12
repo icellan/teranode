@@ -1971,7 +1971,7 @@ func TestBlock_ValidOrderAndBlessed_ErrorCases(t *testing.T) {
 			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil, 2)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "txMap is nil")
 	})
@@ -2005,7 +2005,7 @@ func TestBlock_ValidOrderAndBlessed_WithSubtrees(t *testing.T) {
 			oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 		}
 
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil, 2)
 		require.NoError(t, err) // Should succeed with empty subtrees
 	})
 }
@@ -2709,7 +2709,7 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This should now trigger validateSubtree function
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil, 2)
 		// Will likely error due to missing metadata but exercises the validateSubtree path
 		_ = err
 	})
@@ -2770,7 +2770,7 @@ func TestAdditionalCoverageFunctions(t *testing.T) {
 		logger := ulogger.TestLogger{}
 
 		// This exercises more complex validation paths
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil, 2)
 		// Will error but exercises multiple validation functions
 		_ = err
 	})
@@ -2902,7 +2902,7 @@ func TestMaximumCoverageBoost(t *testing.T) {
 		// This should exercise deep validation paths including:
 		// - validateSubtree with multiple nodes
 		// - validateTransaction for each transaction
-		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil)
+		err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, nil, 2)
 		_ = err // Will error but exercises many code paths
 	})
 
@@ -4323,7 +4323,7 @@ func TestBlock_Valid_CoinbasePlaceholderCheck(t *testing.T) {
 		}
 
 		// This should pass validation - coinbase placeholder is in correct position
-		err = block.validOrderAndBlessed(ctx, logger, deps, 1, nil)
+		err = block.validOrderAndBlessed(ctx, logger, deps, 1, nil, 2)
 		// Note: this will likely fail on other validation checks, but it should pass the coinbase placeholder check
 		_ = err
 	})
@@ -4978,7 +4978,7 @@ func BenchmarkBlock_ValidOrderAndBlessed_DiskVsMemory(b *testing.B) {
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					if err := block.validOrderAndBlessed(ctx, logger, deps, concurrency, impl.dirs(b)); err != nil {
+					if err := block.validOrderAndBlessed(ctx, logger, deps, concurrency, impl.dirs(b), 2); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -5027,7 +5027,7 @@ func TestBlock_ValidOrderAndBlessed_DiskMapDirs(t *testing.T) {
 				oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
 			}
 
-			err = block.validOrderAndBlessed(context.Background(), ulogger.TestLogger{}, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, tc.dirs(t))
+			err = block.validOrderAndBlessed(context.Background(), ulogger.TestLogger{}, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, tc.dirs(t), 2)
 			require.NoError(t, err)
 		})
 	}

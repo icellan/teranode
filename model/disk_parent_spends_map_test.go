@@ -315,3 +315,48 @@ func TestNewDiskParentSpendsMap_RejectsZeroCapacity(t *testing.T) {
 	})
 	require.Error(t, err)
 }
+
+// TestDiskParentSpendsMap_SameParentClustering covers ordishs's review point:
+// inpoints that share one parent hash but differ only in output index land in
+// the SAME segment and SAME start bucket (the index lives in key[32:36],
+// outside both the segment window key[8:16] and bucket window key[0:8]), so a
+// consolidation/sweep of many outputs of one parent forms a probe chain in a
+// single segment. This asserts correctness under that clustering: every
+// distinct (hash, index) is inserted exactly once, and re-inserting any is
+// detected as a duplicate — with capacity sized for the load.
+func TestDiskParentSpendsMap_SameParentClustering(t *testing.T) {
+	const n = 20000 // many outputs of ONE parent, all clustering in one segment
+
+	m, err := NewDiskParentSpendsMap(DiskParentSpendsMapOptions{
+		BasePaths:      []string{t.TempDir()},
+		FilterCapacity: n, // size for the clustered load
+	})
+	require.NoError(t, err)
+	defer m.Close()
+
+	var parent chainhash.Hash
+	binary.LittleEndian.PutUint64(parent[0:8], 0xDEADBEEF)
+	binary.LittleEndian.PutUint64(parent[8:16], 0xC0FFEE) // fixes segment+bucket for all
+
+	// First pass: every distinct output index is a new entry.
+	for i := uint64(0); i < n; i++ {
+		got, err := m.SetIfNotExists(subtreepkg.Inpoint{Hash: parent, Index: uint32(i)})
+		require.NoErrorf(t, err, "insert of index %d (same-parent cluster) must not overflow at sized capacity", i)
+		require.Truef(t, got, "index %d should be newly inserted", i)
+	}
+	require.Equal(t, int64(n), m.Stats().Entries)
+
+	// Second pass: every one is now a duplicate (probe chain still resolves correctly).
+	for i := uint64(0); i < n; i++ {
+		got, err := m.SetIfNotExists(subtreepkg.Inpoint{Hash: parent, Index: uint32(i)})
+		require.NoError(t, err)
+		require.Falsef(t, got, "index %d should be detected as duplicate", i)
+	}
+
+	// A different parent (different hash) with the same indices is still distinct.
+	var other chainhash.Hash
+	binary.LittleEndian.PutUint64(other[0:8], 0xFEEDFACE)
+	got, err := m.SetIfNotExists(subtreepkg.Inpoint{Hash: other, Index: 0})
+	require.NoError(t, err)
+	require.True(t, got, "different parent hash must be a distinct entry")
+}
