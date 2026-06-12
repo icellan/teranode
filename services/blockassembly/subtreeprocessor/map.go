@@ -180,7 +180,11 @@ func (s *SplitSwissMap) Clear() {
 	// inserts must succeed.
 	s.frozen.Store(false)
 
-	ncpu := runtime.NumCPU()
+	// GOMAXPROCS(0), not NumCPU(): this parallel clear is bandwidth-bound and
+	// should track runnable parallelism, matching ParallelBulkSetIfNotExists
+	// below and the inserter sizing — under a cgroup CPU quota NumCPU() reports
+	// host cores and oversubscribes.
+	ncpu := runtime.GOMAXPROCS(0)
 	if ncpu > int(s.nrOfBuckets) {
 		ncpu = int(s.nrOfBuckets)
 	}
