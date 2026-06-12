@@ -162,4 +162,7 @@ func (m *DiskTxMapUint64) SetIfNotExists(_ chainhash.Hash, _ uint64) (bool, erro
 func (m *DiskTxMapUint64) PutMulti(_ []chainhash.Hash, _ uint64) error {
 	return errors.NewProcessingError("DiskTxMapUint64: PutMulti not supported")
 }
-func (m *DiskTxMapUint64) Iter(_ func(hash chainhash.Hash, value uint64) bool) {}
+func (m *DiskTxMapUint64) Iter(_ func(hash chainhash.Hash, value uint64) bool) {
+	// No-op: block validation only uses Put/Get/Exists/Length. Iter exists
+	// solely to satisfy the txmap.TxMap interface and is intentionally empty.
+}
