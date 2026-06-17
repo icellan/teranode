@@ -14,8 +14,11 @@ import (
 const (
 	// defaultOverloadRetryMaxElapsed bounds the total time a single wrapper
 	// call may spend retrying overload rejections before the error is
-	// returned to the caller.
-	defaultOverloadRetryMaxElapsed = 30 * time.Second
+	// returned to the caller. Sized to survive the multi-minute sustained
+	// overloads seen during big-output mainnet eras: once the budget is spent
+	// the overload error propagates and the failure path this layer exists to
+	// avoid (mass spend failures → block-validation retry loops) reappears.
+	defaultOverloadRetryMaxElapsed = 2 * time.Minute
 
 	// defaultOverloadRetryBaseBackoff is the first wait between overload
 	// retries; it grows exponentially up to defaultOverloadRetryMaxBackoff.
@@ -145,7 +148,13 @@ func (c *Client) retryOnOverload(do func() aerospike.Error) aerospike.Error {
 
 		start := gocore.CurrentTime()
 
+		// Release the connection permit while we back off: the server isn't
+		// seeing this op during the sleep, so holding the slot only starves
+		// other callers (turning sustained overload into an ErrTimeout storm).
+		// Re-take it (blocking, never timing out) before the retry.
+		c.releasePermit()
 		time.Sleep(wait)
+		c.reacquirePermit()
 
 		backoff = retry.CappedExponentialBackoff(backoff, overloadRetryBackoffFactor, c.overloadRetry.maxBackoff)
 
@@ -189,9 +198,14 @@ func (c *Client) retryBatchOnOverload(records []aerospike.BatchRecordIfc, do fun
 	backoff := c.overloadRetry.baseBackoff
 
 	for attempt := 1; ; attempt++ {
+		// In the partial-overload path the top-level err is nil while the
+		// failed records carry the overload code, so log a representative
+		// error rather than <nil>.
+		logErr := batchOverloadError(err, failed)
+
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			c.logOverloadGiveUp(attempt, err)
+			c.logOverloadGiveUp(attempt, logErr)
 			return batchOverloadError(err, failed)
 		}
 
@@ -203,11 +217,16 @@ func (c *Client) retryBatchOnOverload(records []aerospike.BatchRecordIfc, do fun
 			wait = remaining
 		}
 
-		c.logOverloadRetry(attempt, wait, err)
+		c.logOverloadRetry(attempt, wait, logErr)
 
 		start := gocore.CurrentTime()
 
+		// Release the connection permit while we back off (see retryOnOverload):
+		// holding it during the sleep only starves other callers. Re-take it
+		// (blocking, never timing out) before the retry.
+		c.releasePermit()
 		time.Sleep(wait)
+		c.reacquirePermit()
 
 		backoff = retry.CappedExponentialBackoff(backoff, overloadRetryBackoffFactor, c.overloadRetry.maxBackoff)
 
@@ -257,8 +276,10 @@ func overloadedRecords(records []aerospike.BatchRecordIfc, includeUnfinished boo
 // batchOverloadError picks the error to return when the retry budget is
 // exhausted: the last overload-matching top-level error, else the first
 // still-failed record's error, so the result always Matches an overload code
-// and downstream classification (e.g. the spend circuit breaker) keeps
-// working.
+// and callers can still recognise the outcome as overload. Note the spend
+// circuit breaker no longer treats DEVICE_OVERLOAD as an infrastructure
+// failure (it is owned by this retry layer), so an exhausted-budget overload
+// no longer trips the breaker.
 func batchOverloadError(lastErr aerospike.Error, failed []aerospike.BatchRecordIfc) aerospike.Error {
 	if isOverloadError(lastErr) {
 		return lastErr

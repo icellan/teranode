@@ -199,6 +199,50 @@ func TestRetryOnOverload(t *testing.T) {
 		require.Less(t, elapsed, 250*time.Millisecond, "sleep must be capped to the remaining budget, not the full backoff")
 	})
 
+	t.Run("permit is released during the backoff sleep", func(t *testing.T) {
+		// With a real capacity-1 semaphore, the retry loop must not hold the
+		// permit across its backoff sleep — otherwise sustained overload starves
+		// every other caller into ErrTimeout. do() always reports overload so
+		// the loop runs for the whole budget; a second caller must still be able
+		// to take the permit while the retrier sleeps.
+		c := newOverloadTestClient(600*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond)
+		c.connSemaphore = make(chan struct{}, 1)
+
+		firstCall := make(chan struct{}, 1)
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			// Mirror the wrapper methods: hold a permit for the whole call.
+			_ = c.acquirePermit(nil)
+			defer c.releasePermit()
+
+			_ = c.retryOnOverload(func() aerospike.Error {
+				select {
+				case firstCall <- struct{}{}:
+				default:
+				}
+				return overloadErr(types.DEVICE_OVERLOAD)
+			})
+		}()
+
+		<-firstCall // first attempt done; the loop is now backing off
+
+		select {
+		case c.connSemaphore <- struct{}{}:
+			<-c.connSemaphore // hand it back so the retrier can re-acquire
+		case <-time.After(300 * time.Millisecond):
+			t.Fatal("permit was not released during the backoff sleep (held across retries)")
+		}
+
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("retry did not complete")
+		}
+	})
+
 	t.Run("maxElapsed zero disables retry", func(t *testing.T) {
 		c := newOverloadTestClient(0, time.Millisecond, 4*time.Millisecond)
 

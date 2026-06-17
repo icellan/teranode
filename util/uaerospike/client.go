@@ -160,9 +160,9 @@ type ClientStats struct {
 func NewClientStats() *ClientStats {
 	stat := gocore.NewStat("Aerospike")
 	return &ClientStats{
-		stat:              stat,
-		operateStat:       stat.NewStat("Operate").AddRanges(0, 1, 100, 1_000, 10_000, 100_000),
-		batchOperateStat:  stat.NewStat("BatchOperate").AddRanges(0, 1, 100, 1_000, 10_000, 100_000),
+		stat:             stat,
+		operateStat:      stat.NewStat("Operate").AddRanges(0, 1, 100, 1_000, 10_000, 100_000),
+		batchOperateStat: stat.NewStat("BatchOperate").AddRanges(0, 1, 100, 1_000, 10_000, 100_000),
 		// overloadRetryStat isolates time spent in the overload backoff loop.
 		// The base op stats above are taken at method entry, so during overload
 		// they span the retries too and read above raw server latency; read
@@ -552,6 +552,20 @@ func (c *Client) releasePermit() {
 	}
 
 	<-c.connSemaphore
+}
+
+// reacquirePermit blocks until a connection-semaphore permit is available.
+// Used to re-take the permit after an overload backoff sleep released it
+// (see retryOnOverload). Unlike acquirePermit it never times out: the wait
+// happens while the device is recovering, so surfacing it as ErrTimeout would
+// just convert overload into a timeout storm. No-op when the semaphore is
+// disabled.
+func (c *Client) reacquirePermit() {
+	if c.connSemaphore == nil {
+		return
+	}
+
+	c.connSemaphore <- struct{}{}
 }
 
 // CalculateKeySource generates a key source based on the transaction hash, vout, and batch size.
