@@ -75,6 +75,31 @@ func TestOverloadRetryDefaults(t *testing.T) {
 	})
 }
 
+func TestJitteredBackoff(t *testing.T) {
+	t.Run("non-positive durations are returned unchanged", func(t *testing.T) {
+		require.Equal(t, time.Duration(0), jitteredBackoff(0))
+		require.Equal(t, -time.Second, jitteredBackoff(-time.Second))
+	})
+
+	t.Run("stays within the jitter band and actually varies", func(t *testing.T) {
+		const base = time.Second
+
+		minWait := time.Duration(float64(base) * (1 - overloadRetryJitter))
+		maxWait := time.Duration(float64(base) * (1 + overloadRetryJitter))
+
+		seen := make(map[time.Duration]struct{})
+
+		for i := 0; i < 1000; i++ {
+			got := jitteredBackoff(base)
+			require.GreaterOrEqual(t, got, minWait)
+			require.LessOrEqual(t, got, maxWait)
+			seen[got] = struct{}{}
+		}
+
+		require.Greater(t, len(seen), 1, "jitter must decorrelate retries, not return a constant")
+	})
+}
+
 func TestRetryOnOverload(t *testing.T) {
 	t.Run("success first try calls once", func(t *testing.T) {
 		c := newOverloadTestClient(50*time.Millisecond, time.Millisecond, 4*time.Millisecond)
@@ -151,6 +176,27 @@ func TestRetryOnOverload(t *testing.T) {
 		require.True(t, err.Matches(types.DEVICE_OVERLOAD))
 		require.Greater(t, calls, 1, "should have retried at least once")
 		require.GreaterOrEqual(t, elapsed, 20*time.Millisecond, "should have kept retrying until the budget elapsed")
+	})
+
+	t.Run("sleep is capped to the remaining budget", func(t *testing.T) {
+		// baseBackoff far exceeds maxElapsed: without capping, the first sleep
+		// alone overshoots the budget by the full backoff. The sleep must be
+		// clamped to the time remaining so maxElapsed is a real ceiling on the
+		// wall time spent retrying.
+		c := newOverloadTestClient(20*time.Millisecond, 500*time.Millisecond, 500*time.Millisecond)
+
+		calls := 0
+		start := time.Now()
+		err := c.retryOnOverload(func() aerospike.Error {
+			calls++
+			return overloadErr(types.DEVICE_OVERLOAD)
+		})
+		elapsed := time.Since(start)
+
+		require.NotNil(t, err)
+		require.True(t, err.Matches(types.DEVICE_OVERLOAD))
+		require.Greater(t, calls, 1, "should have retried at least once")
+		require.Less(t, elapsed, 250*time.Millisecond, "sleep must be capped to the remaining budget, not the full backoff")
 	})
 
 	t.Run("maxElapsed zero disables retry", func(t *testing.T) {
@@ -314,6 +360,30 @@ func TestRetryBatchOnOverload(t *testing.T) {
 		require.NotNil(t, err)
 		require.True(t, err.Matches(types.DEVICE_OVERLOAD))
 		require.Greater(t, calls, 1, "should have retried at least once")
+	})
+
+	t.Run("sleep is capped to the remaining budget", func(t *testing.T) {
+		// baseBackoff far exceeds maxElapsed: the per-attempt sleep must be
+		// clamped to the remaining budget so maxElapsed bounds the batch retry
+		// wall time too.
+		c := newOverloadTestClient(20*time.Millisecond, 500*time.Millisecond, 500*time.Millisecond)
+		records := newTestBatchRecords(t, 2)
+
+		calls := 0
+		start := time.Now()
+		err := c.retryBatchOnOverload(records, func(recs []aerospike.BatchRecordIfc) aerospike.Error {
+			calls++
+			for _, rec := range recs {
+				setResult(rec, types.DEVICE_OVERLOAD)
+			}
+			return nil
+		})
+		elapsed := time.Since(start)
+
+		require.NotNil(t, err)
+		require.True(t, err.Matches(types.DEVICE_OVERLOAD))
+		require.Greater(t, calls, 1, "should have retried at least once")
+		require.Less(t, elapsed, 250*time.Millisecond, "sleep must be capped to the remaining budget, not the full backoff")
 	})
 
 	t.Run("maxElapsed zero disables batch retry", func(t *testing.T) {

@@ -1,6 +1,7 @@
 package uaerospike
 
 import (
+	"math/rand/v2"
 	"time"
 
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
@@ -26,6 +27,12 @@ const (
 	// overloadRetryBackoffFactor is the exponential growth factor applied
 	// between overload retries.
 	overloadRetryBackoffFactor = 2.0
+
+	// overloadRetryJitter is the fraction (±25%) by which each backoff sleep
+	// is randomly perturbed. Under overload many operations fail at the same
+	// instant and would otherwise retry in lockstep against an already
+	// struggling server; jitter decorrelates the herd.
+	overloadRetryJitter = 0.25
 )
 
 // overloadResultCodes are the result codes treated as "server overloaded":
@@ -85,6 +92,19 @@ func WithLogger(logger ulogger.Logger) ClientOption {
 	}
 }
 
+// jitteredBackoff returns d scaled by a uniform random factor in
+// [1-overloadRetryJitter, 1+overloadRetryJitter]. Non-positive d is returned
+// unchanged. Callers must still clamp the result to any remaining budget.
+func jitteredBackoff(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+
+	factor := 1 - overloadRetryJitter + rand.Float64()*(2*overloadRetryJitter)
+
+	return time.Duration(float64(d) * factor)
+}
+
 // isOverloadError reports whether err (or any error wrapped inside it) is one
 // of the overload result codes. nil-safe.
 func isOverloadError(err aerospike.Error) bool {
@@ -107,16 +127,25 @@ func (c *Client) retryOnOverload(do func() aerospike.Error) aerospike.Error {
 	backoff := c.overloadRetry.baseBackoff
 
 	for attempt := 1; ; attempt++ {
-		if time.Now().After(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			c.logOverloadGiveUp(attempt, err)
 			return err
 		}
 
-		c.logOverloadRetry(attempt, backoff, err)
+		// Jitter first to decorrelate retrying callers, then clamp: a wait
+		// longer than the time left would push the next attempt beyond
+		// maxElapsed, so it must never exceed the remaining budget.
+		wait := jitteredBackoff(backoff)
+		if wait > remaining {
+			wait = remaining
+		}
+
+		c.logOverloadRetry(attempt, wait, err)
 
 		start := gocore.CurrentTime()
 
-		time.Sleep(backoff)
+		time.Sleep(wait)
 
 		backoff = retry.CappedExponentialBackoff(backoff, overloadRetryBackoffFactor, c.overloadRetry.maxBackoff)
 
@@ -160,16 +189,25 @@ func (c *Client) retryBatchOnOverload(records []aerospike.BatchRecordIfc, do fun
 	backoff := c.overloadRetry.baseBackoff
 
 	for attempt := 1; ; attempt++ {
-		if time.Now().After(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			c.logOverloadGiveUp(attempt, err)
 			return batchOverloadError(err, failed)
 		}
 
-		c.logOverloadRetry(attempt, backoff, err)
+		// Jitter first to decorrelate retrying callers, then clamp: a wait
+		// longer than the time left would push the next attempt beyond
+		// maxElapsed, so it must never exceed the remaining budget.
+		wait := jitteredBackoff(backoff)
+		if wait > remaining {
+			wait = remaining
+		}
+
+		c.logOverloadRetry(attempt, wait, err)
 
 		start := gocore.CurrentTime()
 
-		time.Sleep(backoff)
+		time.Sleep(wait)
 
 		backoff = retry.CappedExponentialBackoff(backoff, overloadRetryBackoffFactor, c.overloadRetry.maxBackoff)
 

@@ -163,6 +163,10 @@ func NewClientStats() *ClientStats {
 		stat:              stat,
 		operateStat:       stat.NewStat("Operate").AddRanges(0, 1, 100, 1_000, 10_000, 100_000),
 		batchOperateStat:  stat.NewStat("BatchOperate").AddRanges(0, 1, 100, 1_000, 10_000, 100_000),
+		// overloadRetryStat isolates time spent in the overload backoff loop.
+		// The base op stats above are taken at method entry, so during overload
+		// they span the retries too and read above raw server latency; read
+		// this stat to separate retry time from server latency.
 		overloadRetryStat: stat.NewStat("OverloadRetry"),
 	}
 }
