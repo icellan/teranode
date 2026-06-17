@@ -43,8 +43,14 @@ type subtreeToCheckExistsStore struct {
 func (s *subtreeToCheckExistsStore) Set(ctx context.Context, key []byte, fileType fileformat.FileType, value []byte, opts ...options.FileOption) error {
 	if fileType == fileformat.FileTypeSubtreeToCheck && bytes.Equal(key, s.targetKey) {
 		s.setAttempts.Add(1)
-		// The concurrent worker's identical write is already present.
-		_ = s.Store.Set(ctx, key, fileType, value, opts...)
+		// The concurrent worker's identical write is already present. Write it
+		// through so the store holds the content the production race would leave
+		// behind, but surface any genuine write failure rather than masking it as
+		// "already exists" — otherwise the test could pass for the wrong reason.
+		if err := s.Store.Set(ctx, key, fileType, value, opts...); err != nil {
+			return err
+		}
+
 		return errors.NewBlobAlreadyExistsError("[File][allowOverwrite] [%x] already exists in store", key)
 	}
 
@@ -132,13 +138,10 @@ func TestCheckBlockSubtrees_SubtreeToCheckAlreadyExists(t *testing.T) {
 
 	// Core contract: a pre-existing content-addressed .subtreeToCheck must never be
 	// the reason the block fails. Pre-fix, CheckBlockSubtrees returns the
-	// "failed to store subtree" / BLOB_EXISTS error and the block is rejected.
-	if err != nil {
-		require.NotContains(t, err.Error(), "failed to store subtree",
-			"BLOB_EXISTS on a content-addressed subtreeToCheck must be treated as benign, not fatal")
-		require.NotContains(t, err.Error(), "already exists in store",
-			"BLOB_EXISTS on a content-addressed subtreeToCheck must be treated as benign, not fatal")
-	}
+	// "failed to store subtreeToCheck" / BLOB_EXISTS error and the block is rejected;
+	// post-fix the block validates cleanly, so assert success directly.
+	require.NoError(t, err,
+		"BLOB_EXISTS on a content-addressed subtreeToCheck must be treated as benign, not fatal")
 
 	require.Positive(t, wrapped.setAttempts.Load(),
 		"test must actually exercise the subtreeToCheck store path (else it proves nothing)")
