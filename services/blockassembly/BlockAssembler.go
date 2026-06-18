@@ -703,9 +703,11 @@ func (b *BlockAssembler) processNewBlockAnnouncement(ctx context.Context) {
 	ctxLogger.Debugf("[BlockAssembler] best block header according to block assembly : %d: %s", bestBlockAccordingToBlockAssemblyHeight, bestBlockAccordingToBlockAssembly.Hash())
 
 	// Publish how far block assembly is behind the chain tip so a stall is alertable
-	// without a human watching external chain-tip monitoring (issue #980, Bug B). The
-	// gauge stays elevated whenever a failure path below returns early; it is reset to
-	// zero on the successful-advance path at the end of this function.
+	// without a human watching external chain-tip monitoring (issue #980, Bug B). This
+	// is a pure height delta: it stays elevated while BA lags on a normal catch-up and
+	// is reset to zero on the successful-advance path at the end of this function. It
+	// reads 0 for an equal-height reorg stall (tip hash differs but height matches) —
+	// processing_stuck_total{reason} is the signal for that case.
 	if lag := int64(bestBlockchainBlockHeaderMeta.Height) - int64(bestBlockAccordingToBlockAssemblyHeight); lag > 0 {
 		prometheusBlockAssemblyTipLagBlocks.Set(float64(lag))
 	} else {
@@ -962,8 +964,9 @@ func (b *BlockAssembler) initState(ctx context.Context) error {
 				return errors.NewProcessingError("[BlockAssembler] refusing to start: no persisted BlockAssembler state but chain is at height %d (past genesis); adopting the tip would skip coinbase UTXO creation for blocks below it and corrupt the UTXO set — reseed BlockAssembler state or rebuild", meta.Height)
 			}
 
-			hash, _ := b.CurrentBlock()
-			b.logger.Infof("[BlockAssembler] setting best block header from GetBestBlockHeader: %s", hash.Hash())
+			// Log the header we are adopting (genesis here). b.CurrentBlock() is still
+			// unset on this path, so logging it would nil-deref.
+			b.logger.Infof("[BlockAssembler] setting best block header from GetBestBlockHeader: %s", header.Hash())
 			b.setBestBlockHeader(header, meta.Height)
 			b.subtreeProcessor.InitCurrentBlockHeader(header)
 		}
