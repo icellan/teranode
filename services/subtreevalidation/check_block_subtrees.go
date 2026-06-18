@@ -1225,11 +1225,12 @@ var prefetchParentBaseFields = []fields.FieldName{fields.BlockIDs, fields.BlockH
 //
 // It deduplicates shared parents — a fan-out level (one funding tx, many
 // children) reads that parent ONCE instead of once per child — and batches the
-// reads. Parents that the store does not resolve are omitted: the validator
-// falls back to a per-parent Get for them, which preserves the existing
-// missing-parent (ErrTxNotFound → deferred revalidation) handling. A genuine
-// store read error is returned so the caller aborts — the bulk read is an
-// optimization, never an authority, but a DB failure must halt, not be swallowed.
+// reads. Parents the store reports as not-found (ErrTxNotFound) are omitted: the
+// validator falls back to a per-parent Get for them, which preserves the existing
+// missing-parent → deferred-revalidation handling. Any other per-item read error
+// — or a function-level error from BatchDecorate — aborts: the bulk read is an
+// optimization, never an authority, but a DB failure must halt, not be silently
+// downgraded to a fallback Get that masks it.
 func (u *Server) prefetchLevelParents(ctx context.Context, levelTxs []missingTx) (map[chainhash.Hash]*meta.Data, error) {
 	distinct := make(map[chainhash.Hash]struct{})
 
@@ -1299,9 +1300,23 @@ func (u *Server) prefetchLevelParents(ctx context.Context, levelTxs []missingTx)
 	result := make(map[chainhash.Hash]*meta.Data, len(items))
 
 	for _, item := range items {
-		// Omit not-found / per-item errors: the validator falls back to a
-		// per-parent Get, preserving missing-parent handling.
-		if item.Data != nil && item.Err == nil {
+		if item.Err != nil {
+			// BatchDecorate reports per-record failures on item.Err while returning
+			// a nil function error (the Aerospike contract). A genuine not-found is
+			// expected — the parent lives in a later batch (cross-subtree) — so we
+			// omit it and let the validator fall back to a per-parent Get, preserving
+			// the missing-parent / deferred-revalidation path. Any OTHER per-item
+			// error (store timeout, external-store read failure, decode error) is a
+			// real DB failure: it must halt the level, never be silently downgraded
+			// to a fallback Get that would mask the failure and amplify reads.
+			if errors.Is(item.Err, errors.ErrTxNotFound) {
+				continue
+			}
+
+			return nil, errors.NewStorageError("[prefetchLevelParents] failed to read parent %s", item.Hash, item.Err)
+		}
+
+		if item.Data != nil {
 			result[item.Hash] = item.Data
 		}
 	}

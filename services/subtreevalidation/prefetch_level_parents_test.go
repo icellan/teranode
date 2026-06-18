@@ -7,6 +7,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -23,6 +24,9 @@ type recordingParentStore struct {
 	requested []chainhash.Hash
 	fields    []fields.FieldName
 	resolve   map[chainhash.Hash]*meta.Data
+	// itemErrs models the Aerospike contract: BatchDecorate returns a nil
+	// function error but records per-record failures on item.Err.
+	itemErrs map[chainhash.Hash]error
 }
 
 func (s *recordingParentStore) BatchDecorate(_ context.Context, items []*utxostore.UnresolvedMetaData, f ...fields.FieldName) error {
@@ -33,6 +37,10 @@ func (s *recordingParentStore) BatchDecorate(_ context.Context, items []*utxosto
 
 	for _, it := range items {
 		s.requested = append(s.requested, it.Hash)
+		if err, ok := s.itemErrs[it.Hash]; ok {
+			it.Err = err
+			continue
+		}
 		if d, ok := s.resolve[it.Hash]; ok {
 			it.Data = d
 		}
@@ -198,4 +206,68 @@ func Test_prefetchLevelParents_IncludesTxWhenAnyNonExtended(t *testing.T) {
 
 	require.True(t, store.hasField(fields.Tx),
 		"fields.Tx must be fetched when any tx in the level is non-extended")
+}
+
+// Test_prefetchLevelParents_OmitsNotFoundParent proves a genuine not-found
+// parent (the cross-subtree parent that lives in a later batch) is omitted from
+// the result map, NOT treated as an error — the validator falls back to a
+// per-parent Get and the existing missing-parent deferral handles it.
+func Test_prefetchLevelParents_OmitsNotFoundParent(t *testing.T) {
+	ctx := context.Background()
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	foundHex := "0000000000000000000000000000000000000000000000000000000000000001"
+	missingHex := "0000000000000000000000000000000000000000000000000000000000000002"
+
+	levelTxs := []missingTx{
+		{tx: mkExtendedTx(t, foundHex, 0), idx: 0},
+		{tx: mkExtendedTx(t, missingHex, 0), idx: 1},
+	}
+
+	found := *levelTxs[0].tx.Inputs[0].PreviousTxIDChainHash()
+	missing := *levelTxs[1].tx.Inputs[0].PreviousTxIDChainHash()
+
+	store := &recordingParentStore{
+		MockUtxostore: &utxostore.MockUtxostore{},
+		resolve:       map[chainhash.Hash]*meta.Data{found: {BlockHeights: []uint32{100}}},
+		itemErrs:      map[chainhash.Hash]error{missing: errors.NewTxNotFoundError("%v not found", missing)},
+	}
+	server.utxoStore = store
+
+	prefetched, err := server.prefetchLevelParents(ctx, levelTxs)
+	require.NoError(t, err, "a not-found parent must not abort the bulk read")
+	require.NotNil(t, prefetched[found])
+	require.Nil(t, prefetched[missing], "not-found parent must be omitted so the validator falls back to Get")
+}
+
+// Test_prefetchLevelParents_AbortsOnRealItemError proves the halt-on-DB-error
+// contract: a per-item error that is NOT a not-found (a store timeout,
+// external-store read failure, decode error — all reported on item.Err while
+// BatchDecorate returns nil) must abort the level, never be silently downgraded
+// to a fallback Get that masks the partial DB failure.
+func Test_prefetchLevelParents_AbortsOnRealItemError(t *testing.T) {
+	ctx := context.Background()
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	failingHex := "0000000000000000000000000000000000000000000000000000000000000003"
+
+	levelTxs := []missingTx{
+		{tx: mkExtendedTx(t, failingHex, 0), idx: 0},
+	}
+
+	failing := *levelTxs[0].tx.Inputs[0].PreviousTxIDChainHash()
+
+	store := &recordingParentStore{
+		MockUtxostore: &utxostore.MockUtxostore{},
+		itemErrs:      map[chainhash.Hash]error{failing: errors.NewStorageError("aerospike timeout")},
+	}
+	server.utxoStore = store
+
+	_, err := server.prefetchLevelParents(ctx, levelTxs)
+	require.Error(t, err, "a real per-item store error must abort the level, not be swallowed")
+	require.True(t, errors.Is(err, errors.ErrStorageError), "abort must surface as a storage error")
 }
