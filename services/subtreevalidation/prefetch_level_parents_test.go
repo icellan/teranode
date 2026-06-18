@@ -21,12 +21,15 @@ type recordingParentStore struct {
 
 	mu        sync.Mutex
 	requested []chainhash.Hash
+	fields    []fields.FieldName
 	resolve   map[chainhash.Hash]*meta.Data
 }
 
-func (s *recordingParentStore) BatchDecorate(_ context.Context, items []*utxostore.UnresolvedMetaData, _ ...fields.FieldName) error {
+func (s *recordingParentStore) BatchDecorate(_ context.Context, items []*utxostore.UnresolvedMetaData, f ...fields.FieldName) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.fields = f
 
 	for _, it := range items {
 		s.requested = append(s.requested, it.Hash)
@@ -36,6 +39,19 @@ func (s *recordingParentStore) BatchDecorate(_ context.Context, items []*utxosto
 	}
 
 	return nil
+}
+
+func (s *recordingParentStore) hasField(want fields.FieldName) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, f := range s.fields {
+		if f == want {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Test_prefetchLevelParents_DedupsSharedParent proves the Phase-1 win: when a
@@ -90,4 +106,96 @@ func Test_prefetchLevelParents_DedupsSharedParent(t *testing.T) {
 	// not once per child (which would be 6).
 	require.Len(t, store.requested, 2,
 		"shared parent must be read once per level, not once per child")
+}
+
+// mkExtendedTx builds a fully-extended single-input tx (From sets the input's
+// PreviousTxScript, which is what IsExtended checks).
+func mkExtendedTx(t *testing.T, parentHex string, vout uint32) *bt.Tx {
+	t.Helper()
+
+	const lockingScript = "76a914000000000000000000000000000000000000000088ac"
+
+	tx := bt.NewTx()
+	require.NoError(t, tx.From(parentHex, vout, lockingScript, 1000))
+
+	return tx
+}
+
+// mkNonExtendedTx builds the same tx but clears the input's PreviousTxScript so
+// IsExtended reports false — the validator would then need fields.Tx to extend it.
+func mkNonExtendedTx(t *testing.T, parentHex string, vout uint32) *bt.Tx {
+	t.Helper()
+
+	tx := mkExtendedTx(t, parentHex, vout)
+	tx.Inputs[0].PreviousTxScript = nil
+	require.False(t, tx.IsExtended())
+
+	return tx
+}
+
+// Test_prefetchLevelParents_OmitsTxWhenAllExtended proves the fields-gating fix:
+// when every tx in the level is already extended (e.g. extended via in-block
+// parents), the validator never requests fields.Tx for any parent, so the bulk
+// prefetch must not fetch it either — fetching Tx would trigger a needless
+// external-store round-trip per distinct parent.
+func Test_prefetchLevelParents_OmitsTxWhenAllExtended(t *testing.T) {
+	ctx := context.Background()
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	parentHex := "0000000000000000000000000000000000000000000000000000000000000001"
+
+	levelTxs := []missingTx{
+		{tx: mkExtendedTx(t, parentHex, 0), idx: 0},
+		{tx: mkExtendedTx(t, parentHex, 1), idx: 1},
+	}
+
+	parent := *levelTxs[0].tx.Inputs[0].PreviousTxIDChainHash()
+
+	store := &recordingParentStore{
+		MockUtxostore: &utxostore.MockUtxostore{},
+		resolve:       map[chainhash.Hash]*meta.Data{parent: {BlockHeights: []uint32{100}}},
+	}
+	server.utxoStore = store
+
+	_, err := server.prefetchLevelParents(ctx, levelTxs)
+	require.NoError(t, err)
+
+	require.True(t, store.hasField(fields.BlockIDs), "BlockIDs is always needed")
+	require.True(t, store.hasField(fields.BlockHeights), "BlockHeights is always needed")
+	require.False(t, store.hasField(fields.Tx),
+		"fields.Tx must be omitted when every tx in the level is already extended")
+}
+
+// Test_prefetchLevelParents_IncludesTxWhenAnyNonExtended proves the other side
+// of the gate: a single non-extended tx in the level means the validator will
+// extend it from the parent outputs, so the prefetch must carry fields.Tx.
+func Test_prefetchLevelParents_IncludesTxWhenAnyNonExtended(t *testing.T) {
+	ctx := context.Background()
+
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	parentHex := "0000000000000000000000000000000000000000000000000000000000000001"
+
+	// One extended, one non-extended — the level still needs Tx for the latter.
+	levelTxs := []missingTx{
+		{tx: mkExtendedTx(t, parentHex, 0), idx: 0},
+		{tx: mkNonExtendedTx(t, parentHex, 1), idx: 1},
+	}
+
+	parent := *levelTxs[0].tx.Inputs[0].PreviousTxIDChainHash()
+
+	store := &recordingParentStore{
+		MockUtxostore: &utxostore.MockUtxostore{},
+		resolve:       map[chainhash.Hash]*meta.Data{parent: {BlockHeights: []uint32{100}}},
+	}
+	server.utxoStore = store
+
+	_, err := server.prefetchLevelParents(ctx, levelTxs)
+	require.NoError(t, err)
+
+	require.True(t, store.hasField(fields.Tx),
+		"fields.Tx must be fetched when any tx in the level is non-extended")
 }

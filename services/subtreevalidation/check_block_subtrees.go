@@ -1212,11 +1212,12 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 // buildParentMapFromLevel builds a hash map of all transactions in a level for quick parent lookups.
 // This map is built ONCE per level and reused for all child transactions in the next level,
 // avoiding O(n²) complexity from rebuilding the map for every child transaction.
-// prefetchParentFields are the metadata fields a bulk parent read must fetch to
-// stand in for the validator's per-parent Get: block IDs/heights (for the
-// unconfirmed-parent sentinel + height resolution) plus the parent tx outputs
-// (needed to extend a non-extended child's inputs).
-var prefetchParentFields = []fields.FieldName{fields.BlockIDs, fields.BlockHeights, fields.Tx}
+// prefetchParentBaseFields are the metadata fields a bulk parent read always
+// fetches to stand in for the validator's per-parent Get: block IDs/heights, for
+// the unconfirmed-parent sentinel + height resolution. The parent tx outputs
+// (fields.Tx) are appended only when the level has a non-extended tx — see
+// prefetchLevelParents.
+var prefetchParentBaseFields = []fields.FieldName{fields.BlockIDs, fields.BlockHeights}
 
 // prefetchLevelParents bulk-reads the distinct parent transactions referenced by
 // a level's transactions and returns them keyed by parent hash, for
@@ -1232,9 +1233,21 @@ var prefetchParentFields = []fields.FieldName{fields.BlockIDs, fields.BlockHeigh
 func (u *Server) prefetchLevelParents(ctx context.Context, levelTxs []missingTx) (map[chainhash.Hash]*meta.Data, error) {
 	distinct := make(map[chainhash.Hash]struct{})
 
+	// Mirror the validator's per-tx `extend := !tx.IsExtended()` decision at the
+	// level grain: only fetch the parent tx outputs (fields.Tx) if at least one tx
+	// in this level still needs extending. A fully-extended level (e.g. all inputs
+	// extended via extendTxWithInBlockParents) resolves heights from
+	// BlockIDs/BlockHeights alone, so fetching Tx would force a needless
+	// external-store round-trip per distinct parent.
+	needTx := false
+
 	for _, mTx := range levelTxs {
 		if mTx.tx == nil {
 			continue
+		}
+
+		if !mTx.tx.IsExtended() {
+			needTx = true
 		}
 
 		for _, in := range mTx.tx.Inputs {
@@ -1249,6 +1262,11 @@ func (u *Server) prefetchLevelParents(ctx context.Context, levelTxs []missingTx)
 
 	if len(distinct) == 0 {
 		return nil, nil
+	}
+
+	prefetchFields := prefetchParentBaseFields
+	if needTx {
+		prefetchFields = append(append([]fields.FieldName(nil), prefetchParentBaseFields...), fields.Tx)
 	}
 
 	items := make([]*utxostore.UnresolvedMetaData, 0, len(distinct))
@@ -1270,7 +1288,7 @@ func (u *Server) prefetchLevelParents(ctx context.Context, levelTxs []missingTx)
 
 		g.Go(func() error {
 			end := subtreepkg.Min(i+batchSize, len(items))
-			return u.utxoStore.BatchDecorate(gCtx, items[i:end], prefetchParentFields...)
+			return u.utxoStore.BatchDecorate(gCtx, items[i:end], prefetchFields...)
 		})
 	}
 
