@@ -117,9 +117,10 @@ func isOverloadError(err aerospike.Error) bool {
 // retryOnOverload runs do, retrying with capped exponential backoff while it
 // keeps failing with an overload result code, until the configured maxElapsed
 // budget is spent. Any other outcome — success or a non-overload error — is
-// returned immediately. The connection-semaphore permit is held by the caller
-// for the whole loop on purpose: an overloaded server should see fewer new
-// operations, not more.
+// returned immediately. The connection-semaphore permit is released during
+// each backoff sleep and re-acquired before the retry: the server isn't
+// seeing the op while we sleep, so holding the slot would only starve other
+// callers (see the loop body and reacquirePermit).
 func (c *Client) retryOnOverload(do func() aerospike.Error) aerospike.Error {
 	err := do()
 	if err == nil || !isOverloadError(err) || !c.overloadRetry.enabled() {
@@ -189,6 +190,12 @@ func (c *Client) retryBatchOnOverload(records []aerospike.BatchRecordIfc, do fun
 		return err
 	}
 
+	// The initial top-level outcome. A BATCH_FAILED here may carry a mix of
+	// overload and non-overload per-record failures; only the overload subset
+	// is retried, so this is preserved to re-surface the signal if a
+	// non-overload failure outlives the retries (see the success exit below).
+	firstErr := err
+
 	failed := overloadedRecords(records, isOverloadError(err))
 	if len(failed) == 0 {
 		return err
@@ -247,6 +254,15 @@ func (c *Client) retryBatchOnOverload(records []aerospike.BatchRecordIfc, do fun
 				return err
 			}
 
+			// The retried subset is clean, but if the initial call reported
+			// BATCH_FAILED and a non-overload per-record failure still remains
+			// — on a record that was never part of the overloaded subset — that
+			// top-level signal must be preserved, or callers that check only the
+			// top-level error would read the partial success as a full success.
+			if firstErr != nil && firstErr.Matches(types.BATCH_FAILED) && hasResidualNonOverloadFailure(records) {
+				return firstErr
+			}
+
 			return nil
 		}
 	}
@@ -271,6 +287,20 @@ func overloadedRecords(records []aerospike.BatchRecordIfc, includeUnfinished boo
 	}
 
 	return failed
+}
+
+// hasResidualNonOverloadFailure reports whether any record still carries a
+// non-overload error. Used at the batch success exit to detect a genuine
+// per-record failure that outlived the overload retries (it was never part of
+// the retried overloaded subset).
+func hasResidualNonOverloadFailure(records []aerospike.BatchRecordIfc) bool {
+	for _, rec := range records {
+		if recErr := rec.BatchRec().Err; recErr != nil && !isOverloadError(recErr) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // batchOverloadError picks the error to return when the retry budget is

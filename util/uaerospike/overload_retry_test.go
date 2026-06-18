@@ -430,6 +430,40 @@ func TestRetryBatchOnOverload(t *testing.T) {
 		require.Less(t, elapsed, 250*time.Millisecond, "sleep must be capped to the remaining budget, not the full backoff")
 	})
 
+	t.Run("mixed batch preserves BATCH_FAILED when a non-overload record stays failed", func(t *testing.T) {
+		// First call reports a top-level BATCH_FAILED carrying one overloaded
+		// record and one genuinely-failed non-overload record. The overloaded
+		// subset retries to success, but the non-overload failure remains — the
+		// original BATCH_FAILED must NOT be swallowed, or top-level-only callers
+		// would read it as success.
+		c := newOverloadTestClient(time.Second, time.Millisecond, 4*time.Millisecond)
+		records := newTestBatchRecords(t, 3)
+
+		calls := 0
+		err := c.retryBatchOnOverload(records, func(recs []aerospike.BatchRecordIfc) aerospike.Error {
+			calls++
+
+			if calls == 1 {
+				setResult(records[0], types.DEVICE_OVERLOAD)
+				setResult(records[1], types.FILTERED_OUT)
+				setResult(records[2], types.OK)
+				return overloadErr(types.BATCH_FAILED)
+			}
+
+			// Retry of the overloaded subset succeeds.
+			for _, rec := range recs {
+				setResult(rec, types.OK)
+			}
+			return nil
+		})
+
+		require.NotNil(t, err, "must not swallow BATCH_FAILED while a non-overload record is still failed")
+		require.True(t, err.Matches(types.BATCH_FAILED))
+		require.Equal(t, 2, calls)
+		require.Equal(t, types.OK, records[0].BatchRec().ResultCode, "overloaded record retried to success")
+		require.Equal(t, types.FILTERED_OUT, records[1].BatchRec().ResultCode, "non-overload failure preserved on the record")
+	})
+
 	t.Run("maxElapsed zero disables batch retry", func(t *testing.T) {
 		c := newOverloadTestClient(0, time.Millisecond, 4*time.Millisecond)
 		records := newTestBatchRecords(t, 2)
