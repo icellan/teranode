@@ -1209,9 +1209,6 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	return nil
 }
 
-// buildParentMapFromLevel builds a hash map of all transactions in a level for quick parent lookups.
-// This map is built ONCE per level and reused for all child transactions in the next level,
-// avoiding O(n²) complexity from rebuilding the map for every child transaction.
 // prefetchParentBaseFields are the metadata fields a bulk parent read always
 // fetches to stand in for the validator's per-parent Get: block IDs/heights, for
 // the unconfirmed-parent sentinel + height resolution. The parent tx outputs
@@ -1324,6 +1321,9 @@ func (u *Server) prefetchLevelParents(ctx context.Context, levelTxs []missingTx)
 	return result, nil
 }
 
+// buildParentMapFromLevel builds a hash map of all transactions in a level for quick parent lookups.
+// This map is built ONCE per level and reused for all child transactions in the next level,
+// avoiding O(n²) complexity from rebuilding the map for every child transaction.
 func buildParentMapFromLevel(parentLevelTxs []missingTx) map[chainhash.Hash]*bt.Tx {
 	if len(parentLevelTxs) == 0 {
 		return nil
