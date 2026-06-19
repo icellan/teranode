@@ -170,12 +170,14 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockH
 			}
 
 			// A missing record surfaces as (nil, nil) on some backends (e.g. Aerospike
-			// get returns nil for a not-found tx). Guard before dereferencing — WAL
-			// replay can feed a winner hash whose tx was pruned between crash and
+			// get returns nil for a not-found tx). Guard before dereferencing txMeta —
+			// WAL replay can feed a winner hash whose tx was pruned between crash and
 			// restart, and a clean error there is logged+counted by the replay path
 			// rather than panicking node startup. Mirrors the nil guard in
-			// ReverseProcessConflicting.
-			if txMeta == nil || txMeta.Tx == nil {
+			// ReverseProcessConflicting. Note: only a nil meta means "not found"; a
+			// non-nil meta with a nil Tx is left to the existing flow (callers may
+			// supply only the fields they need).
+			if txMeta == nil {
 				return errors.NewTxNotFoundError("[ProcessConflicting][%s] winning tx not found", txHash.String())
 			}
 
