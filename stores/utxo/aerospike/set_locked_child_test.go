@@ -42,11 +42,17 @@ func writeLuaErr(rec aerospike.BatchRecordIfc, msg string) {
 }
 
 func newLockedItem(b byte) *batchLocked {
-	return &batchLocked{ctx: context.Background(), txHash: chainhash.Hash{b}, setValue: true, errCh: make(chan error, 1)}
+	// Production sizes errCh at cap 1; here we use cap 2 so that a regression
+	// which double-signals an item (production sends via the non-blocking
+	// trySignal) is not silently dropped on the second send — it lands in the
+	// buffer where recvOnce's "exactly once" check can observe it.
+	return &batchLocked{ctx: context.Background(), txHash: chainhash.Hash{b}, setValue: true, errCh: make(chan error, 2)}
 }
 
-// recvOnce returns the single value delivered on a buffered-1 completion channel
-// and asserts it is signalled exactly once.
+// recvOnce returns the value delivered on a completion channel and asserts the
+// item was signalled exactly once. The channel is sized cap 2 (see
+// newLockedItem) so a spurious second trySignal is buffered rather than dropped,
+// making double-signalling observable here.
 func recvOnce(t *testing.T, ch chan error) error {
 	t.Helper()
 
