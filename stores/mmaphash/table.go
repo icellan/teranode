@@ -90,10 +90,13 @@ type seg struct {
 	mu sync.RWMutex
 }
 
-// maxTotalSlots bounds a grown table. A grow doubles slotsPerSeg; once the
-// total slot count would exceed this, grow refuses and ErrTableFull surfaces
-// (fail-safe). 2^45 slots is orders of magnitude beyond any real block and
-// keeps totalSlots*slotSize comfortably within int64.
+// maxTotalSlots is an arithmetic sanity guard on a grown table, NOT the real
+// capacity ceiling. A grow doubles slotsPerSeg; if the new total would exceed
+// this, grow refuses and ErrTableFull surfaces (fail-safe). At 2^45 slots a
+// real table (slotSize ~37) is a ~1.3 PB mapping — far past the OS per-process
+// address space (~128 TB on x86-64), so in practice grow fails earlier on the
+// mmap call (also error → halt, still fail-safe) and this bound is only reached
+// in theory. Its job is to keep totalSlots*slotSize from overflowing int64.
 const maxTotalSlots = 1 << 45
 
 // Table is a concurrent, off-heap, open-addressing hash table.
