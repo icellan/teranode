@@ -1800,6 +1800,11 @@ func (c *Client) WaitForFSMtoTransitionToGivenState(ctx context.Context, targetS
 	for {
 		currentState, err := c.GetFSMCurrentState(ctx)
 		if err != nil {
+			// Surface the error rather than retrying: a failed state read aborts the
+			// wait. State reads are served from a locally-cached value once the FSMState
+			// subscription has delivered an update, so transient RPC errors are confined
+			// to the brief startup window before the first notification. Callers must
+			// tolerate a transient-error return.
 			return err
 		}
 

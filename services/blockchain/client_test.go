@@ -4724,6 +4724,30 @@ func TestClient_WaitForFSMtoTransitionToGivenState(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("returns once the target state is reached after polling", func(t *testing.T) {
+		ctx := context.Background()
+		calls := 0
+		mockClient := &mockBlockClient{
+			fnGetFSMCurrentState: func() (*blockchain_api.GetFSMStateResponse, error) {
+				calls++
+				// Report IDLE on the first poll, RUNNING afterwards.
+				if calls == 1 {
+					return &blockchain_api.GetFSMStateResponse{State: blockchain_api.FSMStateType_IDLE}, nil
+				}
+				return &blockchain_api.GetFSMStateResponse{State: blockchain_api.FSMStateType_RUNNING}, nil
+			},
+		}
+		client := &Client{
+			client:   mockClient,
+			logger:   logger,
+			settings: tSettings,
+		}
+
+		err := client.WaitForFSMtoTransitionToGivenState(ctx, blockchain_api.FSMStateType_RUNNING)
+		require.NoError(t, err)
+		assert.GreaterOrEqual(t, calls, 2, "expected the loop to re-poll after observing a non-target state")
+	})
+
 	t.Run("times out when target state is never reached", func(t *testing.T) {
 		mockClient := &mockBlockClient{
 			responseGetFSMCurrentState: &blockchain_api.GetFSMStateResponse{
