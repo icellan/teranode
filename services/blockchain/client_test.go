@@ -4702,6 +4702,65 @@ func TestClient_IsFSMCurrentState(t *testing.T) {
 	})
 }
 
+// Test WaitForFSMtoTransitionToGivenState
+func TestClient_WaitForFSMtoTransitionToGivenState(t *testing.T) {
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+
+	t.Run("returns immediately when already in target state", func(t *testing.T) {
+		ctx := context.Background()
+		mockClient := &mockBlockClient{
+			responseGetFSMCurrentState: &blockchain_api.GetFSMStateResponse{
+				State: blockchain_api.FSMStateType_RUNNING,
+			},
+		}
+		client := &Client{
+			client:   mockClient,
+			logger:   logger,
+			settings: tSettings,
+		}
+
+		err := client.WaitForFSMtoTransitionToGivenState(ctx, blockchain_api.FSMStateType_RUNNING)
+		require.NoError(t, err)
+	})
+
+	t.Run("times out when target state is never reached", func(t *testing.T) {
+		mockClient := &mockBlockClient{
+			responseGetFSMCurrentState: &blockchain_api.GetFSMStateResponse{
+				State: blockchain_api.FSMStateType_IDLE,
+			},
+		}
+		client := &Client{
+			client:   mockClient,
+			logger:   logger,
+			settings: tSettings,
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		err := client.WaitForFSMtoTransitionToGivenState(ctx, blockchain_api.FSMStateType_RUNNING)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "context deadline exceeded")
+	})
+
+	t.Run("returns error when state lookup fails", func(t *testing.T) {
+		ctx := context.Background()
+		mockClient := &mockBlockClient{
+			err: errors.NewProcessingError("gRPC error"),
+		}
+		client := &Client{
+			client:   mockClient,
+			logger:   logger,
+			settings: tSettings,
+		}
+
+		err := client.WaitForFSMtoTransitionToGivenState(ctx, blockchain_api.FSMStateType_RUNNING)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "gRPC error")
+	})
+}
+
 // Test SendFSMEvent
 func TestClient_SendFSMEvent(t *testing.T) {
 	logger := ulogger.NewErrorTestLogger(t)

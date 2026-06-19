@@ -1794,15 +1794,25 @@ func (c *Client) IsFSMCurrentState(ctx context.Context, state FSMStateType) (boo
 	return *currentState == state, nil
 }
 
-// WaitForFSMtoTransitionToGivenState waits for the FSM to reach a specific state.
+// WaitForFSMtoTransitionToGivenState waits for the FSM to reach a specific state by
+// polling the current state until it matches the target or the context is cancelled.
 func (c *Client) WaitForFSMtoTransitionToGivenState(ctx context.Context, targetState FSMStateType) error {
-	if _, err := c.client.WaitFSMToTransitionToGivenState(ctx, &blockchain_api.WaitFSMToTransitionRequest{
-		State: targetState,
-	}); err != nil {
-		return errors.UnwrapGRPC(err)
-	}
+	for {
+		currentState, err := c.GetFSMCurrentState(ctx)
+		if err != nil {
+			return err
+		}
 
-	return nil
+		if *currentState == targetState {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(1 * time.Second): // Wait and check again in 1 second
+		}
+	}
 }
 
 // WaitUntilFSMTransitionFromIdleState waits for the FSM to transition from the IDLE state.
