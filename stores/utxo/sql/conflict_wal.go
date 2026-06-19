@@ -48,18 +48,19 @@ func (s *Store) BeginConflictIntent(ctx context.Context, intent utxo.ConflictInt
 
 	var q string
 	if s.engine == "postgres" {
-		q = `INSERT INTO conflict_intents (intent_id, kind, block_height, tx_hashes, started_at)
-		     VALUES ($1, $2, $3, $4, $5)
+		q = `INSERT INTO conflict_intents (intent_id, kind, block_height, block_hash, tx_hashes, started_at)
+		     VALUES ($1, $2, $3, $4, $5, $6)
 		     ON CONFLICT (intent_id) DO NOTHING`
 	} else {
-		q = `INSERT OR IGNORE INTO conflict_intents (intent_id, kind, block_height, tx_hashes, started_at)
-		     VALUES ($1, $2, $3, $4, $5)`
+		q = `INSERT OR IGNORE INTO conflict_intents (intent_id, kind, block_height, block_hash, tx_hashes, started_at)
+		     VALUES ($1, $2, $3, $4, $5, $6)`
 	}
 
 	if _, err := s.db.ExecContext(ctx, q,
 		intentID[:],
 		string(intent.Kind),
 		int64(intent.BlockHeight),
+		intent.BlockHash[:],
 		encodeIntentHashes(intent.TxHashes),
 		intent.StartedAt,
 	); err != nil {
@@ -81,7 +82,7 @@ func (s *Store) CompleteConflictIntent(ctx context.Context, intentID chainhash.H
 
 // PendingConflictIntents returns every begun-but-not-completed intent.
 func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT kind, block_height, tx_hashes, started_at FROM conflict_intents`)
+	rows, err := s.db.QueryContext(ctx, `SELECT kind, block_height, block_hash, tx_hashes, started_at FROM conflict_intents`)
 	if err != nil {
 		return nil, errors.NewStorageError("[PendingConflictIntents] query failed", err)
 	}
@@ -93,12 +94,18 @@ func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictInte
 		var (
 			kind        string
 			blockHeight int64
+			blockHash   []byte
 			txHashes    []byte
 			startedAt   int64
 		)
 
-		if err := rows.Scan(&kind, &blockHeight, &txHashes, &startedAt); err != nil {
+		if err := rows.Scan(&kind, &blockHeight, &blockHash, &txHashes, &startedAt); err != nil {
 			return nil, errors.NewStorageError("[PendingConflictIntents] scan failed", err)
+		}
+
+		bh, err := chainhash.NewHash(blockHash)
+		if err != nil {
+			return nil, errors.NewStorageError("[PendingConflictIntents] corrupt block_hash (kind=%s height=%d startedAt=%d)", kind, blockHeight, startedAt, err)
 		}
 
 		hashes, err := decodeIntentHashes(txHashes)
@@ -109,6 +116,7 @@ func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictInte
 		intents = append(intents, utxo.ConflictIntent{
 			Kind:        utxo.ConflictIntentKind(kind),
 			BlockHeight: uint32(blockHeight),
+			BlockHash:   *bh,
 			TxHashes:    hashes,
 			StartedAt:   startedAt,
 		})

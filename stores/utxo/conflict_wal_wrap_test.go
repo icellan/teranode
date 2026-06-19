@@ -53,7 +53,7 @@ func TestProcessConflicting_WALBeginFailureAborts(t *testing.T) {
 	// proving the function aborted before touching the store.
 	spy := &walSpyStore{MockUtxostore: &MockUtxostore{}, beginErr: errors.NewStorageError("wal unavailable")}
 
-	_, _, err := ProcessConflicting(ctx, spy, 100, []chainhash.Hash{createTestHash("winner")}, nil)
+	_, _, err := ProcessConflicting(ctx, spy, 100, chainhash.Hash{}, []chainhash.Hash{createTestHash("winner")}, nil)
 
 	require.Error(t, err)
 	require.ErrorIs(t, err, errors.ErrStorageError)
@@ -67,7 +67,7 @@ func TestReverseProcessConflicting_WALBeginFailureAborts(t *testing.T) {
 
 	spy := &walSpyStore{MockUtxostore: &MockUtxostore{}, beginErr: errors.NewStorageError("wal unavailable")}
 
-	_, _, err := ReverseProcessConflicting(ctx, spy, 100, []chainhash.Hash{createTestHash("demoted")})
+	_, _, err := ReverseProcessConflicting(ctx, spy, 100, chainhash.Hash{}, []chainhash.Hash{createTestHash("demoted")})
 
 	require.Error(t, err)
 	require.ErrorIs(t, err, errors.ErrStorageError)
@@ -109,7 +109,7 @@ func TestReverseProcessConflicting_WALLifecycleOnSuccess(t *testing.T) {
 	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{counterHash}, false).
 		Return([]*Spend{}, []chainhash.Hash{}, nil).Once()
 
-	_, _, err := ReverseProcessConflicting(ctx, spy, 100, []chainhash.Hash{demotedHash})
+	_, _, err := ReverseProcessConflicting(ctx, spy, 100, chainhash.Hash{}, []chainhash.Hash{demotedHash})
 	require.NoError(t, err)
 
 	require.Len(t, spy.begun, 1, "exactly one intent recorded")

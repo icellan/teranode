@@ -69,7 +69,7 @@ var step5RetryDelays = []time.Duration{0, 50 * time.Millisecond, 200 * time.Mill
 //     (notably block assembly) need this superset to populate a conflictingMap
 //     so the queue→subtree dequeue path can reject children of conflicting
 //     parents that arrive after the cascade has run.
-func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, conflictingTxHashes []chainhash.Hash,
+func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockHash chainhash.Hash, conflictingTxHashes []chainhash.Hash,
 	processedConflictingHashesMap map[chainhash.Hash]struct{}) (losingTxHashesMap txmap.TxMap, allMarkedConflicting []chainhash.Hash, err error) {
 	ctx, _, deferFn := tracing.Tracer("utxo").Start(ctx, "ProcessConflicting")
 
@@ -86,6 +86,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, confli
 	walIntent := ConflictIntent{
 		Kind:        ConflictIntentForward,
 		BlockHeight: blockHeight,
+		BlockHash:   blockHash,
 		TxHashes:    conflictingTxHashes,
 		StartedAt:   time.Now().UnixNano(),
 	}
@@ -333,7 +334,7 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, confli
 //     feed this into processedConflictingHashesMap so the subsequent
 //     moveForwardBlock pass skips ProcessConflicting on these hashes —
 //     re-running it would double-apply the UTXO swap and fail.
-func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32, demotedTxHashes []chainhash.Hash) (cascadedToConflicting []chainhash.Hash, allTouched []chainhash.Hash, err error) {
+func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32, blockHash chainhash.Hash, demotedTxHashes []chainhash.Hash) (cascadedToConflicting []chainhash.Hash, allTouched []chainhash.Hash, err error) {
 	ctx, _, deferFn := tracing.Tracer("utxo").Start(ctx, "ReverseProcessConflicting")
 	defer deferFn()
 
@@ -348,6 +349,7 @@ func ReverseProcessConflicting(ctx context.Context, s Store, blockHeight uint32,
 	walIntent := ConflictIntent{
 		Kind:        ConflictIntentReverse,
 		BlockHeight: blockHeight,
+		BlockHash:   blockHash,
 		TxHashes:    demotedTxHashes,
 		StartedAt:   time.Now().UnixNano(),
 	}

@@ -87,6 +87,13 @@ type ConflictIntent struct {
 	// BlockHeight is the block height the operation was invoked with.
 	BlockHeight uint32
 
+	// BlockHash is the hash of the block whose movement triggered the operation
+	// — the moved-forward block for a forward intent, the moved-back block for a
+	// reverse intent. Startup replay gates on this block's chain membership so a
+	// stale intent (whose block was reorged out from under it) is discarded rather
+	// than blindly re-applied, which would undo a later, valid reorg.
+	BlockHash chainhash.Hash
+
 	// TxHashes is the operation's input hash slice — conflictingTxHashes for
 	// forward, demotedTxHashes for reverse.
 	TxHashes []chainhash.Hash
@@ -96,8 +103,8 @@ type ConflictIntent struct {
 }
 
 // IntentID derives a deterministic identifier for the intent from its kind,
-// block height and the (sorted) set of tx hashes. Two invocations with the
-// same (kind, height, hashes) yield the same id, which makes
+// block hash, block height and the (sorted) set of tx hashes. Two invocations
+// with the same (kind, block, height, hashes) yield the same id, which makes
 // BeginConflictIntent idempotent across a crash-retry of the same operation
 // and lets startup replay deduplicate naturally. The hash ordering is
 // normalised so callers need not pre-sort.
@@ -108,8 +115,9 @@ func (ci ConflictIntent) IntentID() chainhash.Hash {
 		return bytes.Compare(sorted[i][:], sorted[j][:]) < 0
 	})
 
-	buf := make([]byte, 0, len(ci.Kind)+4+len(sorted)*chainhash.HashSize)
+	buf := make([]byte, 0, len(ci.Kind)+chainhash.HashSize+4+len(sorted)*chainhash.HashSize)
 	buf = append(buf, []byte(ci.Kind)...)
+	buf = append(buf, ci.BlockHash[:]...)
 
 	var heightBytes [4]byte
 	binary.BigEndian.PutUint32(heightBytes[:], ci.BlockHeight)

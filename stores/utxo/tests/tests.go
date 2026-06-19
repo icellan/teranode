@@ -621,7 +621,7 @@ func ConflictWALCrashRecovery(t *testing.T, db utxostore.Store) {
 
 			// Replay: seed the processed-hashes map exactly as BlockAssembler does.
 			seeded := map[chainhash.Hash]struct{}{*txW.TxIDChainHash(): {}}
-			_, _, err = utxostore.ProcessConflicting(ctx, db, 20, []chainhash.Hash{*txW.TxIDChainHash()}, seeded)
+			_, _, err = utxostore.ProcessConflicting(ctx, db, 20, chainhash.Hash{}, []chainhash.Hash{*txW.TxIDChainHash()}, seeded)
 			require.NoError(t, err)
 			require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
 
@@ -692,7 +692,7 @@ func ConflictWALCrashRecovery(t *testing.T, db utxostore.Store) {
 			intent := utxostore.ConflictIntent{Kind: utxostore.ConflictIntentReverse, BlockHeight: 20, TxHashes: []chainhash.Hash{*txD.TxIDChainHash()}, StartedAt: 1}
 			require.NoError(t, db.BeginConflictIntent(ctx, intent))
 
-			_, _, err = utxostore.ReverseProcessConflicting(ctx, db, 20, []chainhash.Hash{*txD.TxIDChainHash()})
+			_, _, err = utxostore.ReverseProcessConflicting(ctx, db, 20, chainhash.Hash{}, []chainhash.Hash{*txD.TxIDChainHash()})
 			require.NoError(t, err)
 			require.NoError(t, db.CompleteConflictIntent(ctx, intent.IntentID()))
 

@@ -8,6 +8,8 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	utxofields "github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -15,6 +17,24 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
+
+// blockchainMembershipMock returns a blockchain client mock that reports every
+// block as on/off the longest chain per onChain. notFound makes GetBlockHeader
+// report the block as unknown (treated as off-chain).
+func blockchainMembershipMock(onChain, notFound bool) *blockchain.Mock {
+	m := &blockchain.Mock{}
+	if notFound {
+		m.On("GetBlockHeader", mock.Anything, mock.Anything).
+			Return((*model.BlockHeader)(nil), (*model.BlockHeaderMeta)(nil), errors.NewBlockNotFoundError("unknown block"))
+		return m
+	}
+
+	m.On("GetBlockHeader", mock.Anything, mock.Anything).
+		Return(&model.BlockHeader{}, &model.BlockHeaderMeta{ID: 7}, nil)
+	m.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(onChain, nil)
+
+	return m
+}
 
 // replaySpyStore embeds the utxo mock and records WAL lifecycle calls so the
 // BlockAssembler replay path can be asserted without a full store backend.
@@ -40,22 +60,24 @@ func (s *replaySpyStore) CompleteConflictIntent(_ context.Context, intentID chai
 }
 
 // newReplayTestAssembler builds the minimal BlockAssembler needed to drive
-// replayPendingConflictIntents — it only touches utxoStore and logger.
-func newReplayTestAssembler(store utxo.Store) *BlockAssembler {
+// replayPendingConflictIntents — it touches utxoStore, blockchainClient (for
+// the chain-membership gate) and logger.
+func newReplayTestAssembler(store utxo.Store, bc blockchain.ClientI) *BlockAssembler {
 	// Production initialises metrics in Server.New; do the same so the replay
 	// path's gauge/counter are non-nil.
 	initPrometheusMetrics()
 
 	return &BlockAssembler{
-		logger:    ulogger.TestLogger{},
-		utxoStore: store,
+		logger:           ulogger.TestLogger{},
+		utxoStore:        store,
+		blockchainClient: bc,
 	}
 }
 
 // TestReplayPendingConflictIntents_NoPending is a no-op when the WAL is empty.
 func TestReplayPendingConflictIntents_NoPending(t *testing.T) {
 	spy := &replaySpyStore{MockUtxostore: &utxo.MockUtxostore{}}
-	b := newReplayTestAssembler(spy)
+	b := newReplayTestAssembler(spy, blockchainMembershipMock(false, true))
 
 	b.replayPendingConflictIntents(context.Background())
 
@@ -69,7 +91,7 @@ func TestReplayPendingConflictIntents_LoadErrorIsNotFatal(t *testing.T) {
 		MockUtxostore: &utxo.MockUtxostore{},
 		pendingErr:    errors.NewStorageError("wal read failed"),
 	}
-	b := newReplayTestAssembler(spy)
+	b := newReplayTestAssembler(spy, blockchainMembershipMock(false, true))
 
 	require.NotPanics(t, func() {
 		b.replayPendingConflictIntents(context.Background())
@@ -98,11 +120,57 @@ func TestReplayPendingConflictIntents_ReverseReplayCompletes(t *testing.T) {
 		Return(&meta.Data{}, nil)
 
 	spy := &replaySpyStore{MockUtxostore: mockStore, pending: []utxo.ConflictIntent{intent}}
-	b := newReplayTestAssembler(spy)
+	// Block is unknown/off-chain → reverse intent is NOT stale → it replays.
+	b := newReplayTestAssembler(spy, blockchainMembershipMock(false, true))
 
 	b.replayPendingConflictIntents(context.Background())
 
 	require.Contains(t, spy.completed, intent.IntentID(), "successful replay must clear the intent from the WAL")
+}
+
+// TestReplayPendingConflictIntents_StaleForwardDiscarded covers the corruption
+// the human reviewer flagged: a forward intent whose block is no longer on the
+// longest chain (a later reverse superseded it) must be DISCARDED, not replayed
+// — replaying would re-promote the loser and undo the reverse. The bare mock
+// store has no Get expectation, so if ProcessConflicting were invoked the test
+// would panic; passing proves the gate discarded the intent before re-running.
+func TestReplayPendingConflictIntents_StaleForwardDiscarded(t *testing.T) {
+	intent := utxo.ConflictIntent{
+		Kind:        utxo.ConflictIntentForward,
+		BlockHeight: 300,
+		BlockHash:   chainhash.HashH([]byte("reorged-out-block")),
+		TxHashes:    []chainhash.Hash{chainhash.HashH([]byte("stale-winner"))},
+		StartedAt:   1,
+	}
+
+	spy := &replaySpyStore{MockUtxostore: &utxo.MockUtxostore{}, pending: []utxo.ConflictIntent{intent}}
+	// Block exists but is NOT on the longest chain → forward intent is stale.
+	b := newReplayTestAssembler(spy, blockchainMembershipMock(false, false))
+
+	b.replayPendingConflictIntents(context.Background())
+
+	require.Contains(t, spy.completed, intent.IntentID(), "a stale forward intent must be discarded (deleted) from the WAL")
+}
+
+// TestReplayPendingConflictIntents_StaleReverseDiscarded is the mirror: a reverse
+// intent whose block is back on the longest chain (a later forward re-applied it)
+// must be discarded, not replayed.
+func TestReplayPendingConflictIntents_StaleReverseDiscarded(t *testing.T) {
+	intent := utxo.ConflictIntent{
+		Kind:        utxo.ConflictIntentReverse,
+		BlockHeight: 300,
+		BlockHash:   chainhash.HashH([]byte("re-applied-block")),
+		TxHashes:    []chainhash.Hash{chainhash.HashH([]byte("stale-demoted"))},
+		StartedAt:   1,
+	}
+
+	spy := &replaySpyStore{MockUtxostore: &utxo.MockUtxostore{}, pending: []utxo.ConflictIntent{intent}}
+	// Block IS on the longest chain → reverse intent is stale.
+	b := newReplayTestAssembler(spy, blockchainMembershipMock(true, false))
+
+	b.replayPendingConflictIntents(context.Background())
+
+	require.Contains(t, spy.completed, intent.IntentID(), "a stale reverse intent must be discarded (deleted) from the WAL")
 }
 
 // TestReplayPendingConflictIntents_RealStoreReverseConverges is the crash-
@@ -169,6 +237,11 @@ func TestReplayPendingConflictIntents_RealStoreReverseConverges(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pending, 1, "intent should be pending before replay")
 
+	// The intent's (zero) block hash is unknown to the chain → off-chain → a
+	// reverse intent is not stale, so replay proceeds. Use a deterministic
+	// membership mock rather than relying on the real client's not-found behaviour.
+	items.blockAssembler.blockchainClient = blockchainMembershipMock(false, true)
+
 	// Restart path.
 	items.blockAssembler.replayPendingConflictIntents(ctx)
 
@@ -185,7 +258,7 @@ func TestReplayPendingConflictIntents_RealStoreReverseConverges(t *testing.T) {
 // TestReplayConflictIntent_UnknownKind surfaces an error for an unrecognised
 // intent kind rather than silently skipping it.
 func TestReplayConflictIntent_UnknownKind(t *testing.T) {
-	b := newReplayTestAssembler(&replaySpyStore{MockUtxostore: &utxo.MockUtxostore{}})
+	b := newReplayTestAssembler(&replaySpyStore{MockUtxostore: &utxo.MockUtxostore{}}, blockchainMembershipMock(false, true))
 
 	err := b.replayConflictIntent(context.Background(), utxo.ConflictIntent{
 		Kind:     utxo.ConflictIntentKind("bogus"),

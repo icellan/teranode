@@ -4847,6 +4847,7 @@ func createPostgresSchemaImpl(db DBExecutor) error {
          intent_id     BYTEA PRIMARY KEY
         ,kind          TEXT NOT NULL
         ,block_height  BIGINT NOT NULL
+        ,block_hash    BYTEA NOT NULL
         ,tx_hashes     BYTEA NOT NULL
         ,started_at    BIGINT NOT NULL
 	  );
@@ -5159,6 +5160,7 @@ func createSqliteSchema(db *usql.DB) error {
          intent_id     BLOB PRIMARY KEY
         ,kind          TEXT NOT NULL
         ,block_height  BIGINT NOT NULL
+        ,block_hash    BLOB NOT NULL
         ,tx_hashes     BLOB NOT NULL
         ,started_at    BIGINT NOT NULL
 	  );

@@ -26,6 +26,7 @@ const conflictWALSetSuffix = "_conflictwal"
 const (
 	walBinKind        = "kind"
 	walBinBlockHeight = "blockHeight"
+	walBinBlockHash   = "blockHash"
 	walBinTxHashes    = "txHashes"
 	walBinStartedAt   = "startedAt"
 )
@@ -74,9 +75,12 @@ func (s *Store) BeginConflictIntent(ctx context.Context, intent utxo.ConflictInt
 		return errors.NewStorageError("[BeginConflictIntent] failed to build key for intent %s", intentID.String(), err)
 	}
 
+	blockHash := intent.BlockHash
+
 	bins := []*aerospike.Bin{
 		aerospike.NewBin(walBinKind, string(intent.Kind)),
 		aerospike.NewBin(walBinBlockHeight, int(intent.BlockHeight)),
+		aerospike.NewBin(walBinBlockHash, blockHash[:]),
 		aerospike.NewBin(walBinTxHashes, encodeIntentHashes(intent.TxHashes)),
 		aerospike.NewBin(walBinStartedAt, int(intent.StartedAt)),
 	}
@@ -108,7 +112,7 @@ func (s *Store) CompleteConflictIntent(ctx context.Context, intentID chainhash.H
 // is acceptable.
 func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
 	stmt := aerospike.NewStatement(s.namespace, s.conflictWALSet())
-	stmt.BinNames = []string{walBinKind, walBinBlockHeight, walBinTxHashes, walBinStartedAt}
+	stmt.BinNames = []string{walBinKind, walBinBlockHeight, walBinBlockHash, walBinTxHashes, walBinStartedAt}
 
 	queryPolicy := aerospike.NewQueryPolicy()
 	queryPolicy.MaxRetries = 3
@@ -143,6 +147,11 @@ func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictInte
 			return nil, errors.NewStorageError("[PendingConflictIntents] WAL record missing or invalid %s bin", walBinBlockHeight)
 		}
 
+		blockHashBytes, ok := record.Bins[walBinBlockHash].([]byte)
+		if !ok {
+			return nil, errors.NewStorageError("[PendingConflictIntents] WAL record missing or invalid %s bin", walBinBlockHash)
+		}
+
 		txHashesBytes, ok := record.Bins[walBinTxHashes].([]byte)
 		if !ok {
 			return nil, errors.NewStorageError("[PendingConflictIntents] WAL record missing or invalid %s bin", walBinTxHashes)
@@ -153,6 +162,11 @@ func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictInte
 			return nil, errors.NewStorageError("[PendingConflictIntents] WAL record missing or invalid %s bin", walBinStartedAt)
 		}
 
+		bh, err := chainhash.NewHash(blockHashBytes)
+		if err != nil {
+			return nil, errors.NewStorageError("[PendingConflictIntents] corrupt blockHash (kind=%s height=%d startedAt=%d)", kind, blockHeight, startedAt, err)
+		}
+
 		hashes, err := decodeIntentHashes(txHashesBytes)
 		if err != nil {
 			return nil, errors.NewStorageError("[PendingConflictIntents] corrupt intent record (kind=%s height=%d startedAt=%d)", kind, blockHeight, startedAt, err)
@@ -161,6 +175,7 @@ func (s *Store) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictInte
 		intents = append(intents, utxo.ConflictIntent{
 			Kind:        utxo.ConflictIntentKind(kind),
 			BlockHeight: uint32(blockHeight),
+			BlockHash:   *bh,
 			TxHashes:    hashes,
 			StartedAt:   int64(startedAt),
 		})

@@ -938,6 +938,37 @@ func (b *BlockAssembler) replayPendingConflictIntents(ctx context.Context) {
 	b.logger.Warnf("[BlockAssembler][replayPendingConflictIntents] replaying %d interrupted conflict-resolution intent(s)", len(intents))
 
 	for _, intent := range intents {
+		// Gate on chain membership before re-applying. An intent only describes a
+		// valid operation while the block that triggered it is in the expected
+		// chain position: a forward resolution is valid only while its block is on
+		// the longest chain; a reverse is valid only while its block is off it.
+		// A completed-but-not-tombstoned intent whose block was since reorged the
+		// other way is STALE — blindly re-running it would undo the later, valid
+		// reorg and corrupt UTXO state. Discard such intents instead of replaying.
+		onChain, chainErr := b.isBlockOnLongestChain(ctx, intent.BlockHash)
+		if chainErr != nil {
+			// Could not determine chain state — leave the intent for the next
+			// restart rather than guess. Counted distinctly from a replay failure.
+			prometheusBlockAssemblerConflictIntentReplay.WithLabelValues("chain_check_error").Inc()
+			b.logger.Errorf("[BlockAssembler][replayPendingConflictIntents] could not check chain membership of block %s for %s intent (id %s): %v",
+				intent.BlockHash.String(), intent.Kind, intent.IntentID().String(), chainErr)
+
+			continue
+		}
+
+		if b.isConflictIntentStale(intent.Kind, onChain) {
+			prometheusBlockAssemblerConflictIntentReplay.WithLabelValues("stale").Inc()
+			b.logger.Warnf("[BlockAssembler][replayPendingConflictIntents] discarding stale %s intent for block %s (onLongestChain=%t, id %s) — superseded by a later reorg, not replaying",
+				intent.Kind, intent.BlockHash.String(), onChain, intent.IntentID().String())
+
+			if completeErr := b.utxoStore.CompleteConflictIntent(ctx, intent.IntentID()); completeErr != nil {
+				b.logger.Errorf("[BlockAssembler][replayPendingConflictIntents] failed to clear stale %s intent %s (will retry next restart): %v",
+					intent.Kind, intent.IntentID().String(), completeErr)
+			}
+
+			continue
+		}
+
 		if replayErr := b.replayConflictIntent(ctx, intent); replayErr != nil {
 			prometheusBlockAssemblerConflictIntentReplay.WithLabelValues("failure").Inc()
 			b.logger.Errorf("[BlockAssembler][replayPendingConflictIntents] MANUAL INTERVENTION MAY BE REQUIRED: failed to replay %s intent (height %d, %d txs, id %s): %v",
@@ -958,6 +989,43 @@ func (b *BlockAssembler) replayPendingConflictIntents(ctx context.Context) {
 	}
 }
 
+// isConflictIntentStale reports whether an intent of the given kind is stale —
+// i.e. the block that triggered it is no longer in the chain position the
+// operation assumes. A forward intent is stale once its block leaves the longest
+// chain; a reverse intent is stale once its block rejoins it.
+func (b *BlockAssembler) isConflictIntentStale(kind utxo.ConflictIntentKind, blockOnLongestChain bool) bool {
+	switch kind {
+	case utxo.ConflictIntentForward:
+		return !blockOnLongestChain
+	case utxo.ConflictIntentReverse:
+		return blockOnLongestChain
+	default:
+		// Unknown kind: not classified as stale here; replayConflictIntent surfaces
+		// it as an error.
+		return false
+	}
+}
+
+// isBlockOnLongestChain reports whether the given block hash is currently on the
+// longest chain. A block that is unknown to the blockchain (e.g. pruned after a
+// reorg) is treated as not on the longest chain.
+func (b *BlockAssembler) isBlockOnLongestChain(ctx context.Context, blockHash chainhash.Hash) (bool, error) {
+	_, meta, err := b.blockchainClient.GetBlockHeader(ctx, &blockHash)
+	if err != nil {
+		if errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrNotFound) {
+			return false, nil
+		}
+
+		return false, errors.NewProcessingError("[isBlockOnLongestChain][%s] failed to get block header", blockHash.String(), err)
+	}
+
+	if meta == nil {
+		return false, nil
+	}
+
+	return b.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{meta.ID})
+}
+
 // replayConflictIntent re-runs a single WAL intent against the UTXO store.
 func (b *BlockAssembler) replayConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
 	switch intent.Kind {
@@ -971,11 +1039,11 @@ func (b *BlockAssembler) replayConflictIntent(ctx context.Context, intent utxo.C
 			seeded[h] = struct{}{}
 		}
 
-		_, _, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.TxHashes, seeded)
+		_, _, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, seeded)
 
 		return err
 	case utxo.ConflictIntentReverse:
-		_, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.TxHashes)
+		_, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes)
 
 		return err
 	default:
