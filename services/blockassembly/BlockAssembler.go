@@ -998,7 +998,8 @@ func (b *BlockAssembler) replayPendingConflictIntents(ctx context.Context) {
 		// the longest chain; a reverse is valid only while its block is off it.
 		// A completed-but-not-tombstoned intent whose block was since reorged the
 		// other way is STALE — blindly re-running it would undo the later, valid
-		// reorg and corrupt UTXO state. Discard such intents instead of replaying.
+		// reorg and corrupt UTXO state. Such intents are healed (inverse applied),
+		// not replayed — see the stale branch below.
 		onChain, chainErr := b.isBlockOnLongestChain(ctx, intent.BlockHash)
 		if chainErr != nil {
 			// Could not determine chain state — leave the intent for the next
@@ -1011,12 +1012,28 @@ func (b *BlockAssembler) replayPendingConflictIntents(ctx context.Context) {
 		}
 
 		if b.isConflictIntentStale(intent.Kind, onChain) {
-			prometheusBlockAssemblerConflictIntentReplay.WithLabelValues("stale").Inc()
-			b.logger.Warnf("[BlockAssembler][replayPendingConflictIntents] discarding stale %s intent for block %s (onLongestChain=%t, id %s) — superseded by a later reorg, not replaying",
+			// The block reorged into the OPPOSITE position from what the operation
+			// assumed. Re-running the original op would be wrong, but so would a bare
+			// discard: a partially-applied op (e.g. a forward killed after step 2
+			// locked parents but before step 5 unlocked them, whose block then
+			// reorged off-chain while block assembly was down) would be left torn
+			// with no recovery path. Heal by applying the INVERSE so the UTXO state
+			// converges to the new chain reality.
+			b.logger.Warnf("[BlockAssembler][replayPendingConflictIntents] healing stale %s intent for block %s (onLongestChain=%t, id %s) — block reorged the other way; applying the inverse",
 				intent.Kind, intent.BlockHash.String(), onChain, intent.IntentID().String())
 
+			if healErr := b.healStaleConflictIntent(ctx, intent); healErr != nil {
+				prometheusBlockAssemblerConflictIntentReplay.WithLabelValues("failure").Inc()
+				b.logger.Errorf("[BlockAssembler][replayPendingConflictIntents] MANUAL INTERVENTION MAY BE REQUIRED: failed to heal stale %s intent (height %d, %d txs, id %s): %v",
+					intent.Kind, intent.BlockHeight, len(intent.TxHashes), intent.IntentID().String(), healErr)
+
+				continue
+			}
+
+			prometheusBlockAssemblerConflictIntentReplay.WithLabelValues("stale_healed").Inc()
+
 			if completeErr := b.utxoStore.CompleteConflictIntent(ctx, intent.IntentID()); completeErr != nil {
-				b.logger.Errorf("[BlockAssembler][replayPendingConflictIntents] failed to clear stale %s intent %s (will retry next restart): %v",
+				b.logger.Errorf("[BlockAssembler][replayPendingConflictIntents] healed stale %s intent %s but failed to clear WAL record (will retry next restart): %v",
 					intent.Kind, intent.IntentID().String(), completeErr)
 			}
 
@@ -1103,6 +1120,82 @@ func (b *BlockAssembler) replayConflictIntent(ctx context.Context, intent utxo.C
 	default:
 		return errors.NewProcessingError("[replayConflictIntent] unknown conflict intent kind %q", intent.Kind)
 	}
+}
+
+// healStaleConflictIntent converges the UTXO state for an intent whose block has
+// reorged into the OPPOSITE chain position, by applying the inverse operation
+// rather than discarding it. A bare discard would leave a partially-applied
+// operation torn with no recovery path — the exact failure class this WAL exists
+// to prevent.
+//
+//   - stale forward (block now off-chain): undo it — ReverseProcessConflicting
+//     demotes the winners and restores their counters, then unlock the parents
+//     the forward locked at step 2 (the step-5 unlock a crash may have skipped;
+//     SetLocked(false) is a no-op when already unlocked).
+//   - stale reverse (block now back on-chain): re-apply the forward via
+//     ProcessConflicting, which manages its own step-2 lock / step-5 unlock. The
+//     processed-hashes map is seeded so the "tx is not conflicting" guard does
+//     not fire on an already-applied winner.
+func (b *BlockAssembler) healStaleConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
+	switch intent.Kind {
+	case utxo.ConflictIntentForward:
+		if _, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes); err != nil {
+			return err
+		}
+
+		return b.unlockConflictParents(ctx, intent.TxHashes)
+	case utxo.ConflictIntentReverse:
+		seeded := make(map[chainhash.Hash]struct{}, len(intent.TxHashes))
+		for _, h := range intent.TxHashes {
+			seeded[h] = struct{}{}
+		}
+
+		_, _, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, seeded)
+
+		return err
+	default:
+		return errors.NewProcessingError("[healStaleConflictIntent] unknown conflict intent kind %q", intent.Kind)
+	}
+}
+
+// unlockConflictParents clears the Locked flag on the parents of the given txs'
+// inputs — the parents a forward ProcessConflicting locks at step 2 and unlocks
+// at step 5. Used when healing a stale forward whose step-5 unlock a crash
+// skipped. A winner whose record is gone (pruned) contributes no parents.
+func (b *BlockAssembler) unlockConflictParents(ctx context.Context, txHashes []chainhash.Hash) error {
+	parentSet := make(map[chainhash.Hash]struct{}, len(txHashes))
+
+	for i := range txHashes {
+		h := txHashes[i]
+
+		txMeta, err := b.utxoStore.Get(ctx, &h, fields.Tx)
+		if err != nil {
+			if errors.Is(err, errors.ErrTxNotFound) {
+				continue
+			}
+
+			return errors.NewProcessingError("[unlockConflictParents][%s] failed to load tx", h.String(), err)
+		}
+
+		if txMeta == nil || txMeta.Tx == nil {
+			continue
+		}
+
+		for _, in := range txMeta.Tx.Inputs {
+			parentSet[*in.PreviousTxIDChainHash()] = struct{}{}
+		}
+	}
+
+	if len(parentSet) == 0 {
+		return nil
+	}
+
+	parents := make([]chainhash.Hash, 0, len(parentSet))
+	for p := range parentSet {
+		parents = append(parents, p)
+	}
+
+	return b.utxoStore.SetLocked(ctx, parents, false)
 }
 
 // Wait blocks until all background goroutines have finished.
