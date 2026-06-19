@@ -143,6 +143,11 @@ func TestReverseProcessConflicting_SkipsAlreadyReversedDemoted(t *testing.T) {
 			{TxID: &counterSpenderHash, Vin: 0},
 		}}, nil).Once()
 
+	// isReverseFullyApplied also confirms the recorded spender is no longer
+	// conflicting — the Unmark(C) step completed (#861).
+	mockStore.On("Get", mock.Anything, &counterSpenderHash, mock.Anything).
+		Return(&meta.Data{Conflicting: false}, nil).Once()
+
 	_, touched, err := ReverseProcessConflicting(ctx, mockStore, 100,
 		[]chainhash.Hash{demotedHash})
 
@@ -273,16 +278,66 @@ func TestIsReverseFullyApplied(t *testing.T) {
 
 	demotedTx := createSpendableTestTransaction(parentHash, 0)
 
-	t.Run("parent.SpendingDatas[vout] points to non-D non-nil spender -> true", func(t *testing.T) {
+	t.Run("parent.SpendingDatas[vout] points to non-D non-conflicting spender -> true", func(t *testing.T) {
 		mockStore := &MockUtxostore{}
 		mockStore.On("Get", mock.Anything, &parentHash, mock.Anything).
 			Return(&meta.Data{SpendingDatas: []*spendpkg.SpendingData{
 				{TxID: &otherSpenderHash, Vin: 0},
 			}}, nil).Once()
+		// The recorded spender must also be non-conflicting (Unmark completed).
+		mockStore.On("Get", mock.Anything, &otherSpenderHash, mock.Anything).
+			Return(&meta.Data{Conflicting: false}, nil).Once()
 
 		got, err := isReverseFullyApplied(context.Background(), mockStore, demotedTx, demotedHash)
 		require.NoError(t, err)
 		assert.True(t, got)
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("recorded spender still conflicting -> false (crash between Spend(C) and Unmark(C))", func(t *testing.T) {
+		mockStore := &MockUtxostore{}
+		mockStore.On("Get", mock.Anything, &parentHash, mock.Anything).
+			Return(&meta.Data{SpendingDatas: []*spendpkg.SpendingData{
+				{TxID: &otherSpenderHash, Vin: 0},
+			}}, nil).Once()
+		// Spender C points at parent[vout] but is still Conflicting=true — the
+		// final Unmark(C) never ran (#861). Reverse is NOT fully applied.
+		mockStore.On("Get", mock.Anything, &otherSpenderHash, mock.Anything).
+			Return(&meta.Data{Conflicting: true}, nil).Once()
+
+		got, err := isReverseFullyApplied(context.Background(), mockStore, demotedTx, demotedHash)
+		require.NoError(t, err)
+		assert.False(t, got, "a still-conflicting recorded spender means the reverse must re-run to finish Unmark(C)")
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("recorded spender meta missing -> false", func(t *testing.T) {
+		mockStore := &MockUtxostore{}
+		mockStore.On("Get", mock.Anything, &parentHash, mock.Anything).
+			Return(&meta.Data{SpendingDatas: []*spendpkg.SpendingData{
+				{TxID: &otherSpenderHash, Vin: 0},
+			}}, nil).Once()
+		mockStore.On("Get", mock.Anything, &otherSpenderHash, mock.Anything).
+			Return((*meta.Data)(nil), nil).Once()
+
+		got, err := isReverseFullyApplied(context.Background(), mockStore, demotedTx, demotedHash)
+		require.NoError(t, err)
+		assert.False(t, got, "cannot confirm full application when the spender record is missing")
+		mockStore.AssertExpectations(t)
+	})
+
+	t.Run("recorded spender get error propagates", func(t *testing.T) {
+		mockStore := &MockUtxostore{}
+		mockStore.On("Get", mock.Anything, &parentHash, mock.Anything).
+			Return(&meta.Data{SpendingDatas: []*spendpkg.SpendingData{
+				{TxID: &otherSpenderHash, Vin: 0},
+			}}, nil).Once()
+		mockStore.On("Get", mock.Anything, &otherSpenderHash, mock.Anything).
+			Return((*meta.Data)(nil), errors.NewProcessingError("spender get failed")).Once()
+
+		_, err := isReverseFullyApplied(context.Background(), mockStore, demotedTx, demotedHash)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "error getting recorded spender")
 		mockStore.AssertExpectations(t)
 	})
 

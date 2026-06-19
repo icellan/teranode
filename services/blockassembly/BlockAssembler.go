@@ -867,6 +867,13 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 		}
 	}
 
+	// Replay any conflict-resolution WAL intents left behind by a crash mid-
+	// ProcessConflicting / ReverseProcessConflicting (#861), BEFORE chain-tip
+	// reconciliation — loadUnminedTransactions and any reset() rebuild must see a
+	// healed UTXO state. Replay failures are logged + counted, not fatal: an
+	// unrepaired intent is surfaced for alerting and retried on the next restart.
+	b.replayPendingConflictIntents(ctx)
+
 	// Load unmined transactions (this includes cleanup of old unmined transactions first)
 	if err = b.loadUnminedTransactions(ctx); err != nil {
 		// we cannot start block assembly if we have not loaded unmined transactions successfully
@@ -894,6 +901,86 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 	prometheusBlockAssemblyCurrentBlockHeight.Set(float64(height))
 
 	return nil
+}
+
+// replayPendingConflictIntents drives crash recovery for the conflict-resolution
+// WAL (#861). It loads every intent that a previous process began but never
+// completed (interrupted ProcessConflicting / ReverseProcessConflicting), and
+// re-runs each one. Both functions are idempotent under replay — re-applying a
+// fully-applied or partially-applied operation converges to the same end-state —
+// so a clean restart heals the UTXO store with no operator action.
+//
+// Replay failures are NOT fatal to startup: a failed replay is logged loudly and
+// counted on a Prometheus metric for alerting, and the intent is left in the WAL
+// to be retried on the next restart. Failing startup outright would wedge the
+// node on a single bad intent.
+func (b *BlockAssembler) replayPendingConflictIntents(ctx context.Context) {
+	if b.utxoStore == nil {
+		return
+	}
+
+	intents, err := b.utxoStore.PendingConflictIntents(ctx)
+	if err != nil {
+		// Distinct from per-intent "failure": this is a failure to read the WAL at
+		// all, not a replay attempt — keep the two apart on dashboards/alerts.
+		prometheusBlockAssemblerConflictIntentReplay.WithLabelValues("load_error").Inc()
+		b.logger.Errorf("[BlockAssembler][replayPendingConflictIntents] failed to load pending conflict intents: %v", err)
+
+		return
+	}
+
+	prometheusBlockAssemblerConflictIntentsPending.Set(float64(len(intents)))
+
+	if len(intents) == 0 {
+		return
+	}
+
+	b.logger.Warnf("[BlockAssembler][replayPendingConflictIntents] replaying %d interrupted conflict-resolution intent(s)", len(intents))
+
+	for _, intent := range intents {
+		if replayErr := b.replayConflictIntent(ctx, intent); replayErr != nil {
+			prometheusBlockAssemblerConflictIntentReplay.WithLabelValues("failure").Inc()
+			b.logger.Errorf("[BlockAssembler][replayPendingConflictIntents] MANUAL INTERVENTION MAY BE REQUIRED: failed to replay %s intent (height %d, %d txs, id %s): %v",
+				intent.Kind, intent.BlockHeight, len(intent.TxHashes), intent.IntentID().String(), replayErr)
+
+			continue
+		}
+
+		prometheusBlockAssemblerConflictIntentReplay.WithLabelValues("success").Inc()
+
+		// ProcessConflicting / ReverseProcessConflicting already complete the
+		// intent on success via their own wrapper; this is a belt-and-suspenders
+		// delete (idempotent) so replay is self-contained.
+		if completeErr := b.utxoStore.CompleteConflictIntent(ctx, intent.IntentID()); completeErr != nil {
+			b.logger.Errorf("[BlockAssembler][replayPendingConflictIntents] replayed %s intent %s but failed to clear WAL record (will retry next restart): %v",
+				intent.Kind, intent.IntentID().String(), completeErr)
+		}
+	}
+}
+
+// replayConflictIntent re-runs a single WAL intent against the UTXO store.
+func (b *BlockAssembler) replayConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
+	switch intent.Kind {
+	case utxo.ConflictIntentForward:
+		// Seed the processed-hashes map with the intent's own hashes so the
+		// ProcessConflicting "tx is not conflicting" guard never fires when
+		// replaying a completed-but-not-tombstoned op (winners already
+		// Conflicting=false). The remaining steps are idempotent re-applications.
+		seeded := make(map[chainhash.Hash]struct{}, len(intent.TxHashes))
+		for _, h := range intent.TxHashes {
+			seeded[h] = struct{}{}
+		}
+
+		_, _, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.TxHashes, seeded)
+
+		return err
+	case utxo.ConflictIntentReverse:
+		_, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.TxHashes)
+
+		return err
+	default:
+		return errors.NewProcessingError("[replayConflictIntent] unknown conflict intent kind %q", intent.Kind)
+	}
 }
 
 // Wait blocks until all background goroutines have finished.
