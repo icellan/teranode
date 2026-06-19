@@ -463,16 +463,6 @@ func (m *Mock) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint32
 	return args.Bool(0), args.Error(1)
 }
 
-// OffChainBlockIDs mocks the OffChainBlockIDs method
-func (m *Mock) OffChainBlockIDs(ctx context.Context) ([]uint32, uint32, bool, error) {
-	args := m.Called(ctx)
-	var ids []uint32
-	if v := args.Get(0); v != nil {
-		ids = v.([]uint32)
-	}
-	return ids, uint32(args.Int(1)), args.Bool(2), args.Error(3)
-}
-
 // CheckBlockIsAncestorOfBlock mocks the CheckBlockIsAncestorOfBlock method
 func (m *Mock) CheckBlockIsAncestorOfBlock(ctx context.Context, blockIDs []uint32, blockHash *chainhash.Hash) (bool, error) {
 	args := m.Called(ctx, blockIDs, blockHash)
@@ -541,12 +531,6 @@ func (m *Mock) CatchUpBlocks(ctx context.Context) error {
 // ReportPeerFailure mocks the ReportPeerFailure method
 func (m *Mock) ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, peerID string, failureType string, reason string) error {
 	args := m.Called(ctx, hash, peerID, failureType, reason)
-	return args.Error(0)
-}
-
-// LegacySync mocks the LegacySync method
-func (m *Mock) LegacySync(ctx context.Context) error {
-	args := m.Called(ctx)
 	return args.Error(0)
 }
 
@@ -952,6 +936,7 @@ type mockBlockClient struct {
 	lastSetBlockSubtreesSetReq                   *blockchain_api.SetBlockSubtreesSetRequest
 	responseGetBlocksSubtreesNotSet              *blockchain_api.GetBlocksSubtreesNotSetResponse
 	responseGetFSMCurrentState                   *blockchain_api.GetFSMStateResponse
+	fnGetFSMCurrentState                         func() (*blockchain_api.GetFSMStateResponse, error)
 	responseSendFSMEvent                         *blockchain_api.GetFSMStateResponse
 	lastSendFSMEventReq                          *blockchain_api.SendFSMEventRequest
 	responseGetBlockLocator                      *blockchain_api.GetBlockLocatorResponse
@@ -1301,6 +1286,10 @@ func (m *mockBlockClient) GetFSMCurrentState(
 	in *emptypb.Empty,
 	opts ...grpc.CallOption,
 ) (*blockchain_api.GetFSMStateResponse, error) {
+	if m.fnGetFSMCurrentState != nil {
+		return m.fnGetFSMCurrentState()
+	}
+
 	return m.responseGetFSMCurrentState, m.err
 }
 
@@ -1319,10 +1308,6 @@ func (m *mockBlockClient) Run(ctx context.Context, req *emptypb.Empty, opts ...g
 }
 
 func (m *mockBlockClient) CatchUpBlocks(ctx context.Context, req *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error) {
-	return &emptypb.Empty{}, m.err
-}
-
-func (m *mockBlockClient) LegacySync(ctx context.Context, req *emptypb.Empty, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, m.err
 }
 

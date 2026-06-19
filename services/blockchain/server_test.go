@@ -3709,38 +3709,6 @@ func Test_IsFullyReady(t *testing.T) {
 	}
 }
 
-// Test_LegacySync tests the LegacySync gRPC method
-func Test_LegacySync(t *testing.T) {
-	ctx := setup(t)
-
-	tests := []struct {
-		name        string
-		expectError bool
-	}{
-		{
-			name:        "legacy sync request",
-			expectError: false, // Should succeed or be idempotent
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			request := &emptypb.Empty{}
-
-			response, err := ctx.server.LegacySync(context.Background(), request)
-
-			if tt.expectError {
-				require.Error(t, err)
-				require.Nil(t, response)
-				return
-			}
-
-			require.NoError(t, err)
-			require.NotNil(t, response)
-		})
-	}
-}
-
 // Test_Idle tests the Idle gRPC method
 func Test_Idle(t *testing.T) {
 	ctx := setup(t)
@@ -3769,47 +3737,6 @@ func Test_Idle(t *testing.T) {
 
 			require.NoError(t, err)
 			require.NotNil(t, response)
-		})
-	}
-}
-
-// Test_WaitForFSMtoTransitionToGivenState tests the WaitForFSMtoTransitionToGivenState method
-func Test_WaitForFSMtoTransitionToGivenState(t *testing.T) {
-	ctx := setup(t)
-
-	tests := []struct {
-		name        string
-		targetState blockchain_api.FSMStateType
-		timeout     time.Duration
-		expectError bool
-	}{
-		{
-			name:        "wait for current state (should return immediately)",
-			targetState: blockchain_api.FSMStateType_IDLE, // Common initial state
-			timeout:     1 * time.Second,
-			expectError: false,
-		},
-		{
-			name:        "context cancellation",
-			targetState: blockchain_api.FSMStateType_RUNNING, // Unlikely to be reached immediately
-			timeout:     100 * time.Millisecond,
-			expectError: true, // Should timeout
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			testCtx, cancel := context.WithTimeout(context.Background(), tt.timeout)
-			defer cancel()
-
-			err := ctx.server.WaitForFSMtoTransitionToGivenState(testCtx, tt.targetState)
-
-			if tt.expectError {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), "context deadline exceeded")
-			} else {
-				require.NoError(t, err)
-			}
 		})
 	}
 }

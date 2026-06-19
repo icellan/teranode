@@ -82,12 +82,10 @@ const (
 	FSMStateIDLE           = blockchain_api.FSMStateType_IDLE
 	FSMStateRUNNING        = blockchain_api.FSMStateType_RUNNING
 	FSMStateCATCHINGBLOCKS = blockchain_api.FSMStateType_CATCHINGBLOCKS
-	FSMStateLEGACYSYNCING  = blockchain_api.FSMStateType_LEGACYSYNCING
 
 	FSMEventIDLE          = blockchain_api.FSMEventType_STOP
 	FSMEventRUN           = blockchain_api.FSMEventType_RUN
 	FSMEventCATCHUPBLOCKS = blockchain_api.FSMEventType_CATCHUPBLOCKS
-	FSMEventLEGACYSYNC    = blockchain_api.FSMEventType_LEGACYSYNC
 )
 
 // NewClient creates a new blockchain client with default address settings.
@@ -696,20 +694,6 @@ func (c *Client) CheckBlockIsInCurrentChain(ctx context.Context, blockIDs []uint
 	}
 
 	return resp.GetIsPartOfCurrentChain(), nil
-}
-
-// OffChainBlockIDs returns the complete in-memory off-chain (forked) block ID set
-// plus the highest known block ID, so callers can prefetch the negative set once
-// and resolve main-chain membership locally (id <= maxBlockID AND not in the set).
-// rebuilding is true when the set is stale and callers must fall back to per-block
-// CheckBlockIsInCurrentChain checks.
-func (c *Client) OffChainBlockIDs(ctx context.Context) ([]uint32, uint32, bool, error) {
-	resp, err := c.client.GetOffChainBlockIDs(ctx, &emptypb.Empty{})
-	if err != nil {
-		return nil, 0, false, errors.UnwrapGRPC(err)
-	}
-
-	return resp.GetOffChainBlockIds(), resp.GetMaxBlockId(), resp.GetRebuilding(), nil
 }
 
 // CheckBlockIsAncestorOfBlock checks if any of the given block IDs are ancestors of the block with the given hash.
@@ -1810,15 +1794,35 @@ func (c *Client) IsFSMCurrentState(ctx context.Context, state FSMStateType) (boo
 	return *currentState == state, nil
 }
 
-// WaitForFSMtoTransitionToGivenState waits for the FSM to reach a specific state.
+// WaitForFSMtoTransitionToGivenState waits for the FSM to reach a specific state by
+// polling the current state until it matches the target or the context is cancelled.
 func (c *Client) WaitForFSMtoTransitionToGivenState(ctx context.Context, targetState FSMStateType) error {
-	if _, err := c.client.WaitFSMToTransitionToGivenState(ctx, &blockchain_api.WaitFSMToTransitionRequest{
-		State: targetState,
-	}); err != nil {
-		return errors.UnwrapGRPC(err)
-	}
+	ticker := time.NewTicker(1 * time.Second) // Re-check the state on each tick.
+	defer ticker.Stop()
 
-	return nil
+	for {
+		currentState, err := c.GetFSMCurrentState(ctx)
+		if err == nil && *currentState == targetState {
+			return nil
+		}
+
+		if err != nil {
+			// Keep polling through transient errors rather than aborting the wait. A
+			// state read can fail during the pre-warm window (e.g. a gRPC blip before
+			// the FSMState subscription has populated the cache), which on a fresh node
+			// spans the whole initial block download. Callers treat a returned error as
+			// "stay pessimistic" with no retry, so bailing on a one-off blip would
+			// disable the optimization for the process lifetime. Only ctx cancellation
+			// below ends the wait.
+			c.logger.Debugf("[WaitForFSMtoTransitionToGivenState] state read failed, retrying: %v", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // WaitUntilFSMTransitionFromIdleState waits for the FSM to transition from the IDLE state.
@@ -2028,63 +2032,6 @@ func (c *Client) ReportPeerFailure(ctx context.Context, hash *chainhash.Hash, pe
 	}
 
 	_, err := c.client.ReportPeerFailure(ctx, req)
-	if err != nil {
-		return errors.UnwrapGRPC(err)
-	}
-
-	return nil
-}
-
-// LegacySync sends a legacy sync FSM event to the blockchain service.
-// This method initiates a legacy synchronization process by transitioning the
-// blockchain service's finite state machine to the LEGACY_SYNCING state, which
-// triggers compatibility mode synchronization with older BSV Blockchain network
-// protocols and legacy blockchain implementations.
-//
-// The legacy sync mode is essential for:
-// - Maintaining compatibility with older BSV Blockchain network nodes
-// - Synchronizing with legacy blockchain implementations
-// - Supporting migration scenarios from older Teranode versions
-// - Ensuring interoperability across diverse network topologies
-// - Handling edge cases in blockchain synchronization protocols
-//
-// The method first checks if the FSM is already in the LEGACY_SYNCING state
-// to avoid unnecessary state transitions. If not already in legacy sync mode,
-// it sends the appropriate FSM event to trigger the legacy synchronization
-// process.
-//
-// Legacy synchronization differs from standard sync by:
-// - Using older protocol versions for network communication
-// - Implementing backward-compatible block validation rules
-// - Supporting legacy transaction formats and structures
-// - Maintaining compatibility with pre-upgrade network nodes
-//
-// This operation is typically used during:
-// - Network upgrades and migration periods
-// - Integration with legacy BSV Blockchain infrastructure
-// - Debugging synchronization issues with older nodes
-// - Ensuring network-wide compatibility during protocol transitions
-//
-// The method communicates with the blockchain service via gRPC to send the
-// FSM event that initiates the legacy synchronization process.
-//
-// Parameters:
-//   - ctx: Context for the operation with timeout and cancellation support
-//
-// Returns:
-//   - error: Any error encountered during the FSM event transmission
-func (c *Client) LegacySync(ctx context.Context) error {
-	currentState := c.fmsState.Load()
-	if currentState != nil {
-		// check whether the current state is the same as the target state
-		if *currentState == FSMStateLEGACYSYNCING {
-			return nil
-		}
-	}
-
-	c.logger.Infof("[Blockchain Client] Sending Legacy Sync event")
-
-	_, err := c.client.LegacySync(ctx, &emptypb.Empty{})
 	if err != nil {
 		return errors.UnwrapGRPC(err)
 	}
