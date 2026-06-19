@@ -1799,17 +1799,19 @@ func (c *Client) IsFSMCurrentState(ctx context.Context, state FSMStateType) (boo
 func (c *Client) WaitForFSMtoTransitionToGivenState(ctx context.Context, targetState FSMStateType) error {
 	for {
 		currentState, err := c.GetFSMCurrentState(ctx)
-		if err != nil {
-			// Surface the error rather than retrying: a failed state read aborts the
-			// wait. State reads are served from a locally-cached value once the FSMState
-			// subscription has delivered an update, so transient RPC errors are confined
-			// to the brief startup window before the first notification. Callers must
-			// tolerate a transient-error return.
-			return err
+		if err == nil && *currentState == targetState {
+			return nil
 		}
 
-		if *currentState == targetState {
-			return nil
+		if err != nil {
+			// Keep polling through transient errors rather than aborting the wait. A
+			// state read can fail during the pre-warm window (e.g. a gRPC blip before
+			// the FSMState subscription has populated the cache), which on a fresh node
+			// spans the whole initial block download. Callers treat a returned error as
+			// "stay pessimistic" with no retry, so bailing on a one-off blip would
+			// disable the optimization for the process lifetime. Only ctx cancellation
+			// below ends the wait.
+			c.logger.Debugf("[WaitForFSMtoTransitionToGivenState] state read failed, retrying: %v", err)
 		}
 
 		select {

@@ -4768,10 +4768,18 @@ func TestClient_WaitForFSMtoTransitionToGivenState(t *testing.T) {
 		assert.Contains(t, err.Error(), "context deadline exceeded")
 	})
 
-	t.Run("returns error when state lookup fails", func(t *testing.T) {
+	t.Run("keeps polling through a transient error then succeeds", func(t *testing.T) {
 		ctx := context.Background()
+		calls := 0
 		mockClient := &mockBlockClient{
-			err: errors.NewProcessingError("gRPC error"),
+			fnGetFSMCurrentState: func() (*blockchain_api.GetFSMStateResponse, error) {
+				calls++
+				// Fail the first read, then report the target state.
+				if calls == 1 {
+					return nil, errors.NewProcessingError("transient gRPC error")
+				}
+				return &blockchain_api.GetFSMStateResponse{State: blockchain_api.FSMStateType_RUNNING}, nil
+			},
 		}
 		client := &Client{
 			client:   mockClient,
@@ -4780,8 +4788,8 @@ func TestClient_WaitForFSMtoTransitionToGivenState(t *testing.T) {
 		}
 
 		err := client.WaitForFSMtoTransitionToGivenState(ctx, blockchain_api.FSMStateType_RUNNING)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "gRPC error")
+		require.NoError(t, err, "a transient state-read error must not abort the wait")
+		assert.GreaterOrEqual(t, calls, 2, "expected the loop to retry after a transient error")
 	})
 }
 
