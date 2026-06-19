@@ -1797,6 +1797,9 @@ func (c *Client) IsFSMCurrentState(ctx context.Context, state FSMStateType) (boo
 // WaitForFSMtoTransitionToGivenState waits for the FSM to reach a specific state by
 // polling the current state until it matches the target or the context is cancelled.
 func (c *Client) WaitForFSMtoTransitionToGivenState(ctx context.Context, targetState FSMStateType) error {
+	ticker := time.NewTicker(1 * time.Second) // Re-check the state on each tick.
+	defer ticker.Stop()
+
 	for {
 		currentState, err := c.GetFSMCurrentState(ctx)
 		if err == nil && *currentState == targetState {
@@ -1817,7 +1820,7 @@ func (c *Client) WaitForFSMtoTransitionToGivenState(ctx context.Context, targetS
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(1 * time.Second): // Wait and check again in 1 second
+		case <-ticker.C:
 		}
 	}
 }
