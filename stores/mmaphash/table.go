@@ -90,8 +90,22 @@ type seg struct {
 	mu sync.RWMutex
 }
 
+// maxTotalSlots bounds a grown table. A grow doubles slotsPerSeg; once the
+// total slot count would exceed this, grow refuses and ErrTableFull surfaces
+// (fail-safe). 2^45 slots is orders of magnitude beyond any real block and
+// keeps totalSlots*slotSize comfortably within int64.
+const maxTotalSlots = 1 << 45
+
 // Table is a concurrent, off-heap, open-addressing hash table.
+//
+// growMu coordinates transparent growth (issue #1080): Upsert/Lookup hold it as
+// readers (so many run concurrently across independently-locked segments), and
+// grow holds it exclusively, draining all readers before swapping t.data and
+// t.slotsPerSeg. The segment count (segMask, len(segs)) never changes on grow —
+// only per-segment capacity doubles — so an entry never moves between segments
+// and the per-segment locks are stable.
 type Table struct {
+	growMu      sync.RWMutex
 	data        []byte
 	slotSize    int
 	keySize     int
@@ -100,6 +114,9 @@ type Table struct {
 	segMask     uint64
 	segs        []seg
 	count       atomic.Int64
+	gen         atomic.Uint64 // bumped on each grow; lets Upsert skip redundant grows
+	dir         string        // backing-file directory, retained for grow
+	prefix      string        // backing-file prefix, retained for grow
 }
 
 // ErrTableFull is returned when a segment has no empty slot (capacity exceeded).
@@ -127,19 +144,41 @@ func New(opts Options) (*Table, error) {
 	totalSlots := l.numSeg * l.slotsPerSeg
 	fileBytes := int64(totalSlots) * int64(slotSize)
 
+	data, err := mapRegion(opts.Dir, opts.Prefix, fileBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Table{
+		data:        data,
+		slotSize:    slotSize,
+		keySize:     opts.KeySize,
+		valueSize:   opts.ValueSize,
+		slotsPerSeg: l.slotsPerSeg,
+		segMask:     l.numSeg - 1,
+		segs:        make([]seg, l.numSeg),
+		dir:         opts.Dir,
+		prefix:      opts.Prefix,
+	}, nil
+}
+
+// mapRegion creates a sparse, immediately-unlinked backing file of fileBytes
+// and mmaps it. The open mapping keeps the inode alive; space is reclaimed on
+// munmap or process exit, even after a crash. Used by New and by grow.
+func mapRegion(dir, prefix string, fileBytes int64) ([]byte, error) {
 	// os.CreateTemp does not create parent directories, so ensure Dir exists
 	// first. The Badger-backed implementation this replaced did the equivalent
 	// MkdirAll; without it, configuring block_diskMapDirs to a not-yet-created
 	// path makes every block fail validation. Empty Dir means os.TempDir().
-	if opts.Dir != "" {
-		if err := os.MkdirAll(opts.Dir, 0o700); err != nil {
-			return nil, errors.NewStorageError("mmaphash: create dir %s", opts.Dir, err)
+	if dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, errors.NewStorageError("mmaphash: create dir %s", dir, err)
 		}
 	}
 
-	f, err := os.CreateTemp(opts.Dir, opts.Prefix+"-*.mmh")
+	f, err := os.CreateTemp(dir, prefix+"-*.mmh")
 	if err != nil {
-		return nil, errors.NewStorageError("mmaphash: create temp file in %s", opts.Dir, err)
+		return nil, errors.NewStorageError("mmaphash: create temp file in %s", dir, err)
 	}
 	// Unlink now: the open fd and mmap keep the inode alive; space is reclaimed
 	// on Close (munmap + last fd close) or on process exit, even after a crash.
@@ -164,15 +203,7 @@ func New(opts Options) (*Table, error) {
 	// fd no longer needed; mapping survives close.
 	_ = f.Close()
 
-	return &Table{
-		data:        data,
-		slotSize:    slotSize,
-		keySize:     opts.KeySize,
-		valueSize:   opts.ValueSize,
-		slotsPerSeg: l.slotsPerSeg,
-		segMask:     l.numSeg - 1,
-		segs:        make([]seg, l.numSeg),
-	}, nil
+	return data, nil
 }
 
 // Close unmaps the region, releasing RSS and reclaiming the file's blocks.
@@ -243,27 +274,43 @@ func (t *Table) writeSlot(off int, key []byte, value uint64) {
 
 // Upsert inserts key (with value) if absent. Returns (existingOrNewValue,
 // inserted, error). inserted=false with no error means the key was already
-// present and the returned value is the stored one. ErrTableFull means the
-// segment is full.
+// present and the returned value is the stored one. If a segment is full the
+// table grows transparently (doubling per-segment capacity) and the insert is
+// retried; ErrTableFull is only returned once growth hits the absolute slot
+// cap (fail-safe — never reachable for any real block).
 func (t *Table) Upsert(key []byte, value uint64) (uint64, bool, error) {
 	if len(key) != t.keySize {
 		return 0, false, errors.NewProcessingError("mmaphash: key length %d != table key size %d", len(key), t.keySize)
 	}
-	segIdx, start := t.locate(key)
-	s := &t.segs[segIdx]
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	for {
+		t.growMu.RLock()
+		segIdx, start := t.locate(key)
+		s := &t.segs[segIdx]
+		s.mu.Lock()
 
-	off, found, full := t.probe(segIdx, start, key)
-	if full {
-		return 0, false, ErrTableFull
+		off, found, full := t.probe(segIdx, start, key)
+		if !found && !full {
+			t.writeSlot(off, key, value)
+			t.count.Add(1)
+			s.mu.Unlock()
+			t.growMu.RUnlock()
+			return value, true, nil
+		}
+		if found {
+			v := t.readValue(off)
+			s.mu.Unlock()
+			t.growMu.RUnlock()
+			return v, false, nil
+		}
+		// segment full: grow (under the exclusive lock) and retry.
+		s.mu.Unlock()
+		gen := t.gen.Load()
+		t.growMu.RUnlock()
+
+		if err := t.grow(gen); err != nil {
+			return 0, false, err
+		}
 	}
-	if found {
-		return t.readValue(off), false, nil
-	}
-	t.writeSlot(off, key, value)
-	t.count.Add(1)
-	return value, true, nil
 }
 
 // Lookup returns (value, found).
@@ -271,6 +318,9 @@ func (t *Table) Lookup(key []byte) (uint64, bool, error) {
 	if len(key) != t.keySize {
 		return 0, false, errors.NewProcessingError("mmaphash: key length %d != table key size %d", len(key), t.keySize)
 	}
+	t.growMu.RLock()
+	defer t.growMu.RUnlock()
+
 	segIdx, start := t.locate(key)
 	s := &t.segs[segIdx]
 	s.mu.RLock()
@@ -283,4 +333,82 @@ func (t *Table) Lookup(key []byte) (uint64, bool, error) {
 		return 0, false, nil
 	}
 	return t.readValue(off), true, nil
+}
+
+// grow doubles the per-segment slot capacity, rehashing every live entry into a
+// fresh mmap, then swaps it in. It holds growMu exclusively, so all concurrent
+// Upsert/Lookup readers are drained before t.data/t.slotsPerSeg change — no torn
+// reads. The segment count is unchanged, so an entry keeps its segment and only
+// its in-segment bucket is recomputed.
+//
+// observedGen is the gen value the caller saw before releasing its read lock; if
+// another goroutine already grew in the meantime, this grow is a no-op and the
+// caller simply retries into the larger table (avoids redundant doublings under
+// a thundering herd).
+func (t *Table) grow(observedGen uint64) error {
+	t.growMu.Lock()
+	defer t.growMu.Unlock()
+
+	if t.gen.Load() != observedGen {
+		return nil // someone else already grew; retry will find room
+	}
+
+	numSeg := t.segMask + 1
+	newSlotsPerSeg := t.slotsPerSeg * 2
+	if numSeg*newSlotsPerSeg > maxTotalSlots {
+		// Astronomically large (only reachable under pathological single-parent
+		// clustering far beyond any real block). Stay fail-safe.
+		return ErrTableFull
+	}
+
+	fileBytes := int64(numSeg*newSlotsPerSeg) * int64(t.slotSize)
+	newData, err := mapRegion(t.dir, t.prefix, fileBytes)
+	if err != nil {
+		return err
+	}
+
+	// Rehash: scan old slots; each occupied slot keeps its segment (its global
+	// index / old slotsPerSeg) and is re-probed within that segment's larger
+	// window. Copying the whole slot preserves state byte, key and value.
+	newMask := newSlotsPerSeg - 1
+	oldSlots := numSeg * t.slotsPerSeg
+	for i := uint64(0); i < oldSlots; i++ {
+		o := int(i) * t.slotSize
+		if t.data[o] == 0 {
+			continue // empty
+		}
+		segIdx := i / t.slotsPerSeg
+		key := t.data[o+1 : o+1+t.keySize]
+		bucket := binary.LittleEndian.Uint64(key[0:8]) & newMask
+		base := segIdx * newSlotsPerSeg
+		placed := false
+		for j := uint64(0); j < newSlotsPerSeg; j++ {
+			local := (bucket + j) & newMask
+			no := int(base+local) * t.slotSize
+			if newData[no] == 0 {
+				copy(newData[no:no+t.slotSize], t.data[o:o+t.slotSize])
+				placed = true
+				break
+			}
+		}
+		// A segment held at most old-slotsPerSeg entries, so they always fit in
+		// the doubled window. If that invariant is ever violated we must NOT
+		// silently drop the entry: a lost parentSpendsMap entry is a missed
+		// duplicate-input, i.e. accepting an invalid block. Fail the grow loudly
+		// instead — newData is not yet swapped in, so t is left untouched.
+		if !placed {
+			_ = unix.Munmap(newData)
+			return errors.NewProcessingError("mmaphash: rehash could not place entry; segment overflow in doubled window (unexpected)")
+		}
+	}
+
+	old := t.data
+	t.data = newData
+	t.slotsPerSeg = newSlotsPerSeg
+	t.gen.Add(1)
+
+	// Release the old mapping. The swap is already published; a munmap error
+	// only leaks the old region (reclaimed at process exit), so do not fail.
+	_ = unix.Munmap(old)
+	return nil
 }
