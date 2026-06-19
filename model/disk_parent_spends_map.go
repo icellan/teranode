@@ -34,8 +34,8 @@ func NewDiskParentSpendsMap(opts DiskParentSpendsMapOptions) (*DiskParentSpendsM
 	if len(opts.BasePaths) == 0 {
 		return nil, errors.NewProcessingError("DiskParentSpendsMap: at least one base path is required")
 	}
-	// The mmap table is fixed-capacity, so a zero FilterCapacity would build a
-	// minimal table that overflows almost immediately. Fail fast instead.
+	// A zero FilterCapacity is a misconfiguration: the table would start minimal
+	// and grow repeatedly from nothing under load. Fail fast so sizing is explicit.
 	if opts.FilterCapacity == 0 {
 		return nil, errors.NewProcessingError("DiskParentSpendsMap: FilterCapacity must be > 0")
 	}

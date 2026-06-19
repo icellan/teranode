@@ -178,7 +178,11 @@ func mapRegion(dir, prefix string, fileBytes int64) ([]byte, error) {
 
 	f, err := os.CreateTemp(dir, prefix+"-*.mmh")
 	if err != nil {
-		return nil, errors.NewStorageError("mmaphash: create temp file in %s", dir, err)
+		shownDir := dir
+		if shownDir == "" {
+			shownDir = os.TempDir() // os.CreateTemp falls back to this when dir is empty
+		}
+		return nil, errors.NewStorageError("mmaphash: create temp file in %s", shownDir, err)
 	}
 	// Unlink now: the open fd and mmap keep the inode alive; space is reclaimed
 	// on Close (munmap + last fd close) or on process exit, even after a crash.
@@ -355,7 +359,10 @@ func (t *Table) grow(observedGen uint64) error {
 
 	numSeg := t.segMask + 1
 	newSlotsPerSeg := t.slotsPerSeg * 2
-	if numSeg*newSlotsPerSeg > maxTotalSlots {
+	// Division form: the product stays <= 2^46 given the per-grow invariant, but
+	// checking newSlotsPerSeg against maxTotalSlots/numSeg keeps the bound safe
+	// without any chance of a uint64 multiply overflowing. numSeg is always >= 1.
+	if newSlotsPerSeg > maxTotalSlots/numSeg {
 		// Astronomically large (only reachable under pathological single-parent
 		// clustering far beyond any real block). Stay fail-safe.
 		return ErrTableFull
