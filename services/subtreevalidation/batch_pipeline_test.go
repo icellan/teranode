@@ -31,10 +31,7 @@ func TestRunLoadProcessPipeline_ProcessesInOrderSerially(t *testing.T) {
 		overlap   bool
 	)
 
-	loaded := make([]bool, numBatches)
-
-	load := func(_ context.Context, idx int) ([]*bt.Tx, []*bt.Arena, error) {
-		loaded[idx] = true
+	load := func(_ context.Context, _ int) ([]*bt.Tx, []*bt.Arena, error) {
 		return nil, nil, nil
 	}
 
@@ -75,6 +72,7 @@ func TestRunLoadProcessPipeline_ProcessErrorReleasesPendingBatches(t *testing.T)
 		mu          sync.Mutex
 		loadedCount int
 		released    = map[int]int{}
+		processed   []int
 	)
 
 	wantErr := errors.NewProcessingError("process boom")
@@ -102,6 +100,10 @@ func TestRunLoadProcessPipeline_ProcessErrorReleasesPendingBatches(t *testing.T)
 	}
 
 	process := func(idx int, _ []*bt.Tx, _ []*bt.Arena) error {
+		mu.Lock()
+		processed = append(processed, idx)
+		mu.Unlock()
+
 		if idx == 1 {
 			return wantErr
 		}
@@ -122,6 +124,14 @@ func TestRunLoadProcessPipeline_ProcessErrorReleasesPendingBatches(t *testing.T)
 
 	mu.Lock()
 	defer mu.Unlock()
+
+	// PROCESS must stop at the failing batch: batch 0 succeeds, batch 1 errors,
+	// and no later batch is processed. This is the consensus-relevant property —
+	// no UTXO mutation may run after a fatal error — and it is what guards the
+	// drain check in runLoadProcessPipeline. Asserting only the arena balance
+	// below would still pass if the abort guard were removed and batches 2..N
+	// were processed (and released) after the error.
+	require.Equal(t, []int{0, 1}, processed, "process must stop at the failing batch; no batch may be processed after the error")
 
 	// Every batch the producer loaded must have had its arenas released exactly
 	// once — no leak, no double release.
@@ -183,7 +193,7 @@ func TestRunLoadProcessPipeline_LoadErrorAborts(t *testing.T) {
 	require.Equal(t, []int{0, 1, 2}, processed)
 	// Every non-failing batch that was loaded contributes one arena; all must
 	// be released (processed ones after process, the failing batch none).
-	require.Equal(t, releasedN, countNonFailingLoaded(loadCalls, 3))
+	require.Equal(t, countNonFailingLoaded(loadCalls, 3), releasedN)
 }
 
 // countNonFailingLoaded returns how many loaded batches carried a (releasable)
@@ -199,34 +209,94 @@ func countNonFailingLoaded(loadCalls, failIdx int) int {
 	return n
 }
 
-// TestRunLoadProcessPipeline_OverlapsLoadWithProcess proves the speed-up: with
-// a per-batch LOAD delay and PROCESS delay, the pipeline wall-clock must be
-// well below the sequential sum (load+process per batch), because LOAD of
-// batch N+1 overlaps PROCESS of batch N.
+// TestRunLoadProcessPipeline_OverlapsLoadWithProcess proves the overlap
+// deterministically (no wall-clock thresholds): while process(N) runs, it
+// blocks until load(N+1) has started. If LOAD did not run a batch ahead of
+// PROCESS this would deadlock on the timeout and the test would fail — so a
+// success is positive proof that load(N+1) overlaps process(N).
 func TestRunLoadProcessPipeline_OverlapsLoadWithProcess(t *testing.T) {
-	const (
-		numBatches  = 8
-		loadDelay   = 8 * time.Millisecond
-		processTime = 8 * time.Millisecond
+	const numBatches = 4
+
+	loadStarted := make([]chan struct{}, numBatches)
+	for i := range loadStarted {
+		loadStarted[i] = make(chan struct{})
+	}
+
+	var (
+		mu       sync.Mutex
+		overlaps int
 	)
 
-	load := func(_ context.Context, _ int) ([]*bt.Tx, []*bt.Arena, error) {
-		time.Sleep(loadDelay)
+	load := func(_ context.Context, idx int) ([]*bt.Tx, []*bt.Arena, error) {
+		close(loadStarted[idx])
 		return nil, nil, nil
 	}
-	process := func(_ int, _ []*bt.Tx, _ []*bt.Arena) error {
-		time.Sleep(processTime)
+
+	process := func(idx int, _ []*bt.Tx, _ []*bt.Arena) error {
+		// While processing batch idx, the producer must already be loading
+		// batch idx+1 (one batch ahead). Wait for that load to start; the
+		// timeout only guards against a hang if the overlap never happens.
+		if idx+1 < numBatches {
+			select {
+			case <-loadStarted[idx+1]:
+				mu.Lock()
+				overlaps++
+				mu.Unlock()
+			case <-time.After(2 * time.Second):
+				t.Errorf("load of batch %d did not start during process of batch %d — no overlap", idx+1, idx)
+			}
+		}
+
 		return nil
 	}
 
-	start := time.Now()
 	err := runLoadProcessPipeline(context.Background(), numBatches, load, process, func([]*bt.Arena) {})
-	elapsed := time.Since(start)
 	require.NoError(t, err)
 
-	sequential := numBatches * (loadDelay + processTime)
-	// Pipeline lower bound ≈ loadDelay (first load) + numBatches*processTime.
-	// Require a clear win over sequential (allow scheduling slack).
-	require.Less(t, elapsed, sequential*3/4,
-		"pipeline (%s) should be well below sequential (%s)", elapsed, sequential)
+	require.Equal(t, numBatches-1, overlaps, "every process(N) must overlap load(N+1)")
+}
+
+// TestRunLoadProcessPipeline_ProcessPanicReleasesBatch asserts that if process
+// panics, the panicking batch's arenas are still released (the release is
+// deferred), and the panic propagates to the caller. Without the deferred
+// release the arenas would leak from the pool on a process panic.
+func TestRunLoadProcessPipeline_ProcessPanicReleasesBatch(t *testing.T) {
+	const numBatches = 4
+
+	panicArena := bt.NewArena(1)
+
+	var (
+		mu       sync.Mutex
+		released = map[*bt.Arena]bool{}
+	)
+
+	load := func(_ context.Context, idx int) ([]*bt.Tx, []*bt.Arena, error) {
+		if idx == 0 {
+			return nil, []*bt.Arena{panicArena}, nil
+		}
+		return nil, []*bt.Arena{bt.NewArena(1)}, nil
+	}
+
+	process := func(idx int, _ []*bt.Tx, _ []*bt.Arena) error {
+		if idx == 0 {
+			panic("process boom")
+		}
+		return nil
+	}
+
+	release := func(arenas []*bt.Arena) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, a := range arenas {
+			released[a] = true
+		}
+	}
+
+	require.Panics(t, func() {
+		_ = runLoadProcessPipeline(context.Background(), numBatches, load, process, release)
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.True(t, released[panicArena], "panicking batch's arenas must be released via defer")
 }

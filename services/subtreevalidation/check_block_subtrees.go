@@ -69,7 +69,17 @@ func (c *countingReadCloser) Close() error {
 // release the arenas (putSubtreeArena) once processTransactionsInLevels has
 // consumed the txs. On error it releases any arenas it allocated before
 // returning, so the caller never has to clean up after a failed load.
-func (u *Server) loadSubtreeBatch(ctx context.Context, request *subtreevalidation_api.CheckBlockSubtreesRequest, batchSubtrees []chainhash.Hash, peerID string, dah uint32) (allTransactions []*bt.Tx, batchArenas []*bt.Arena, err error) {
+//
+// ctx governs the batch load itself (errgroup, store reads) and is the
+// pipeline's cancellable per-load context — when CheckBlockSubtrees aborts
+// (a later batch's processing fails) this ctx is cancelled to stop the load.
+// fetchCtx is the durable top-level request context, deliberately NOT derived
+// from the pipeline's load-abort context: it governs only the on-demand peer
+// subtree_data download (see the rationale at the fetch site) so that a
+// cross-batch abort does not cancel an in-flight peer fetch and trigger the
+// peer's storer.Abort. Pass the same context for both only when there is no
+// pipeline (e.g. tests).
+func (u *Server) loadSubtreeBatch(ctx, fetchCtx context.Context, request *subtreevalidation_api.CheckBlockSubtreesRequest, batchSubtrees []chainhash.Hash, peerID string, dah uint32) (allTransactions []*bt.Tx, batchArenas []*bt.Arena, err error) {
 	// Load transactions for this batch of subtrees in parallel
 	subtreeTxs := make([][]*bt.Tx, len(batchSubtrees))
 	batchArenas = make([]*bt.Arena, len(batchSubtrees))
@@ -252,19 +262,21 @@ func (u *Server) loadSubtreeBatch(ctx context.Context, request *subtreevalidatio
 					// Retry on 503 — peer's asset service may reject under admission control
 					// while it generates the file on-demand from Aerospike.
 					//
-					// IMPORTANT: pass the parent ctx, NOT gCtx, to the HTTP fetch and the
-					// stream processor. gCtx is the errgroup's cancellable context — using
-					// it here means a single sibling failure cancels every in-flight
-					// subtree_data download in this batch. Because each cancellation closes
-					// the upstream connection, the peer aborts its on-demand creation
-					// (storer.Abort), discarding work that was already paid for in Aerospike
-					// reads. Detaching from gCtx lets each fetch complete (or hit its own
-					// http_streaming_timeout) so the peer can finish writing its subtreeData
-					// file — converting wasted Aerospike work into a pre-warmed cache for
-					// the next retry. The trade-off is that batch failure detection waits
-					// for in-flight peers instead of cancelling early; acceptable here
-					// because the per-fetch streaming timeout still bounds it.
-					body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(ctx, url)
+					// IMPORTANT: pass fetchCtx, NOT ctx or gCtx, to the HTTP fetch and the
+					// stream processor. Both ctx (the pipeline's per-load context) and gCtx
+					// (the errgroup's child of ctx) are cancelled when this load is aborted —
+					// either by a sibling subtree failing in this batch (gCtx) or by a LATER
+					// batch's processing failing, which cancels the pipeline load context
+					// (ctx). Cancelling here closes the upstream connection, so the peer
+					// aborts its on-demand creation (storer.Abort), discarding work already
+					// paid for in Aerospike reads. fetchCtx is the durable top-level request
+					// context, independent of both abort paths, so each fetch completes (or
+					// hits its own http_streaming_timeout) and the peer finishes writing its
+					// subtreeData file — converting otherwise-wasted Aerospike work into a
+					// pre-warmed cache for the next retry. The trade-off is that abort
+					// detection waits for in-flight peers instead of cancelling early;
+					// acceptable here because the per-fetch streaming timeout still bounds it.
+					body, subtreeDataErr := util.DoHTTPRequestBodyReaderWithRetry(fetchCtx, url)
 					if subtreeDataErr != nil {
 						return errors.NewServiceError("[CheckBlockSubtrees][%s] failed to get subtree data from %s", subtreeHash.String(), url, subtreeDataErr)
 					}
@@ -277,8 +289,8 @@ func (u *Server) loadSubtreeBatch(ctx context.Context, request *subtreevalidatio
 					}
 
 					// Process transactions directly from the stream while storing to disk.
-					// Same rationale as above for using ctx instead of gCtx.
-					err = u.processSubtreeDataStream(ctx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah, arena)
+					// Same rationale as above for using fetchCtx instead of ctx/gCtx.
+					err = u.processSubtreeDataStream(fetchCtx, subtreeToCheck, countingBody, &subtreeTxs[subtreeIdx], dah, arena)
 					_ = countingBody.Close()
 
 					// Track bytes downloaded from peer after stream is consumed
@@ -324,7 +336,7 @@ func (u *Server) loadSubtreeBatch(ctx context.Context, request *subtreevalidatio
 			}
 		}
 
-		return nil, nil, errors.NewProcessingError("[CheckBlockSubtreesRequest] Failed to get subtree tx hashes", err)
+		return nil, nil, errors.NewProcessingError("[CheckBlockSubtrees] failed to load subtree transactions", err)
 	}
 
 	// Collect all transactions from this batch of subtrees
@@ -561,7 +573,18 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 			batchSubtrees := missingSubtrees[batchStart:batchEnd]
 			u.logger.Debugf("[CheckBlockSubtrees] Loading subtree batch %d/%d with %d subtrees for block %s", batchIdx+1, numBatches, len(batchSubtrees), block.Hash().String())
 
-			return u.loadSubtreeBatch(loadCtx, request, batchSubtrees, peerID, dah)
+			// loadCtx (the pipeline's per-load context) governs the load and is
+			// cancelled on abort; ctx is the durable top-level request context
+			// passed as fetchCtx so an in-flight peer subtree_data download is not
+			// cancelled by a later batch's failure. See loadSubtreeBatch.
+			txs, arenas, loadErr := u.loadSubtreeBatch(loadCtx, ctx, request, batchSubtrees, peerID, dah)
+			if loadErr != nil {
+				// Restore the batch context the pre-pipeline loop carried — with
+				// loads running ahead, knowing which batch failed matters more.
+				return nil, nil, errors.NewProcessingError("[CheckBlockSubtrees] failed to load subtree batch %d/%d", batchIdx+1, numBatches, loadErr)
+			}
+
+			return txs, arenas, nil
 		},
 		func(batchIdx int, allTransactions []*bt.Tx, _ []*bt.Arena) error {
 			batchTxCount := len(allTransactions)

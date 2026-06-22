@@ -104,8 +104,13 @@ func runLoadProcessPipeline(
 			continue
 		}
 
-		perr := process(b.idx, b.txs, b.arenas)
-		release(b.arenas)
+		// Release via defer so the batch's arenas return to the pool even if
+		// process panics (the panic unwinds through here to the recover in
+		// CheckBlockSubtrees); a plain post-call release would be skipped.
+		perr := func() error {
+			defer release(b.arenas)
+			return process(b.idx, b.txs, b.arenas)
+		}()
 
 		if perr != nil {
 			retErr = perr

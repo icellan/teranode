@@ -95,9 +95,11 @@ func wireMultiBatchMocks(server *Server) {
 	server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
 		mock.Anything, mock.Anything, mock.Anything).
 		Return([]uint32{1, 2, 3}, nil).Maybe()
-	server.blockchainClient.(*blockchain.Mock).On("IsFSMCurrentState",
-		mock.Anything, mock.Anything).
-		Return(true, nil).Maybe()
+	// CheckBlockSubtrees gates optimistic fetch on GetFSMCurrentState (not
+	// IsFSMCurrentState); mock the method actually on the code path.
+	runningState := blockchain.FSMStateRUNNING
+	server.blockchainClient.(*blockchain.Mock).On("GetFSMCurrentState", mock.Anything).
+		Return(&runningState, nil).Maybe()
 }
 
 // TestCheckBlockSubtrees_MultiBatch_BalancesArenas drives the real batch
@@ -119,6 +121,10 @@ func TestCheckBlockSubtrees_MultiBatch_BalancesArenas(t *testing.T) {
 	blockBytes, err := block.Bytes()
 	require.NoError(t, err)
 
+	// arenaGets/arenaPuts are package-global; the pre/post delta is only valid
+	// because subtreevalidation tests run sequentially (no t.Parallel, per
+	// .claude/rules/testing.md). A concurrent test touching the pool would
+	// perturb these deltas.
 	gets0, puts0 := arenaGets.Load(), arenaPuts.Load()
 
 	_, err = server.CheckBlockSubtrees(context.Background(), &subtreevalidation_api.CheckBlockSubtreesRequest{
