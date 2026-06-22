@@ -195,6 +195,14 @@ func mapRegion(dir, prefix string, fileBytes int64) ([]byte, error) {
 		return nil, errors.NewStorageError("mmaphash: unlink temp file %s", f.Name(), rmErr)
 	}
 
+	// Truncate makes the file sparse — blocks are committed lazily on first
+	// write-fault, which is what keeps RSS tracking live entries (untouched
+	// segments never allocate). Known limitation: if the backing disk is full
+	// when a slot is first written, that store fault delivers SIGBUS (process
+	// crash) rather than a returnable error. Committing blocks up front
+	// (fallocate) would trade that crash for an early error but defeats the
+	// sparse design (a grow would commit the full doubled size). Left sparse;
+	// disk capacity for the maps is an operator/provisioning concern.
 	if err = f.Truncate(fileBytes); err != nil {
 		_ = f.Close()
 		return nil, errors.NewStorageError("mmaphash: ftruncate %d bytes", fileBytes, err)
