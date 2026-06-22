@@ -236,6 +236,57 @@ func TestBlockAssembly_Start(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("Start with no state but non-genesis chain refuses", func(t *testing.T) {
+		// Bug A (issue #980): if no BlockAssembler checkpoint is persisted but the
+		// chain has already advanced past genesis, adopting the tip as the resume
+		// point silently skips processCoinbaseUtxos for every missed block, leaving
+		// permanent UTXO holes. A running node must refuse to start instead.
+		initPrometheusMetrics()
+
+		tSettings := createTestSettings(t)
+
+		utxoStoreURL, err := url.Parse("sqlitememory:///test")
+		require.NoError(t, err)
+
+		utxoStore, err := utxostoresql.New(t.Context(), ulogger.TestLogger{}, tSettings, utxoStoreURL)
+		require.NoError(t, err)
+
+		stats := gocore.NewStat("test")
+
+		// A non-genesis tip header that the node would otherwise silently adopt.
+		tipHeader := &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  model.GenesisBlockHeader.Hash(),
+			HashMerkleRoot: &chainhash.Hash{},
+			Timestamp:      uint32(time.Now().Unix()),
+			Bits:           model.NBit{0xff, 0xff, 0x7f, 0x20},
+			Nonce:          1,
+		}
+
+		blockchainClient := &blockchain.Mock{}
+		// No persisted BlockAssembler state.
+		blockchainClient.On("GetState", mock.Anything, mock.Anything).Return([]byte{}, sql.ErrNoRows)
+		blockchainClient.On("SetState", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+		// Chain tip is well past genesis.
+		blockchainClient.On("GetBestBlockHeader", mock.Anything).Return(tipHeader, &model.BlockHeaderMeta{Height: 100}, nil)
+		blockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).Return([]*model.BlockHeader{model.GenesisBlockHeader}, []*model.BlockHeaderMeta{{Height: 0}}, nil)
+		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
+		blockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
+		blockchainClient.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.ErrNotFound)
+		runningState := blockchain.FSMStateRUNNING
+		blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&runningState, nil)
+		subChan := make(chan *blockchain_api.Notification, 1)
+		blockchainClient.On("Subscribe", mock.Anything, mock.Anything).Return(subChan, nil)
+
+		blockAssembler, err := NewBlockAssembler(t.Context(), ulogger.TestLogger{}, tSettings, stats, utxoStore, nil, blockchainClient, nil)
+		require.NoError(t, err)
+		require.NotNil(t, blockAssembler)
+
+		err = blockAssembler.Start(t.Context())
+		require.Error(t, err)
+		require.ErrorContains(t, err, "refusing to start")
+	})
+
 	t.Run("Start with existing state in blockchain", func(t *testing.T) {
 		initPrometheusMetrics()
 
@@ -1244,22 +1295,37 @@ func TestBlockAssembly_CoinbaseSubsidyBugReproduction(t *testing.T) {
 
 		wg.Wait()
 
-		// Test with normal parameters - should get full subsidy + fees
-		miningCandidate, _, err := testItems.blockAssembler.GetMiningCandidate(ctx)
-		require.NoError(t, err, "Failed to get mining candidate")
-		assert.NotNil(t, miningCandidate)
-
 		expectedSubsidy := uint64(5000000000) // 50 BSV for early blocks
 		expectedTotal := totalExpectedFees + expectedSubsidy
 
-		assert.Equal(t, expectedTotal, miningCandidate.CoinbaseValue,
+		// Wait until the assembler has committed all 3 txs into the mining
+		// candidate before asserting on the coinbase value. AddTxBatch enqueues
+		// asynchronously (subtreeProcessor.AddBatch -> queue), so a candidate
+		// read too early reports NumTxs < 3 and a coinbase missing the
+		// not-yet-aggregated fees — the source of the CI flake where
+		// CoinbaseValue equalled the subsidy only. Mirrors the wait already used
+		// by the GetMiningCandidate test earlier in this file.
+		var coinbaseValue uint64
+
+		require.Eventually(t, func() bool {
+			mc, _, mcErr := testItems.blockAssembler.GetMiningCandidate(ctx)
+			if mcErr != nil || mc == nil || mc.NumTxs != 3 {
+				return false
+			}
+
+			coinbaseValue = mc.CoinbaseValue
+
+			return true
+		}, 5*time.Second, 20*time.Millisecond, "mining candidate did not include all 3 txs in time")
+
+		assert.Equal(t, expectedTotal, coinbaseValue,
 			"Normal scenario: should have fees (%d) + subsidy (%d) = %d",
 			totalExpectedFees, expectedSubsidy, expectedTotal)
 
 		t.Logf("NORMAL CASE: height=%d, fees=%d (%.8f BSV), subsidy=%d (%.8f BSV), total=%d (%.8f BSV)",
 			height, totalExpectedFees, float64(totalExpectedFees)/1e8,
 			expectedSubsidy, float64(expectedSubsidy)/1e8,
-			miningCandidate.CoinbaseValue, float64(miningCandidate.CoinbaseValue)/1e8)
+			coinbaseValue, float64(coinbaseValue)/1e8)
 
 		// Now test what happens if we could somehow corrupt the chain params
 		// (This demonstrates what the bug would look like)

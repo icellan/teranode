@@ -737,7 +737,7 @@ func (t *TxMetaCache) RemoveBlockIDs(ctx context.Context, removals []utxo.BlockI
 //     the actual store update happens before this method is invoked.
 func (t *TxMetaCache) setMinedInCacheParallel(ctx context.Context, hashes []*chainhash.Hash, _ uint32) error {
 	g := new(errgroup.Group)
-	util.SafeSetLimit(g, 100)
+	util.SafeSetLimit(t.logger, g, 100)
 
 	for _, hash := range hashes {
 		hash := hash
@@ -1022,6 +1022,22 @@ func (t *TxMetaCache) SetConflicting(ctx context.Context, txHashes []chainhash.H
 // - Error if the operation fails
 func (t *TxMetaCache) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setValue bool) error {
 	return t.utxoStore.SetLocked(ctx, txHashes, setValue)
+}
+
+// BeginConflictIntent delegates to the wrapped store. The conflict-resolution
+// write-ahead log lives in the durable backend, not the in-memory cache.
+func (t *TxMetaCache) BeginConflictIntent(ctx context.Context, intent utxo.ConflictIntent) error {
+	return t.utxoStore.BeginConflictIntent(ctx, intent)
+}
+
+// CompleteConflictIntent delegates to the wrapped store.
+func (t *TxMetaCache) CompleteConflictIntent(ctx context.Context, intentID chainhash.Hash) error {
+	return t.utxoStore.CompleteConflictIntent(ctx, intentID)
+}
+
+// PendingConflictIntents delegates to the wrapped store.
+func (t *TxMetaCache) PendingConflictIntents(ctx context.Context) ([]utxo.ConflictIntent, error) {
+	return t.utxoStore.PendingConflictIntents(ctx)
 }
 
 // MarkTransactionsOnLongestChain marks transactions as being on the longest chain or not.

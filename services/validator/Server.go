@@ -34,7 +34,6 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
-	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
@@ -123,6 +122,10 @@ type Server struct {
 	// is used to send rejected transaction data to Kafka topics for monitoring and analysis.
 	rejectedTxKafkaProducerClient kafka.KafkaAsyncProducerI
 
+	// policyRejectedTxKafkaProducerClient publishes consensus-valid but policy-rejected
+	// transactions to Kafka. Subtree validation pods consume these to cache raw tx bytes.
+	policyRejectedTxKafkaProducerClient kafka.KafkaAsyncProducerI
+
 	// blockAssemblyClient connects to the block assembly service for mining integration,
 	// enabling the validator service to participate in block template generation and
 	// transaction inclusion in mining operations. This client is used to interact with
@@ -155,19 +158,21 @@ type Server struct {
 func NewServer(logger ulogger.Logger, tSettings *settings.Settings, utxoStore utxo.Store,
 	blockchainClient blockchain.ClientI, consumerClient kafka.KafkaConsumerGroupI,
 	txMetaKafkaProducerClient kafka.KafkaAsyncProducerI, rejectedTxKafkaProducerClient kafka.KafkaAsyncProducerI,
+	policyRejectedTxKafkaProducerClient kafka.KafkaAsyncProducerI,
 	blockAssemblyClient blockassembly.ClientI) *Server {
 	initPrometheusMetrics()
 
 	return &Server{
-		logger:                        logger,
-		settings:                      tSettings,
-		utxoStore:                     utxoStore,
-		stats:                         gocore.NewStat("validator"),
-		blockchainClient:              blockchainClient,
-		consumerClient:                consumerClient,
-		txMetaKafkaProducerClient:     txMetaKafkaProducerClient,
-		rejectedTxKafkaProducerClient: rejectedTxKafkaProducerClient,
-		blockAssemblyClient:           blockAssemblyClient,
+		logger:                              logger,
+		settings:                            tSettings,
+		utxoStore:                           utxoStore,
+		stats:                               gocore.NewStat("validator"),
+		blockchainClient:                    blockchainClient,
+		consumerClient:                      consumerClient,
+		txMetaKafkaProducerClient:           txMetaKafkaProducerClient,
+		rejectedTxKafkaProducerClient:       rejectedTxKafkaProducerClient,
+		policyRejectedTxKafkaProducerClient: policyRejectedTxKafkaProducerClient,
+		blockAssemblyClient:                 blockAssemblyClient,
 	}
 }
 
@@ -295,7 +300,7 @@ func (v *Server) Init(ctx context.Context) (err error) {
 		return errors.NewServiceError("[Init] blockassembly client is nil while enabled in the validator", nil)
 	}
 
-	v.validator, err = New(ctx, v.logger, v.settings, v.utxoStore, v.txMetaKafkaProducerClient, v.rejectedTxKafkaProducerClient, v.blockAssemblyClient, v.blockchainClient)
+	v.validator, err = New(ctx, v.logger, v.settings, v.utxoStore, v.txMetaKafkaProducerClient, v.rejectedTxKafkaProducerClient, v.policyRejectedTxKafkaProducerClient, v.blockAssemblyClient, v.blockchainClient)
 	if err != nil {
 		return errors.NewServiceError("[Init] could not create validator", err)
 	}
@@ -443,14 +448,9 @@ func (v *Server) ValidateTransaction(ctx context.Context, req *validator_api.Val
 // the server-side option mapping, preventing the field-by-field mapping from
 // silently drifting between sides.
 //
-// Returns an error when the wire form contains malformed ParentMetadata
-// entries (nil or wrong-length hash). Failing closed is deliberate: a
-// silently-dropped ParentMetadata entry would force the validator into the
-// UTXO-store fallback for that input, where an in-block parent has empty
-// BlockHeights and would be stamped with unconfirmedParentHeight → BDK
-// rejection with bad-txns-unconfirmed-input-in-block. The whole point of
-// carrying ParentMetadata over the wire is to prevent that silent rejection
-// shape, so any wire degradation must surface as a request-level error.
+// The (*Options, error) signature is retained for caller stability even though
+// every field is now a scalar optional that cannot fail to project; the error
+// is always nil.
 func optionsFromValidateRequest(req *validator_api.ValidateTransactionRequest) (*Options, error) {
 	opts := NewDefaultOptions()
 
@@ -474,6 +474,10 @@ func optionsFromValidateRequest(req *validator_api.ValidateTransactionRequest) (
 		opts.SkipTxMetaPublishing = *req.SkipTxmetaPublishing
 	}
 
+	if req.InBlock != nil {
+		opts.InBlock = *req.InBlock
+	}
+
 	if req.CandidateBlockTime != nil {
 		opts.CandidateBlockTime = *req.CandidateBlockTime
 	}
@@ -482,11 +486,9 @@ func optionsFromValidateRequest(req *validator_api.ValidateTransactionRequest) (
 		opts.CandidateParentMedianTime = *req.CandidateParentMedianTime
 	}
 
-	parentMetadata, err := parentMetadataFromWire(req.ParentMetadata)
-	if err != nil {
-		return nil, err
+	if req.UnconfirmedParentsAtCandidateHeight != nil {
+		opts.UnconfirmedParentsAtCandidateHeight = *req.UnconfirmedParentsAtCandidateHeight
 	}
-	opts.ParentMetadata = parentMetadata
 
 	return opts, nil
 }
@@ -505,42 +507,6 @@ func isProtobufContentType(contentType string) bool {
 		ct = strings.TrimSpace(ct[:idx])
 	}
 	return ct == "application/x-protobuf" || ct == "application/protobuf"
-}
-
-// parentMetadataFromWire reconstructs the in-memory ParentMetadata map from
-// the repeated proto form. Returns nil for an empty/missing field — both
-// proto3 round-trip identically and a nil map signals "no in-block-parent
-// metadata supplied for this request" downstream.
-//
-// Fails closed on malformed entries: a nil entry or a parent_hash whose
-// length is not chainhash.HashSize is rejected with an error rather than
-// silently skipped. Rationale: any client that emits a malformed entry has
-// a bug, and silently dropping the entry would force the validator into the
-// UTXO-store fallback for the corresponding input. For an in-block parent
-// that path stamps the unconfirmedParentHeight sentinel, which the BDK
-// adapter then translates to MEMPOOL_HEIGHT and rejects with
-// bad-txns-unconfirmed-input-in-block — exactly the silent consensus-mode
-// rejection that carrying ParentMetadata on the wire is meant to prevent.
-// Surfacing the wire error as a request-level error keeps the client's bug
-// visible instead of letting it manifest as a misleading consensus
-// rejection downstream.
-func parentMetadataFromWire(src []*validator_api.ParentTxMetadata) (map[chainhash.Hash]*ParentTxMetadata, error) {
-	if len(src) == 0 {
-		return nil, nil
-	}
-	out := make(map[chainhash.Hash]*ParentTxMetadata, len(src))
-	for i, entry := range src {
-		if entry == nil {
-			return nil, errors.NewProcessingError("[parentMetadataFromWire] entry %d is nil", i)
-		}
-		if len(entry.ParentHash) != chainhash.HashSize {
-			return nil, errors.NewProcessingError("[parentMetadataFromWire] entry %d has malformed parent_hash length: got %d bytes, want %d", i, len(entry.ParentHash), chainhash.HashSize)
-		}
-		var hash chainhash.Hash
-		copy(hash[:], entry.ParentHash)
-		out[hash] = &ParentTxMetadata{BlockHeight: entry.BlockHeight}
-	}
-	return out, nil
 }
 
 // validateTransaction performs the internal validation logic for a single transaction.
@@ -815,6 +781,10 @@ func extractValidationParams(c echo.Context) (uint32, *Options) {
 		options.SkipTxMetaPublishing = boolVal
 	}
 
+	if inBlockStr := c.QueryParam("inBlock"); inBlockStr != "" {
+		options.InBlock = inBlockStr == trueString || inBlockStr == "1"
+	}
+
 	if candidateBlockTimeStr := c.QueryParam("candidateBlockTime"); candidateBlockTimeStr != "" {
 		if v, err := strconv.ParseUint(candidateBlockTimeStr, 10, 32); err == nil {
 			options.CandidateBlockTime = uint32(v)
@@ -837,6 +807,13 @@ func extractValidationParams(c echo.Context) (uint32, *Options) {
 			// downstream rejection.
 			c.Logger().Warnf("extractValidationParams: ignoring unparsable candidateParentMedianTime=%q: %v", candidateParentMedianTimeStr, err)
 		}
+	}
+
+	// Parity with the gRPC body field (UnconfirmedParentsAtCandidateHeight) and
+	// the client's buildValidateTxHTTPQuery, so the legacy query-string /tx path
+	// cannot silently drop the flag a block-validation / legacy-sync caller set.
+	if unconfirmedParentsStr := c.QueryParam("unconfirmedParentsAtCandidateHeight"); unconfirmedParentsStr != "" {
+		options.UnconfirmedParentsAtCandidateHeight = unconfirmedParentsStr == trueString || unconfirmedParentsStr == "1"
 	}
 
 	return blockHeight, options
@@ -873,12 +850,11 @@ func (v *Server) handleSingleTx(ctx context.Context) echo.HandlerFunc {
 
 		// The /tx endpoint supports two body shapes, discriminated by Content-Type:
 		//   - application/x-protobuf: body is a serialised ValidateTransactionRequest
-		//     (the modern path; carries every field gRPC carries, including
-		//     ParentMetadata which has no query-string representation).
+		//     (the modern path; carries every field gRPC carries).
 		//   - any other Content-Type (legacy, including application/octet-stream):
 		//     body is the raw tx bytes; scalar fields come from query params via
 		//     extractValidationParams. Kept for backward compatibility with
-		//     non-protobuf callers; ParentMetadata is necessarily nil on this path.
+		//     non-protobuf callers.
 		var req *validator_api.ValidateTransactionRequest
 		if isProtobufContentType(c.Request().Header.Get("Content-Type")) {
 			req = &validator_api.ValidateTransactionRequest{}
