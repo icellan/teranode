@@ -14,6 +14,7 @@ import (
 	utxofields "github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -44,9 +45,19 @@ type replaySpyStore struct {
 	pending    []utxo.ConflictIntent
 	pendingErr error
 	completed  []chainhash.Hash
+	// drainOnReRead makes the post-replay re-read of the WAL (the call that
+	// updates the pending gauge) return empty, modelling a store that actually
+	// removed the intents that were completed during the drain loop.
+	drainOnReRead bool
+	pendingCalls  int
 }
 
 func (s *replaySpyStore) PendingConflictIntents(_ context.Context) ([]utxo.ConflictIntent, error) {
+	s.pendingCalls++
+	if s.drainOnReRead && s.pendingCalls > 1 {
+		return nil, s.pendingErr
+	}
+
 	return s.pending, s.pendingErr
 }
 
@@ -82,6 +93,38 @@ func TestReplayPendingConflictIntents_NoPending(t *testing.T) {
 	b.replayPendingConflictIntents(context.Background())
 
 	require.Empty(t, spy.completed, "nothing to complete when no intents are pending")
+}
+
+// TestReplayPendingConflictIntents_PendingGaugeReflectsPostReplay verifies the
+// conflict_intents_pending gauge is updated to the post-replay WAL count (so an
+// alert clears once recovery succeeds) rather than latching at the startup count.
+func TestReplayPendingConflictIntents_PendingGaugeReflectsPostReplay(t *testing.T) {
+	demoted := chainhash.HashH([]byte("gauge-demoted"))
+
+	intent := utxo.ConflictIntent{
+		Kind:        utxo.ConflictIntentReverse,
+		BlockHeight: 500,
+		TxHashes:    []chainhash.Hash{demoted},
+		StartedAt:   1,
+	}
+
+	mockStore := &utxo.MockUtxostore{}
+	// Demoted tx resolves with a nil body → ReverseProcessConflicting is a no-op
+	// success → intent completed.
+	mockStore.On("Get", mock.Anything, &demoted, mock.Anything).Return(&meta.Data{}, nil)
+
+	// First read returns the pending intent; the post-replay re-read returns empty
+	// (the store removed the completed intent).
+	spy := &replaySpyStore{MockUtxostore: mockStore, pending: []utxo.ConflictIntent{intent}, drainOnReRead: true}
+	b := newReplayTestAssembler(spy, blockchainMembershipMock(false, true))
+
+	// Sentinel so we can prove the gauge was actively updated.
+	prometheusBlockAssemblerConflictIntentsPending.Set(99)
+
+	b.replayPendingConflictIntents(context.Background())
+
+	require.Equal(t, float64(0), testutil.ToFloat64(prometheusBlockAssemblerConflictIntentsPending),
+		"pending gauge must reflect the drained WAL after a successful replay, not the startup count")
 }
 
 // TestReplayPendingConflictIntents_LoadErrorIsNotFatal verifies a failure to

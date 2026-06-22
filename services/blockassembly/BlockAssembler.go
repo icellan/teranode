@@ -1058,6 +1058,18 @@ func (b *BlockAssembler) replayPendingConflictIntents(ctx context.Context) {
 				intent.Kind, intent.IntentID().String(), completeErr)
 		}
 	}
+
+	// Re-read the WAL so the pending gauge reflects post-replay reality. Without
+	// this the gauge latches at the startup count and an alert on
+	// conflict_intents_pending > 0 keeps firing after a successful recovery until
+	// the next restart. The remaining count is whatever could not be resolved
+	// (replay/heal failures, chain-check errors, or completions that failed to
+	// delete) — exactly what an operator should still be alerted on.
+	if remaining, err := b.utxoStore.PendingConflictIntents(ctx); err != nil {
+		b.logger.Warnf("[BlockAssembler][replayPendingConflictIntents] could not re-read WAL to update pending gauge: %v", err)
+	} else {
+		prometheusBlockAssemblerConflictIntentsPending.Set(float64(len(remaining)))
+	}
 }
 
 // isConflictIntentStale reports whether an intent of the given kind is stale —
