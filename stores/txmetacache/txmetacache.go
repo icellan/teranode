@@ -506,6 +506,17 @@ func (t *TxMetaCache) Get(ctx context.Context, hash *chainhash.Hash, f ...fields
 //
 // The method optimizes retrieval by first checking the cache for each transaction,
 // then batching any cache misses into a single call to the underlying store.
+// metaBytesBufPool recycles the per-transaction MetaBytes serialization buffers
+// used to repopulate the cache in BatchDecorate. The initial capacity covers the
+// common single-parent transaction (17-byte header + a few dozen inpoint bytes)
+// with headroom; larger transactions grow their buffer on first use and keep it.
+var metaBytesBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 256)
+		return &b
+	},
+}
+
 func (t *TxMetaCache) BatchDecorate(ctx context.Context, hashes []*utxo.UnresolvedMetaData, fields ...fields.FieldName) error {
 	if err := t.utxoStore.BatchDecorate(ctx, hashes, fields...); err != nil {
 		return err
@@ -517,6 +528,19 @@ func (t *TxMetaCache) BatchDecorate(ctx context.Context, hashes []*utxo.Unresolv
 	// Note: values are serialized the same way SetCache() does (via MetaBytes).
 	keys := make([][]byte, 0, len(hashes))
 	values := make([][]byte, 0, len(hashes))
+
+	// The per-tx MetaBytes serialization buffers are recycled through a pool:
+	// SetCacheMultiValuesRaw (SetMulti) copies the value bytes into the cache's
+	// own chunk storage before returning, so each buffer is dead afterwards.
+	// They are held in `values` until then, so return them only after the cache
+	// write completes (deferred), not per iteration.
+	bufPtrs := make([]*[]byte, 0, len(hashes))
+
+	defer func() {
+		for _, bp := range bufPtrs {
+			metaBytesBufPool.Put(bp)
+		}
+	}()
 
 	for _, data := range hashes {
 		if data == nil || data.Data == nil {
@@ -545,16 +569,24 @@ func (t *TxMetaCache) BatchDecorate(ctx context.Context, hashes []*utxo.Unresolv
 			t.logger.Warnf("stored tx meta maybe too big for txmeta cache, size: %d, parent hash count: %d", data.Data.SizeInBytes, len(data.Data.TxInpoints.ParentTxHashes))
 		}
 
-		// get the metabytes directly here.
-		txMetaBytes, err := data.Data.MetaBytes()
+		// Serialize into a pooled buffer; the cache copies it on insert.
+		bufPtr := metaBytesBufPool.Get().(*[]byte)
+
+		txMetaBytes, err := data.Data.MetaBytesInto((*bufPtr)[:0])
 		if err != nil {
+			metaBytesBufPool.Put(bufPtr)
+
 			if errors.Is(err, errors.ErrProcessing) {
 				t.logger.Debugf("error serializing txMeta for [%s]: %v", data.Hash.String(), err)
 			} else {
 				t.logger.Errorf("error serializing txMeta for [%s]: %v", data.Hash.String(), err)
 			}
+
 			continue
 		}
+
+		*bufPtr = txMetaBytes // keep the (possibly grown) backing array for reuse
+		bufPtrs = append(bufPtrs, bufPtr)
 
 		keys = append(keys, data.Hash.CloneBytes())
 		values = append(values, txMetaBytes)
