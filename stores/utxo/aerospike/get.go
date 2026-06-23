@@ -580,30 +580,54 @@ func (s *Store) addAbstractedBins(bins []fields.FieldName) []fields.FieldName {
 func (s *Store) buildBatchRecords(items []*utxo.UnresolvedMetaData, policy *aerospike.BatchReadPolicy, optionalFields []fields.FieldName) ([]aerospike.BatchRecordIfc, error) {
 	batchRecords := make([]aerospike.BatchRecordIfc, len(items))
 
+	// Most BatchDecorate calls request a uniform field set for every item:
+	// callers either pass optionalFields or rely on the default and leave
+	// item.Fields nil. Expand that shared set and convert it to wire names ONCE
+	// and reuse the (read-only) results across every such item, instead of
+	// re-expanding and re-allocating per item. Items that carry their own
+	// item.Fields (the rare per-item path) are expanded individually below.
+	//
+	// The shared slices are only read downstream: the result-parsing pass ranges
+	// over item.Fields, and the aerospike client only reads BatchRead BinNames
+	// (it never sorts or mutates them in place), so sharing one backing array
+	// across records is safe.
+	sharedBins := optionalFields
+	if len(sharedBins) == 0 {
+		sharedBins = defaultDecorateBins
+	}
+
+	sharedExpanded := s.addAbstractedBins(sharedBins)
+	sharedNames := fields.FieldNamesToStrings(sharedExpanded)
+
 	for idx, item := range items {
 		key, err := aerospike.NewKey(s.namespace, s.setName, item.Hash[:])
 		if err != nil {
 			return nil, errors.NewProcessingError("failed to init new aerospike key for txMeta", err)
 		}
 
-		// Default fields - optimized for common use cases without scripts
-		// Services that need full transaction (persister, API) explicitly request fields.Tx
-		bins := []fields.FieldName{fields.Fee, fields.SizeInBytes, fields.TxInpoints, fields.BlockIDs, fields.IsCoinbase}
+		expanded := sharedExpanded
+		names := sharedNames
+
 		if len(item.Fields) > 0 {
-			bins = item.Fields
-		} else if len(optionalFields) > 0 {
-			bins = optionalFields
+			// Item-specific field set: expand and convert it on its own.
+			expanded = s.addAbstractedBins(item.Fields)
+			names = fields.FieldNamesToStrings(expanded)
 		}
 
-		item.Fields = s.addAbstractedBins(bins)
+		item.Fields = expanded
 
-		record := aerospike.NewBatchRead(policy, key, fields.FieldNamesToStrings(item.Fields))
 		// Add to batch
-		batchRecords[idx] = record
+		batchRecords[idx] = aerospike.NewBatchRead(policy, key, names)
 	}
 
 	return batchRecords, nil
 }
+
+// defaultDecorateBins is the field set BatchDecorate reads when the caller
+// requests none — optimized for common use cases without scripts. Services that
+// need the full transaction (persister, API) explicitly request fields.Tx. Kept
+// package-level so the common path does not re-allocate it per item.
+var defaultDecorateBins = []fields.FieldName{fields.Fee, fields.SizeInBytes, fields.TxInpoints, fields.BlockIDs, fields.IsCoinbase}
 
 func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, optionalFields ...fields.FieldName) error {
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
