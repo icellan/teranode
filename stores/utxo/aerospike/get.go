@@ -570,22 +570,20 @@ func (s *Store) addAbstractedBins(bins []fields.FieldName) []fields.FieldName {
 //   - ctx: Context for cancellation
 //   - items: Transactions to fetch
 //   - fields: Optional fields to retrieve
-func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, optionalFields ...fields.FieldName) error {
-	var err error
-
-	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
-	// we only want to read from the master for tx metadata, due to blockIDs being updated
-	// however we still want to read from the replica for the utxos in case of aerospike failures
-	batchPolicy.ReplicaPolicy = aerospike.SEQUENCE
-
-	policy := util.GetAerospikeBatchReadPolicy(s.settings)
-
+//
+// buildBatchRecords constructs the per-item aerospike BatchRead records for a
+// BatchDecorate call: one aerospike.Key per item (digest of the tx hash) plus
+// the expanded field-name set to read. It also records the expanded field set
+// back onto each item (item.Fields) so the result-parsing pass knows which bins
+// were requested. This is pure construction — no network I/O — which makes it
+// the unit the allocation benchmark targets.
+func (s *Store) buildBatchRecords(items []*utxo.UnresolvedMetaData, policy *aerospike.BatchReadPolicy, optionalFields []fields.FieldName) ([]aerospike.BatchRecordIfc, error) {
 	batchRecords := make([]aerospike.BatchRecordIfc, len(items))
 
 	for idx, item := range items {
 		key, err := aerospike.NewKey(s.namespace, s.setName, item.Hash[:])
 		if err != nil {
-			return errors.NewProcessingError("failed to init new aerospike key for txMeta", err)
+			return nil, errors.NewProcessingError("failed to init new aerospike key for txMeta", err)
 		}
 
 		// Default fields - optimized for common use cases without scripts
@@ -602,6 +600,22 @@ func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaD
 		record := aerospike.NewBatchRead(policy, key, fields.FieldNamesToStrings(item.Fields))
 		// Add to batch
 		batchRecords[idx] = record
+	}
+
+	return batchRecords, nil
+}
+
+func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, optionalFields ...fields.FieldName) error {
+	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
+	// we only want to read from the master for tx metadata, due to blockIDs being updated
+	// however we still want to read from the replica for the utxos in case of aerospike failures
+	batchPolicy.ReplicaPolicy = aerospike.SEQUENCE
+
+	policy := util.GetAerospikeBatchReadPolicy(s.settings)
+
+	batchRecords, err := s.buildBatchRecords(items, policy, optionalFields)
+	if err != nil {
+		return err
 	}
 
 	if len(batchRecords) == 0 {
