@@ -799,9 +799,7 @@ func (s *Store) handleSpendSignal(ctx context.Context, signal LuaSignal, txID *c
 	case LuaSignalDAHSet:
 		// Only set DAH if BlockHeightRetention is configured (> 0)
 		// When retention is 0, it means "don't use automatic retention"
-		if retention := s.settings.GetUtxoStoreBlockHeightRetention(); retention > 0 {
-			dahHeight := thisBlockHeight + retention
-
+		if dahHeight, ok := s.deleteAtHeightFor(thisBlockHeight); ok {
 			if err := s.SetDAHForChildRecords(txID, childCount, dahHeight); err != nil {
 				s.logger.Errorf("Failed to set DAH for child records: %v", err)
 			}
@@ -1002,7 +1000,7 @@ func (s *Store) handleExtraRecords(ctx context.Context, txID *chainhash.Hash, in
 			case LuaSignalDAHSet:
 				// Only set DAH if BlockHeightRetention is configured (> 0)
 				// When retention is 0, it means "don't use automatic retention"
-				if retention := s.settings.GetUtxoStoreBlockHeightRetention(); retention > 0 {
+				if dah, ok := s.deleteAtHeightFor(s.blockHeight.Load()); ok {
 					// Sanity check: verify all children are actually spent before
 					// setting DAH. The spentExtraRecs counter can drift due to
 					// interrupted rollbacks, so we don't trust it blindly.
@@ -1029,9 +1027,6 @@ func (s *Store) handleExtraRecords(ctx context.Context, txID *chainhash.Hash, in
 							return nil
 						}
 					}
-
-					thisBlockHeight := s.blockHeight.Load()
-					dah := thisBlockHeight + retention
 
 					if err := s.SetDAHForChildRecords(txID, ret.ChildCount, dah); err != nil {
 						return err

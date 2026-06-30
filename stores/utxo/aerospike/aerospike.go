@@ -518,6 +518,25 @@ func (s *Store) GetBlockHeight() uint32 {
 	return s.blockHeight.Load()
 }
 
+// deleteAtHeightFor returns the delete-at-height (DAH) to stamp on a record that
+// becomes prunable at blockHeight — blockHeight + the configured retention window —
+// and whether retention is enabled. When retention is 0 ("don't use automatic
+// retention") the second return is false and no DAH should be set.
+//
+// This is the single source of truth for the Go DAH formula and the retention
+// guard, shared by the create, spend and setMined paths so they cannot drift. The
+// Aerospike filter-expression path (buildDeleteAtHeightExpression) and the Lua
+// setDeleteAtHeight UDF compute the same blockHeight + retention and MUST be kept
+// in sync with this function.
+func (s *Store) deleteAtHeightFor(blockHeight uint32) (uint32, bool) {
+	retention := s.settings.GetUtxoStoreBlockHeightRetention()
+	if retention == 0 {
+		return 0, false
+	}
+
+	return blockHeight + retention, true
+}
+
 func (s *Store) SetMedianBlockTime(medianTime uint32) error {
 	s.logger.Debugf("setting median block time to %d", medianTime)
 	s.medianBlockTime.Store(medianTime)
