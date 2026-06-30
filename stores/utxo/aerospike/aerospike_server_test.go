@@ -600,7 +600,10 @@ func TestAerospike(t *testing.T) {
 		value, err = client.Get(util.GetAerospikeReadPolicy(tSettings), txKey)
 		require.NoError(t, err)
 
-		assert.Equal(t, 11, value.Bins[fields.DeleteAtHeight.String()])
+		// setMined stamps the DAH relative to the height of the block the tx is mined
+		// into (BlockHeight=123), plus the retention window — not the store's cached
+		// chain tip.
+		assert.Equal(t, int(123+tSettings.GetUtxoStoreBlockHeightRetention()), value.Bins[fields.DeleteAtHeight.String()])
 
 		// try to spend with different txid
 		spends, err = store.Spend(ctx, spendTx3, 1)

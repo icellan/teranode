@@ -348,7 +348,14 @@ func (s *Store) processBatchResultsForSetMined(ctx context.Context, batchRecords
 	retention := s.settings.GetUtxoStoreBlockHeightRetention()
 	var dahHeight uint32
 	if retention > 0 {
-		dahHeight = thisBlockHeight + retention
+		// DAH is relative to the height of the block the tx is mined into
+		// (minedBlockInfo.BlockHeight), NOT the store's cached chain tip
+		// (thisBlockHeight). The cached tip lags behind the block being validated
+		// during catchup/sync; using it stamped the DAH too low and let the pruner
+		// delete the record before the retention window elapsed. This value is used
+		// for the child/pagination records and must match the master DAH set by the
+		// setMined UDF (which now also uses the mined block height).
+		dahHeight = minedBlockInfo.BlockHeight + retention
 	}
 
 	// Reuse a single LuaMapResponse across all per-record parses in this batch.
