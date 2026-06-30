@@ -1006,7 +1006,7 @@ func TestAerospike(t *testing.T) {
 		assert.Nil(t, rec.Bins["creating"])
 
 		// Increment via multi API
-		require.NoError(t, store.IncrementSpentRecordsMulti([]*chainhash.Hash{bigTx.TxIDChainHash()}, 1))
+		require.NoError(t, store.IncrementSpentRecordsMulti([]*chainhash.Hash{bigTx.TxIDChainHash()}, 1, 0))
 
 		rec2, err := client.Get(util.GetAerospikeReadPolicy(tSettings), bigTxKey)
 		require.NoError(t, err)
@@ -1065,7 +1065,7 @@ func TestAerospike(t *testing.T) {
 		var invalid chainhash.Hash // zero hash, not present
 		ids := []*chainhash.Hash{valid, &invalid}
 
-		aggErr := store.IncrementSpentRecordsMulti(ids, 1)
+		aggErr := store.IncrementSpentRecordsMulti(ids, 1, 0)
 		require.Error(t, aggErr)
 		t.Logf("Error: %v", aggErr)
 
@@ -1319,7 +1319,7 @@ func TestIncrementSpentRecords(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, 0, totalExtraRecs)
 
-	res, err := store.IncrementSpentRecords(tx.TxIDChainHash(), 1)
+	res, err := store.IncrementSpentRecords(tx.TxIDChainHash(), 1, 0)
 	require.NoError(t, err)
 
 	// Lua now clamps spentExtraRecs to [0, totalExtraRecs] instead of erroring.
@@ -1951,7 +1951,7 @@ func TestAerospikeWithBatchSize(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, 2, totalExtraRecs)
 
-		_, err = store.IncrementSpentRecords(tx.TxIDChainHash(), 1)
+		_, err = store.IncrementSpentRecords(tx.TxIDChainHash(), 1, 0)
 		require.NoError(t, err)
 
 		resp, err = client.Get(nil, txKey)
@@ -1965,7 +1965,7 @@ func TestAerospikeWithBatchSize(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, 1, spentExtraRecs)
 
-		_, err = store.IncrementSpentRecords(tx.TxIDChainHash(), -1)
+		_, err = store.IncrementSpentRecords(tx.TxIDChainHash(), -1, 0)
 		require.NoError(t, err)
 
 		resp, err = client.Get(nil, txKey)
