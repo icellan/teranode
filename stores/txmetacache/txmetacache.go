@@ -493,6 +493,36 @@ func (t *TxMetaCache) Get(ctx context.Context, hash *chainhash.Hash, f ...fields
 	return t.utxoStore.Get(ctx, hash, f...)
 }
 
+const (
+	metaBytesBufInitialCapacity = 256
+	metaBytesBufMaxRetain       = 64 * 1024
+)
+
+// metaBytesBufPool recycles the per-transaction MetaBytes serialization buffers
+// used to repopulate the cache in BatchDecorate. The initial capacity covers the
+// common single-parent transaction (17-byte header + a few dozen inpoint bytes)
+// with headroom; larger transactions grow their buffer on first use.
+var metaBytesBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, metaBytesBufInitialCapacity)
+		return &b
+	},
+}
+
+// putMetaBytesBuf returns a buffer to metaBytesBufPool, mirroring the max-retain
+// guard on putTxMetaCacheReadBuffer: an occasional large-parent tx must not pin a
+// hundreds-of-KB backing array in the pool forever and ratchet up process RSS, so
+// any buffer grown past metaBytesBufMaxRetain is dropped for a fresh initial-cap one.
+func putMetaBytesBuf(bp *[]byte) {
+	if cap(*bp) > metaBytesBufMaxRetain {
+		*bp = make([]byte, 0, metaBytesBufInitialCapacity)
+	} else {
+		*bp = (*bp)[:0]
+	}
+
+	metaBytesBufPool.Put(bp)
+}
+
 // BatchDecorate retrieves metadata for multiple transactions in a single batch operation.
 // This is more efficient than calling Get for each transaction individually.
 //
@@ -506,17 +536,6 @@ func (t *TxMetaCache) Get(ctx context.Context, hash *chainhash.Hash, f ...fields
 //
 // The method optimizes retrieval by first checking the cache for each transaction,
 // then batching any cache misses into a single call to the underlying store.
-// metaBytesBufPool recycles the per-transaction MetaBytes serialization buffers
-// used to repopulate the cache in BatchDecorate. The initial capacity covers the
-// common single-parent transaction (17-byte header + a few dozen inpoint bytes)
-// with headroom; larger transactions grow their buffer on first use and keep it.
-var metaBytesBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 0, 256)
-		return &b
-	},
-}
-
 func (t *TxMetaCache) BatchDecorate(ctx context.Context, hashes []*utxo.UnresolvedMetaData, fields ...fields.FieldName) error {
 	if err := t.utxoStore.BatchDecorate(ctx, hashes, fields...); err != nil {
 		return err
@@ -538,7 +557,7 @@ func (t *TxMetaCache) BatchDecorate(ctx context.Context, hashes []*utxo.Unresolv
 
 	defer func() {
 		for _, bp := range bufPtrs {
-			metaBytesBufPool.Put(bp)
+			putMetaBytesBuf(bp)
 		}
 	}()
 
@@ -574,7 +593,7 @@ func (t *TxMetaCache) BatchDecorate(ctx context.Context, hashes []*utxo.Unresolv
 
 		txMetaBytes, err := data.Data.MetaBytesInto((*bufPtr)[:0])
 		if err != nil {
-			metaBytesBufPool.Put(bufPtr)
+			putMetaBytesBuf(bufPtr)
 
 			if errors.Is(err, errors.ErrProcessing) {
 				t.logger.Debugf("error serializing txMeta for [%s]: %v", data.Hash.String(), err)

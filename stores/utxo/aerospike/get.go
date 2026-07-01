@@ -559,18 +559,6 @@ func (s *Store) addAbstractedBins(bins []fields.FieldName) []fields.FieldName {
 	return newBins
 }
 
-// BatchDecorate efficiently fetches metadata for multiple transactions.
-// It optimizes database access by:
-//   - Batching multiple queries
-//   - Deduplicating requests
-//   - Managing external storage access
-//   - Handling partial responses
-//
-// Parameters:
-//   - ctx: Context for cancellation
-//   - items: Transactions to fetch
-//   - fields: Optional fields to retrieve
-//
 // buildBatchRecords constructs the per-item aerospike BatchRead records for a
 // BatchDecorate call: one aerospike.Key per item (digest of the tx hash) plus
 // the expanded field-name set to read. It also records the expanded field set
@@ -629,6 +617,17 @@ func (s *Store) buildBatchRecords(items []*utxo.UnresolvedMetaData, policy *aero
 // package-level so the common path does not re-allocate it per item.
 var defaultDecorateBins = []fields.FieldName{fields.Fee, fields.SizeInBytes, fields.TxInpoints, fields.BlockIDs, fields.IsCoinbase}
 
+// BatchDecorate efficiently fetches metadata for multiple transactions.
+// It optimizes database access by:
+//   - Batching multiple queries
+//   - Deduplicating requests
+//   - Managing external storage access
+//   - Handling partial responses
+//
+// Parameters:
+//   - ctx: Context for cancellation
+//   - items: Transactions to fetch
+//   - fields: Optional fields to retrieve
 func (s *Store) BatchDecorate(ctx context.Context, items []*utxo.UnresolvedMetaData, optionalFields ...fields.FieldName) error {
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
 	// we only want to read from the master for tx metadata, due to blockIDs being updated

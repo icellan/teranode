@@ -86,7 +86,7 @@ func hashFor(g, i int) chainhash.Hash {
 // pooled serialization buffers, every decorated transaction lands in the cache
 // with its own correct metadata (no buffer cross-contamination within a call).
 func Test_TxMetaCache_BatchDecorate_PooledBuffers_Correct(t *testing.T) {
-	for _, bt := range []BucketType{Unallocated, Native} {
+	for _, bt := range []BucketType{Unallocated, Native, Pointer} {
 		cache := newPerHashCache(t, bt)
 		ctx := context.Background()
 
@@ -108,12 +108,39 @@ func Test_TxMetaCache_BatchDecorate_PooledBuffers_Correct(t *testing.T) {
 	}
 }
 
+// Test_putMetaBytesBuf_maxRetainGuard mirrors the guard on putTxMetaCacheReadBuffer:
+// an oversized buffer must be shrunk back to the initial capacity before it is
+// returned to the pool, so an occasional large-parent tx cannot permanently bloat
+// the pooled write buffers and ratchet up process RSS. A normally-sized buffer is
+// retained as-is (only its length reset).
+func Test_putMetaBytesBuf_maxRetainGuard(t *testing.T) {
+	oversized := make([]byte, metaBytesBufMaxRetain+1)
+	op := &oversized
+	putMetaBytesBuf(op)
+	require.LessOrEqual(t, cap(*op), metaBytesBufInitialCapacity, "oversized buffer must be shrunk before returning to pool")
+	require.Len(t, *op, 0)
+
+	normal := make([]byte, 100, metaBytesBufInitialCapacity)
+	np := &normal
+	putMetaBytesBuf(np)
+	require.Equal(t, metaBytesBufInitialCapacity, cap(*np), "normally-sized buffer must be retained")
+	require.Len(t, *np, 0)
+}
+
 // Test_TxMetaCache_BatchDecorate_PooledBuffers_Concurrent stresses the buffer
 // pool: many goroutines run BatchDecorate over disjoint hash sets at once. Each
 // entry must still round-trip to its own hash-derived metadata. Run under -race
-// to catch any cross-goroutine reuse of a pooled buffer.
+// to catch any cross-goroutine reuse of a pooled buffer. Pointer is included
+// because it deserializes each value into a fresh *meta.Data — the path most
+// sensitive to a recycled buffer aliasing another tx's bytes.
 func Test_TxMetaCache_BatchDecorate_PooledBuffers_Concurrent(t *testing.T) {
-	cache := newPerHashCache(t, Unallocated)
+	for _, bt := range []BucketType{Unallocated, Native, Pointer} {
+		testBatchDecoratePooledBuffersConcurrent(t, bt)
+	}
+}
+
+func testBatchDecoratePooledBuffersConcurrent(t *testing.T, bt BucketType) {
+	cache := newPerHashCache(t, bt)
 	ctx := context.Background()
 
 	const (
@@ -122,6 +149,11 @@ func Test_TxMetaCache_BatchDecorate_PooledBuffers_Concurrent(t *testing.T) {
 	)
 
 	var wg sync.WaitGroup
+
+	// require/FailNow must run on the test goroutine (testify contract), so child
+	// goroutines report BatchDecorate errors over a channel and we assert after Wait.
+	errCh := make(chan error, goroutines)
+
 	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
 
@@ -133,19 +165,26 @@ func Test_TxMetaCache_BatchDecorate_PooledBuffers_Concurrent(t *testing.T) {
 				items[i] = &utxo.UnresolvedMetaData{Hash: hashFor(g, i)}
 			}
 
-			require.NoError(t, cache.BatchDecorate(ctx, items, fields.Fee, fields.SizeInBytes, fields.TxInpoints))
+			if err := cache.BatchDecorate(ctx, items, fields.Fee, fields.SizeInBytes, fields.TxInpoints); err != nil {
+				errCh <- err
+			}
 		}(g)
 	}
 
 	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		require.NoError(t, err)
+	}
 
 	for g := 0; g < goroutines; g++ {
 		for i := 0; i < perG; i++ {
 			h := hashFor(g, i)
 			got, found := cache.GetMetaCached(ctx, h)
-			require.True(t, found, "g=%d tx %d missing", g, i)
-			require.Equal(t, feeFor(h), got.Fee, "g=%d tx %d fee", g, i)
-			require.Equal(t, sizeFor(h), got.SizeInBytes, "g=%d tx %d size", g, i)
+			require.True(t, found, "bucket %v: g=%d tx %d missing", bt, g, i)
+			require.Equal(t, feeFor(h), got.Fee, "bucket %v: g=%d tx %d fee", bt, g, i)
+			require.Equal(t, sizeFor(h), got.SizeInBytes, "bucket %v: g=%d tx %d size", bt, g, i)
 		}
 	}
 }
