@@ -457,8 +457,8 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 							if notification.Type == model.NotificationType_BlockSubtreesSet {
 								cHash := chainhash.Hash(notification.Hash)
 								bv.logger.Infof("[BlockValidation:setMined] received BlockSubtreesSet notification: %s", cHash.String())
-								// push block hash to the setMinedChan
-								bv.setMinedChan <- &cHash
+								// push block hash to the setMinedChan (non-blocking; worker is sole drainer)
+								bv.enqueueSetMined(ctx, &cHash)
 							}
 
 							// Listen for BlockMinedUnset notifications (sent by InvalidateBlock RPC)
@@ -466,8 +466,8 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 							if notification.Type == model.NotificationType_BlockMinedUnset {
 								cHash := chainhash.Hash(notification.Hash)
 								bv.logger.Infof("[BlockValidation:setMined] received BlockMinedUnset notification: %s", cHash.String())
-								// push block hash to the setMinedChan for immediate processing
-								bv.setMinedChan <- &cHash
+								// push block hash to the setMinedChan for immediate processing (non-blocking)
+								bv.enqueueSetMined(ctx, &cHash)
 							}
 						}
 					}
@@ -643,8 +643,10 @@ func (u *BlockValidation) start(ctx context.Context) error {
 						default:
 						}
 
-						// put the block back in the setMinedChan for retry
-						u.setMinedChan <- blockHash
+						// put the block back in the setMinedChan for retry — non-blocking,
+						// because this runs on the worker goroutine that is the sole drainer
+						// of setMinedChan; a blocking self-send into a full channel wedges it.
+						u.enqueueSetMined(ctx, blockHash)
 						return
 					}
 
@@ -708,69 +710,76 @@ func (u *BlockValidation) start(ctx context.Context) error {
 	return nil
 }
 
-func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context, g *errgroup.Group) {
+// processBlockMinedNotSet enqueues every block the blockchain reports as still needing
+// setTxMined onto setMinedChan for the dedicated worker to process serially.
+//
+// Why serial (not parallel goroutines, as it used to be):
+//
+// SetTxMined for a block fans out into per-subtree errgroup workers and ultimately into
+// SetMinedMulti / SetMinedMultiWithExpressions, each of which pushes 1024-key Aerospike
+// batches through aerospike-client-go/v8. The client's per-node nodeStats map updates the
+// result-code histogram under a global RWMutex.Lock() on every batch result. Running
+// multiple SetTxMined operations in parallel produces a thundering herd on that mutex and
+// throughput collapses to near zero — observed in production as 4+ in-flight operations
+// running for 20+ minutes with no completions while the queue grew.
+//
+// Routing through setMinedChan reuses the existing serial worker (BlockValidation.go ~L501),
+// which already handles the MinedSet guard, tryClaim dedup, retry-on-error, and cleanup.
+// We deliberately do NOT call tryClaimBlockForSetMined here because the claim must be
+// released by the consumer, and the worker owns that lifecycle.
+//
+// The errgroup parameter is retained for caller-signature stability (the periodic ticker
+// reuses start()'s errgroup); we no longer add work to it from this function.
+func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context, _ *errgroup.Group) {
 	if u.blockchainClient == nil {
 		return
 	}
 
-	// first check whether all old blocks have been processed properly
 	blocksMinedNotSet, err := u.blockchainClient.GetBlocksMinedNotSet(ctx)
 	if err != nil {
 		u.logger.Errorf("[BlockValidation:start] failed to get blocks mined not set: %s", err)
+		return
 	}
 
-	if len(blocksMinedNotSet) > 0 {
-		u.logger.Infof("[BlockValidation:start] found %d blocks mined not set", len(blocksMinedNotSet))
+	if len(blocksMinedNotSet) == 0 {
+		return
+	}
 
+	u.logger.Infof("[BlockValidation:start] found %d blocks mined not set, queuing for serial setMined processing", len(blocksMinedNotSet))
+
+	// Enqueue the backlog from a background goroutine so start() is never blocked. This
+	// runs during start() BEFORE the setMinedChan worker is launched, and the backlog
+	// (GetBlocksMinedNotSet has no SQL LIMIT) can exceed the channel buffer, so a blocking
+	// send on the caller's goroutine would deadlock boot. One goroutine feeds the worker at
+	// its drain rate (not one per over-buffer block); the worker dedups via MinedSet/tryClaim.
+	go func() {
 		for _, block := range blocksMinedNotSet {
-			blockHash := block.Hash()
-
-			// Atomically check and claim the block to prevent duplicate processing
-			if !u.tryClaimBlockForSetMined(blockHash) {
-				u.logger.Debugf("[BlockValidation:start] block %s already being processed, skipping", blockHash.String())
-				continue
+			select {
+			case <-ctx.Done():
+				return
+			case u.setMinedChan <- block.Hash():
 			}
-
-			g.Go(func() error {
-				// Ensure cleanup happens regardless of success, error, panic, or context cancellation
-				defer func() {
-					if deleteErr := u.blockHashesCurrentlyValidated.Delete(*blockHash); deleteErr != nil {
-						u.logger.Errorf("[BlockValidation:start][%s] failed to delete blockHash from blockHashesCurrentlyValidated: %s", blockHash.String(), deleteErr)
-					}
-				}()
-
-				u.logger.Debugf("[BlockValidation:start] processing block mined not set: %s", blockHash.String())
-
-				select {
-				case <-ctx.Done():
-					return nil
-				default:
-					// get the block metadata to check if the block is invalid
-					_, blockHeaderMeta, err := u.blockchainClient.GetBlockHeader(ctx, blockHash)
-					if err != nil {
-						u.logger.Errorf("[BlockValidation:start] failed to get block header: %s", err)
-
-						u.setMinedChan <- blockHash
-
-						return nil
-					}
-
-					if err = u.setTxMinedStatus(ctx, blockHash, blockHeaderMeta.Invalid); err != nil {
-						if errors.Is(err, context.Canceled) {
-							u.logger.Infof("[BlockValidation:start] failed to set block mined: %s", err)
-						} else {
-							u.logger.Errorf("[BlockValidation:start] failed to set block mined: %s", err)
-						}
-						u.setMinedChan <- blockHash
-						return nil
-					}
-
-					u.logger.Infof("[BlockValidation:start] processed block mined and set mined_set: %s", blockHash.String())
-
-					return nil
-				}
-			})
 		}
+	}()
+}
+
+// enqueueSetMined schedules blockHash for the setMinedChan worker without ever blocking
+// the caller. The worker is the sole drainer of setMinedChan, so a blocking send would
+// wedge mined finalization — most acutely from the worker's own retry path, where a
+// blocking self-send into a full channel deadlocks the one goroutine that drains it. A
+// direct send is attempted first; if the buffer is full the send is completed from a
+// short-lived goroutine that also honours ctx cancellation. The worker dedups via the
+// MinedSet/tryClaim guards, so a re-queued or reordered hash is harmless.
+func (u *BlockValidation) enqueueSetMined(ctx context.Context, blockHash *chainhash.Hash) {
+	select {
+	case u.setMinedChan <- blockHash:
+	default:
+		go func() {
+			select {
+			case <-ctx.Done():
+			case u.setMinedChan <- blockHash:
+			}
+		}()
 	}
 }
 
@@ -1392,7 +1401,7 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// When waitForPreviousBlocksToBeProcessed is done, all the previous blocks will be processed
 		if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
 			// Parent block isn't mined yet - re-trigger the setMinedChan for the parent block
-			u.setMinedChan <- block.Header.HashPrevBlock
+			u.enqueueSetMined(ctx, block.Header.HashPrevBlock)
 
 			if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
 				// Give up, the parent block isn't being fully validated
