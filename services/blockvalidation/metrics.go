@@ -77,9 +77,9 @@ var (
 	// unbounded Prometheus cardinality (one permanent series per distinct hash
 	// over the node's lifetime). The specific block hash is recorded in the
 	// accompanying log lines for manual repair.
-	prometheusBlockValidationSetMinedRetries       prometheus.Counter
-	prometheusBlockValidationSetMinedDrops         prometheus.Counter
-	prometheusBlockValidationSetMinedEnqueueSpawns prometheus.Counter
+	prometheusBlockValidationSetMinedRetries         prometheus.Counter
+	prometheusBlockValidationSetMinedDrops           prometheus.Counter
+	prometheusBlockValidationSetMinedEnqueueOverflow prometheus.Counter
 )
 
 var (
@@ -237,12 +237,12 @@ func _initPrometheusMetrics() {
 		},
 	)
 
-	prometheusBlockValidationSetMinedEnqueueSpawns = promauto.NewCounter(
+	prometheusBlockValidationSetMinedEnqueueOverflow = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: "teranode",
 			Subsystem: "blockvalidation",
-			Name:      "setmined_enqueue_spawns_total",
-			Help:      "Total number of setMined enqueues deferred to a goroutine because setMinedChan was full. A sustained rise means producers are outpacing the serial setMined worker and parked goroutines are accumulating until slots free.",
+			Name:      "setmined_enqueue_overflow_total",
+			Help:      "Total number of setMined enqueues parked in the overflow set because setMinedChan was full. A sustained rise means producers are outpacing the serial setMined worker; the overflow set is deduped by block hash, so memory stays bounded by the number of distinct blocks.",
 		},
 	)
 
