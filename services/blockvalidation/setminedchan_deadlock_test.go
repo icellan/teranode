@@ -55,7 +55,7 @@ func TestProcessBlockMinedNotSet_DoesNotBlockWhenBacklogExceedsBuffer(t *testing
 
 	done := make(chan struct{})
 	go func() {
-		bv.processBlockMinedNotSet(ctx, nil)
+		bv.processBlockMinedNotSet(ctx)
 		close(done)
 	}()
 
@@ -71,8 +71,11 @@ func TestProcessBlockMinedNotSet_DoesNotBlockWhenBacklogExceedsBuffer(t *testing
 // on: enqueuing a block for the setMined worker must never block the caller, even when
 // the channel is full. The setMined worker is the sole drainer of setMinedChan, so a
 // blocking send from the worker's own retry path — or from any producer while the worker
-// is busy — would wedge mined finalization. No hash may be dropped.
+// is busy — would wedge mined finalization. No hash may be dropped while the context
+// remains active (a canceled context releases the deferred send without delivering).
 func TestEnqueueSetMined_DoesNotBlockWhenChannelFull(t *testing.T) {
+	initPrometheusMetrics()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -101,7 +104,21 @@ func TestEnqueueSetMined_DoesNotBlockWhenChannelFull(t *testing.T) {
 	}
 
 	// Both hashes are still delivered (no drops): the buffered one first, then the one
-	// completed by enqueueSetMined once a slot frees.
-	require.Equal(t, h1, <-bv.setMinedChan)
-	require.Equal(t, h2, <-bv.setMinedChan)
+	// completed by enqueueSetMined once a slot frees. Bounded waits so a regression in
+	// the async send fails the test instead of hanging the suite.
+	require.Equal(t, h1, recvHashWithTimeout(t, bv.setMinedChan))
+	require.Equal(t, h2, recvHashWithTimeout(t, bv.setMinedChan))
+}
+
+// recvHashWithTimeout receives from ch or fails the test after a bounded wait.
+func recvHashWithTimeout(t *testing.T, ch <-chan *chainhash.Hash) *chainhash.Hash {
+	t.Helper()
+
+	select {
+	case h := <-ch:
+		return h
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for hash on setMinedChan")
+		return nil
+	}
 }

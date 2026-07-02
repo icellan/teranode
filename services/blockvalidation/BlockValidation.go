@@ -512,8 +512,10 @@ func (u *BlockValidation) start(ctx context.Context) error {
 		// check whether all old blocks have their subtrees_set set
 		u.processSubtreesNotSet(gCtx, g)
 
-		// check whether all old blocks have their mined_set set
-		u.processBlockMinedNotSet(gCtx, g)
+		// check whether all old blocks have their mined_set set. This pass is
+		// fire-and-forget: the backlog is fed to the setMinedChan worker from a
+		// background goroutine, so g.Wait() below does not gate startup on it.
+		u.processBlockMinedNotSet(gCtx)
 
 		// wait for all blocks to be processed
 		if err := g.Wait(); err != nil {
@@ -540,7 +542,7 @@ func (u *BlockValidation) start(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				u.processSubtreesNotSet(ctx, g)
-				u.processBlockMinedNotSet(ctx, g)
+				u.processBlockMinedNotSet(ctx)
 			}
 		}
 	}()
@@ -646,6 +648,9 @@ func (u *BlockValidation) start(ctx context.Context) error {
 						// put the block back in the setMinedChan for retry — non-blocking,
 						// because this runs on the worker goroutine that is the sole drainer
 						// of setMinedChan; a blocking self-send into a full channel wedges it.
+						// Re-queue order is best-effort (a deferred send can be overtaken by
+						// later ones); correctness relies on the worker's idempotent
+						// MinedSet/tryClaim guards, not on FIFO delivery.
 						u.enqueueSetMined(ctx, blockHash)
 						return
 					}
@@ -727,10 +732,7 @@ func (u *BlockValidation) start(ctx context.Context) error {
 // which already handles the MinedSet guard, tryClaim dedup, retry-on-error, and cleanup.
 // We deliberately do NOT call tryClaimBlockForSetMined here because the claim must be
 // released by the consumer, and the worker owns that lifecycle.
-//
-// The errgroup parameter is retained for caller-signature stability (the periodic ticker
-// reuses start()'s errgroup); we no longer add work to it from this function.
-func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context, _ *errgroup.Group) {
+func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context) {
 	if u.blockchainClient == nil {
 		return
 	}
@@ -774,6 +776,11 @@ func (u *BlockValidation) enqueueSetMined(ctx context.Context, blockHash *chainh
 	select {
 	case u.setMinedChan <- blockHash:
 	default:
+		// Counted so operators can see parked-sender accumulation when producers
+		// outpace the serial worker (the assumption is the worker always
+		// eventually drains and frees these goroutines).
+		prometheusBlockValidationSetMinedEnqueueSpawns.Inc()
+
 		go func() {
 			select {
 			case <-ctx.Done():
