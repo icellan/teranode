@@ -3421,19 +3421,34 @@ func (m *mockSubtreeStore) GetIoReader(ctx context.Context, key []byte, fileType
 	return nil, errors.NewBlobNotFoundError("mock error")
 }
 
-// createValidSubtreeMetadata creates valid subtree metadata that won't trigger retries
+// createValidSubtreeMetadata creates valid subtree metadata that won't trigger retries.
+// Non-coinbase nodes get a dummy parent because go-subtree v1.4.0's SubtreeMeta.Serialize
+// rejects empty TxInpoints on non-coinbase entries ("parent tx hashes are not set for node N").
+// The coinbase placeholder at index 0 keeps an empty TxInpoints, matching the on-wire shape.
 func createValidSubtreeMetadata(subtree *subtreepkg.Subtree) ([]byte, error) {
-	// Create SubtreeMeta with proper structure
 	subtreeMeta := subtreepkg.NewSubtreeMeta(subtree)
 
-	// Initialize TxInpoints array for all nodes up to Length()
-	for i := 0; i < subtree.Length(); i++ {
-		// Create empty TxInpoints for all nodes (including root)
-		txInpoints := subtreepkg.NewTxInpoints()
-		subtreeMeta.TxInpoints[i] = txInpoints
+	var dummyParent chainhash.Hash
+	dummyParent[0] = 0xde
+
+	dummyInput := &bt.Input{PreviousTxOutIndex: 0}
+	if err := dummyInput.PreviousTxIDAdd(&dummyParent); err != nil {
+		return nil, err
 	}
 
-	// Serialize the metadata
+	dummyInpoints, err := subtreepkg.NewTxInpointsFromInputs([]*bt.Input{dummyInput})
+	if err != nil {
+		return nil, err
+	}
+
+	for i := 0; i < subtree.Length(); i++ {
+		if i == 0 && len(subtree.Nodes) > 0 && subtree.Nodes[0].Hash == *subtreepkg.CoinbasePlaceholderHash {
+			subtreeMeta.TxInpoints[i] = subtreepkg.NewTxInpoints()
+			continue
+		}
+		subtreeMeta.TxInpoints[i] = dummyInpoints
+	}
+
 	return subtreeMeta.Serialize()
 }
 
@@ -5030,6 +5045,59 @@ func TestBlock_Valid_DupTxDetected_DiskMapDirs(t *testing.T) {
 			require.Error(t, err)
 			require.True(t, errors.Is(err, errors.ErrBlockInvalid), "expected ErrBlockInvalid, got %v", err)
 			require.Contains(t, err.Error(), "duplicate transaction")
+		})
+	}
+}
+
+// TestBlock_EmptyBlock_DiskMapDirs verifies a coinbase-only block — whose
+// TransactionCount is 0, since GetAndValidateSubtrees derives it from subtree
+// lengths and an empty block has no subtrees — passes checkDuplicateTransactions
+// and validOrderAndBlessed when block_diskMapDirs is set. The mmap-backed maps
+// reject FilterCapacity == 0, so the call sites must clamp the derived capacity
+// to a floor of 1; without the clamp every empty block fails validation on
+// nodes configured with disk-backed maps.
+func TestBlock_EmptyBlock_DiskMapDirs(t *testing.T) {
+	cases := []struct {
+		name string
+		dirs func(t *testing.T) []string
+	}{
+		{"in_memory", func(*testing.T) []string { return nil }},
+		{"single_disk", func(t *testing.T) []string { return []string{t.TempDir()} }},
+		{"multi_disk", func(t *testing.T) []string { return []string{t.TempDir(), t.TempDir()} }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tSettings := test.CreateBaseTestSettings(t)
+
+			blockHeaderBytes, _ := hex.DecodeString(block1Header)
+			blockHeader, err := NewBlockHeaderFromBytes(blockHeaderBytes)
+			require.NoError(t, err)
+
+			coinbase, err := bt.NewTxFromString(CoinbaseHex)
+			require.NoError(t, err)
+
+			block, err := NewBlock(blockHeader, coinbase, nil, 0, 123, 0, 0)
+			require.NoError(t, err)
+			require.Zero(t, block.TransactionCount)
+
+			ctx := context.Background()
+			logger := ulogger.TestLogger{}
+			dirs := tc.dirs(t)
+
+			err = block.checkDuplicateTransactions(ctx, logger, tSettings.Block.CheckDuplicateTransactionsConcurrency, dirs)
+			require.NoError(t, err)
+
+			deps := &validationDependencies{
+				txMetaStore:           createTestUTXOStore(t),
+				subtreeStore:          &mockSubtreeStore{shouldError: true},
+				currentChain:          []*BlockHeader{},
+				currentBlockHeaderIDs: []uint32{},
+				oldBlockIDsMap:        txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+			}
+
+			err = block.validOrderAndBlessed(ctx, logger, deps, tSettings.Block.ValidOrderAndBlessedConcurrency, dirs, tSettings.Block.ParentSpendsCapacityMultiplier)
+			require.NoError(t, err)
 		})
 	}
 }
