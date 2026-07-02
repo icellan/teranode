@@ -3421,34 +3421,19 @@ func (m *mockSubtreeStore) GetIoReader(ctx context.Context, key []byte, fileType
 	return nil, errors.NewBlobNotFoundError("mock error")
 }
 
-// createValidSubtreeMetadata creates valid subtree metadata that won't trigger retries.
-// Non-coinbase nodes get a dummy parent because go-subtree v1.4.0's SubtreeMeta.Serialize
-// rejects empty TxInpoints on non-coinbase entries ("parent tx hashes are not set for node N").
-// The coinbase placeholder at index 0 keeps an empty TxInpoints, matching the on-wire shape.
+// createValidSubtreeMetadata creates valid subtree metadata that won't trigger retries
 func createValidSubtreeMetadata(subtree *subtreepkg.Subtree) ([]byte, error) {
+	// Create SubtreeMeta with proper structure
 	subtreeMeta := subtreepkg.NewSubtreeMeta(subtree)
 
-	var dummyParent chainhash.Hash
-	dummyParent[0] = 0xde
-
-	dummyInput := &bt.Input{PreviousTxOutIndex: 0}
-	if err := dummyInput.PreviousTxIDAdd(&dummyParent); err != nil {
-		return nil, err
-	}
-
-	dummyInpoints, err := subtreepkg.NewTxInpointsFromInputs([]*bt.Input{dummyInput})
-	if err != nil {
-		return nil, err
-	}
-
+	// Initialize TxInpoints array for all nodes up to Length()
 	for i := 0; i < subtree.Length(); i++ {
-		if i == 0 && len(subtree.Nodes) > 0 && subtree.Nodes[0].Hash == *subtreepkg.CoinbasePlaceholderHash {
-			subtreeMeta.TxInpoints[i] = subtreepkg.NewTxInpoints()
-			continue
-		}
-		subtreeMeta.TxInpoints[i] = dummyInpoints
+		// Create empty TxInpoints for all nodes (including root)
+		txInpoints := subtreepkg.NewTxInpoints()
+		subtreeMeta.TxInpoints[i] = txInpoints
 	}
 
+	// Serialize the metadata
 	return subtreeMeta.Serialize()
 }
 
@@ -5080,6 +5065,11 @@ func TestBlock_EmptyBlock_DiskMapDirs(t *testing.T) {
 			block, err := NewBlock(blockHeader, coinbase, nil, 0, 123, 0, 0)
 			require.NoError(t, err)
 			require.Zero(t, block.TransactionCount)
+
+			// checkDuplicateTransactions allocates block.txMap (mmap-backed
+			// DiskTxMapUint64 when dirs are set); release it on all paths so
+			// the mmap files/fds are freed and TempDir cleanup stays reliable.
+			defer block.releaseTxMap()
 
 			ctx := context.Background()
 			logger := ulogger.TestLogger{}
