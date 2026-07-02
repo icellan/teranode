@@ -75,7 +75,6 @@ func TestCleanupDuringStartup(t *testing.T) {
 	})
 }
 
-
 // TestLoadUnminedTransactionsExcludesConflicting tests that loadUnminedTransactions excludes conflicting transactions
 func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 	initPrometheusMetrics()
