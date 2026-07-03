@@ -753,7 +753,7 @@ func (u *BlockValidation) start(ctx context.Context) error {
 // throughput collapses to near zero — observed in production as 4+ in-flight operations
 // running for 20+ minutes with no completions while the queue grew.
 //
-// Routing through setMinedChan reuses the existing serial worker (BlockValidation.go ~L501),
+// Routing through setMinedChan reuses the existing serial setMinedChan worker,
 // which already handles the MinedSet guard, tryClaim dedup, retry-on-error, and cleanup.
 // We deliberately do NOT call tryClaimBlockForSetMined here because the claim must be
 // released by the consumer, and the worker owns that lifecycle.
