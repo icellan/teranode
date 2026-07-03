@@ -381,7 +381,7 @@ require (
 	github.com/polydawn/refmt v0.89.1-0.20231129105047-37766d95467a // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/prometheus/client_model v0.6.2
-	github.com/prometheus/common v0.68.0 // indirect
+	github.com/prometheus/common v0.68.1 // indirect
 	github.com/prometheus/procfs v0.20.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/webtransport-go v0.10.0 // indirect
@@ -466,3 +466,10 @@ require (
 	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/yuin/gopher-lua v1.1.2 // indirect
 )
+
+// TEMPORARY: local go-batcher checkout with unreleased completion/PutBatch/
+// WithGreedyAccumulate (PR https://github.com/bsv-blockchain/go-batcher/pull/119,
+// not yet merged/tagged). MUST be replaced with a pinned v2.1.0+ require
+// before this branch is opened as a PR — see docs/designs/batcher-group-completion.md
+// Phase L4 and the implementation plan's ground rules.
+replace github.com/bsv-blockchain/go-batcher/v2 => ../../../go-batcher

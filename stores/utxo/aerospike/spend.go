@@ -58,10 +58,11 @@ package aerospike
 import (
 	"context"
 	"runtime/debug"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
+	"github.com/bsv-blockchain/go-batcher/v2/completion"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -73,7 +74,6 @@ import (
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/ordishs/gocore"
-	"golang.org/x/sync/errgroup"
 )
 
 // maxAggregatedSpendErrs caps how many per-spend errors are wrapped into the
@@ -98,11 +98,31 @@ const maxAggregatedSpendErrs = 10
 
 // batchSpend represents a single UTXO spend request in a batch
 type batchSpend struct {
-	spend             *utxo.Spend // UTXO to spend
-	blockHeight       uint32      // Current block height
-	errCh             chan error  // Channel for completion notification
+	spend       *utxo.Spend // UTXO to spend
+	blockHeight uint32      // Current block height
+	group       *completion.Group
+	completed   atomic.Bool // guards exactly-once completion; also lets a caller
+	// safely identify which items finished before an abort (see resolveSpendCompletions)
 	ignoreConflicting bool
 	ignoreLocked      bool
+}
+
+// complete writes err into the item's result slot (spend.Err) and marks the
+// shared group's completion counter. Idempotent: only the first call has any
+// effect, so dispatch paths that sweep an entire batch on panic (which may
+// include items already completed by an earlier stage) never double-signal
+// or race a second write into spend.Err.
+//
+// The slot write happens strictly before the CompareAndSwap succeeds, and
+// group.Done()'s eventual close(done) — or, on the abort path, a caller
+// observing completed.Load()==true — both synchronize-with this write via
+// the Go memory model's atomic-operation ordering, making the slot safe to
+// read after either signal.
+func (b *batchSpend) complete(err error) {
+	if b.completed.CompareAndSwap(false, true) {
+		b.spend.Err = err
+		b.group.Done()
+	}
 }
 
 // IncrementSpentRecordsMulti performs a single BatchOperate to increment spent-extra-records for many txids.
@@ -310,127 +330,82 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		return nil, err
 	}
 
-	var (
-		mu sync.Mutex
-		g  = errgroup.Group{}
-
-		spentSpends     = make([]*utxo.Spend, 0, len(spends))
-		txAlreadyExists bool
-	)
+	items := make([]*batchSpend, len(spends))
+	group := completion.NewGroup(int32(len(spends)))
 
 	for idx, spend := range spends {
 		if spend == nil {
 			return nil, errors.NewProcessingError("spend should not be nil")
 		}
 
-		idx := idx
-		spend := spend
+		item := &batchSpend{
+			spend:             spend,
+			blockHeight:       blockHeight,
+			group:             group,
+			ignoreConflicting: useIgnoreConflicting,
+			ignoreLocked:      useIgnoreLocked,
+		}
+		items[idx] = item
 
-		g.Go(func() error {
-			// Per-worker panic recovery. The parent's defer only catches panics in the
-			// parent goroutine — errgroup propagates errors but does not recover panics
-			// inside g.Go bodies, so without this a worker panic would crash the process.
-			defer func() {
-				handleSpendPanic(recover(), &spends[idx].Err, s.logger)
-			}()
+		// Fast-fail check: if circuit breaker is already open, reject immediately.
+		if s.spendCircuitBreaker != nil && !s.spendCircuitBreaker.Allow() {
+			item.complete(errors.NewServiceUnavailableError("[SPEND] circuit breaker open, rejecting request"))
+			continue
+		}
 
-			// Fast-fail check: if circuit breaker is already open, reject immediately
-			if s.spendCircuitBreaker != nil && !s.spendCircuitBreaker.Allow() {
-				spends[idx].Err = errors.NewServiceUnavailableError("[SPEND] circuit breaker open, rejecting request")
-				return nil
-			}
-
-			errCh := make(chan error, 1)
-			s.spendBatcher.PutCtx(ctx, &batchSpend{
-				spend:             spend,
-				blockHeight:       blockHeight,
-				errCh:             errCh,
-				ignoreConflicting: useIgnoreConflicting,
-				ignoreLocked:      useIgnoreLocked,
-			})
-
-			// Wait for batch response with timeout to prevent indefinite blocking
-			var batchErr error
-			spendTimeout := s.settings.UtxoStore.SpendWaitTimeout
-			if spendTimeout <= 0 {
-				spendTimeout = 30 * time.Second
-			}
-
-			timer := time.NewTimer(spendTimeout)
-			defer timer.Stop()
-
-			select {
-			case batchErr = <-errCh:
-				// Batch completed successfully or with error
-			case <-ctx.Done():
-				spends[idx].Err = errors.NewContextCanceledError("[SPEND][%s:%d] context canceled while waiting for batch response", spend.TxID.String(), spend.Vout)
-				return nil
-			case <-timer.C:
-				if prometheusUtxoMapErrors != nil {
-					prometheusUtxoMapErrors.WithLabelValues("Spend", "BatchTimeout").Inc()
-				}
-				spends[idx].Err = errors.NewServiceUnavailableError("[SPEND][%s:%d] batch operation timed out after %s", spend.TxID.String(), spend.Vout, spendTimeout)
-				return nil
-			}
-
-			if batchErr != nil && errors.Is(batchErr, errors.ErrTxNotFound) {
-				mu.Lock()
-				exists := txAlreadyExists
-				mu.Unlock()
-				// the parent transaction was not found, this can happen when the parent tx has been DAH'd and removed from
-				// the utxo store. We can check whether the tx already exists, which means it has been validated and
-				// blessed. In this case we can just return early.
-				if exists {
-					// we've previously validated that this tx already exists, no point doing a lookup again or logging anything
-					batchErr = nil
-				} else if _, batchErr = s.Get(ctx, tx.TxIDChainHash()); batchErr == nil {
-					s.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
-
-					batchErr = nil
-
-					mu.Lock()
-					txAlreadyExists = true
-					mu.Unlock()
-				}
-			}
-
-			if batchErr != nil {
-				spends[idx].Err = batchErr
-
-				s.logger.Debugf("[SPEND][%s:%d] error in aerospike spend: %+v", spend.TxID.String(), spend.Vout, spend.Err)
-
-				var errSpent *errors.UtxoSpentErrData
-				if errors.AsData(batchErr, &errSpent) {
-					spends[idx].ConflictingTxID = errSpent.SpendingData.TxID
-				}
-
-				// s.logger.Errorf("error in aerospike spend (batched mode) %s: %v\n", spends[idx].TxID.String(), spends[idx].Err)
-
-				// don't stop processing the rest of the batch, we want to see all errors
-				return nil
-			}
-
-			mu.Lock()
-			spentSpends = append(spentSpends, spend)
-			mu.Unlock()
-
-			return nil
-		})
+		s.spendBatcher.PutCtx(ctx, item)
 	}
 
-	if err = g.Wait(); err != nil {
-		return nil, errors.NewError("error in aerospike spend (batched mode)", err)
+	// One shared wait for the whole batch, instead of one goroutine + timer
+	// per input. spendTimeout mirrors the previous per-item fallback.
+	spendTimeout := s.settings.UtxoStore.SpendWaitTimeout
+	if spendTimeout <= 0 {
+		spendTimeout = 30 * time.Second
 	}
 
-	if len(spends) != len(spentSpends) { // there must have been failures
+	if waitErr := group.Wait(ctx, spendTimeout); waitErr != nil {
+		// The group did not complete within budget (context canceled, or the
+		// dispatcher took longer than spendTimeout). Some items may already
+		// have finished before the abort — resolveSpendCompletions(onlyCompleted=true)
+		// safely identifies exactly those via each item's own CAS-guarded
+		// completed flag and leaves any still-in-flight item's slot
+		// untouched, since the dispatcher may still be writing to it.
+		result := s.resolveSpendCompletions(ctx, tx, items, true)
+
+		// Same rollback rationale as the normal path below: only roll back
+		// for a genuine validation failure among the spends we know
+		// completed, never for a bare timeout/cancel — the Lua spend script
+		// is idempotent for the same spender, so successful spends can
+		// safely remain and will be silently skipped on retry.
+		if result.rollbackNeeded && len(result.spentSpends) > 0 {
+			if unspendErr := s.Unspend(context.Background(), result.spentSpends); unspendErr != nil {
+				s.logger.Errorf("error in aerospike unspend (batched mode, after wait error): %v", unspendErr)
+			}
+		}
+
+		if errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded) {
+			return spends, errors.NewContextCanceledError("[SPEND] context canceled while waiting for batch response: %s", waitErr)
+		}
+
+		if prometheusUtxoMapErrors != nil {
+			prometheusUtxoMapErrors.WithLabelValues("Spend", "BatchTimeout").Inc()
+		}
+
+		return spends, errors.NewServiceUnavailableError("[SPEND] batch operation timed out after %s: %s", spendTimeout, waitErr)
+	}
+
+	// group.Wait returned nil: every item has completed, so every slot is
+	// safe to read regardless of the CAS flag (onlyCompleted=false).
+	result := s.resolveSpendCompletions(ctx, tx, items, false)
+
+	if len(spends) != len(result.spentSpends) { // there must have been failures
 		// Only rollback successful spends when the transaction is genuinely invalid
 		// (double-spend, frozen, conflicting, hash mismatch). For transient infrastructure
 		// errors (DEVICE_OVERLOAD, timeout, etc.), skip the rollback — the Lua spend
 		// script is idempotent for the same spender, so successful spends can safely
 		// remain and will be silently skipped on retry.
-		if needsSpendRollback(spends) {
-			unspendErr := s.Unspend(context.Background(), spentSpends)
-			if unspendErr != nil {
+		if result.rollbackNeeded {
+			if unspendErr := s.Unspend(context.Background(), result.spentSpends); unspendErr != nil {
 				s.logger.Errorf("error in aerospike unspend (batched mode): %v", unspendErr)
 			}
 		}
@@ -457,6 +432,90 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	return spends, nil
 }
 
+// spendCompletionResult is the outcome of resolveSpendCompletions: which
+// spends succeeded, and whether rollback is warranted for any completed
+// failure.
+type spendCompletionResult struct {
+	spentSpends    []*utxo.Spend
+	rollbackNeeded bool
+}
+
+// resolveSpendCompletions applies the ErrTxNotFound "already blessed"
+// fallback and conflict-data extraction to each item exactly once, and
+// reports which spends succeeded plus whether any completed spend carries a
+// rollback-triggering error (see needsSpendRollback/isSpendRollbackError).
+//
+// When onlyCompleted is true (the group.Wait abort path), an item whose
+// completed flag is still false is skipped without touching its slot: the
+// dispatcher may still be writing it, and observing completed==false gives
+// no synchronizes-with guarantee, so reading spend.Err here would race.
+// Observing completed==true DOES synchronize-with that item's own complete()
+// call (both operate on the same atomic.Bool), so the slot is safely
+// readable for exactly the items this loop processes. When onlyCompleted is
+// false (the normal, non-abort path), group.Wait having returned nil already
+// guarantees every item completed, so the flag is a no-op safety check here,
+// not the source of truth.
+func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []*batchSpend, onlyCompleted bool) *spendCompletionResult {
+	result := &spendCompletionResult{spentSpends: make([]*utxo.Spend, 0, len(items))}
+
+	var txAlreadyExists bool
+
+	for _, item := range items {
+		if onlyCompleted && !item.completed.Load() {
+			continue
+		}
+
+		spend := item.spend
+
+		if spend.Err != nil && errors.Is(spend.Err, errors.ErrTxNotFound) {
+			// the parent transaction was not found, this can happen when the parent tx has been DAH'd and removed from
+			// the utxo store. We can check whether the tx already exists, which means it has been validated and
+			// blessed. In this case we can just clear the error.
+			if txAlreadyExists {
+				// we've previously validated that this tx already exists, no point doing a lookup again or logging anything
+				spend.Err = nil
+			} else if _, getErr := s.Get(ctx, tx.TxIDChainHash()); getErr == nil {
+				s.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
+
+				spend.Err = nil
+				txAlreadyExists = true
+			}
+		}
+
+		if spend.Err != nil {
+			s.logger.Debugf("[SPEND][%s:%d] error in aerospike spend: %+v", spend.TxID.String(), spend.Vout, spend.Err)
+
+			var errSpent *errors.UtxoSpentErrData
+			if errors.AsData(spend.Err, &errSpent) {
+				spend.ConflictingTxID = errSpent.SpendingData.TxID
+			}
+
+			if isSpendRollbackError(spend.Err) {
+				result.rollbackNeeded = true
+			}
+
+			// don't stop processing the rest of the batch, we want to see all errors
+			continue
+		}
+
+		result.spentSpends = append(result.spentSpends, spend)
+	}
+
+	return result
+}
+
+// isSpendRollbackError reports whether err is one of the validation-error
+// types that indicates the transaction is genuinely invalid (as opposed to a
+// transient infrastructure failure). Extracted from needsSpendRollback so
+// resolveSpendCompletions can apply the same predicate to a single error at
+// a time without building a throwaway slice.
+func isSpendRollbackError(err error) bool {
+	return errors.Is(err, errors.ErrSpent) ||
+		errors.Is(err, errors.ErrTxConflicting) ||
+		errors.Is(err, errors.ErrFrozen) ||
+		errors.Is(err, errors.ErrUtxoHashMismatch)
+}
+
 // needsSpendRollback returns true if any spend failed due to a validation error
 // that indicates the transaction is genuinely invalid. Only explicit Lua-level
 // validation failures trigger rollback — infrastructure errors (DEVICE_OVERLOAD,
@@ -467,10 +526,7 @@ func needsSpendRollback(spends []*utxo.Spend) bool {
 		if spend.Err == nil {
 			continue
 		}
-		if errors.Is(spend.Err, errors.ErrSpent) ||
-			errors.Is(spend.Err, errors.ErrTxConflicting) ||
-			errors.Is(spend.Err, errors.ErrFrozen) ||
-			errors.Is(spend.Err, errors.ErrUtxoHashMismatch) {
+		if isSpendRollbackError(spend.Err) {
 			return true
 		}
 	}
@@ -505,14 +561,14 @@ func (s *Store) useExpressionSpend() bool {
 //  5. Manages DAH settings
 //  6. Updates external storage
 func (s *Store) sendSpendBatchLua(batch []*batchSpend) {
-	// go-batcher recovers panics in this fn; re-signal every item's errCh on
-	// panic (e.g. the unchecked .(int) in processSpendBatchResults) so a crash
-	// cannot orphan waiting spenders. trySignal is a no-op for items already
-	// signalled (buffered-1 full), so this never double-delivers or blocks.
+	// go-batcher recovers panics in this fn; re-complete every item on panic
+	// (e.g. the unchecked .(int) in processSpendBatchResults) so a crash
+	// cannot orphan waiting spenders. complete is a no-op for items already
+	// completed (CAS-guarded), so this never double-delivers or races.
 	defer func() {
 		signalBatchPanic(recover(), batch, "sendSpendBatchLua", s.logger, func(it *batchSpend, err error) {
 			if it != nil {
-				trySignal(it.errCh, err)
+				it.complete(err)
 			}
 		})
 	}()
@@ -525,7 +581,7 @@ func (s *Store) sendSpendBatchLua(batch []*batchSpend) {
 			return item.spend
 		},
 		func(item *batchSpend, err error) {
-			item.errCh <- err
+			item.complete(err)
 		},
 	)
 	if len(batch) == 0 {
@@ -600,12 +656,12 @@ func (s *Store) prepareSpendBatches(batch []*batchSpend, batchID uint64) (map[ke
 	for idx, bItem := range batch {
 		key, err := s.getOrCreateAerospikeKey(bItem, s.utxoBatchSize, aeroKeyMap)
 		if err != nil {
-			bItem.errCh <- err
+			bItem.complete(err)
 			continue
 		}
 
 		if err := s.validateSpendItem(bItem); err != nil {
-			bItem.errCh <- err
+			bItem.complete(err)
 			continue
 		}
 
@@ -692,12 +748,12 @@ func (s *Store) executeSpendBatch(batchRecords []aerospike.BatchRecordIfc, batch
 	batchPolicy := util.GetAerospikeBatchPolicy(s.settings)
 	err := s.batchOperate(batchPolicy, batchRecords)
 	if err != nil {
-		// trySignal (not a blocking send): items skipped in prepareSpendBatches
-		// already have a queued result on their buffered-1 errCh, and a blocking
-		// re-send here would wedge the dispatch worker permanently.
+		// complete is CAS-guarded: items already completed in prepareSpendBatches
+		// (key-creation/validation failures) are simply no-ops here, so this
+		// safely covers every remaining item without double-signalling.
 		for idx, bItem := range batch {
 			var sendErr error = errors.NewStorageError("[SPEND_BATCH_LUA][%s] failed to batch spend aerospike map utxo in batchId %d: %d - %w", bItem.spend.TxID.String(), batchID, idx, err)
-			trySignal(bItem.errCh, sendErr)
+			bItem.complete(sendErr)
 		}
 		return err
 	}
@@ -761,7 +817,7 @@ func (s *Store) processSingleBatchResult(ctx context.Context, batchRecord aerosp
 func (s *Store) handleBatchError(batchByKey []aerospike.MapValue, batch []*batchSpend, thisBlockHeight uint32, batchID uint64, err error) {
 	for _, batchItem := range batchByKey {
 		idx := batchItem["idx"].(int)
-		batch[idx].errCh <- errors.NewStorageError("[SPEND_BATCH_LUA][%s] error in aerospike spend batch record, blockHeight %d: %d", batch[idx].spend.TxID.String(), thisBlockHeight, batchID, err)
+		batch[idx].complete(errors.NewStorageError("[SPEND_BATCH_LUA][%s] error in aerospike spend batch record, blockHeight %d: %d", batch[idx].spend.TxID.String(), thisBlockHeight, batchID, err))
 	}
 	// Only count infrastructure failures toward the circuit breaker.
 	// Per-record data-state errors (e.g. KEY_NOT_FOUND_ERROR from missing
@@ -775,7 +831,7 @@ func (s *Store) handleBatchError(batchByKey []aerospike.MapValue, batch []*batch
 func (s *Store) handleMissingResponse(batchByKey []aerospike.MapValue, batch []*batchSpend, txID *chainhash.Hash) {
 	for _, batchItem := range batchByKey {
 		idx := batchItem["idx"].(int)
-		batch[idx].errCh <- errors.NewProcessingError("[SPEND_BATCH_LUA][%s] could not parse response", txID.String())
+		batch[idx].complete(errors.NewProcessingError("[SPEND_BATCH_LUA][%s] could not parse response", txID.String()))
 	}
 }
 
@@ -783,7 +839,7 @@ func (s *Store) handleMissingResponse(batchByKey []aerospike.MapValue, batch []*
 func (s *Store) handleParseError(batchByKey []aerospike.MapValue, batch []*batchSpend, txID *chainhash.Hash, err error) {
 	for _, batchItem := range batchByKey {
 		idx := batchItem["idx"].(int)
-		batch[idx].errCh <- errors.NewProcessingError("[SPEND_BATCH_LUA][%s] could not parse response", txID.String(), err)
+		batch[idx].complete(errors.NewProcessingError("[SPEND_BATCH_LUA][%s] could not parse response", txID.String(), err))
 	}
 }
 
@@ -817,7 +873,7 @@ func (s *Store) handleSpendSignal(ctx context.Context, signal LuaSignal, txID *c
 func (s *Store) handleSuccessfulSpends(batchByKey []aerospike.MapValue, batch []*batchSpend) {
 	for _, batchItem := range batchByKey {
 		idx := batchItem["idx"].(int)
-		batch[idx].errCh <- nil
+		batch[idx].complete(nil)
 	}
 	// Record successful batch operation for circuit breaker
 	if s.spendCircuitBreaker != nil {
@@ -832,7 +888,7 @@ func (s *Store) handleErrorSpends(res *LuaMapResponse, batchByKey []aerospike.Ma
 		generalErr := s.createGeneralError(res.ErrorCode, txID, thisBlockHeight, batchID, res.Message)
 		for _, batchItem := range batchByKey {
 			idx := batchItem["idx"].(int)
-			batch[idx].errCh <- generalErr
+			batch[idx].complete(generalErr)
 		}
 	} else if res.Errors != nil {
 		// Individual errors for specific spends
@@ -841,7 +897,7 @@ func (s *Store) handleErrorSpends(res *LuaMapResponse, batchByKey []aerospike.Ma
 		// ERROR status but no message or errors
 		for _, batchItem := range batchByKey {
 			idx := batchItem["idx"].(int)
-			batch[idx].errCh <- errors.NewStorageError("[SPEND_BATCH_LUA][%s] error in LUA spend batch record, blockHeight %d: %d - %v", txID.String(), thisBlockHeight, batchID, res)
+			batch[idx].complete(errors.NewStorageError("[SPEND_BATCH_LUA][%s] error in LUA spend batch record, blockHeight %d: %d - %v", txID.String(), thisBlockHeight, batchID, res))
 		}
 	}
 }
@@ -872,9 +928,9 @@ func (s *Store) handleIndividualErrors(errors map[int]LuaErrorInfo, batchByKey [
 		idx := batchItem["idx"].(int)
 
 		if errMsg, hasError := errors[idx]; hasError {
-			batch[idx].errCh <- s.createSpendError(errMsg, batch[idx], txID)
+			batch[idx].complete(s.createSpendError(errMsg, batch[idx], txID))
 		} else {
-			batch[idx].errCh <- nil
+			batch[idx].complete(nil)
 		}
 	}
 }
