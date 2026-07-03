@@ -54,20 +54,6 @@ func signalBatchPanic[T any](recovered any, batch []T, fnName string, logger ulo
 	return true
 }
 
-// trySignal delivers v on a completion channel without blocking and without
-// re-delivering when a result is already queued. It is the correct primitive for
-// the buffered-1 completion channels used across the batchers (get/outpoint/
-// spend/increment/setDAH/locked): a still-waiting submitter receives the value
-// immediately, an already-signalled channel (buffer full) is left untouched, and
-// a departed submitter cannot wedge the worker. Do NOT use it for unbuffered
-// channels — there it would race the receiver and silently drop the signal.
-func trySignal[T any](ch chan T, v T) {
-	select {
-	case ch <- v:
-	default:
-	}
-}
-
 // batchSignalTimeout bounds a single non-blocking completion send. It exists
 // only so an unbuffered completion channel whose submitter has already departed
 // cannot wedge the worker. Buffered-1 channels (the common case) never reach the

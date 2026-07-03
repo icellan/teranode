@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/bsv-blockchain/go-batcher/v2/completion"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/validator/validator_api"
@@ -358,7 +359,8 @@ func TestBatchValidation(t *testing.T) {
 	tx := createTestTransaction(t)
 	txBytes := tx.Bytes()
 
-	// Create test batch with valid transaction data
+	// Create test batch with valid transaction data sharing one completion group.
+	group := completion.NewGroup(2)
 	batch := []*batchItem{
 		{
 			req: &validator_api.ValidateTransactionRequest{
@@ -369,7 +371,7 @@ func TestBatchValidation(t *testing.T) {
 				SkipPolicyChecks:     boolPtr(false),
 				CreateConflicting:    boolPtr(false),
 			},
-			done: make(chan validateBatchResponse),
+			group: group,
 		},
 		{
 			req: &validator_api.ValidateTransactionRequest{
@@ -380,16 +382,18 @@ func TestBatchValidation(t *testing.T) {
 				SkipPolicyChecks:     boolPtr(false),
 				CreateConflicting:    boolPtr(false),
 			},
-			done: make(chan validateBatchResponse),
+			group: group,
 		},
 	}
 
-	// Call the method under test in a goroutine
-	go client.sendBatchToValidator(context.Background(), batch)
+	// Call the method under test.
+	client.sendBatchToValidator(context.Background(), batch)
 
-	// Get the results from the channels
-	response1 := <-batch[0].done
-	response2 := <-batch[1].done
+	// Every item was completed exactly once (a double-Done would have panicked
+	// in the dispatcher); read the result slots after the group completes.
+	require.NoError(t, group.Wait(context.Background(), 0))
+	response1 := batch[0].result
+	response2 := batch[1].result
 
 	// Verify results
 	assert.NoError(t, response1.err)
@@ -416,7 +420,8 @@ func TestBatchValidation_ResourceExhausted(t *testing.T) {
 	tx := createTestTransaction(t)
 	txBytes := tx.Bytes()
 
-	// Create test batch with valid transaction data
+	// Create test batch with valid transaction data sharing one completion group.
+	group := completion.NewGroup(1)
 	batch := []*batchItem{
 		{
 			req: &validator_api.ValidateTransactionRequest{
@@ -427,15 +432,16 @@ func TestBatchValidation_ResourceExhausted(t *testing.T) {
 				SkipPolicyChecks:     boolPtr(false),
 				CreateConflicting:    boolPtr(false),
 			},
-			done: make(chan validateBatchResponse),
+			group: group,
 		},
 	}
 
-	// Call the method under test in a goroutine
-	go client.sendBatchToValidator(context.Background(), batch)
+	// Call the method under test.
+	client.sendBatchToValidator(context.Background(), batch)
 
-	// Get the results from the channel
-	response := <-batch[0].done
+	// Read the result slot after the group completes.
+	require.NoError(t, group.Wait(context.Background(), 0))
+	response := batch[0].result
 
 	// Verify results - HTTP fallback should work
 	assert.NoError(t, response.err)

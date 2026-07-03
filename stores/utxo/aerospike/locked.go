@@ -40,16 +40,18 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	group := completion.NewGroup(int32(len(txHashes)))
 
 	for idx, txHash := range txHashes {
-		item := &batchLocked{
+		items[idx] = &batchLocked{
 			ctx:      ctx,
 			txHash:   txHash,
 			setValue: setValue,
 			group:    group,
 		}
-		items[idx] = item
-
-		s.lockedBatcher.PutCtx(ctx, item)
 	}
+
+	// Enqueue all hashes as one ordered group via a single PutBatchCtx, instead
+	// of one PutCtx per hash — cutting the per-item channel-send and collector-
+	// select overhead to a single operation for the whole set.
+	s.lockedBatcher.PutBatchCtx(ctx, items)
 
 	// s.batcherWait <= 0 means unbounded (ctx-only) — Group.Wait treats a
 	// non-positive timeout the same way, mirroring the previous

@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-batcher/v2"
+	"github.com/bsv-blockchain/go-batcher/v2/completion"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/validator/validator_api"
@@ -50,8 +51,30 @@ type batchItem struct {
 	// req contains the validation request for a single transaction
 	req *validator_api.ValidateTransactionRequest
 
-	// done is a channel that receives the validation result
-	done chan validateBatchResponse
+	// group is the shared completion group the submitter waits on; the
+	// dispatcher calls Done exactly once per item via complete.
+	group *completion.Group
+
+	// completed guards exactly-once completion (CAS).
+	completed atomic.Bool
+
+	// result holds the validation outcome (metadata + error) for this item.
+	// Written before completed flips true; safe to read once group.Wait
+	// returns nil.
+	result validateBatchResponse
+}
+
+// complete writes resp into the item's result slot and marks the shared
+// group's completion counter. Idempotent: only the first call has any effect,
+// so a panic-recovery sweep over an already-completed item never
+// double-signals or races a second write into result.
+func (it *batchItem) complete(resp validateBatchResponse) {
+	if it.completed.CompareAndSwap(false, true) {
+		it.result = resp
+		if it.group != nil {
+			it.group.Done()
+		}
+	}
 }
 
 // Client implements a gRPC client for the validator service, providing transaction
@@ -383,13 +406,21 @@ func (c *Client) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHeight
 	}
 
 	// Batch mode
-	doneCh := make(chan validateBatchResponse)
-	c.batcher.PutCtx(ctx, &batchItem{
-		req:  buildValidateTxRequest(tx.SerializeBytes(), blockHeight, validationOptions),
-		done: doneCh,
-	})
+	group := completion.NewGroup(1)
+	item := &batchItem{
+		req:   buildValidateTxRequest(tx.SerializeBytes(), blockHeight, validationOptions),
+		group: group,
+	}
+	c.batcher.PutCtx(ctx, item)
 
-	r := <-doneCh
+	// group.Wait(context.Background(), 0): 0 timeout allocates no timer and a
+	// background context never cancels, so this blocks purely on the dispatcher
+	// completing the item — identical to the previous bare <-doneCh receive (no
+	// timeout, no ctx arm). It can only return nil, so the result slot is always
+	// safe to read here.
+	_ = group.Wait(context.Background(), 0)
+
+	r := item.result
 
 	if r.err != nil {
 		c.logger.Errorf("[ValidateWithOptions] failed to validate batched transaction: %v", r.err)
@@ -434,6 +465,21 @@ func (c *Client) handleValidationError(ctx context.Context, tx *bt.Tx, blockHeig
 // If the batch exceeds the gRPC message size limit, it falls back to validating
 // each transaction individually over HTTP.
 func (c *Client) sendBatchToValidator(ctx context.Context, batch []*batchItem) {
+	// go-batcher recovers panics raised in this dispatch fn; without a sweep a
+	// panic part-way through would strand every submitter blocked on group.Wait
+	// (unbuffered handoff, no timeout). complete is CAS-guarded, so
+	// re-completing an item an earlier stage already completed is a no-op.
+	defer func() {
+		if r := recover(); r != nil {
+			c.logger.Errorf("[sendBatchToValidator] recovered panic, failing %d batch item(s): %v", len(batch), r)
+
+			err := errors.NewProcessingError("panic in sendBatchToValidator: %v", r)
+			for _, item := range batch {
+				item.complete(validateBatchResponse{err: err})
+			}
+		}
+	}()
+
 	// Prepare batch request
 	requests := make([]*validator_api.ValidateTransactionRequest, 0, len(batch))
 	for _, item := range batch {
@@ -481,10 +527,10 @@ func (c *Client) handleBatchHTTPFallback(ctx context.Context, batch []*batchItem
 
 		tx, err := bt.NewTxFromBytes(txReq.TransactionData)
 		if err != nil {
-			item.done <- validateBatchResponse{
+			item.complete(validateBatchResponse{
 				metaData: nil,
 				err:      errors.NewServiceError("Failed to parse transaction for HTTP fallback: %v", err),
-			}
+			})
 
 			continue
 		}
@@ -504,7 +550,7 @@ func (c *Client) handleBatchHTTPFallback(ctx context.Context, batch []*batchItem
 		options, err := optionsFromValidateRequest(txReq)
 		if err != nil {
 			c.logger.Errorf("[%s] HTTP fallback rejected: client-built request failed projection: %v", tx.TxID(), err)
-			item.done <- validateBatchResponse{metaData: nil, err: err}
+			item.complete(validateBatchResponse{metaData: nil, err: err})
 			continue
 		}
 
@@ -513,10 +559,10 @@ func (c *Client) handleBatchHTTPFallback(ctx context.Context, batch []*batchItem
 
 		if httpErr == nil {
 			c.logger.Debugf("[%s] Successfully validated via HTTP fallback", tx.TxID())
-			item.done <- validateBatchResponse{metaData: nil, err: nil}
+			item.complete(validateBatchResponse{metaData: nil, err: nil})
 		} else {
 			c.logger.Errorf("[%s] HTTP fallback failed: %v", tx.TxID(), httpErr)
-			item.done <- validateBatchResponse{metaData: nil, err: httpErr}
+			item.complete(validateBatchResponse{metaData: nil, err: httpErr})
 		}
 	}
 }
@@ -525,9 +571,9 @@ func (c *Client) handleBatchHTTPFallback(ctx context.Context, batch []*batchItem
 func (c *Client) processBatchResponse(batch []*batchItem, resp *validator_api.ValidateTransactionBatchResponse) {
 	for i, item := range batch {
 		if !resp.Errors[i].IsNil() {
-			item.done <- validateBatchResponse{metaData: nil, err: resp.Errors[i]}
+			item.complete(validateBatchResponse{metaData: nil, err: resp.Errors[i]})
 		} else {
-			item.done <- validateBatchResponse{metaData: resp.Metadata[i], err: nil}
+			item.complete(validateBatchResponse{metaData: resp.Metadata[i], err: nil})
 		}
 	}
 }
@@ -535,7 +581,7 @@ func (c *Client) processBatchResponse(batch []*batchItem, resp *validator_api.Va
 // notifyAllBatchItems notifies all items in a batch with the same response
 func (c *Client) notifyAllBatchItems(batch []*batchItem, metadata []byte, err error) {
 	for _, item := range batch {
-		item.done <- validateBatchResponse{metaData: metadata, err: err}
+		item.complete(validateBatchResponse{metaData: metadata, err: err})
 	}
 }
 

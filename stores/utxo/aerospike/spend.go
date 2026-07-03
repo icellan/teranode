@@ -246,17 +246,61 @@ func (s *Store) SetDAHForChildRecordsMulti(items []struct {
 
 // batchIncrement handles record count updates for paginated transactions
 type batchIncrement struct {
-	txID        *chainhash.Hash               // Transaction hash
-	increment   int                           // Count adjustment
-	blockHeight uint32                        // Height of the operation, for DAH = blockHeight + retention
-	res         chan incrementSpentRecordsRes // Result channel
+	txID        *chainhash.Hash   // Transaction hash
+	increment   int               // Count adjustment
+	blockHeight uint32            // Height of the operation, for DAH = blockHeight + retention
+	group       *completion.Group // shared group the producer waits on
+	completed   atomic.Bool       // guards exactly-once completion (see complete)
+	res         interface{}       // result slot: raw Lua response, written before completed flips true
+	err         error             // result slot: written before completed flips true
 }
 
+// complete writes the result (res, err) into the item's slots and marks the
+// shared group's completion counter. Idempotent: only the first call has any
+// effect (CAS-guarded), so a dispatch path that sweeps the whole batch on
+// panic — which may include an item an earlier stage already completed — never
+// double-signals or races a second write into the slots.
+//
+// The slot writes happen strictly before the CompareAndSwap succeeds, and
+// group.Done()'s eventual close(done) synchronizes-with them via the Go memory
+// model, making the slots safe to read after group.Wait returns nil. group may
+// be nil (defensive; the sole producer IncrementSpentRecords always supplies
+// one) in which case Done is skipped.
+func (b *batchIncrement) complete(res interface{}, err error) {
+	if b.completed.CompareAndSwap(false, true) {
+		b.res = res
+		b.err = err
+		if b.group != nil {
+			b.group.Done()
+		}
+	}
+}
+
+// batchDAH represents a single DeleteAtHeight write on one (child) record.
 type batchDAH struct {
-	txID           *chainhash.Hash // Transaction hash
-	childIdx       uint32          // Child record index
-	deleteAtHeight uint32          // DeleteAtHeight (0 = no delete)
-	errCh          chan error      // Error Result channel
+	txID           *chainhash.Hash   // Transaction hash
+	childIdx       uint32            // Child record index
+	deleteAtHeight uint32            // DeleteAtHeight (0 = no delete)
+	group          *completion.Group // nil for fire-and-forget submitters (see complete)
+	completed      atomic.Bool       // guards exactly-once completion (see complete)
+	result         error             // written before completed flips true
+}
+
+// complete writes err into the item's result slot and marks the shared group's
+// completion counter. Idempotent (CAS-guarded), so a panic-recovery sweep over
+// an item an earlier stage already completed never double-signals or races a
+// second write into result.
+//
+// group may be nil for a fire-and-forget submitter (the counter-drift
+// master-DAH clear in handleExtraRecords): the write still executes via the
+// dispatcher, the submitter simply does not wait for it, so Done is skipped.
+func (b *batchDAH) complete(err error) {
+	if b.completed.CompareAndSwap(false, true) {
+		b.result = err
+		if b.group != nil {
+			b.group.Done()
+		}
+	}
 }
 
 // handleSpendPanic processes a recovered value from Spend's deferred recover
@@ -333,6 +377,13 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	items := make([]*batchSpend, len(spends))
 	group := completion.NewGroup(int32(len(spends)))
 
+	// Enqueue all inputs of this tx as one ordered group via a single
+	// PutBatchCtx, instead of one PutCtx per input — cutting the per-item
+	// channel-send and collector-select overhead to a single operation for the
+	// whole tx. Circuit-breaker fast-failed items complete inline (decrementing
+	// the group) and are excluded from the enqueued set.
+	toEnqueue := make([]*batchSpend, 0, len(spends))
+
 	for idx, spend := range spends {
 		if spend == nil {
 			return nil, errors.NewProcessingError("spend should not be nil")
@@ -353,8 +404,11 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			continue
 		}
 
-		s.spendBatcher.PutCtx(ctx, item)
+		toEnqueue = append(toEnqueue, item)
 	}
+
+	// PutBatchCtx is a no-op on an empty slice (e.g. every input fast-failed).
+	s.spendBatcher.PutBatchCtx(ctx, toEnqueue)
 
 	// One shared wait for the whole batch, instead of one goroutine + timer
 	// per input. spendTimeout mirrors the previous per-item fallback.
@@ -973,48 +1027,49 @@ func (s *Store) createSpendError(errMsg LuaErrorInfo, batchItem *batchSpend, txI
 	}
 }
 
-// SetDAHForChildRecords sets DAH for all child records of a transaction
+// SetDAHForChildRecords sets DAH for all child records of a transaction. Every
+// child is enqueued into the setDAH batcher under one shared completion group,
+// and a single group.Wait replaces the previous per-child goroutine + timer +
+// channel receive.
 func (s *Store) SetDAHForChildRecords(txID *chainhash.Hash, childCount int, dah uint32) error {
-	errs := make([]error, childCount)
-
-	for i := uint32(0); i < uint32(childCount); i++ { // nolint: gosec
-		// Buffered-1 so the dispatch fn's trySignal always delivers and never
-		// wedges the batcher worker if this caller has already given up below.
-		errCh := make(chan error, 1)
-
-		go func() {
-			s.setDAHBatcher.Put(&batchDAH{
-				txID:           txID,
-				childIdx:       i + 1, // We want to set DAH for child record i+1
-				deleteAtHeight: dah,
-				errCh:          errCh,
-			})
-		}()
-
-		// Bound the wait so a wedged setDAH batcher cannot pin this caller forever.
-		if s.batcherWait > 0 {
-			timer := time.NewTimer(s.batcherWait)
-			select {
-			case errs[i] = <-errCh:
-			case <-timer.C:
-				errs[i] = errors.NewServiceUnavailableError("[setDAHForChildRecords][%s] set DAH for child record %d did not complete within %s", txID.String(), i, s.batcherWait)
-			}
-			timer.Stop()
-		} else {
-			errs[i] = <-errCh
-		}
-
-		if errs[i] != nil {
-			s.logger.Errorf("[setDAHForChildRecords][%s] failed to set DAH for child record %d: %v", txID.String(), i, errs[i])
-		}
+	if childCount == 0 {
+		return nil
 	}
 
+	items := make([]*batchDAH, childCount)
+	group := completion.NewGroup(int32(childCount))
+
+	for i := uint32(0); i < uint32(childCount); i++ { // nolint: gosec
+		item := &batchDAH{
+			txID:           txID,
+			childIdx:       i + 1, // We want to set DAH for child record i+1
+			deleteAtHeight: dah,
+			group:          group,
+		}
+		items[i] = item
+
+		s.setDAHBatcher.Put(item)
+	}
+
+	// s.batcherWait <= 0 means unbounded (ctx-only) — Group.Wait treats a
+	// non-positive timeout the same way, mirroring the previous per-child
+	// fallback (which waited unbounded on errCh when batcherWait <= 0), while a
+	// positive value still bounds the wait so a wedged batcher cannot pin the
+	// caller forever.
+	if waitErr := group.Wait(s.ctx, s.batcherWait); waitErr != nil {
+		return errors.NewServiceUnavailableError("[setDAHForChildRecords][%s] set DAH for child records did not complete within %s: %s", txID.String(), s.batcherWait, waitErr)
+	}
+
+	// group.Wait returned nil: every child has completed, so every result slot
+	// is safe to read. Report an aggregate failure if any child errored,
+	// matching the previous behaviour.
 	var errorsFound bool
 
-	for _, err := range errs {
-		if err != nil {
+	for i, item := range items {
+		if item.result != nil {
 			errorsFound = true
-			break
+
+			s.logger.Errorf("[setDAHForChildRecords][%s] failed to set DAH for child record %d: %v", txID.String(), i, item.result)
 		}
 	}
 
@@ -1068,17 +1123,27 @@ func (s *Store) handleExtraRecords(ctx context.Context, txID *chainhash.Hash, in
 						if !allSpent {
 							s.logger.Warnf("[handleExtraRecords][%s] spentExtraRecs triggered DAH but not all children are spent — counter drift detected, clearing master DAH", txID.String())
 							// Lua already set DAH on the master record inline.
-							// Clear it since children aren't actually all-spent.
-							errCh := make(chan error, 1)
-							s.setDAHBatcher.PutCtx(ctx, &batchDAH{
+							// Clear it since children aren't actually all-spent, and
+							// WAIT for the clear to be applied before returning — the
+							// caller (and its tests) rely on the drifted DAH being
+							// gone once handleExtraRecords returns. The error is
+							// logged but not propagated (best-effort cleanup), which
+							// matches the pre-conversion behaviour that waited on a
+							// per-item errCh and logged without returning it.
+							group := completion.NewGroup(1)
+							item := &batchDAH{
 								txID:           txID,
 								childIdx:       0, // master record
 								deleteAtHeight: 0, // clear DAH
-								errCh:          errCh,
-							})
-							if dahErr := <-errCh; dahErr != nil {
-								s.logger.Errorf("[handleExtraRecords][%s] failed to clear drifted master DAH: %v", txID.String(), dahErr)
+								group:          group,
 							}
+							s.setDAHBatcher.PutCtx(ctx, item)
+							if werr := group.Wait(ctx, s.batcherWait); werr != nil {
+								s.logger.Errorf("[handleExtraRecords][%s] failed to clear drifted master DAH: %v", txID.String(), werr)
+							} else if item.result != nil {
+								s.logger.Errorf("[handleExtraRecords][%s] failed to clear drifted master DAH: %v", txID.String(), item.result)
+							}
+
 							return nil
 						}
 					}
@@ -1165,49 +1230,52 @@ func (s *Store) verifyAllChildrenSpent(ctx context.Context, txID *chainhash.Hash
 	return true, nil
 }
 
-type incrementSpentRecordsRes struct {
-	res interface{}
-	err error
-}
-
 // IncrementSpentRecords updates the record count for paginated transactions.
 // Used for cleanup management of large transactions.
 func (s *Store) IncrementSpentRecords(txid *chainhash.Hash, increment int, blockHeight uint32) (interface{}, error) {
-	res := make(chan incrementSpentRecordsRes, 1)
+	group := completion.NewGroup(1)
+	item := &batchIncrement{
+		txID:        txid,
+		increment:   increment,
+		blockHeight: blockHeight,
+		group:       group,
+	}
 
-	go func() {
-		s.incrementBatcher.Put(&batchIncrement{
-			txID:        txid,
-			increment:   increment,
-			blockHeight: blockHeight,
-			res:         res,
-		})
-	}()
+	// Enqueue inline: Put is a non-blocking channel send, so the previous
+	// goroutine wrapper (needed only to avoid blocking on a per-item channel)
+	// is unnecessary under the group model.
+	s.incrementBatcher.Put(item)
 
 	spendTimeout := s.settings.UtxoStore.SpendWaitTimeout
 	if spendTimeout <= 0 {
 		spendTimeout = 30 * time.Second
 	}
 
-	timer := time.NewTimer(spendTimeout)
-	defer timer.Stop()
-
-	select {
-	case response := <-res:
-		return response.res, response.err
-	case <-timer.C:
+	// Bounded by spendTimeout (the previous timer budget) and additionally
+	// cancellable by store shutdown via s.ctx — the only context available to
+	// this ctx-less producer, matching SetDAHForChildRecords. The enqueued item
+	// is still drained on Close (setDAH/increment drain after spend), so an early
+	// s.ctx cancel does not drop the write.
+	if waitErr := group.Wait(s.ctx, spendTimeout); waitErr != nil {
 		if prometheusUtxoMapErrors != nil {
 			prometheusUtxoMapErrors.WithLabelValues("IncrementSpentRecords", "BatchTimeout").Inc()
 		}
-		return nil, errors.NewServiceUnavailableError("[IncrementSpentRecords][%s] batch operation timed out after %s", txid.String(), spendTimeout)
+
+		return nil, errors.NewServiceUnavailableError("[IncrementSpentRecords][%s] batch operation timed out after %s: %s", txid.String(), spendTimeout, waitErr)
 	}
+
+	// group.Wait returned nil: the single item has completed, so its result
+	// slots are safe to read.
+	return item.res, item.err
 }
 
 func (s *Store) sendIncrementBatch(batch []*batchIncrement) {
-	// go-batcher recovers panics in this fn; re-signal every res channel on panic.
+	// go-batcher recovers panics in this fn; re-complete every item on panic so a
+	// crash cannot orphan the waiting submitters. complete is CAS-guarded, so this
+	// never double-signals an item some earlier stage already completed.
 	defer func() {
 		signalBatchPanic(recover(), batch, "sendIncrementBatch", s.logger, func(it *batchIncrement, err error) {
-			trySignal(it.res, incrementSpentRecordsRes{err: err})
+			it.complete(nil, err)
 		})
 	}()
 
@@ -1224,7 +1292,7 @@ func (s *Store) sendIncrementBatch(batch []*batchIncrement) {
 	for i, item := range batch {
 		aeroKey, err := aerospike.NewKey(s.namespace, s.setName, item.txID[:])
 		if err != nil {
-			trySignal(item.res, incrementSpentRecordsRes{err: errors.NewProcessingError("failed to init new aerospike key for txMeta", err)})
+			item.complete(nil, errors.NewProcessingError("failed to init new aerospike key for txMeta", err))
 
 			handled[i] = true
 			batchRecords[i] = aerospike.NewBatchRead(nil, placeholderKey, nil)
@@ -1241,12 +1309,15 @@ func (s *Store) sendIncrementBatch(batch []*batchIncrement) {
 
 	// send the batch to aerospike
 	if err := s.batchOperate(batchPolicy, batchRecords); err != nil {
+		// complete is CAS-guarded: items already completed above (key-creation
+		// failures, tracked via handled[]) are simply skipped, so this covers
+		// every remaining item without double-signalling.
 		for i, item := range batch {
 			if handled[i] {
 				continue
 			}
 
-			trySignal(item.res, incrementSpentRecordsRes{err: errors.NewStorageError("error in aerospike increment batch records", err)})
+			item.complete(nil, errors.NewStorageError("error in aerospike increment batch records", err))
 		}
 
 		return
@@ -1260,32 +1331,35 @@ func (s *Store) sendIncrementBatch(batch []*batchIncrement) {
 
 		batchRecord := batchRecordIfc.BatchRec()
 		if batchRecord.Err != nil {
-			trySignal(batch[idx].res, incrementSpentRecordsRes{err: errors.NewStorageError("error in aerospike increment batch record", batchRecord.Err)})
+			batch[idx].complete(nil, errors.NewStorageError("error in aerospike increment batch record", batchRecord.Err))
 			continue
 		}
 
 		if batchRecord.Record == nil {
-			trySignal(batch[idx].res, incrementSpentRecordsRes{err: errors.NewProcessingError("no record returned from Lua")})
+			batch[idx].complete(nil, errors.NewProcessingError("no record returned from Lua"))
 			continue
 		}
 
 		// Get the raw response from Lua
 		rawResponse := batchRecord.Record.Bins[LuaSuccess.String()]
 		if rawResponse == nil {
-			trySignal(batch[idx].res, incrementSpentRecordsRes{err: errors.NewProcessingError("no response from Lua")})
+			batch[idx].complete(nil, errors.NewProcessingError("no response from Lua"))
 			continue
 		}
 
 		// Pass through the raw response - let the caller handle parsing
-		trySignal(batch[idx].res, incrementSpentRecordsRes{res: rawResponse})
+		batch[idx].complete(rawResponse, nil)
 	}
 }
 
 func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
-	// go-batcher recovers panics in this fn; re-signal every errCh on panic.
+	// go-batcher recovers panics in this fn; re-complete every item on panic so a
+	// crash cannot orphan a waiting submitter. complete is CAS-guarded and
+	// nil-group tolerant, so this never double-signals and safely no-ops for
+	// fire-and-forget (nil-group) items.
 	defer func() {
 		signalBatchPanic(recover(), batch, "sendSetDAHBatch", s.logger, func(it *batchDAH, err error) {
-			trySignal(it.errCh, err)
+			it.complete(err)
 		})
 	}()
 
@@ -1302,13 +1376,12 @@ func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
 		key, err := aerospike.NewKey(s.namespace, s.setName, keySource)
 		if err != nil {
 			// Previously this only logged and continued, leaving batchRecords[i]
-			// nil (→ nil-deref panic in the result loop) AND never signalling the
-			// item's errCh (→ the submitter blocked forever). Signal it and keep
-			// the slot index-aligned with a NOOP placeholder.
+			// nil (→ nil-deref panic in the result loop) AND never completing the
+			// item (→ the submitter blocked forever). Complete it and keep the
+			// slot index-aligned with a NOOP placeholder.
 			s.logger.Errorf("[SetDAHBatch][%s] failed to create key for pagination record %d: %v", b.txID.String(), b.childIdx, err)
 
-			var keyErr error = errors.NewProcessingError("[SetDAHBatch] failed to create key", err)
-			trySignal(b.errCh, keyErr)
+			b.complete(errors.NewProcessingError("[SetDAHBatch] failed to create key", err))
 
 			handled[i] = true
 			batchRecords[i] = aerospike.NewBatchRead(nil, placeholderKey, nil)
@@ -1325,13 +1398,15 @@ func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
 
 	// Execute batch operation
 	if err := s.batchOperate(util.GetAerospikeBatchPolicy(s.settings), batchRecords); err != nil {
+		// complete is CAS-guarded: items already completed above (key-creation
+		// failures, tracked via handled[]) are skipped, so this covers every
+		// remaining item without double-signalling.
 		for i, bItem := range batch {
 			if handled[i] {
 				continue
 			}
 
-			var sendErr error = errors.NewStorageError("[SetDAHBatch][%s] failed to set DAH", bItem.txID.String(), err)
-			trySignal(bItem.errCh, sendErr)
+			bItem.complete(errors.NewStorageError("[SetDAHBatch][%s] failed to set DAH", bItem.txID.String(), err))
 		}
 
 		return
@@ -1344,11 +1419,10 @@ func (s *Store) sendSetDAHBatch(batch []*batchDAH) {
 		}
 
 		if recErr := batchRecord.BatchRec().Err; recErr != nil {
-			var sendErr error = recErr
-			trySignal(batch[batchIdx].errCh, sendErr)
+			batch[batchIdx].complete(recErr)
 			continue
 		}
 
-		trySignal(batch[batchIdx].errCh, error(nil))
+		batch[batchIdx].complete(nil)
 	}
 }

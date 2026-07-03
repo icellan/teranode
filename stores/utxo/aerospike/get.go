@@ -60,9 +60,10 @@ import (
 	"context"
 	"encoding/binary"
 	"slices"
-	"time"
+	"sync/atomic"
 
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
+	"github.com/bsv-blockchain/go-batcher/v2/completion"
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -96,17 +97,53 @@ type batchGetItemData struct {
 
 // batchGetItem represents a single item in a batch get operation
 type batchGetItem struct {
-	hash   chainhash.Hash        // Transaction hash
-	fields []fields.FieldName    // Fields to retrieve
-	done   chan batchGetItemData // Channel for result
+	hash      chainhash.Hash     // Transaction hash
+	fields    []fields.FieldName // Fields to retrieve
+	group     *completion.Group  // Shared completion group for the submitting get() call
+	completed atomic.Bool        // guards exactly-once completion
+	result    *batchGetItemData  // caller-allocated result slot; written before completed flips true (see complete)
+}
+
+// complete writes data into the item's caller-allocated result slot and marks
+// the shared group's completion counter. Idempotent: only the first call has
+// any effect, so a panic-recovery sweep over an already-completed item never
+// double-signals or races a second write into the slot.
+//
+// The slot write happens strictly before the CompareAndSwap succeeds, and
+// group.Done()'s eventual close(done) synchronizes-with this write via the Go
+// memory model, making the slot safe to read after group.Wait returns nil.
+func (it *batchGetItem) complete(data batchGetItemData) {
+	if it.completed.CompareAndSwap(false, true) {
+		if it.result != nil {
+			*it.result = data
+		}
+		if it.group != nil {
+			it.group.Done()
+		}
+	}
 }
 
 // batchOutpoint represents a single outpoint in a batch previous output operation.
 // It is used to efficiently retrieve previous output data for transaction inputs
 // by batching multiple requests together to optimize database access.
 type batchOutpoint struct {
-	outpoint *bt.Input  // The previous output to retrieve data for
-	errCh    chan error // Channel to receive any error from the batch operation
+	outpoint  *bt.Input         // The previous output to retrieve data for
+	group     *completion.Group // Shared completion group for the submitting decorate call
+	completed atomic.Bool       // guards exactly-once completion
+	result    error             // written before completed flips true; see complete
+}
+
+// complete writes err into the item's result slot and marks the shared group's
+// completion counter. Idempotent: only the first call has any effect, so a
+// panic-recovery sweep over an already-completed item never double-signals or
+// races a second write into result.
+func (it *batchOutpoint) complete(err error) {
+	if it.completed.CompareAndSwap(false, true) {
+		it.result = err
+		if it.group != nil {
+			it.group.Done()
+		}
+	}
 }
 
 // GetSpend checks if a UTXO has been spent and returns its current status.
@@ -367,8 +404,10 @@ func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Da
 // The method creates a batchGetItem with the request parameters and sends it to the
 // getBatcher for processing. It then waits on a done channel for the result.
 func (s *Store) get(ctx context.Context, hash *chainhash.Hash, bins []fields.FieldName) (*meta.Data, error) {
-	done := make(chan batchGetItemData, 1)
-	item := &batchGetItem{hash: *hash, fields: bins, done: done}
+	var res batchGetItemData
+
+	group := completion.NewGroup(1)
+	item := &batchGetItem{hash: *hash, fields: bins, group: group, result: &res}
 
 	if s.getBatcher != nil {
 		s.getBatcher.PutCtx(ctx, item)
@@ -379,40 +418,37 @@ func (s *Store) get(ctx context.Context, hash *chainhash.Hash, bins []fields.Fie
 		}()
 	}
 
-	// Bound the wait so a wedged batcher (e.g. a stuck v8 batch op, or a dispatch
-	// fn that failed to signal) cannot pin this goroutine for the life of the
-	// process. The legacy/validation callers thread a deadline-less context down
-	// here, so ctx.Done() alone is not enough. A nil timeout channel (batcherWait
-	// == 0, e.g. a Store built without New) disables the arm and preserves the
+	// One shared wait for the item, bounded so a wedged batcher (e.g. a stuck v8
+	// batch op, or a dispatch fn that failed to signal) cannot pin this goroutine
+	// for the life of the process. The legacy/validation callers thread a
+	// deadline-less context down here, so ctx.Done() alone is not enough. A
+	// non-positive batcherWait (e.g. a Store built without New) disables the
+	// timeout arm — Group.Wait then waits on ctx/completion only — preserving the
 	// original behaviour.
-	var timeoutCh <-chan time.Time
-
-	if s.batcherWait > 0 {
-		timer := time.NewTimer(s.batcherWait)
-		defer timer.Stop()
-
-		timeoutCh = timer.C
-	}
-
-	select {
-	case data := <-done:
-		if data.Err != nil {
-			if e, ok := data.Err.(*errors.Error); ok {
-				prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", e.Code().Enum().String()).Inc()
-			} else {
-				prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", "unknown").Inc()
-			}
-		} else {
-			prometheusTxMetaAerospikeMapGet.Inc()
+	if waitErr := group.Wait(ctx, s.batcherWait); waitErr != nil {
+		// Do not read res on the error path: the dispatcher may still be writing
+		// to the slot after we have given up waiting on it.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", "ContextCanceled").Inc()
+			return nil, ctxErr
 		}
-		return data.Data, data.Err
-	case <-ctx.Done():
-		prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", "ContextCanceled").Inc()
-		return nil, ctx.Err()
-	case <-timeoutCh:
+
 		prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", "BatchTimeout").Inc()
 		return nil, errors.NewServiceUnavailableError("aerospike get batch did not complete within %s", s.batcherWait)
 	}
+
+	// group.Wait returned nil: the item has completed, so the slot is safe to read.
+	if res.Err != nil {
+		if e, ok := res.Err.(*errors.Error); ok {
+			prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", e.Code().Enum().String()).Inc()
+		} else {
+			prometheusTxMetaAerospikeMapErrors.WithLabelValues("Get", "unknown").Inc()
+		}
+	} else {
+		prometheusTxMetaAerospikeMapGet.Inc()
+	}
+
+	return res.Data, res.Err
 }
 
 // getTxFromBins reconstructs a Bitcoin transaction from Aerospike bin data.
@@ -1237,7 +1273,7 @@ func (s *Store) getAllExtraUTXOs(ctx context.Context, txID *chainhash.Hash, tota
 //   - Handles both internal and external storage
 //   - Returns locking scripts and amounts
 func (s *Store) PreviousOutputsDecorate(_ context.Context, tx *bt.Tx) error {
-	errChans := make([]chan error, 0, len(tx.Inputs))
+	items := make([]*batchOutpoint, 0, len(tx.Inputs))
 
 	for _, input := range tx.Inputs {
 		if input.PreviousTxScript != nil {
@@ -1245,35 +1281,34 @@ func (s *Store) PreviousOutputsDecorate(_ context.Context, tx *bt.Tx) error {
 			continue
 		}
 
-		errChan := make(chan error, 1)
-		errChans = append(errChans, errChan)
+		items = append(items, &batchOutpoint{outpoint: input})
+	}
 
+	group := completion.NewGroup(int32(len(items)))
+
+	for _, item := range items {
+		item.group = group
 		// Wrap the outpoint in OutpointRequest and put it in the batcher
-		s.outpointBatcher.Put(&batchOutpoint{
-			outpoint: input,
-			errCh:    errChan,
-		})
+		s.outpointBatcher.Put(item)
 	}
 
-	// Wait for all error channels to receive a result, bounded so a wedged
-	// outpoint batcher cannot pin this goroutine for the life of the process.
-	var timeoutCh <-chan time.Time
-
-	if s.batcherWait > 0 {
-		timer := time.NewTimer(s.batcherWait)
-		defer timer.Stop()
-
-		timeoutCh = timer.C
+	// One shared wait for the whole group, bounded so a wedged outpoint batcher
+	// cannot pin this goroutine for the life of the process. This site never had
+	// a ctx.Done() arm (the ctx param is unused), so wait on completion/timeout
+	// only. A non-positive batcherWait disables the timeout arm, mirroring the
+	// previous nil-timeoutCh (unbounded) behaviour.
+	if waitErr := group.Wait(context.Background(), s.batcherWait); waitErr != nil {
+		// Do not read item slots on the error path: the dispatcher may still be
+		// writing to them after we have given up waiting.
+		return errors.NewServiceUnavailableError("aerospike outpoint batch did not complete within %s", s.batcherWait)
 	}
 
-	for _, errChan := range errChans {
-		select {
-		case err := <-errChan:
-			if err != nil {
-				return err
-			}
-		case <-timeoutCh:
-			return errors.NewServiceUnavailableError("aerospike outpoint batch did not complete within %s", s.batcherWait)
+	// group.Wait returned nil: every item has completed, so every slot is safe to
+	// read. Report the first failure found, matching the previous first-error
+	// return behaviour.
+	for _, item := range items {
+		if item.result != nil {
+			return item.result
 		}
 	}
 
@@ -1315,7 +1350,7 @@ func (s *Store) sendOutpointBatch(batch []*batchOutpoint) {
 	// crash mid-decoration cannot orphan the waiting submitters.
 	defer func() {
 		signalBatchPanic(recover(), batch, "sendOutpointBatch", s.logger, func(it *batchOutpoint, err error) {
-			util.SafeSend(it.errCh, err, batchSignalTimeout)
+			it.complete(err)
 		})
 	}()
 
@@ -1349,7 +1384,7 @@ func (s *Store) sendOutpointBatch(batch []*batchOutpoint) {
 		key, err := aerospike.NewKey(s.namespace, s.setName, txHash[:])
 		if err != nil {
 			for _, item := range batch {
-				sendErrorAndClose(item.errCh, errors.NewProcessingError("failed to init new aerospike key for txMeta", err))
+				item.complete(errors.NewProcessingError("failed to init new aerospike key for txMeta", err))
 			}
 
 			return
@@ -1369,7 +1404,7 @@ func (s *Store) sendOutpointBatch(batch []*batchOutpoint) {
 	err = s.batchOperate(batchPolicy, batchRecords)
 	if err != nil {
 		for _, item := range batch {
-			sendErrorAndClose(item.errCh, errors.NewStorageError("error in aerospike send outpoint batch records", err))
+			item.complete(errors.NewStorageError("error in aerospike send outpoint batch records", err))
 		}
 
 		return
@@ -1428,9 +1463,9 @@ func (s *Store) sendOutpointBatch(batch []*batchOutpoint) {
 		previousTx := txs[*batchItem.outpoint.PreviousTxIDChainHash()]
 		if previousTx == nil {
 			if err, ok := txErrors[*batchItem.outpoint.PreviousTxIDChainHash()]; ok {
-				sendErrorAndClose(batchItem.errCh, err)
+				batchItem.complete(err)
 			} else {
-				sendErrorAndClose(batchItem.errCh, errors.NewTxNotFoundError("previous tx not found: %v", batchItem.outpoint.PreviousTxID))
+				batchItem.complete(errors.NewTxNotFoundError("previous tx not found: %v", batchItem.outpoint.PreviousTxID))
 			}
 
 			continue
@@ -1438,17 +1473,16 @@ func (s *Store) sendOutpointBatch(batch []*batchOutpoint) {
 
 		// Guard the output index: a corrupt/short Outputs slice (or a nil-padded
 		// entry from OP_RETURN removal) would otherwise panic here and, because
-		// go-batcher recovers the panic, orphan every remaining errCh in the batch.
+		// go-batcher recovers the panic, orphan every remaining item in the batch.
 		outIdx := batchItem.outpoint.PreviousTxOutIndex
 		if int(outIdx) >= len(previousTx.Outputs) || previousTx.Outputs[outIdx] == nil {
-			sendErrorAndClose(batchItem.errCh, errors.NewTxInvalidError("previous tx %s has no output at index %d", batchItem.outpoint.PreviousTxID, outIdx))
+			batchItem.complete(errors.NewTxInvalidError("previous tx %s has no output at index %d", batchItem.outpoint.PreviousTxID, outIdx))
 			continue
 		}
 
 		batchItem.outpoint.PreviousTxSatoshis = previousTx.Outputs[outIdx].Satoshis
 		batchItem.outpoint.PreviousTxScript = previousTx.Outputs[outIdx].LockingScript
-		batchItem.errCh <- nil
-		close(batchItem.errCh)
+		batchItem.complete(nil)
 	}
 
 	prometheusTxMetaAerospikeMapGetMulti.Inc()
@@ -1674,7 +1708,7 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 	// and leak their goroutines permanently.
 	defer func() {
 		signalBatchPanic(recover(), batch, "sendGetBatch", s.logger, func(it *batchGetItem, err error) {
-			trySignal(it.done, batchGetItemData{Err: err})
+			it.complete(batchGetItemData{Err: err})
 		})
 	}()
 
@@ -1697,7 +1731,7 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 		s.logger.Errorf("failed to get batch of txmeta: %v", err)
 
 		for _, bItem := range batch {
-			bItem.done <- batchGetItemData{Err: err}
+			bItem.complete(batchGetItemData{Err: err})
 		}
 
 		return
@@ -1705,27 +1739,9 @@ func (s *Store) sendGetBatch(batch []*batchGetItem) {
 
 	for _, item := range items {
 		// send the data back to the original caller
-		batch[item.Idx].done <- batchGetItemData{
+		batch[item.Idx].complete(batchGetItemData{
 			Data: item.Data,
 			Err:  item.Err,
-		}
+		})
 	}
-}
-
-// sendErrorAndClose sends an error to a channel and closes it safely.
-// This utility function handles the common pattern of sending an error result
-// and closing the channel, with protection against blocking on a full channel.
-//
-// The function uses a non-blocking select to avoid deadlocks when the receiving
-// goroutine has already stopped listening on the channel.
-//
-// Parameters:
-//   - errCh: Error channel to send the error to and close
-//   - err: Error to send (may be nil)
-func sendErrorAndClose(errCh chan error, err error) {
-	select {
-	case errCh <- err:
-	default:
-	}
-	close(errCh)
 }

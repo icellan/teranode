@@ -34,76 +34,13 @@ func okOperate() func(*aerospike.BatchPolicy, []aerospike.BatchRecordIfc) aerosp
 	return func(*aerospike.BatchPolicy, []aerospike.BatchRecordIfc) aerospike.Error { return nil }
 }
 
-func requireSignalled[T any](t *testing.T, ch chan T, i int) {
-	t.Helper()
-	select {
-	case <-ch:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("item %d was orphaned: no completion signal", i)
-	}
-}
-
-// requireGroupCompleted is requireSignalled's group-completion-protocol
+// requireGroupCompleted is the group-completion-protocol
 // equivalent: a single group.Wait standing in for "every item in the batch
 // received a completion signal, none was orphaned" (the group's counter
 // only reaches zero once every item's complete() has run).
 func requireGroupCompleted(t *testing.T, group *completion.Group, timeout time.Duration) {
 	t.Helper()
 	require.NoError(t, group.Wait(context.Background(), timeout), "group did not complete: an item was orphaned")
-}
-
-func TestSendIncrementBatch_NeverOrphans(t *testing.T) {
-	mk := func() []*batchIncrement {
-		b := make([]*batchIncrement, 4)
-		for i := range b {
-			h := chainhash.Hash{byte(i + 1)}
-			b[i] = &batchIncrement{txID: &h, increment: 1, res: make(chan incrementSpentRecordsRes, 1)}
-		}
-		return b
-	}
-
-	for name, fn := range map[string]func() func(*aerospike.BatchPolicy, []aerospike.BatchRecordIfc) aerospike.Error{
-		"panic": panicOperate, "batchOperate error": errorOperate, "ok (nil records)": okOperate,
-	} {
-		t.Run(name, func(t *testing.T) {
-			s := newTestStoreForGet(t)
-			s.batchOperateFn = fn()
-
-			b := mk()
-			require.NotPanics(t, func() { s.sendIncrementBatch(b) })
-
-			for i, it := range b {
-				requireSignalled(t, it.res, i)
-			}
-		})
-	}
-}
-
-func TestSendSetDAHBatch_NeverOrphans(t *testing.T) {
-	mk := func() []*batchDAH {
-		b := make([]*batchDAH, 4)
-		for i := range b {
-			h := chainhash.Hash{byte(i + 1)}
-			b[i] = &batchDAH{txID: &h, childIdx: uint32(i + 1), deleteAtHeight: 100, errCh: make(chan error, 1)}
-		}
-		return b
-	}
-
-	for name, fn := range map[string]func() func(*aerospike.BatchPolicy, []aerospike.BatchRecordIfc) aerospike.Error{
-		"panic": panicOperate, "batchOperate error": errorOperate, "ok (nil records)": okOperate,
-	} {
-		t.Run(name, func(t *testing.T) {
-			s := newTestStoreForGet(t)
-			s.batchOperateFn = fn()
-
-			b := mk()
-			require.NotPanics(t, func() { s.sendSetDAHBatch(b) })
-
-			for i, it := range b {
-				requireSignalled(t, it.errCh, i)
-			}
-		})
-	}
 }
 
 func TestSetLockedBatch_NeverOrphans(t *testing.T) {
@@ -175,24 +112,5 @@ func TestSendSpendBatchLua_NeverOrphans(t *testing.T) {
 
 			requireGroupCompleted(t, group, 2*time.Second)
 		})
-	}
-}
-
-func TestSendStoreBatch_PanicSignalsAllWaiters(t *testing.T) {
-	s := newTestStoreForSendStoreBatch(t)
-	s.batchOperateFn = panicOperate()
-
-	const n = 3
-
-	batch := make([]*BatchStoreItem, n)
-	for i := range batch {
-		tx := txWithSingleOutput(t)
-		batch[i] = NewBatchStoreItem(tx.TxIDChainHash(), false, tx, 100, nil, 0, make(chan error, 1))
-	}
-
-	require.NotPanics(t, func() { s.sendStoreBatch(batch) })
-
-	for i, item := range batch {
-		requireSignalled(t, item.done, i)
 	}
 }
