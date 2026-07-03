@@ -194,7 +194,7 @@ require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.1.3
 	github.com/bsv-blockchain/go-alert-system v0.1.6
-	github.com/bsv-blockchain/go-batcher/v2 v2.0.4
+	github.com/bsv-blockchain/go-batcher/v2 v2.0.6
 	github.com/bsv-blockchain/go-bc v1.1.5
 	github.com/bsv-blockchain/go-bn v1.1.4
 	github.com/bsv-blockchain/go-lockfree-queue v1.0.0
@@ -466,10 +466,3 @@ require (
 	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/yuin/gopher-lua v1.1.2 // indirect
 )
-
-// TEMPORARY: local go-batcher checkout with unreleased completion/PutBatch/
-// WithGreedyAccumulate (PR https://github.com/bsv-blockchain/go-batcher/pull/119,
-// not yet merged/tagged). MUST be replaced with a pinned v2.1.0+ require
-// before this branch is opened as a PR — see docs/designs/batcher-group-completion.md
-// Phase L4 and the implementation plan's ground rules.
-replace github.com/bsv-blockchain/go-batcher/v2 => ../../../go-batcher
