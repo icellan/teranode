@@ -101,26 +101,34 @@ type batchSpend struct {
 	spend       *utxo.Spend // UTXO to spend
 	blockHeight uint32      // Current block height
 	group       *completion.Group
-	completed   atomic.Bool // guards exactly-once completion; also lets a caller
-	// safely identify which items finished before an abort (see resolveSpendCompletions)
+	completed   atomic.Bool // guards exactly-once completion (Done + slot write)
+	// published is stored (release) AFTER spend.Err is written, so a caller
+	// acquire-loading it on the abort path synchronizes-with that write and can
+	// then safely read the slot (see resolveSpendCompletions). completed alone
+	// cannot serve this role: it is set by the CAS, i.e. BEFORE the slot write.
+	published         atomic.Bool
 	ignoreConflicting bool
 	ignoreLocked      bool
 }
 
 // complete writes err into the item's result slot (spend.Err) and marks the
-// shared group's completion counter. Idempotent: only the first call has any
-// effect, so dispatch paths that sweep an entire batch on panic (which may
-// include items already completed by an earlier stage) never double-signal
-// or race a second write into spend.Err.
+// shared group's completion counter. Idempotent: only the first call wins the
+// CAS, so dispatch paths that sweep an entire batch on panic (which may include
+// items an earlier stage already completed) never double-signal or clobber a
+// second value into spend.Err.
 //
-// The slot write happens strictly before the CompareAndSwap succeeds, and
-// group.Done()'s eventual close(done) — or, on the abort path, a caller
-// observing completed.Load()==true — both synchronize-with this write via
-// the Go memory model's atomic-operation ordering, making the slot safe to
-// read after either signal.
+// Ordering: the winner writes spend.Err, then stores published, then calls
+// group.Done(). Readers that got a nil group.Wait (the normal path) are safe
+// because Done()'s close(done) synchronizes-with the wait. The abort path
+// (group.Wait timed out / ctx cancelled) cannot rely on Done, so it instead
+// acquire-loads published: observing published==true synchronizes-with the
+// store, and since the slot write is sequenced before that store, the slot is
+// then safe to read. Gating the abort read on completed (set by the CAS, BEFORE
+// the slot write) would NOT establish that happens-before edge.
 func (b *batchSpend) complete(err error) {
 	if b.completed.CompareAndSwap(false, true) {
 		b.spend.Err = err
+		b.published.Store(true)
 		b.group.Done()
 	}
 }
@@ -291,9 +299,11 @@ type batchDAH struct {
 // an item an earlier stage already completed never double-signals or races a
 // second write into result.
 //
-// group may be nil for a fire-and-forget submitter (the counter-drift
-// master-DAH clear in handleExtraRecords): the write still executes via the
-// dispatcher, the submitter simply does not wait for it, so Done is skipped.
+// group may be nil for a fire-and-forget submitter — one that enqueues the DAH
+// write but does not wait for it: the write still executes via the dispatcher,
+// so Done is simply skipped. This is a defensive capability; every production
+// submitter (SetDAHForChildRecords and the counter-drift master-DAH clear in
+// handleExtraRecords) wires a real group and waits synchronously.
 func (b *batchDAH) complete(err error) {
 	if b.completed.CompareAndSwap(false, true) {
 		b.result = err
@@ -437,15 +447,23 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			}
 		}
 
+		// Do NOT return the live spends slice on the abort path: items still
+		// in-flight are owned by the dispatcher goroutine, which will keep
+		// writing spend.Err after we return here (it runs on s.ctx, not the
+		// caller ctx that was just cancelled). Handing that slice back would let
+		// a caller read a slot the dispatcher is concurrently writing — a data
+		// race, and an in-flight item still reads Err==nil (misclassified as a
+		// successful spend). A Wait error means the whole operation failed;
+		// callers must treat it as such and not inspect per-item slots.
 		if errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded) {
-			return spends, errors.NewContextCanceledError("[SPEND] context canceled while waiting for batch response: %s", waitErr)
+			return nil, errors.NewContextCanceledError("[SPEND] context canceled while waiting for batch response: %s", waitErr)
 		}
 
 		if prometheusUtxoMapErrors != nil {
 			prometheusUtxoMapErrors.WithLabelValues("Spend", "BatchTimeout").Inc()
 		}
 
-		return spends, errors.NewServiceUnavailableError("[SPEND] batch operation timed out after %s: %s", spendTimeout, waitErr)
+		return nil, errors.NewServiceUnavailableError("[SPEND] batch operation timed out after %s: %s", spendTimeout, waitErr)
 	}
 
 	// group.Wait returned nil: every item has completed, so every slot is
@@ -500,11 +518,11 @@ type spendCompletionResult struct {
 // rollback-triggering error (see needsSpendRollback/isSpendRollbackError).
 //
 // When onlyCompleted is true (the group.Wait abort path), an item whose
-// completed flag is still false is skipped without touching its slot: the
-// dispatcher may still be writing it, and observing completed==false gives
-// no synchronizes-with guarantee, so reading spend.Err here would race.
-// Observing completed==true DOES synchronize-with that item's own complete()
-// call (both operate on the same atomic.Bool), so the slot is safely
+// published flag is still false is skipped without touching its slot: the
+// dispatcher may still be writing it (or have won the CAS but not yet stored
+// published), and reading spend.Err before observing published==true would
+// race. Observing published==true synchronizes-with that item's complete()
+// store, which is sequenced after the slot write, so the slot is safely
 // readable for exactly the items this loop processes. When onlyCompleted is
 // false (the normal, non-abort path), group.Wait having returned nil already
 // guarantees every item completed, so the flag is a no-op safety check here,
@@ -515,7 +533,7 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 	var txAlreadyExists bool
 
 	for _, item := range items {
-		if onlyCompleted && !item.completed.Load() {
+		if onlyCompleted && !item.published.Load() {
 			continue
 		}
 

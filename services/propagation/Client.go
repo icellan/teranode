@@ -273,6 +273,13 @@ func (c *Client) ProcessTransaction(ctx context.Context, tx *bt.Tx) error {
 	}
 
 	if c.batchSize > 0 {
+		// Single-item submissions allocate a completion.Group (a struct plus one
+		// internal channel) where the pre-group code allocated a single bare
+		// channel — a net +1 small heap allocation per call. This is an accepted
+		// trade-off: it keeps one uniform completion mechanism across the single-
+		// and multi-item (PutBatch) paths. The group's real win — eliminating the
+		// per-item collector goroutine and timer — applies to the multi-item store
+		// batchers; here it is purely the wait primitive.
 		group := completion.NewGroup(1)
 		item := &batchItem{
 			ctx:   ctx,

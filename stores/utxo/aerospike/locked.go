@@ -54,8 +54,14 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	s.lockedBatcher.PutBatchCtx(ctx, items)
 
 	// s.batcherWait <= 0 means unbounded (ctx-only) — Group.Wait treats a
-	// non-positive timeout the same way, mirroring the previous
-	// waitForLockedResult behavior exactly.
+	// non-positive timeout the same way. This mirrors the previous
+	// waitForLockedResult timeout/ctx behavior, but NOT the errgroup.WithContext
+	// fail-fast: the old code cancelled the shared ctx on the first item error
+	// so the other in-flight waits aborted immediately, whereas group.Wait has
+	// no per-item error propagation and returns only once every item completes
+	// (or ctx/batcherWait elapses). The first non-nil result is still returned
+	// below, so for a multi-hash call this is a worst-case-latency change under
+	// partial failure, not a correctness change.
 	if waitErr := group.Wait(ctx, s.batcherWait); waitErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			// Matches the previous per-item behavior: surface the raw context
