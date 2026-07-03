@@ -2,6 +2,7 @@ package aerospike
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 
 	"github.com/bsv-blockchain/aerospike-client-go/v8"
@@ -21,6 +22,10 @@ type batchLocked struct {
 	group      *completion.Group
 	completed  atomic.Bool
 	result     error // written before completed flips true; see complete
+	// onError, if set, is invoked with the result the first time this item
+	// completes with a non-nil error. SetLocked uses it to fail-fast (cancel the
+	// shared wait on the first failing hash); nil for callers that don't need it.
+	onError func(error)
 }
 
 // complete writes err into the item's result slot and marks the shared
@@ -31,6 +36,9 @@ type batchLocked struct {
 func (b *batchLocked) complete(err error) {
 	if b.completed.CompareAndSwap(false, true) {
 		b.result = err
+		if err != nil && b.onError != nil {
+			b.onError(err)
+		}
 		b.group.Done()
 	}
 }
@@ -39,12 +47,37 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	items := make([]*batchLocked, len(txHashes))
 	group := completion.NewGroup(int32(len(txHashes)))
 
+	// Restore the errgroup.WithContext fail-fast: cancel the wait the moment the
+	// first hash fails, so a partial failure returns immediately instead of
+	// blocking on the remaining in-flight hashes. Only the caller-side wait is
+	// cancelled — waitCtx is never handed to the dispatcher, so in-flight
+	// Aerospike writes for the other hashes are left to finish; we just stop
+	// waiting on them. The first captured error is returned (matching
+	// errgroup.Wait's "first non-nil error" contract).
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		mu       sync.Mutex
+		firstErr error
+	)
+
+	failFast := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		mu.Unlock()
+	}
+
 	for idx, txHash := range txHashes {
 		items[idx] = &batchLocked{
 			ctx:      ctx,
 			txHash:   txHash,
 			setValue: setValue,
 			group:    group,
+			onError:  failFast,
 		}
 	}
 
@@ -54,32 +87,31 @@ func (s *Store) SetLocked(ctx context.Context, txHashes []chainhash.Hash, setVal
 	s.lockedBatcher.PutBatchCtx(ctx, items)
 
 	// s.batcherWait <= 0 means unbounded (ctx-only) — Group.Wait treats a
-	// non-positive timeout the same way. This mirrors the previous
-	// waitForLockedResult timeout/ctx behavior, but NOT the errgroup.WithContext
-	// fail-fast: the old code cancelled the shared ctx on the first item error
-	// so the other in-flight waits aborted immediately, whereas group.Wait has
-	// no per-item error propagation and returns only once every item completes
-	// (or ctx/batcherWait elapses). The first non-nil result is still returned
-	// below, so for a multi-hash call this is a worst-case-latency change under
-	// partial failure, not a correctness change.
-	if waitErr := group.Wait(ctx, s.batcherWait); waitErr != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			// Matches the previous per-item behavior: surface the raw context
-			// error, not a wrapped teranode error type.
-			return ctxErr
-		}
+	// non-positive timeout the same way. waitCtx cancellation (from failFast on
+	// the first failing hash, or from the parent ctx) also unblocks the wait.
+	waitErr := group.Wait(waitCtx, s.batcherWait)
 
-		return errors.NewServiceUnavailableError("set locked did not complete within %s", s.batcherWait)
+	// Parent-context cancellation takes precedence: surface the raw context
+	// error, not a wrapped teranode error type (matches the previous behavior).
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
 
-	// group.Wait returned nil: every item has completed, so every result is
-	// safe to read. Report the first failure found, matching errgroup.Wait's
-	// "first non-nil error" contract that the previous implementation relied
-	// on (errgroup.WithContext(ctx) there).
-	for _, item := range items {
-		if item.result != nil {
-			return item.result
-		}
+	// Fail-fast: the first failing hash captured its error and cancelled the
+	// wait. Every failing complete() runs failFast, so this also covers the
+	// all-completed case where a hash failed.
+	mu.Lock()
+	fe := firstErr
+	mu.Unlock()
+
+	if fe != nil {
+		return fe
+	}
+
+	// No hash failed and the parent ctx is fine, so a non-nil waitErr is the
+	// batcherWait timeout.
+	if waitErr != nil {
+		return errors.NewServiceUnavailableError("set locked did not complete within %s", s.batcherWait)
 	}
 
 	return nil
