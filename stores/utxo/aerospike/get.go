@@ -101,7 +101,7 @@ type batchGetItem struct {
 	fields    []fields.FieldName // Fields to retrieve
 	group     *completion.Group  // Shared completion group for the submitting get() call
 	completed atomic.Bool        // guards exactly-once completion
-	result    *batchGetItemData  // caller-allocated result slot; written before completed flips true (see complete)
+	result    *batchGetItemData  // caller-allocated result slot; written by the CAS winner, after the CAS and before group.Done() (see complete)
 }
 
 // complete writes data into the item's caller-allocated result slot and marks
@@ -109,9 +109,11 @@ type batchGetItem struct {
 // any effect, so a panic-recovery sweep over an already-completed item never
 // double-signals or races a second write into the slot.
 //
-// The slot write happens strictly before the CompareAndSwap succeeds, and
-// group.Done()'s eventual close(done) synchronizes-with this write via the Go
-// memory model, making the slot safe to read after group.Wait returns nil.
+// The slot write happens inside the CAS-winner branch, after the CAS succeeds
+// and before group.Done(); group.Done()'s close(done) synchronizes-with a nil
+// group.Wait(), making the slot safe to read only after group.Wait returns
+// nil. completed is the exactly-once guard (CAS), not a publication flag by
+// itself.
 func (it *batchGetItem) complete(data batchGetItemData) {
 	if it.completed.CompareAndSwap(false, true) {
 		if it.result != nil {
@@ -130,7 +132,7 @@ type batchOutpoint struct {
 	outpoint  *bt.Input         // The previous output to retrieve data for
 	group     *completion.Group // Shared completion group for the submitting decorate call
 	completed atomic.Bool       // guards exactly-once completion
-	result    error             // written before completed flips true; see complete
+	result    error             // written by the CAS winner, after the CAS and before group.Done(); see complete
 }
 
 // complete writes err into the item's result slot and marks the shared group's
@@ -402,7 +404,8 @@ func (s *Store) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Da
 //
 // Implementation Details:
 // The method creates a batchGetItem with the request parameters and sends it to the
-// getBatcher for processing. It then waits on a done channel for the result.
+// getBatcher for processing. It then waits on a shared completion.Group and reads
+// the result from the item's result slot once the wait returns.
 func (s *Store) get(ctx context.Context, hash *chainhash.Hash, bins []fields.FieldName) (*meta.Data, error) {
 	var res batchGetItemData
 
@@ -1702,10 +1705,11 @@ func (s *Store) GetTxInpointsFromExternalStore(ctx context.Context, txHash chain
 
 // sendGetBatch processes a batch of get requests efficiently
 func (s *Store) sendGetBatch(batch []*batchGetItem) {
-	// go-batcher recovers panics raised in this fn, so without re-signalling the
-	// per-item done channels a panic (e.g. a malformed bin tripping an unchecked
-	// type assertion in getTxFromBins) would orphan every waiter in this batch
-	// and leak their goroutines permanently.
+	// go-batcher recovers panics raised in this fn, so without completing every
+	// item (via batchGetItem.complete(), which writes its result slot and marks
+	// the shared completion.Group) a panic (e.g. a malformed bin tripping an
+	// unchecked type assertion in getTxFromBins) would orphan every waiter in
+	// this batch and leak their goroutines permanently.
 	defer func() {
 		signalBatchPanic(recover(), batch, "sendGetBatch", s.logger, func(it *batchGetItem, err error) {
 			it.complete(batchGetItemData{Err: err})

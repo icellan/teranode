@@ -259,8 +259,8 @@ type batchIncrement struct {
 	blockHeight uint32            // Height of the operation, for DAH = blockHeight + retention
 	group       *completion.Group // shared group the producer waits on
 	completed   atomic.Bool       // guards exactly-once completion (see complete)
-	res         interface{}       // result slot: raw Lua response, written before completed flips true
-	err         error             // result slot: written before completed flips true
+	res         interface{}       // result slot: raw Lua response; written by the CAS winner, after the CAS and before group.Done()
+	err         error             // result slot: written by the CAS winner, after the CAS and before group.Done()
 }
 
 // complete writes the result (res, err) into the item's slots and marks the
@@ -269,11 +269,12 @@ type batchIncrement struct {
 // panic — which may include an item an earlier stage already completed — never
 // double-signals or races a second write into the slots.
 //
-// The slot writes happen strictly before the CompareAndSwap succeeds, and
-// group.Done()'s eventual close(done) synchronizes-with them via the Go memory
-// model, making the slots safe to read after group.Wait returns nil. group may
-// be nil (defensive; the sole producer IncrementSpentRecords always supplies
-// one) in which case Done is skipped.
+// The slot writes happen inside the CAS-winner branch, after the CAS succeeds
+// and before group.Done(); group.Done()'s close(done) synchronizes-with a nil
+// group.Wait(), making the slots safe to read only after group.Wait returns
+// nil. completed is the exactly-once guard (CAS), not a publication flag by
+// itself. group may be nil (defensive; the sole producer IncrementSpentRecords
+// always supplies one) in which case Done is skipped.
 func (b *batchIncrement) complete(res interface{}, err error) {
 	if b.completed.CompareAndSwap(false, true) {
 		b.res = res
@@ -291,7 +292,7 @@ type batchDAH struct {
 	deleteAtHeight uint32            // DeleteAtHeight (0 = no delete)
 	group          *completion.Group // nil for fire-and-forget submitters (see complete)
 	completed      atomic.Bool       // guards exactly-once completion (see complete)
-	result         error             // written before completed flips true
+	result         error             // written by the CAS winner, after the CAS and before group.Done()
 }
 
 // complete writes err into the item's result slot and marks the shared group's
@@ -1083,11 +1084,11 @@ func (s *Store) SetDAHForChildRecords(txID *chainhash.Hash, childCount int, dah 
 	// matching the previous behaviour.
 	var errorsFound bool
 
-	for i, item := range items {
+	for _, item := range items {
 		if item.result != nil {
 			errorsFound = true
 
-			s.logger.Errorf("[setDAHForChildRecords][%s] failed to set DAH for child record %d: %v", txID.String(), i, item.result)
+			s.logger.Errorf("[setDAHForChildRecords][%s] failed to set DAH for child record %d: %v", txID.String(), item.childIdx, item.result)
 		}
 	}
 

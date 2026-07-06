@@ -21,7 +21,7 @@ type batchLocked struct {
 	setValue   bool
 	group      *completion.Group
 	completed  atomic.Bool
-	result     error // written before completed flips true; see complete
+	result     error // written by the CAS winner, after the CAS and before group.Done(); see complete
 	// onError, if set, is invoked with the result the first time this item
 	// completes with a non-nil error. SetLocked uses it to fail-fast (cancel the
 	// shared wait on the first failing hash); nil for callers that don't need it.

@@ -59,8 +59,8 @@ type batchItem struct {
 	completed atomic.Bool
 
 	// result holds the validation outcome (metadata + error) for this item.
-	// Written before completed flips true; safe to read once group.Wait
-	// returns nil.
+	// Written by the CAS winner, after the CAS and before group.Done(); safe
+	// to read only once group.Wait returns nil.
 	result validateBatchResponse
 }
 

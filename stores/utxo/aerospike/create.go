@@ -140,9 +140,9 @@ type BatchStoreItem struct {
 	// without racing a second write into result.
 	completed atomic.Bool
 
-	// result carries the terminal error for this item. Written strictly before
-	// completed flips true (see complete), so it is safe to read once the group
-	// has completed.
+	// result carries the terminal error for this item. Written by the CAS
+	// winner, after the CAS and before group.Done() (see complete), so it is
+	// safe to read only after group.Wait returns nil.
 	result error
 }
 
@@ -150,9 +150,11 @@ type BatchStoreItem struct {
 // completion counter. Idempotent: only the first call has any effect, so a
 // panic-recovery sweep over an already-completed item, or a goroutine that took
 // ownership of the item's result, never double-signals or races a second write
-// into result. The slot write happens strictly before the CompareAndSwap
-// succeeds, and group.Done()'s eventual channel close synchronizes-with this
-// write, making the slot safe to read after the group completes.
+// into result. The slot write happens inside the CAS-winner branch, after the
+// CAS succeeds and before group.Done(); group.Done()'s eventual channel close
+// synchronizes-with a nil group.Wait(), making the slot safe to read only after
+// group.Wait returns nil. completed is the exactly-once guard (CAS), not a
+// publication flag by itself.
 func (b *BatchStoreItem) complete(err error) {
 	if b.completed.CompareAndSwap(false, true) {
 		b.result = err
