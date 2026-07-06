@@ -435,6 +435,21 @@ func (c *Client) handleBatchError(batch []*batchItem, err error, format string, 
 //   - batch: Slice of transaction items with completion channels
 //   - response: gRPC response containing per-transaction error status
 func (c *Client) handleBatchResponse(batch []*batchItem, response *propagation_api.ProcessTransactionBatchResponse) {
+	// The server must return exactly one result per batch item. If it returns
+	// fewer (a contract violation), ranging over response.Errors would leave the
+	// tail items un-completed and strand their callers forever on group.Wait
+	// (single-item ProcessTransaction waits unbounded with no ctx arm). Guard the
+	// length and fail every item with a clear error rather than stranding them or
+	// index-panicking into the sweep.
+	if len(response.Errors) != len(batch) {
+		err := errors.NewProcessingError("[handleBatchResponse] propagation returned %d results for a batch of %d", len(response.Errors), len(batch))
+		for _, item := range batch {
+			item.complete(err)
+		}
+
+		return
+	}
+
 	for i, err := range response.Errors {
 		if !err.IsNil() { // don't do err != nil, proto can't return nil TError
 			batch[i].complete(err)
