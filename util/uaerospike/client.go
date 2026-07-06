@@ -205,6 +205,18 @@ type Client struct {
 	// and would serialise otherwise-parallel calls. bsv5 already makes a close
 	// racing those ops non-fatal; at worst an in-flight single-record op errors
 	// on close, which callers tolerate. The zero value is ready to use.
+	//
+	// The promoted Query is likewise deliberately NOT drained. It is only used by
+	// infrequent background scans (pruner ProcessExpiredPreservations /
+	// QueryOldUnminedTransactions, conflict PendingConflictIntents), and — unlike
+	// BatchOperate — Query merely starts the scan: the partition map is touched
+	// lazily as the returned Recordset streams and on its Close, both outside the
+	// Query() call. Guarding it would therefore require holding the RLock across
+	// the entire recordset lifetime at every call site (or a callback-style API),
+	// not a one-line wrapper. Since bsv5 makes the close-race non-fatal, a scan
+	// racing shutdown at worst errors that background scan, so the extra coupling
+	// isn't warranted here; revisit if a scan is ever added to a shutdown-critical
+	// path.
 	drainMu sync.RWMutex
 }
 
