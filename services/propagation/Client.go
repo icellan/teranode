@@ -394,15 +394,15 @@ func (c *Client) TriggerBatcher() {
 // This method provides uniform error handling for batch processing failures:
 //
 //  1. Logs the error with the provided format string and additional context
-//  2. Distributes the error to all transaction items in the batch through their
-//     individual completion channels
+//  2. Distributes the error to all transaction items in the batch by completing
+//     each on the shared completion group
 //  3. Ensures all goroutines waiting on transaction completion are unblocked
 //
 // This centralized error handling ensures consistent behavior across different
 // batch processing failure scenarios.
 //
 // Parameters:
-//   - batch: Slice of transaction items with completion channels
+//   - batch: Slice of transaction items sharing a completion group
 //   - err: Error to propagate to all transactions
 //   - format: Log message format string
 //   - args: Additional arguments for the format string
@@ -425,14 +425,14 @@ func (c *Client) handleBatchError(batch []*batchItem, err error, format string, 
 //
 // 1. Iterating through each transaction in the batch
 // 2. Mapping response errors to the corresponding transactions
-// 3. Sending appropriate errors or success notifications via completion channels
+// 3. Completing each transaction on the shared completion group with its error or success
 // 4. Ensuring all waiting goroutines are unblocked with the correct status
 //
 // The method ensures that even within a successful batch, individual transaction
 // errors are properly captured and reported.
 //
 // Parameters:
-//   - batch: Slice of transaction items with completion channels
+//   - batch: Slice of transaction items sharing a completion group
 //   - response: gRPC response containing per-transaction error status
 func (c *Client) handleBatchResponse(batch []*batchItem, response *propagation_api.ProcessTransactionBatchResponse) {
 	// The server must return exactly one result per batch item. If it returns
@@ -473,7 +473,7 @@ func (c *Client) handleBatchResponse(batch []*batchItem, response *propagation_a
 //
 // Parameters:
 //   - ctx: Context for HTTP request processing
-//   - batch: Slice of transaction items with completion channels
+//   - batch: Slice of transaction items sharing a completion group
 //   - txs: Raw transaction bytes for each transaction in the batch
 //
 // Returns:
@@ -543,11 +543,11 @@ func (c *Client) processBatchViaHTTP(ctx context.Context, batch []*batchItem, it
 // 4. For other types of errors, properly unwraps and propagates them
 //
 // The method ensures all transactions in the batch receive appropriate error
-// feedback through their individual completion channels.
+// feedback by completing each on the shared completion group.
 //
 // Parameters:
 //   - ctx: Context for batch processing with timeout/cancellation
-//   - batch: Slice of transaction items with completion channels
+//   - batch: Slice of transaction items sharing a completion group
 //
 // Returns:
 //   - error: Error if batch processing fails at the transport level

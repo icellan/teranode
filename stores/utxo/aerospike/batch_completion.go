@@ -17,24 +17,24 @@ import (
 // go-batcher recovers panics raised inside the batch fn (see
 // dispatchAndRecord in go-batcher/v2: it wraps b.fn(batch) in a deferred
 // recover). Without our own guard, a panic part-way through a dispatch fn
-// leaves every not-yet-signalled per-item completion channel orphaned: the
-// worker survives, but the submitter goroutines waiting on those channels park
-// forever (the contexts threaded down from legacy sync / validation have no
-// deadline). That is the mechanism behind the production goroutine leak
-// (thousands parked in (*Store).get's select).
+// leaves the not-yet-completed items un-signalled: the worker survives, but the
+// submitter goroutines waiting on the shared completion.Group park forever
+// (group.Wait, and the contexts threaded down from legacy sync / validation
+// have no deadline). That is the mechanism behind the production goroutine leak
+// (thousands parked in (*Store).get's wait).
 //
 // Install it as the FIRST statement of each dispatch fn:
 //
 //	defer func() {
 //	    signalBatchPanic(recover(), batch, "sendGetBatch", s.logger, func(it *batchGetItem, err error) {
-//	        util.SafeSend(it.done, batchGetItemData{Err: err}, batchSignalTimeout)
+//	        it.complete(err)
 //	    })
 //	}()
 //
-// signal MUST be non-blocking / panic-safe (wrap util.SafeSend) so that a
-// submitter that already left (e.g. timed out) cannot block the worker, and a
-// double-send on a buffered-1 channel cannot deadlock it. Returns true if a
-// panic was actually handled (recovered != nil).
+// signal MUST be non-blocking and idempotent. Production passes it.complete,
+// which is CAS-guarded, so signalling an item an earlier stage already completed
+// is a safe no-op (no double-signal, no block). Returns true if a panic was
+// actually handled (recovered != nil).
 func signalBatchPanic[T any](recovered any, batch []T, fnName string, logger ulogger.Logger, signal func(item T, err error)) bool {
 	if recovered == nil {
 		return false
@@ -53,13 +53,6 @@ func signalBatchPanic[T any](recovered any, batch []T, fnName string, logger ulo
 
 	return true
 }
-
-// batchSignalTimeout bounds a single non-blocking completion send. It exists
-// only so an unbuffered completion channel whose submitter has already departed
-// cannot wedge the worker. Buffered-1 channels (the common case) never reach the
-// timeout. Kept small because it is paid per item only on the rare error/panic
-// fan-out paths.
-const batchSignalTimeout = 5 * time.Second
 
 // batcherWaitTimeout bounds how long a submitter waits for a batcher to deliver
 // a result before giving up with a ServiceUnavailable error. This is the

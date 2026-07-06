@@ -1333,7 +1333,7 @@ func (s *Store) PreviousOutputsDecorate(_ context.Context, tx *bt.Tx) error {
 // on large blocks and to mirror the Phase 1 errgroup bound in the legacy caller
 // (services/legacy/netsync/handle_block.go). Throughput is not affected by the
 // bound: the actual ceiling is BatcherMaxConcurrent aerospike batches in flight,
-// not the goroutine count, since producers are mostly parked on errChan receives.
+// not the goroutine count, since producers are mostly parked on the shared completion group's Wait.
 func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) error {
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(s.logger, g, s.settings.UtxoStore.OutpointBatcherSize)
@@ -1349,7 +1349,7 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 }
 
 func (s *Store) sendOutpointBatch(batch []*batchOutpoint) {
-	// go-batcher recovers panics in this fn; re-signal every errCh on panic so a
+	// go-batcher recovers panics in this fn; complete every item on panic so a
 	// crash mid-decoration cannot orphan the waiting submitters.
 	defer func() {
 		signalBatchPanic(recover(), batch, "sendOutpointBatch", s.logger, func(it *batchOutpoint, err error) {
