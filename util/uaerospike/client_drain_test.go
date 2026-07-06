@@ -20,10 +20,17 @@ func TestClient_Close_WaitsForInFlightOp(t *testing.T) {
 	c.beginOp()
 
 	closed := make(chan struct{})
+	started := make(chan struct{})
 	go func() {
+		// Signal that the goroutine is scheduled and about to call Close, so the
+		// block assertion below can't pass merely because Close() hasn't been
+		// invoked yet (scheduler delay would otherwise be a false positive).
+		close(started)
 		c.Close()
 		close(closed)
 	}()
+
+	<-started
 
 	// Close must block while the operation is still in flight.
 	select {
