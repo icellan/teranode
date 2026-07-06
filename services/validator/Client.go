@@ -569,6 +569,20 @@ func (c *Client) handleBatchHTTPFallback(ctx context.Context, batch []*batchItem
 
 // processBatchResponse handles successful batch responses
 func (c *Client) processBatchResponse(batch []*batchItem, resp *validator_api.ValidateTransactionBatchResponse) {
+	// The server must return one Errors + Metadata entry per batch item. If it
+	// returns fewer (a contract violation), indexing resp.Errors[i]/Metadata[i]
+	// would panic; the sweep would still release callers, but with an opaque
+	// "panic in sendBatchToValidator" error. Guard the lengths and fail every
+	// item with a clear error instead, mirroring the propagation client.
+	if len(resp.Errors) != len(batch) || len(resp.Metadata) != len(batch) {
+		err := errors.NewProcessingError("[processBatchResponse] validator returned %d errors / %d metadata for a batch of %d", len(resp.Errors), len(resp.Metadata), len(batch))
+		for _, item := range batch {
+			item.complete(validateBatchResponse{err: err})
+		}
+
+		return
+	}
+
 	for i, item := range batch {
 		if !resp.Errors[i].IsNil() {
 			item.complete(validateBatchResponse{metaData: nil, err: resp.Errors[i]})
