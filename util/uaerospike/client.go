@@ -236,6 +236,21 @@ func (c *Client) endOp() { c.drainMu.RUnlock() }
 // shared per-host client (util.CloseAerospikeClient, via Store.Close) waits for
 // outstanding operations instead of racing them. The nil check keeps Close safe
 // on a Client whose construction never set an underlying client.
+//
+// Two blocking properties follow from taking the exclusive drain Lock, both
+// benign on the normal shutdown path (batchers are drained before
+// CloseAerospikeClient runs, so the Lock is uncontended) but worth knowing if
+// Close is ever reached with an in-flight overloaded batch op:
+//   - Symmetric to Close waiting on in-flight ops, Go's RWMutex blocks new RLock
+//     acquisitions once a Lock is pending, so once Close is entered every new
+//     BatchOperate blocks in beginOp until Close returns (up to the overload-retry
+//     ceiling). Post-close ops do NOT fail fast; they wait, then run against the
+//     closed client and error.
+//   - util.CloseAerospikeClient invokes this while holding the process-wide
+//     aerospikeConnectionMutex that getAerospikeClient also takes, so a drain that
+//     stalls here serialises client construction/teardown for ALL hosts, not just
+//     the one being closed. If that path ever becomes reachable under load, close
+//     outside the mutex (snapshot+delete under lock, Close after unlock).
 func (c *Client) Close() {
 	c.drainMu.Lock()
 	defer c.drainMu.Unlock()
