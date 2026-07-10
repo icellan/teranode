@@ -1572,38 +1572,46 @@ func (s *Service) flushCleanupBatches(ctx context.Context, parentUpdates map[str
 	return nil
 }
 
-// executeBatchCleanupCombined sends parent UDF updates and child record
-// deletions in a SINGLE Aerospike BatchOperate call. Halves the round-trip
-// count vs the two-call path. Only safe when defensive mode is off (because
-// the defensive safety check has an implicit ordering dependency between
-// parent.deletedChildren writes and child record deletions).
-func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[string]*parentUpdateInfo, keys []*aerospike.Key) error {
-	if len(updates) == 0 && len(keys) == 0 {
-		return nil
-	}
+// buildCombinedCleanupRecords builds the batch records for the single-round-trip
+// combined cleanup: parent updates in [0, parentEnd) followed by child deletions
+// in [parentEnd, len).
+//
+// Parent updates prefer the injected native-op builder
+// (buildAddDeletedChildrenRecord → native subOpAddDeletedChildren), fall back to
+// a direct Lua NewBatchUDF, and finally to a plain MapPutItems BatchWrite when
+// neither mod-teranode path is configured. This mirrors executeBatchParentUpdates:
+// keying the choice purely on luaPackage (the old behaviour) ignored the native
+// builder and left the pruner emitting batch_sub_udf on native-op deployments
+// with defensive mode off.
+//
+// parentUsesModTeranode reports whether the parent-update records carry a
+// mod-teranode SUCCESS-map response (native or UDF, both silent on missing
+// parents) rather than the plain BatchWrite path (missing parent → KEY_NOT_FOUND).
+// The caller uses it to parse the batch results.
+func (s *Service) buildCombinedCleanupRecords(updates map[string]*parentUpdateInfo, keys []*aerospike.Key) (batchRecords []aerospike.BatchRecordIfc, parentEnd int, parentUsesModTeranode bool) {
+	batchRecords = make([]aerospike.BatchRecordIfc, 0, len(updates)+len(keys))
 
-	batchRecords := make([]aerospike.BatchRecordIfc, 0, len(updates)+len(keys))
+	parentUsesModTeranode = s.buildAddDeletedChildrenRecord != nil || s.luaPackage != ""
 
-	// Parent updates: prefer Lua UDF (silent on missing parents — no
-	// KEY_NOT_FOUND noise in client metrics) and fall back to a plain
-	// BatchWrite+MapPutItems if no Lua package is configured.
-	parentEnd := 0
-	useUDF := s.luaPackage != ""
 	if len(updates) > 0 {
-		if useUDF {
+		if parentUsesModTeranode {
 			batchUDFPolicy := aerospike.NewBatchUDFPolicy()
 			for _, info := range updates {
 				childHashList := make([]interface{}, 0, len(info.childHashes))
 				for _, childHash := range info.childHashes {
 					childHashList = append(childHashList, childHash.String())
 				}
-				batchRecords = append(batchRecords, aerospike.NewBatchUDF(
-					batchUDFPolicy,
-					info.key,
-					s.luaPackage,
-					"addDeletedChildren",
-					aerospike.NewValue(childHashList),
-				))
+				if s.buildAddDeletedChildrenRecord != nil {
+					batchRecords = append(batchRecords, s.buildAddDeletedChildrenRecord(batchUDFPolicy, info.key, childHashList))
+				} else {
+					batchRecords = append(batchRecords, aerospike.NewBatchUDF(
+						batchUDFPolicy,
+						info.key,
+						s.luaPackage,
+						"addDeletedChildren",
+						aerospike.NewValue(childHashList),
+					))
+				}
 			}
 		} else {
 			batchWritePolicy := aerospike.NewBatchWritePolicy()
@@ -1619,6 +1627,7 @@ func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[s
 			}
 		}
 	}
+
 	parentEnd = len(batchRecords)
 
 	// Child deletions — TTL touch (utxoSetTTL=true) or hard delete.
@@ -1637,6 +1646,21 @@ func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[s
 			}
 		}
 	}
+
+	return batchRecords, parentEnd, parentUsesModTeranode
+}
+
+// executeBatchCleanupCombined sends parent updates and child record deletions in
+// a SINGLE Aerospike BatchOperate call. Halves the round-trip count vs the
+// two-call path. Only safe when defensive mode is off (because the defensive
+// safety check has an implicit ordering dependency between parent.deletedChildren
+// writes and child record deletions).
+func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[string]*parentUpdateInfo, keys []*aerospike.Key) error {
+	if len(updates) == 0 && len(keys) == 0 {
+		return nil
+	}
+
+	batchRecords, parentEnd, parentUsesModTeranode := s.buildCombinedCleanupRecords(updates, keys)
 
 	if len(batchRecords) == 0 {
 		return nil
@@ -1671,8 +1695,10 @@ func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[s
 		if i < parentEnd {
 			// Parent update result
 			if batchRec.Err != nil {
-				// BatchWrite path surfaces missing parents as KEY_NOT_FOUND
-				if !useUDF && batchRec.Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
+				// Plain MapPutItems BatchWrite path surfaces missing parents as
+				// KEY_NOT_FOUND; the mod-teranode paths (native + UDF) handle
+				// missing parents server-side and never surface it here.
+				if !parentUsesModTeranode && batchRec.Err.Matches(aerospike.ErrKeyNotFound.ResultCode) {
 					parentNotFound++
 					continue
 				}
@@ -1682,10 +1708,12 @@ func (s *Service) executeBatchCleanupCombined(ctx context.Context, updates map[s
 				parentErrors++
 				continue
 			}
-			// UDF path returns a SUCCESS/ERROR map in the record bins
-			if useUDF && batchRec.Record != nil && batchRec.Record.Bins != nil {
+			// mod-teranode paths (native + UDF) return a SUCCESS/ERROR map in the
+			// record bins; the UDF path yields map[interface{}]interface{} and the
+			// native-op dispatcher yields map[string]interface{}.
+			if parentUsesModTeranode && batchRec.Record != nil && batchRec.Record.Bins != nil {
 				if resp, ok := batchRec.Record.Bins["SUCCESS"]; ok {
-					if respMap, ok := resp.(map[interface{}]interface{}); ok {
+					if respMap, ok := normaliseAddDeletedChildrenResponse(resp); ok {
 						if status, ok := respMap["status"].(string); ok {
 							switch status {
 							case "OK":
