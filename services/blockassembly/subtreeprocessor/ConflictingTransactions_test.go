@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	txmap "github.com/bsv-blockchain/go-tx-map"
@@ -16,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -82,8 +84,19 @@ func TestProcessConflictingTransactions(t *testing.T) {
 	_ = losingTxMap.Put(conflictingTx2, 1)
 
 	mockUtxoStore.On("ProcessConflicting", mock.Anything, conflictingNodes).Return(losingTxMap, nil)
-	mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(&meta.Data{Conflicting: true}, nil)
-	mockUtxoStore.On("GetCounterConflicting", mock.Anything, mock.Anything).Return([]chainhash.Hash{conflictingTx1, conflictingTx2}, nil)
+
+	// The ghost-aware counter-conflicting walk reads the tx body and its parents
+	// directly: give both conflicting txs the same single-input body whose parent
+	// slot is unspent, so each walk resolves to just the tx itself.
+	conflictingTxBody := bt.NewTx()
+	conflictingTxInput := &bt.Input{PreviousTxOutIndex: 0}
+	conflictingParentHash := chainhash.HashH([]byte("conflicting-parent"))
+	_ = conflictingTxInput.PreviousTxIDAdd(&conflictingParentHash)
+	conflictingTxBody.Inputs = append(conflictingTxBody.Inputs, conflictingTxInput)
+
+	mockUtxoStore.On("Get", mock.Anything, mock.Anything, []fields.FieldName{fields.Utxos}).
+		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{nil}}, nil)
+	mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(&meta.Data{Tx: conflictingTxBody, Conflicting: true}, nil)
 	mockUtxoStore.On("SetConflicting", mock.Anything, mock.Anything, mock.Anything).Return([]*utxo.Spend{}, []chainhash.Hash{}, nil)
 	mockUtxoStore.On("Unspend", mock.Anything, mock.Anything, mock.Anything).Return(nil)
 	mockUtxoStore.On("Spend", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]*utxo.Spend{}, nil)

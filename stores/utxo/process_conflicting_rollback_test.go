@@ -34,14 +34,13 @@ func TestProcessConflictingRollback_Step3Failure(t *testing.T) {
 	mockStore.On("Get", mock.Anything, &conflictingTxHash, mock.Anything).Return(&meta.Data{
 		Tx:          winningTx,
 		Conflicting: true,
-	}, nil).Once()
+	}, nil).Times(3)
 
-	mockStore.On("GetCounterConflicting", mock.Anything, conflictingTxHash).
-		Return([]chainhash.Hash{losingTxHash}, nil).Once()
+	stubCounterConflictingWalk(mockStore, winningTx, losingTxHash)
 
 	// step 1: MarkConflictingRecursively → SetConflicting(losing, true)
 	affectedSpends := []*Spend{{TxID: &losingTxHash, Vout: 0}}
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, true).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), true).
 		Return(affectedSpends, []chainhash.Hash{}, nil).Once()
 
 	// step 2: Unspend(affectedSpends, true) commits successfully (locks parents)
@@ -58,9 +57,9 @@ func TestProcessConflictingRollback_Step3Failure(t *testing.T) {
 		Tx: losingTx,
 	}, nil).Once()
 	mockStore.On("Spend", mock.Anything, losingTx, mock.Anything, mock.Anything).
-		Return([]*Spend{}, nil).Once()
+		Return([]*Spend{}, nil).Twice()
 	// 3c. SetConflicting(allMarkedHashes, false) — undoes step 1
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, false).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), false).
 		Return([]*Spend{}, []chainhash.Hash{}, nil).Once()
 	// 3d. SetLocked(parents, false) — undoes step 2's lock
 	mockStore.On("SetLocked", mock.Anything, []chainhash.Hash{losingTxHash}, false).
@@ -92,13 +91,12 @@ func TestProcessConflictingRollback_RollbackAlsoFails(t *testing.T) {
 	mockStore.On("Get", mock.Anything, &conflictingTxHash, mock.Anything).Return(&meta.Data{
 		Tx:          winningTx,
 		Conflicting: true,
-	}, nil).Once()
+	}, nil).Times(3)
 
-	mockStore.On("GetCounterConflicting", mock.Anything, conflictingTxHash).
-		Return([]chainhash.Hash{losingTxHash}, nil).Once()
+	stubCounterConflictingWalk(mockStore, winningTx, losingTxHash)
 
 	affectedSpends := []*Spend{{TxID: &losingTxHash, Vout: 0}}
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, true).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), true).
 		Return(affectedSpends, []chainhash.Hash{}, nil).Once()
 
 	mockStore.On("Unspend", mock.Anything, affectedSpends, []bool{true}).Return(nil).Once()
@@ -114,9 +112,9 @@ func TestProcessConflictingRollback_RollbackAlsoFails(t *testing.T) {
 	}, nil).Once()
 	// re-spend losing tx (rollback step 2) succeeds
 	mockStore.On("Spend", mock.Anything, losingTx, mock.Anything, mock.Anything).
-		Return([]*Spend{}, nil).Once()
+		Return([]*Spend{}, nil).Twice()
 	// SetConflicting(false) FAILS — rollback failure
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, false).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), false).
 		Return([]*Spend{}, []chainhash.Hash{}, errors.NewProcessingError("set conflicting false failed")).Once()
 	// SetLocked(false) still attempted (best-effort) and succeeds
 	mockStore.On("SetLocked", mock.Anything, []chainhash.Hash{losingTxHash}, false).
@@ -149,13 +147,12 @@ func TestProcessConflictingRollback_Step5RetrySucceeds(t *testing.T) {
 	mockStore.On("Get", mock.Anything, &conflictingTxHash, mock.Anything).Return(&meta.Data{
 		Tx:          winningTx,
 		Conflicting: true,
-	}, nil).Once()
+	}, nil).Twice()
 
-	mockStore.On("GetCounterConflicting", mock.Anything, conflictingTxHash).
-		Return([]chainhash.Hash{losingTxHash}, nil).Once()
+	stubCounterConflictingWalk(mockStore, winningTx, losingTxHash)
 
 	affectedSpends := []*Spend{{TxID: &losingTxHash, Vout: 0}}
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, true).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), true).
 		Return(affectedSpends, []chainhash.Hash{}, nil).Once()
 
 	mockStore.On("Unspend", mock.Anything, affectedSpends, []bool{true}).Return(nil).Once()
@@ -197,13 +194,12 @@ func TestProcessConflictingRollback_Step5RetryExhausted(t *testing.T) {
 	mockStore.On("Get", mock.Anything, &conflictingTxHash, mock.Anything).Return(&meta.Data{
 		Tx:          winningTx,
 		Conflicting: true,
-	}, nil).Once()
+	}, nil).Twice()
 
-	mockStore.On("GetCounterConflicting", mock.Anything, conflictingTxHash).
-		Return([]chainhash.Hash{losingTxHash}, nil).Once()
+	stubCounterConflictingWalk(mockStore, winningTx, losingTxHash)
 
 	affectedSpends := []*Spend{{TxID: &losingTxHash, Vout: 0}}
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, true).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), true).
 		Return(affectedSpends, []chainhash.Hash{}, nil).Once()
 
 	mockStore.On("Unspend", mock.Anything, affectedSpends, []bool{true}).Return(nil).Once()
@@ -246,13 +242,12 @@ func TestProcessConflictingRollback_PartialStep3Spend(t *testing.T) {
 	mockStore.On("Get", mock.Anything, &conflictingTxHash, mock.Anything).Return(&meta.Data{
 		Tx:          winningTx,
 		Conflicting: true,
-	}, nil).Once()
+	}, nil).Times(3)
 
-	mockStore.On("GetCounterConflicting", mock.Anything, conflictingTxHash).
-		Return([]chainhash.Hash{losingTxHash}, nil).Once()
+	stubCounterConflictingWalk(mockStore, winningTx, losingTxHash)
 
 	affectedSpends := []*Spend{{TxID: &losingTxHash, Vout: 0}}
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, true).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), true).
 		Return(affectedSpends, []chainhash.Hash{}, nil).Once()
 
 	mockStore.On("Unspend", mock.Anything, affectedSpends, []bool{true}).Return(nil).Once()
@@ -276,9 +271,9 @@ func TestProcessConflictingRollback_PartialStep3Spend(t *testing.T) {
 		Tx: losingTx,
 	}, nil).Once()
 	mockStore.On("Spend", mock.Anything, losingTx, mock.Anything, mock.Anything).
-		Return([]*Spend{}, nil).Once()
+		Return([]*Spend{}, nil).Twice()
 	// 3c. SetConflicting(allMarkedHashes, false) — undoes step 1
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, false).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), false).
 		Return([]*Spend{}, []chainhash.Hash{}, nil).Once()
 	// 3d. SetLocked(parents, false) — undoes step 2's lock
 	mockStore.On("SetLocked", mock.Anything, []chainhash.Hash{losingTxHash}, false).
@@ -314,17 +309,16 @@ func TestProcessConflictingRollback_CascadeDescendants(t *testing.T) {
 	mockStore.On("Get", mock.Anything, &conflictingTxHash, mock.Anything).Return(&meta.Data{
 		Tx:          winningTx,
 		Conflicting: true,
-	}, nil).Once()
+	}, nil).Times(3)
 
-	mockStore.On("GetCounterConflicting", mock.Anything, conflictingTxHash).
-		Return([]chainhash.Hash{losingTxHash}, nil).Once()
+	stubCounterConflictingWalk(mockStore, winningTx, losingTxHash)
 
 	// step 1: MarkConflictingRecursively first marks the losing tx and its BFS yields a
 	// descendant. The second SetConflicting call (for the descendant) returns no further
 	// children, terminating the BFS. allMarkedHashes ends up [losingTxHash, descendantHash].
 	losingSpends := []*Spend{{TxID: &losingTxHash, Vout: 0}}
 	descendantSpends := []*Spend{{TxID: &descendantHash, Vout: 0}}
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, true).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), true).
 		Return(losingSpends, []chainhash.Hash{descendantHash}, nil).Once()
 	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{descendantHash}, true).
 		Return(descendantSpends, []chainhash.Hash{}, nil).Once()
@@ -344,12 +338,12 @@ func TestProcessConflictingRollback_CascadeDescendants(t *testing.T) {
 		Tx: losingTx,
 	}, nil).Once()
 	mockStore.On("Spend", mock.Anything, losingTx, mock.Anything, mock.Anything).
-		Return([]*Spend{}, nil).Once()
+		Return([]*Spend{}, nil).Twice()
 	// 3c. attempt to fetch descendant body — store has nothing for it, surface but continue
 	mockStore.On("Get", mock.Anything, &descendantHash, mock.Anything).
 		Return((*meta.Data)(nil), errors.NewNotFoundError("descendant not found")).Once()
 	// 3d. SetConflicting(allMarkedHashes, false) — clears flag on losing AND descendant
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash, descendantHash}, false).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash, descendantHash), false).
 		Return([]*Spend{}, []chainhash.Hash{}, nil).Once()
 	// 3e. SetLocked(false) on the unique parents marked unspendable
 	mockStore.On("SetLocked", mock.Anything, mock.MatchedBy(func(hs []chainhash.Hash) bool {

@@ -21,7 +21,24 @@ import (
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.org/x/sync/errgroup"
+)
+
+// prometheusUtxoCounterConflictingGhostSpends counts every confirmed ghost spender
+// tolerated by the counter-conflicting walk: a parent output that still records a
+// spender whose own record no longer exists (e.g. a never-mined conflicting loser
+// purged while the parent still references it). These free functions have no
+// logger, so the counter is the observability surface — each tolerated ghost slot
+// bumps it once.
+var prometheusUtxoCounterConflictingGhostSpends = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Namespace: "teranode",
+		Subsystem: "utxo",
+		Name:      "counter_conflicting_ghost_spends",
+		Help:      "Number of confirmed ghost spender references tolerated by the counter-conflicting walk",
+	},
 )
 
 // step5RetryDelays controls the bounded back-off when SetLocked(false) fails at the very
@@ -122,6 +139,12 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, confli
 	losingTxHashesPerConflictingTx := make([][]chainhash.Hash, len(conflictingTxHashes))
 	losingTxHashesPerConflictingTxCount := atomic.Int64{}
 
+	// ghostSpendsPerConflictingTx collects, per winning transaction, the parent
+	// output slots whose recorded spender is a confirmed ghost (record gone). The
+	// walk tolerates those instead of erroring; the slots are cleared below so the
+	// winner can spend them.
+	ghostSpendsPerConflictingTx := make([][]*Spend, len(conflictingTxHashes))
+
 	g, gCtx := errgroup.WithContext(ctx)
 
 	for idx, txHash := range conflictingTxHashes {
@@ -148,8 +171,10 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, confli
 			}
 
 			// get the counter conflicting transactions for the current transaction
-			// this includes all the children of the conflicting transaction
-			if losingTxHashesPerConflictingTx[idx], err = s.GetCounterConflicting(gCtx, txHash); err != nil {
+			// this includes all the children of the conflicting transaction. The
+			// ghost-aware walk is used directly (not the Store method) because the
+			// tolerated ghost slots must be cleared before the winner spends them.
+			if losingTxHashesPerConflictingTx[idx], ghostSpendsPerConflictingTx[idx], err = getCounterConflictingTxHashesAndGhostSpends(gCtx, s, txHash); err != nil {
 				return errors.NewProcessingError("[ProcessConflicting][%s] error getting counter conflicting txs", txHash.String(), err)
 			}
 
@@ -188,6 +213,17 @@ func ProcessConflicting(ctx context.Context, s Store, blockHeight uint32, confli
 
 	allMarkedConflicting = allMarkedHashes
 	step1Committed = true
+
+	// Ghost slots: a confirmed-absent spender still occupies parent output slots
+	// the winners need, and no loser-derived unspend can clear them — the unspend
+	// ownership check only clears a spend the caller owns, and a ghost has no
+	// record to derive that spend from. Clear them together with the loser spends
+	// in step 2, passing the recorded ghost spending data as the expected value,
+	// so the winner's spend in step 3 succeeds and the dangling reference is
+	// healed for good.
+	for _, ghostSpends := range ghostSpendsPerConflictingTx {
+		affectedParentSpends = append(affectedParentSpends, ghostSpends...)
+	}
 
 	// - 2: un-spend txa, marking the input txs as not spendable (txp & txq)
 	if err = s.Unspend(ctx, affectedParentSpends, true); err != nil {
@@ -986,20 +1022,35 @@ func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) (
 }
 
 func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhash.Hash) ([]chainhash.Hash, error) {
+	counterConflicting, _, err := getCounterConflictingTxHashesAndGhostSpends(ctx, s, txHash)
+
+	return counterConflicting, err
+}
+
+// getCounterConflictingTxHashesAndGhostSpends is the implementation behind
+// GetCounterConflictingTxHashes. Alongside the counter-conflicting set it returns
+// the "ghost" slots it tolerated: parent outputs whose recorded spender has no
+// store record anymore (confirmed by a direct probe of the spender). A confirmed
+// ghost has no BlockIDs, so it is definitionally not mined on our chain and is
+// excluded from the counter set instead of failing the whole walk with NOT_FOUND —
+// which used to wedge block validation forever on a block referencing such a slot.
+// ProcessConflicting uses the returned ghost slots to clear the dangling spends so
+// the winning transaction can actually spend those outputs.
+func getCounterConflictingTxHashesAndGhostSpends(ctx context.Context, s Store, txHash chainhash.Hash) ([]chainhash.Hash, []*Spend, error) {
 	ctx, _, deferFn := tracing.Tracer("utxo").Start(ctx, "GetCounterConflictingTxHashes")
 
 	defer deferFn()
 
 	txMeta, err := s.Get(ctx, &txHash, fields.Tx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	counterConflictingMap := make(map[chainhash.Hash]struct{})
 	counterConflictingMap[txHash] = struct{}{}
 
 	// get the unique parent txs
-	parentTxs := make(map[chainhash.Hash][]*chainhash.Hash)
+	parentTxs := make(map[chainhash.Hash][]*spendpkg.SpendingData)
 
 	for _, input := range txMeta.Tx.Inputs {
 		// get the parent tx
@@ -1011,43 +1062,59 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 
 		parentTxMeta, err := s.Get(ctx, parentTxHash, fields.Utxos)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 
-		spendingTxIDs := make([]*chainhash.Hash, len(parentTxMeta.SpendingDatas))
-
-		for idx, spendingData := range parentTxMeta.SpendingDatas {
-			if spendingData == nil {
-				continue
-			}
-
-			spendingTxIDs[idx] = spendingData.TxID
-		}
-
-		parentTxs[*parentTxHash] = spendingTxIDs
+		parentTxs[*parentTxHash] = parentTxMeta.SpendingDatas
 	}
 
+	var ghostSpends []*Spend
+
 	for _, input := range txMeta.Tx.Inputs {
-		parenTxIDS, ok := parentTxs[*input.PreviousTxIDChainHash()]
+		parentSpendingDatas, ok := parentTxs[*input.PreviousTxIDChainHash()]
 		if ok {
 			// check the length of the spending txs, if it's less than the index, then the input is not spent
-			if len(parenTxIDS) <= int(input.PreviousTxOutIndex) {
+			if len(parentSpendingDatas) <= int(input.PreviousTxOutIndex) {
 				// throw an error
-				return nil, errors.NewProcessingError("[GetCounterConflictingTxHashes][%s] cannot process counter conflicting, input %d of %s is out of range (len: %d, %v)", txHash.String(), input.PreviousTxOutIndex, input.PreviousTxIDChainHash().String(), len(parenTxIDS), parenTxIDS)
+				return nil, nil, errors.NewProcessingError("[GetCounterConflictingTxHashes][%s] cannot process counter conflicting, input %d of %s is out of range (len: %d, %v)", txHash.String(), input.PreviousTxOutIndex, input.PreviousTxIDChainHash().String(), len(parentSpendingDatas), parentSpendingDatas)
 			}
 
-			spendingTxID := parenTxIDS[input.PreviousTxOutIndex]
-			if spendingTxID != nil {
-				counterConflictingMap[*spendingTxID] = struct{}{}
+			spendingData := parentSpendingDatas[input.PreviousTxOutIndex]
+			if spendingData != nil && spendingData.TxID != nil {
+				spendingTxID := spendingData.TxID
 
 				childHashes, err := s.GetConflictingChildren(ctx, *spendingTxID)
 				if err != nil {
-					return nil, err
+					if !isNotFoundErr(err) {
+						return nil, nil, err
+					}
+
+					// A NOT_FOUND out of the BFS does not prove the spender itself is
+					// absent — the walk may have failed on a missing descendant of a
+					// live (possibly mined on our chain) spender. Probe the spender
+					// record directly and tolerate only a confirmed ghost; anything
+					// else fails closed with the original error.
+					if _, probeErr := s.Get(ctx, spendingTxID, fields.Conflicting); probeErr == nil || !isNotFoundErr(probeErr) {
+						return nil, nil, err
+					}
+
+					ghostSpend, ghostErr := newGhostSlotSpend(ctx, s, input, spendingData)
+					if ghostErr != nil {
+						return nil, nil, ghostErr
+					}
+
+					prometheusUtxoCounterConflictingGhostSpends.Inc()
+
+					ghostSpends = append(ghostSpends, ghostSpend)
+
+					continue
 				}
+
+				counterConflictingMap[*spendingTxID] = struct{}{}
 
 				for _, childHash := range childHashes {
 					if childHash.Equal(subtree.FrozenBytesTxHash) {
-						return nil, errors.NewProcessingError("[GetCounterConflictingTxHashes][%s] tx has frozen child", spendingTxID.String())
+						return nil, nil, errors.NewProcessingError("[GetCounterConflictingTxHashes][%s] tx has frozen child", spendingTxID.String())
 					}
 
 					counterConflictingMap[childHash] = struct{}{}
@@ -1062,7 +1129,43 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 		counterConflicting = append(counterConflicting, child)
 	}
 
-	// fmt.Printf("counterConflicting: %v\n", counterConflicting)
+	return counterConflicting, ghostSpends, nil
+}
 
-	return counterConflicting, nil
+// isNotFoundErr reports whether err denotes a missing record on any UTXO-store
+// backend: aerospike surfaces ErrTxNotFound, the SQL stores ErrNotFound.
+func isNotFoundErr(err error) bool {
+	return errors.Is(err, errors.ErrTxNotFound) || errors.Is(err, errors.ErrNotFound)
+}
+
+// newGhostSlotSpend builds the Spend that clears a confirmed ghost's dangling
+// spend from its parent output slot. The recorded spending data is passed as the
+// expected value so the store's unspend ownership check lets the clear through.
+// The parent is re-read with its tx body because the utxo hash needs the output's
+// locking script and satoshis.
+func newGhostSlotSpend(ctx context.Context, s Store, input *bt.Input, recorded *spendpkg.SpendingData) (*Spend, error) {
+	parentTxHash := input.PreviousTxIDChainHash()
+
+	parentTxMeta, err := s.Get(ctx, parentTxHash, fields.Tx)
+	if err != nil {
+		return nil, err
+	}
+
+	if parentTxMeta.Tx == nil || int(input.PreviousTxOutIndex) >= len(parentTxMeta.Tx.Outputs) {
+		return nil, errors.NewProcessingError("[GetCounterConflictingTxHashes] cannot build ghost slot spend, output %s:%d not present", parentTxHash.String(), input.PreviousTxOutIndex)
+	}
+
+	output := parentTxMeta.Tx.Outputs[input.PreviousTxOutIndex]
+
+	utxoHash, err := util.UTXOHash(parentTxHash, input.PreviousTxOutIndex, output.LockingScript, output.Satoshis)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Spend{
+		TxID:         parentTxHash,
+		Vout:         input.PreviousTxOutIndex,
+		UTXOHash:     utxoHash,
+		SpendingData: recorded,
+	}, nil
 }

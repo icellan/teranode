@@ -5,11 +5,15 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/spend"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -32,16 +36,16 @@ func TestProcessConflicting_Success(t *testing.T) {
 		Conflicting: true,
 	}, nil)
 
-	// Mock GetCounterConflicting call
+	// Stub the counter-conflicting walk: the parent slot records the losing tx
+	// as a live spender, so the walk result is {conflicting tx, losing tx}
 	losingTxHash := createTestHash("losing-tx-1")
-	mockStore.On("GetCounterConflicting", mock.Anything, conflictingTxHash).
-		Return([]chainhash.Hash{losingTxHash}, nil)
+	stubCounterConflictingWalk(mockStore, testTx, losingTxHash)
 
 	// Mock SetConflicting call for marking losing txs as conflicting
 	affectedSpends := []*Spend{
 		{TxID: &losingTxHash, Vout: 0},
 	}
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, true).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), true).
 		Return(affectedSpends, []chainhash.Hash{}, nil)
 
 	// Mock Unspend call
@@ -140,9 +144,11 @@ func TestProcessConflicting_GetCounterConflictingError(t *testing.T) {
 		Conflicting: true,
 	}, nil)
 
-	// Mock GetCounterConflicting call returning error
-	mockStore.On("GetCounterConflicting", mock.Anything, conflictingTxHash).
-		Return([]chainhash.Hash{}, errors.NewProcessingError("counter conflicting error"))
+	// The walk fails reading the parent record: the error must surface as the
+	// counter-conflicting failure
+	prevTxHash := createTestHash("prev-tx")
+	mockStore.On("Get", mock.Anything, &prevTxHash, []fields.FieldName{fields.Utxos}).
+		Return(nil, errors.NewProcessingError("counter conflicting error"))
 
 	// Execute test
 	result, _, err := ProcessConflicting(ctx, mockStore, 1, conflictingTxHashes, map[chainhash.Hash]struct{}{})
@@ -168,11 +174,10 @@ func TestProcessConflicting_UnspendError(t *testing.T) {
 		Conflicting: true,
 	}, nil)
 
-	mockStore.On("GetCounterConflicting", mock.Anything, conflictingTxHash).
-		Return([]chainhash.Hash{losingTxHash}, nil)
+	stubCounterConflictingWalk(mockStore, createTestTransaction(), losingTxHash)
 
 	affectedSpends := []*Spend{{TxID: &losingTxHash, Vout: 0}}
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, true).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), true).
 		Return(affectedSpends, []chainhash.Hash{}, nil)
 
 	// Mock Unspend call returning error
@@ -180,7 +185,7 @@ func TestProcessConflicting_UnspendError(t *testing.T) {
 		Return(errors.NewProcessingError("unspend failed"))
 
 	// step 2 failed → rollback only undoes step 1 (clear conflicting flag).
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, false).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), false).
 		Return([]*Spend{}, []chainhash.Hash{}, nil)
 
 	// Execute test
@@ -209,13 +214,12 @@ func TestProcessConflicting_SpendError(t *testing.T) {
 	mockStore.On("Get", mock.Anything, &conflictingTxHash, mock.Anything).Return(&meta.Data{
 		Tx:          testTx,
 		Conflicting: true,
-	}, nil).Once()
+	}, nil).Times(3)
 
-	mockStore.On("GetCounterConflicting", mock.Anything, conflictingTxHash).
-		Return([]chainhash.Hash{losingTxHash}, nil)
+	stubCounterConflictingWalk(mockStore, testTx, losingTxHash)
 
 	affectedSpends := []*Spend{{TxID: &losingTxHash, Vout: 0}}
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, true).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), true).
 		Return(affectedSpends, []chainhash.Hash{}, nil)
 
 	mockStore.On("Unspend", mock.Anything, affectedSpends, mock.Anything).Return(nil)
@@ -227,7 +231,10 @@ func TestProcessConflicting_SpendError(t *testing.T) {
 		Err:  errors.NewProcessingError("spend error"),
 	}
 	mockStore.On("Spend", mock.Anything, testTx, mock.Anything, mock.Anything).
-		Return([]*Spend{spendWithError}, errors.NewTxInvalidError("spend failed"))
+		Return([]*Spend{spendWithError}, errors.NewTxInvalidError("spend failed")).Once()
+	// rollback re-spends the winning tx too (it is part of the marked cascade)
+	mockStore.On("Spend", mock.Anything, testTx, mock.Anything, mock.Anything).
+		Return([]*Spend{}, nil).Once()
 
 	// step-3 failure rollback path: re-fetch losing tx body, re-spend it, clear conflicting,
 	// unlock parents. (No partial successful step-3 spends — the only spend has Err != nil.)
@@ -236,7 +243,7 @@ func TestProcessConflicting_SpendError(t *testing.T) {
 	}, nil).Once()
 	mockStore.On("Spend", mock.Anything, losingTx, mock.Anything, mock.Anything).
 		Return([]*Spend{}, nil).Once()
-	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{losingTxHash}, false).
+	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), false).
 		Return([]*Spend{}, []chainhash.Hash{}, nil)
 	mockStore.On("SetLocked", mock.Anything, []chainhash.Hash{losingTxHash}, false).Return(nil)
 
@@ -911,4 +918,264 @@ func createTestTransactionWithInputs(parentTxHash chainhash.Hash, inputIndex uin
 	tx.Outputs = append(tx.Outputs, output)
 
 	return tx
+}
+
+// ghostSpendsToleratedCounterValue reads the current value of the
+// teranode_utxo_counter_conflicting_ghost_spends counter from the default
+// prometheus registry, returning 0 when the metric is not registered yet.
+func ghostSpendsToleratedCounterValue(t *testing.T) float64 {
+	t.Helper()
+
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+
+	for _, mf := range mfs {
+		if mf.GetName() == "teranode_utxo_counter_conflicting_ghost_spends" {
+			return mf.GetMetric()[0].GetCounter().GetValue()
+		}
+	}
+
+	return 0
+}
+
+// A parent output records a spender whose own record no longer exists (a
+// "ghost", e.g. a never-mined conflicting loser purged by the reaper while the
+// parent still references it). The walk must probe the spender itself and,
+// once confirmed absent, exclude it from the counter-conflicting set instead
+// of failing the whole walk with TX_NOT_FOUND.
+func TestGetCounterConflictingTxHashes_ToleratesConfirmedGhostSpender(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	winningTx := createTestTransaction()
+	winningTxHash := createTestHash("winning-tx")
+	parentTxHash := *winningTx.Inputs[0].PreviousTxIDChainHash()
+	ghostTxHash := createTestHash("ghost-spender-tx")
+
+	parentTx := createTestParentTransaction()
+
+	mockStore.On("Get", mock.Anything, &winningTxHash, []fields.FieldName{fields.Tx}).
+		Return(&meta.Data{Tx: winningTx}, nil)
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos}).
+		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&ghostTxHash, 0)}}, nil)
+	mockStore.On("GetConflictingChildren", mock.Anything, ghostTxHash).
+		Return(([]chainhash.Hash)(nil), errors.NewTxNotFoundError("%v not found", ghostTxHash))
+	// the probe confirms the spender record itself is gone
+	mockStore.On("Get", mock.Anything, &ghostTxHash, []fields.FieldName{fields.Conflicting}).
+		Return(nil, errors.NewTxNotFoundError("%v not found", ghostTxHash))
+	// the ghost-slot build re-reads the parent with its tx body for the utxo hash
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Tx}).
+		Return(&meta.Data{Tx: parentTx}, nil)
+
+	counterBefore := ghostSpendsToleratedCounterValue(t)
+
+	result, err := GetCounterConflictingTxHashes(ctx, mockStore, winningTxHash)
+
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{winningTxHash}, result)
+	require.Equal(t, counterBefore+1, ghostSpendsToleratedCounterValue(t))
+	mockStore.AssertExpectations(t)
+}
+
+// A NOT_FOUND out of the BFS does not prove the spender is absent — the walk
+// may have failed on a missing descendant while the spender itself is alive
+// (and possibly mined on our chain). The probe must detect the live spender
+// and fail closed by propagating the original error.
+func TestGetCounterConflictingTxHashes_FailsClosedWhenSpenderAliveAndDescendantMissing(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	winningTx := createTestTransaction()
+	winningTxHash := createTestHash("winning-tx")
+	parentTxHash := *winningTx.Inputs[0].PreviousTxIDChainHash()
+	spenderTxHash := createTestHash("live-spender-tx")
+
+	mockStore.On("Get", mock.Anything, &winningTxHash, []fields.FieldName{fields.Tx}).
+		Return(&meta.Data{Tx: winningTx}, nil)
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos}).
+		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&spenderTxHash, 0)}}, nil)
+	// the BFS fails on a missing descendant of the (live) spender
+	mockStore.On("GetConflictingChildren", mock.Anything, spenderTxHash).
+		Return(([]chainhash.Hash)(nil), errors.NewTxNotFoundError("descendant not found"))
+	// the probe finds the spender record alive
+	mockStore.On("Get", mock.Anything, &spenderTxHash, []fields.FieldName{fields.Conflicting}).
+		Return(&meta.Data{}, nil)
+
+	result, err := GetCounterConflictingTxHashes(ctx, mockStore, winningTxHash)
+
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound))
+	require.Nil(t, result)
+	mockStore.AssertExpectations(t)
+}
+
+// When the probe itself fails with anything other than NOT_FOUND, the ghost is
+// unconfirmed and the walk must fail closed by propagating the original error.
+func TestGetCounterConflictingTxHashes_FailsClosedWhenProbeErrors(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	winningTx := createTestTransaction()
+	winningTxHash := createTestHash("winning-tx")
+	parentTxHash := *winningTx.Inputs[0].PreviousTxIDChainHash()
+	spenderTxHash := createTestHash("maybe-ghost-tx")
+
+	mockStore.On("Get", mock.Anything, &winningTxHash, []fields.FieldName{fields.Tx}).
+		Return(&meta.Data{Tx: winningTx}, nil)
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos}).
+		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&spenderTxHash, 0)}}, nil)
+	mockStore.On("GetConflictingChildren", mock.Anything, spenderTxHash).
+		Return(([]chainhash.Hash)(nil), errors.NewTxNotFoundError("%v not found", spenderTxHash))
+	mockStore.On("Get", mock.Anything, &spenderTxHash, []fields.FieldName{fields.Conflicting}).
+		Return(nil, errors.NewStorageError("backend unavailable"))
+
+	result, err := GetCounterConflictingTxHashes(ctx, mockStore, winningTxHash)
+
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound))
+	require.Nil(t, result)
+	mockStore.AssertExpectations(t)
+}
+
+// A missing parent record erases the whole spend graph for that input; the
+// walk must keep failing closed rather than dereference a missing slot.
+func TestGetCounterConflictingTxHashes_FailsClosedOnMissingParent(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	winningTx := createTestTransaction()
+	winningTxHash := createTestHash("winning-tx")
+	parentTxHash := *winningTx.Inputs[0].PreviousTxIDChainHash()
+
+	mockStore.On("Get", mock.Anything, &winningTxHash, []fields.FieldName{fields.Tx}).
+		Return(&meta.Data{Tx: winningTx}, nil)
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos}).
+		Return(nil, errors.NewTxNotFoundError("%v not found", parentTxHash))
+
+	result, err := GetCounterConflictingTxHashes(ctx, mockStore, winningTxHash)
+
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrTxNotFound))
+	require.Nil(t, result)
+	mockStore.AssertExpectations(t)
+}
+
+// Resolution over a confirmed ghost must not only tolerate the ghost in the
+// walk: the parent slot still records the ghost's spend, which no loser-derived
+// unspend can clear (ownership check). ProcessConflicting must clear that slot
+// explicitly — passing the recorded ghost spending data as the expected value —
+// so the winner's spend in step 3 can succeed and the dangling ref is healed.
+func TestProcessConflicting_HealsConfirmedGhostSlot(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	winningTx := createTestTransaction()
+	winningTxHash := createTestHash("winning-tx")
+	parentTxHash := *winningTx.Inputs[0].PreviousTxIDChainHash()
+	ghostTxHash := createTestHash("ghost-spender-tx")
+
+	parentTx := createTestParentTransaction()
+	ghostSpendingData := spend.NewSpendingData(&ghostTxHash, 0)
+
+	expectedUtxoHash, err := util.UTXOHash(&parentTxHash, 0, parentTx.Outputs[0].LockingScript, parentTx.Outputs[0].Satoshis)
+	require.NoError(t, err)
+
+	mockStore.On("Get", mock.Anything, &winningTxHash, []fields.FieldName{fields.Tx, fields.BlockIDs, fields.Conflicting}).
+		Return(&meta.Data{Tx: winningTx, Conflicting: true}, nil)
+	mockStore.On("Get", mock.Anything, &winningTxHash, []fields.FieldName{fields.Tx}).
+		Return(&meta.Data{Tx: winningTx}, nil)
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos}).
+		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{ghostSpendingData}}, nil)
+	mockStore.On("GetConflictingChildren", mock.Anything, ghostTxHash).
+		Return(([]chainhash.Hash)(nil), errors.NewTxNotFoundError("%v not found", ghostTxHash))
+	mockStore.On("Get", mock.Anything, &ghostTxHash, []fields.FieldName{fields.Conflicting}).
+		Return(nil, errors.NewTxNotFoundError("%v not found", ghostTxHash))
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Tx}).
+		Return(&meta.Data{Tx: parentTx}, nil)
+
+	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{winningTxHash}, true).
+		Return([]*Spend{}, []chainhash.Hash{}, nil)
+
+	// step 2 must include the ghost slot, with the recorded ghost spend as the
+	// expected spending data so the store's ownership check lets it clear
+	mockStore.On("Unspend", mock.Anything, mock.MatchedBy(func(spends []*Spend) bool {
+		if len(spends) != 1 {
+			return false
+		}
+
+		sp := spends[0]
+
+		return sp.TxID.Equal(parentTxHash) && sp.Vout == 0 &&
+			sp.UTXOHash.Equal(*expectedUtxoHash) &&
+			sp.SpendingData != nil && sp.SpendingData.TxID.Equal(ghostTxHash)
+	}), mock.Anything).Return(nil)
+
+	mockStore.On("Spend", mock.Anything, winningTx, mock.Anything, mock.Anything).
+		Return([]*Spend{}, nil)
+	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{winningTxHash}, false).
+		Return([]*Spend{}, []chainhash.Hash{}, nil)
+	mockStore.On("SetLocked", mock.Anything, []chainhash.Hash{parentTxHash}, false).
+		Return(nil)
+
+	losingMap, _, err := ProcessConflicting(ctx, mockStore, 1, []chainhash.Hash{winningTxHash}, map[chainhash.Hash]struct{}{})
+
+	require.NoError(t, err)
+	require.NotNil(t, losingMap)
+	mockStore.AssertExpectations(t)
+}
+
+// createTestParentTransaction builds a parent tx with a spendable output so
+// the ghost-slot tests can compute a real utxo hash for output 0.
+func createTestParentTransaction() *bt.Tx {
+	tx := bt.NewTx()
+
+	input := &bt.Input{
+		PreviousTxOutIndex: 0,
+	}
+	prevTxHash := createTestHash("grandparent-tx")
+	_ = input.PreviousTxIDAdd(&prevTxHash)
+	tx.Inputs = append(tx.Inputs, input)
+
+	tx.Outputs = append(tx.Outputs, &bt.Output{
+		Satoshis:      1000,
+		LockingScript: &bscript.Script{bscript.OpTRUE},
+	})
+
+	return tx
+}
+
+// hashSetMatcher matches a []chainhash.Hash argument against an expected set,
+// ignoring order — the counter-conflicting walk builds its result from a map.
+func hashSetMatcher(want ...chainhash.Hash) interface{} {
+	return mock.MatchedBy(func(hs []chainhash.Hash) bool {
+		if len(hs) != len(want) {
+			return false
+		}
+
+		seen := make(map[chainhash.Hash]struct{}, len(hs))
+		for _, h := range hs {
+			seen[h] = struct{}{}
+		}
+
+		for _, w := range want {
+			if _, ok := seen[w]; !ok {
+				return false
+			}
+		}
+
+		return true
+	})
+}
+
+// stubCounterConflictingWalk wires the store calls the ghost-aware counter-
+// conflicting walk makes for a root tx built by the createTestTransaction
+// helpers: the parent slot records spenderTxHash as a live spender with no
+// conflicting children of its own. The walk result is {root, spender}.
+func stubCounterConflictingWalk(mockStore *MockUtxostore, rootTx *bt.Tx, spenderTxHash chainhash.Hash) {
+	parentTxHash := *rootTx.Inputs[0].PreviousTxIDChainHash()
+
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos}).
+		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&spenderTxHash, 0)}}, nil).Once()
+	mockStore.On("GetConflictingChildren", mock.Anything, spenderTxHash).
+		Return([]chainhash.Hash{}, nil).Once()
 }
