@@ -1126,7 +1126,9 @@ func (sm *SyncManager) createUtxos(ctx context.Context, txMap *txmap.SyncedMap[c
 				SubtreeIdx:  0, // legacy path produces a single subtree at index 0
 			}))
 
-			if _, err := sm.utxoStore.Create(gCtx, txWrapper.Tx, blockHeightUint32, createOpts...); err != nil {
+			createOpts = append(createOpts, utxo.WithCreateOnly())
+
+			if _, _, err := sm.utxoStore.SpendAndCreate(gCtx, txWrapper.Tx, blockHeightUint32, createOpts...); err != nil {
 				if errors.Is(err, errors.ErrTxExists) {
 					existingTxsMu.Lock()
 					existingTxHashes = append(existingTxHashes, &txHash)

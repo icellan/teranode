@@ -53,7 +53,7 @@ func TestHTTPEndpoints(t *testing.T) {
 		utxoMock.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(metaData, nil)
 
 		// Mock the Spend method with empty slice of *utxo.Spend for the return value
-		utxoMock.On("Spend", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]*utxo.Spend{}, nil)
+		utxoMock.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, []*utxo.Spend{}, nil)
 
 		// Create a new server
 		server := validator.NewServer(logger, tSettings, utxoMock, nil, nil, nil, nil, nil, nil)
@@ -108,7 +108,7 @@ func TestHTTPEndpoints(t *testing.T) {
 		utxoMock.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(metaData, nil)
 
 		// Mock the Spend method with empty slice of *utxo.Spend for the return value
-		utxoMock.On("Spend", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return([]*utxo.Spend{}, nil)
+		utxoMock.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, []*utxo.Spend{}, nil)
 
 		// Create a new server
 		server := validator.NewServer(logger, tSettings, utxoMock, nil, nil, nil, nil, nil, nil)

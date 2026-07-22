@@ -12,32 +12,33 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
 
-// spendRetrySpyStore wraps NullStore; Spend behaviour is scripted per tx hash.
+// spendRetrySpyStore wraps NullStore; SpendAndCreate behaviour is scripted per tx hash.
 type spendRetrySpyStore struct {
 	*nullstore.NullStore
 	mu sync.Mutex
-	// failuresLeft[txid] = how many times Spend should fail with failErr[txid]
+	// failuresLeft[txid] = how many times SpendAndCreate should fail with failErr[txid]
 	failuresLeft map[chainhash.Hash]int
 	failErr      map[chainhash.Hash]error
 	spendCalls   atomic.Int64
 }
 
-func (s *spendRetrySpyStore) Spend(_ context.Context, tx *bt.Tx, _ uint32, _ ...utxo.IgnoreFlags) ([]*utxo.Spend, error) {
+func (s *spendRetrySpyStore) SpendAndCreate(_ context.Context, tx *bt.Tx, _ uint32, _ ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
 	s.spendCalls.Add(1)
 	h := *tx.TxIDChainHash()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if n, ok := s.failuresLeft[h]; ok && n > 0 {
 		s.failuresLeft[h] = n - 1
-		return nil, s.failErr[h]
+		return nil, nil, s.failErr[h]
 	}
-	return nil, nil
+	return nil, nil, nil
 }
 
 func newSpendRetryHarness(t *testing.T, spy *spendRetrySpyStore) (*BlockValidation, *model.Block, []*bt.Tx) {
