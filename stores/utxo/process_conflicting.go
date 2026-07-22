@@ -570,6 +570,16 @@ func selectCountersForDemotedTx(ctx context.Context, s Store, demotedTx *bt.Tx, 
 
 			candidateMeta, err := s.Get(ctx, &candidate, fields.Tx, fields.Conflicting, fields.CreatedAt)
 			if err != nil {
+				// ConflictingChildren entries are never removed once written: a
+				// conflicting loser purged by the conflicting-branch DAH (or a
+				// healed ghost) stays listed after its record is gone. An absent
+				// candidate cannot be re-promoted whatever the cause — skip it
+				// instead of hard-failing, which would wedge moveBackBlock on
+				// every retry.
+				if isNotFoundErr(err) {
+					continue
+				}
+
 				return nil, errors.NewProcessingError("[selectCountersForDemotedTx][%s] error getting candidate counter", candidate.String(), err)
 			}
 
@@ -859,10 +869,54 @@ func MarkConflictingRecursively(ctx context.Context, s Store, hashes []chainhash
 		for _, child := range spendingChildTxs {
 			if _, ok := visited[child]; !ok {
 				visited[child] = struct{}{}
-				markedOrder = append(markedOrder, child)
 				nextBatch = append(nextBatch, child)
 			}
 		}
+
+		// Probe the discovered children before recursing: a marked record's
+		// output slot can point at a ghost (spends applied, record never
+		// created), and feeding it back into SetConflicting would fail
+		// NOT_FOUND and wedge the whole cascade. A confirmed-absent child
+		// cannot be marked and has no readable descendants — skip it. (The
+		// counter-conflicting walk fails closed on reaped mined spenders
+		// before ProcessConflicting ever cascades here.)
+		if len(nextBatch) > 0 {
+			exists := make([]bool, len(nextBatch))
+			g, gCtx := errgroup.WithContext(ctx)
+
+			for i, child := range nextBatch {
+				i := i
+				child := child
+				g.Go(func() error {
+					if _, probeErr := s.Get(gCtx, &child, fields.Conflicting); probeErr != nil {
+						if isNotFoundErr(probeErr) {
+							return nil
+						}
+
+						return probeErr
+					}
+
+					exists[i] = true
+
+					return nil
+				})
+			}
+
+			if err = g.Wait(); err != nil {
+				return nil, nil, err
+			}
+
+			alive := nextBatch[:0]
+			for i, child := range nextBatch {
+				if exists[i] {
+					markedOrder = append(markedOrder, child)
+					alive = append(alive, child)
+				}
+			}
+
+			nextBatch = alive
+		}
+
 		toProcess = nextBatch
 	}
 
@@ -959,6 +1013,12 @@ func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) (
 	visited[hash] = struct{}{}
 	currentLevel := []chainhash.Hash{hash}
 
+	// reapedByParent records, per enqueued child, whether the node that
+	// enqueued it lists it in deletedChildren — i.e. the pruner deleted the
+	// child's record after it was mined and fully spent. Written between
+	// levels, read only by the next level's goroutines.
+	reapedByParent := make(map[chainhash.Hash]bool)
+
 	for len(currentLevel) > 0 {
 		results := make([]*meta.Data, len(currentLevel))
 		g, gCtx := errgroup.WithContext(ctx)
@@ -967,9 +1027,29 @@ func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) (
 			i := i
 			current := current
 			g.Go(func() error {
-				txMeta, err := s.Get(gCtx, &current, fields.Utxos, fields.ConflictingChildren)
+				txMeta, err := s.Get(gCtx, &current, fields.Utxos, fields.ConflictingChildren, fields.DeletedChildren)
 				if err != nil {
-					return err
+					// The root's absence is the caller's signal (the counter
+					// walk probes and classifies it) — always propagate it, as
+					// well as any non-NOT_FOUND failure.
+					if current.Equal(hash) || !isNotFoundErr(err) {
+						return err
+					}
+
+					// An absent descendant its parent lists in deletedChildren
+					// was reaped after being mined — the subtree holds settled
+					// history and must not be treated as demotable. Fail closed,
+					// mirroring the counter walk's reaped-spender gate.
+					if reapedByParent[current] {
+						return errors.NewProcessingError("[GetConflictingChildren][%s] descendant %s was reaped after being mined (listed in its parent's deletedChildren)", hash.String(), current.String(), err)
+					}
+
+					// A confirmed-absent ghost descendant (spends applied, record
+					// never created): it cannot be demoted and has no readable
+					// descendants — skip it instead of wedging every consumer of
+					// this walk. results[i] stays nil and the hash is dropped
+					// from the visited set below.
+					return nil
 				}
 				results[i] = txMeta
 				return nil
@@ -981,8 +1061,10 @@ func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) (
 		}
 
 		var nextLevel []chainhash.Hash
-		for _, txMeta := range results {
+		for i, txMeta := range results {
 			if txMeta == nil {
+				// tolerated ghost descendant — exclude it from the result set
+				delete(visited, currentLevel[i])
 				continue
 			}
 
@@ -990,6 +1072,7 @@ func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) (
 				for _, child := range txMeta.ConflictingChildren {
 					if _, ok := visited[child]; !ok {
 						visited[child] = struct{}{}
+						reapedByParent[child] = txMeta.DeletedChildren[child]
 						nextLevel = append(nextLevel, child)
 					}
 				}
@@ -1001,6 +1084,7 @@ func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) (
 						child := *spendingData.TxID
 						if _, ok := visited[child]; !ok {
 							visited[child] = struct{}{}
+							reapedByParent[child] = txMeta.DeletedChildren[child]
 							nextLevel = append(nextLevel, child)
 						}
 					}
@@ -1030,12 +1114,17 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 // getCounterConflictingTxHashesAndGhostSpends is the implementation behind
 // GetCounterConflictingTxHashes. Alongside the counter-conflicting set it returns
 // the "ghost" slots it tolerated: parent outputs whose recorded spender has no
-// store record anymore (confirmed by a direct probe of the spender). A confirmed
-// ghost has no BlockIDs, so it is definitionally not mined on our chain and is
-// excluded from the counter set instead of failing the whole walk with NOT_FOUND —
-// which used to wedge block validation forever on a block referencing such a slot.
-// ProcessConflicting uses the returned ghost slots to clear the dangling spends so
-// the winning transaction can actually spend those outputs.
+// store record anymore (confirmed by a direct probe of the spender). Absence
+// alone does not prove the spender was never mined — DAH housekeeping also reaps
+// mined, fully-spent records — but the pruner records every reaped child in its
+// surviving parents' deletedChildren map, so a spender absent AND listed there
+// is a settled, mined spend and the walk fails closed on it. A spender absent
+// and NOT listed is a genuine ghost: definitionally not mined on our chain, it
+// is excluded from the counter set instead of failing the whole walk with
+// NOT_FOUND — which used to wedge block validation forever on a block
+// referencing such a slot. ProcessConflicting uses the returned ghost slots to
+// clear the dangling spends so the winning transaction can actually spend those
+// outputs.
 func getCounterConflictingTxHashesAndGhostSpends(ctx context.Context, s Store, txHash chainhash.Hash) ([]chainhash.Hash, []*Spend, error) {
 	ctx, _, deferFn := tracing.Tracer("utxo").Start(ctx, "GetCounterConflictingTxHashes")
 
@@ -1050,7 +1139,7 @@ func getCounterConflictingTxHashesAndGhostSpends(ctx context.Context, s Store, t
 	counterConflictingMap[txHash] = struct{}{}
 
 	// get the unique parent txs
-	parentTxs := make(map[chainhash.Hash][]*spendpkg.SpendingData)
+	parentTxs := make(map[chainhash.Hash]*meta.Data)
 
 	for _, input := range txMeta.Tx.Inputs {
 		// get the parent tx
@@ -1060,19 +1149,22 @@ func getCounterConflictingTxHashesAndGhostSpends(ctx context.Context, s Store, t
 	for parentTx := range parentTxs {
 		parentTxHash := &parentTx
 
-		parentTxMeta, err := s.Get(ctx, parentTxHash, fields.Utxos)
+		// DeletedChildren feeds the reaped-spender check on the ghost tolerance
+		// below.
+		parentTxMeta, err := s.Get(ctx, parentTxHash, fields.Utxos, fields.DeletedChildren)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		parentTxs[*parentTxHash] = parentTxMeta.SpendingDatas
+		parentTxs[*parentTxHash] = parentTxMeta
 	}
 
 	var ghostSpends []*Spend
 
 	for _, input := range txMeta.Tx.Inputs {
-		parentSpendingDatas, ok := parentTxs[*input.PreviousTxIDChainHash()]
+		parentTxMeta, ok := parentTxs[*input.PreviousTxIDChainHash()]
 		if ok {
+			parentSpendingDatas := parentTxMeta.SpendingDatas
 			// check the length of the spending txs, if it's less than the index, then the input is not spent
 			if len(parentSpendingDatas) <= int(input.PreviousTxOutIndex) {
 				// throw an error
@@ -1096,6 +1188,16 @@ func getCounterConflictingTxHashesAndGhostSpends(ctx context.Context, s Store, t
 					// else fails closed with the original error.
 					if _, probeErr := s.Get(ctx, spendingTxID, fields.Conflicting); probeErr == nil || !isNotFoundErr(probeErr) {
 						return nil, nil, err
+					}
+
+					// The probe proves the record is gone, not that the spender was
+					// never mined: DAH housekeeping reaps mined, fully-spent records
+					// too. The pruner marks every reaped child in its surviving
+					// parents' deletedChildren map, so a spender listed there held a
+					// settled, mined spend — clearing its slot would bless a
+					// double-spend of a settled output. Fail closed instead.
+					if parentTxMeta.DeletedChildren[*spendingTxID] {
+						return nil, nil, errors.NewProcessingError("[GetCounterConflictingTxHashes][%s] spender %s of parent %s was reaped after being mined (listed in the parent's deletedChildren) — its settled spend is not a ghost", txHash.String(), spendingTxID.String(), input.PreviousTxIDChainHash().String(), err)
 					}
 
 					ghostSpend, ghostErr := newGhostSlotSpend(ctx, s, input, spendingData)

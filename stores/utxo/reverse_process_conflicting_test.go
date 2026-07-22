@@ -9,6 +9,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	spendpkg "github.com/bsv-blockchain/teranode/stores/utxo/spend"
 	"github.com/stretchr/testify/assert"
@@ -1071,4 +1072,37 @@ func TestSpendsForTx(t *testing.T) {
 		require.NoError(t, err)
 		assert.Empty(t, got)
 	})
+}
+
+// ConflictingChildren entries are never removed once written: a conflicting
+// loser purged by the conflicting-branch DAH (or a healed ghost) stays listed
+// in its parent's bin after its record is gone. The counter selection must
+// skip such dangling entries — an absent candidate cannot be re-promoted
+// whatever the cause — instead of hard-failing and wedging moveBackBlock.
+func TestSelectCountersForDemotedTx_SkipsDanglingConflictingChild(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	parentHash := createTestHash("dangling-parent")
+	demotedHash := createTestHash("dangling-demoted")
+	purgedHash := createTestHash("dangling-purged-loser")
+	counterHash := createTestHash("dangling-counter")
+
+	demotedTx := createSpendableTestTransaction(parentHash, 0)
+	counterTx := createSpendableTestTransaction(parentHash, 0)
+
+	mockStore.On("Get", mock.Anything, &parentHash, []fields.FieldName{fields.ConflictingChildren}).
+		Return(&meta.Data{ConflictingChildren: []chainhash.Hash{purgedHash, counterHash}}, nil)
+	// the purged loser: still listed, record long reaped
+	mockStore.On("Get", mock.Anything, &purgedHash, []fields.FieldName{fields.Tx, fields.Conflicting, fields.CreatedAt}).
+		Return(nil, errors.NewTxNotFoundError("%v not found", purgedHash))
+	mockStore.On("Get", mock.Anything, &counterHash, []fields.FieldName{fields.Tx, fields.Conflicting, fields.CreatedAt}).
+		Return(&meta.Data{Tx: counterTx, Conflicting: true, CreatedAt: 42}, nil)
+
+	result, err := selectCountersForDemotedTx(ctx, mockStore, demotedTx, map[chainhash.Hash]struct{}{demotedHash: {}})
+
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{counterHash}, result,
+		"the live counter must still be selected after skipping the dangling entry")
+	mockStore.AssertExpectations(t)
 }

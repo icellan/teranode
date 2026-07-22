@@ -79,6 +79,13 @@ type Data struct {
 	// ConflictingChildren contains the transaction IDs of all transactions that tried to spend this conflicting transaction
 	ConflictingChildren []chainhash.Hash `json:"conflictingChildren"`
 
+	// DeletedChildren contains the transaction IDs of child records the DAH
+	// pruner deleted while this (parent) record survived. A spender recorded in
+	// a parent output slot whose own record is absent but listed here was a
+	// mined, settled spend that was reaped — not a ghost. Maintained by the
+	// aerospike pruner only; not part of the binary serialization.
+	DeletedChildren map[chainhash.Hash]bool `json:"deletedChildren,omitempty"`
+
 	// Locked is a flag indicating if the transaction is locked and not spendable
 	Locked bool `json:"locked"`
 

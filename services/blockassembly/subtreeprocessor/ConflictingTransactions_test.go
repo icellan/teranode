@@ -94,7 +94,7 @@ func TestProcessConflictingTransactions(t *testing.T) {
 	_ = conflictingTxInput.PreviousTxIDAdd(&conflictingParentHash)
 	conflictingTxBody.Inputs = append(conflictingTxBody.Inputs, conflictingTxInput)
 
-	mockUtxoStore.On("Get", mock.Anything, mock.Anything, []fields.FieldName{fields.Utxos}).
+	mockUtxoStore.On("Get", mock.Anything, mock.Anything, []fields.FieldName{fields.Utxos, fields.DeletedChildren}).
 		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{nil}}, nil)
 	mockUtxoStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(&meta.Data{Tx: conflictingTxBody, Conflicting: true}, nil)
 	mockUtxoStore.On("SetConflicting", mock.Anything, mock.Anything, mock.Anything).Return([]*utxo.Spend{}, []chainhash.Hash{}, nil)

@@ -147,7 +147,7 @@ func TestProcessConflicting_GetCounterConflictingError(t *testing.T) {
 	// The walk fails reading the parent record: the error must surface as the
 	// counter-conflicting failure
 	prevTxHash := createTestHash("prev-tx")
-	mockStore.On("Get", mock.Anything, &prevTxHash, []fields.FieldName{fields.Utxos}).
+	mockStore.On("Get", mock.Anything, &prevTxHash, []fields.FieldName{fields.Utxos, fields.DeletedChildren}).
 		Return(nil, errors.NewProcessingError("counter conflicting error"))
 
 	// Execute test
@@ -270,6 +270,11 @@ func TestMarkConflictingRecursively_Success(t *testing.T) {
 
 	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{txHash}, true).
 		Return(affectedSpends, childTxs, nil)
+
+	// the cascade probes each discovered child before recursing (ghost filter);
+	// the child is a live record, so the probe finds it
+	mockStore.On("Get", mock.Anything, &childHash, []fields.FieldName{fields.Conflicting}).
+		Return(&meta.Data{}, nil)
 
 	// Mock recursive call for child transactions
 	childAffectedSpends := []*Spend{{TxID: &childHash, Vout: 0}}
@@ -956,7 +961,7 @@ func TestGetCounterConflictingTxHashes_ToleratesConfirmedGhostSpender(t *testing
 
 	mockStore.On("Get", mock.Anything, &winningTxHash, []fields.FieldName{fields.Tx}).
 		Return(&meta.Data{Tx: winningTx}, nil)
-	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos}).
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos, fields.DeletedChildren}).
 		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&ghostTxHash, 0)}}, nil)
 	mockStore.On("GetConflictingChildren", mock.Anything, ghostTxHash).
 		Return(([]chainhash.Hash)(nil), errors.NewTxNotFoundError("%v not found", ghostTxHash))
@@ -977,6 +982,122 @@ func TestGetCounterConflictingTxHashes_ToleratesConfirmedGhostSpender(t *testing
 	mockStore.AssertExpectations(t)
 }
 
+// An absent spender record is not necessarily a ghost: DAH housekeeping reaps
+// mined, fully-spent records too, and marks each reaped child in its surviving
+// parents' deletedChildren map. A spender confirmed absent by the probe but
+// listed there held a settled, mined spend — tolerating it would clear the
+// slot and bless a block that double-spends a settled output. The walk must
+// fail closed instead.
+func TestGetCounterConflictingTxHashes_FailsClosedOnReapedMinedSpender(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	winningTx := createTestTransaction()
+	winningTxHash := createTestHash("winning-tx")
+	parentTxHash := *winningTx.Inputs[0].PreviousTxIDChainHash()
+	reapedTxHash := createTestHash("reaped-mined-spender-tx")
+
+	mockStore.On("Get", mock.Anything, &winningTxHash, []fields.FieldName{fields.Tx}).
+		Return(&meta.Data{Tx: winningTx}, nil)
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos, fields.DeletedChildren}).
+		Return(&meta.Data{
+			SpendingDatas:   []*spend.SpendingData{spend.NewSpendingData(&reapedTxHash, 0)},
+			DeletedChildren: map[chainhash.Hash]bool{reapedTxHash: true},
+		}, nil)
+	mockStore.On("GetConflictingChildren", mock.Anything, reapedTxHash).
+		Return(([]chainhash.Hash)(nil), errors.NewTxNotFoundError("%v not found", reapedTxHash))
+	// the probe confirms the record is gone — but the parent says it was reaped,
+	// not never-created
+	mockStore.On("Get", mock.Anything, &reapedTxHash, []fields.FieldName{fields.Conflicting}).
+		Return(nil, errors.NewTxNotFoundError("%v not found", reapedTxHash))
+
+	result, err := GetCounterConflictingTxHashes(ctx, mockStore, winningTxHash)
+
+	require.Error(t, err)
+	require.Nil(t, result)
+	mockStore.AssertExpectations(t)
+}
+
+// A ghost can also sit one level deeper: a live conflicting loser whose output
+// slot records a spender that has no record (spends applied, record never
+// created). The BFS must skip such a confirmed-absent descendant instead of
+// failing the whole walk with NOT_FOUND — which wedged block validation just
+// like the depth-1 case.
+func TestGetConflictingChildren_ToleratesGhostDescendant(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	rootHash := createTestHash("live-loser-root")
+	ghostChildHash := createTestHash("ghost-descendant")
+
+	bfsFields := []fields.FieldName{fields.Utxos, fields.ConflictingChildren, fields.DeletedChildren}
+
+	mockStore.On("Get", mock.Anything, &rootHash, bfsFields).
+		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&ghostChildHash, 0)}}, nil)
+	mockStore.On("Get", mock.Anything, &ghostChildHash, bfsFields).
+		Return(nil, errors.NewTxNotFoundError("%v not found", ghostChildHash))
+
+	children, err := GetConflictingChildren(ctx, mockStore, rootHash)
+
+	require.NoError(t, err)
+	require.Empty(t, children, "the ghost descendant must not appear in the result")
+	mockStore.AssertExpectations(t)
+}
+
+// An absent descendant listed in its parent's deletedChildren was reaped after
+// being mined — the subtree holds settled history and must not be treated as
+// demotable. The BFS fails closed, mirroring the counter walk's reaped gate.
+func TestGetConflictingChildren_FailsClosedOnReapedDescendant(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	rootHash := createTestHash("live-loser-root")
+	reapedChildHash := createTestHash("reaped-descendant")
+
+	bfsFields := []fields.FieldName{fields.Utxos, fields.ConflictingChildren, fields.DeletedChildren}
+
+	mockStore.On("Get", mock.Anything, &rootHash, bfsFields).
+		Return(&meta.Data{
+			SpendingDatas:   []*spend.SpendingData{spend.NewSpendingData(&reapedChildHash, 0)},
+			DeletedChildren: map[chainhash.Hash]bool{reapedChildHash: true},
+		}, nil)
+	mockStore.On("Get", mock.Anything, &reapedChildHash, bfsFields).
+		Return(nil, errors.NewTxNotFoundError("%v not found", reapedChildHash))
+
+	children, err := GetConflictingChildren(ctx, mockStore, rootHash)
+
+	require.Error(t, err)
+	require.Nil(t, children)
+	mockStore.AssertExpectations(t)
+}
+
+// The cascade discovers children from the SpendingDatas of the records it just
+// marked — which can include a ghost (spends applied, record never created).
+// Feeding the ghost back into SetConflicting would fail NOT_FOUND and wedge
+// the cascade; it must be probed and skipped instead.
+func TestMarkConflictingRecursively_SkipsGhostChild(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	loserHash := createTestHash("live-loser")
+	ghostChildHash := createTestHash("ghost-spending-child")
+
+	loserSpends := []*Spend{{TxID: &loserHash, Vout: 0}}
+	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{loserHash}, true).
+		Return(loserSpends, []chainhash.Hash{ghostChildHash}, nil)
+	// the probe of the discovered child finds no record — a ghost
+	mockStore.On("Get", mock.Anything, &ghostChildHash, []fields.FieldName{fields.Conflicting}).
+		Return(nil, errors.NewTxNotFoundError("%v not found", ghostChildHash))
+
+	spends, markedHashes, err := MarkConflictingRecursively(ctx, mockStore, []chainhash.Hash{loserHash})
+
+	require.NoError(t, err)
+	require.Equal(t, loserSpends, spends)
+	require.Equal(t, []chainhash.Hash{loserHash}, markedHashes,
+		"the ghost child was never marked and must not appear in the marked set")
+	mockStore.AssertExpectations(t)
+}
+
 // A NOT_FOUND out of the BFS does not prove the spender is absent — the walk
 // may have failed on a missing descendant while the spender itself is alive
 // (and possibly mined on our chain). The probe must detect the live spender
@@ -992,7 +1113,7 @@ func TestGetCounterConflictingTxHashes_FailsClosedWhenSpenderAliveAndDescendantM
 
 	mockStore.On("Get", mock.Anything, &winningTxHash, []fields.FieldName{fields.Tx}).
 		Return(&meta.Data{Tx: winningTx}, nil)
-	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos}).
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos, fields.DeletedChildren}).
 		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&spenderTxHash, 0)}}, nil)
 	// the BFS fails on a missing descendant of the (live) spender
 	mockStore.On("GetConflictingChildren", mock.Anything, spenderTxHash).
@@ -1022,7 +1143,7 @@ func TestGetCounterConflictingTxHashes_FailsClosedWhenProbeErrors(t *testing.T) 
 
 	mockStore.On("Get", mock.Anything, &winningTxHash, []fields.FieldName{fields.Tx}).
 		Return(&meta.Data{Tx: winningTx}, nil)
-	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos}).
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos, fields.DeletedChildren}).
 		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&spenderTxHash, 0)}}, nil)
 	mockStore.On("GetConflictingChildren", mock.Anything, spenderTxHash).
 		Return(([]chainhash.Hash)(nil), errors.NewTxNotFoundError("%v not found", spenderTxHash))
@@ -1049,7 +1170,7 @@ func TestGetCounterConflictingTxHashes_FailsClosedOnMissingParent(t *testing.T) 
 
 	mockStore.On("Get", mock.Anything, &winningTxHash, []fields.FieldName{fields.Tx}).
 		Return(&meta.Data{Tx: winningTx}, nil)
-	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos}).
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos, fields.DeletedChildren}).
 		Return(nil, errors.NewTxNotFoundError("%v not found", parentTxHash))
 
 	result, err := GetCounterConflictingTxHashes(ctx, mockStore, winningTxHash)
@@ -1084,7 +1205,7 @@ func TestProcessConflicting_HealsConfirmedGhostSlot(t *testing.T) {
 		Return(&meta.Data{Tx: winningTx, Conflicting: true}, nil)
 	mockStore.On("Get", mock.Anything, &winningTxHash, []fields.FieldName{fields.Tx}).
 		Return(&meta.Data{Tx: winningTx}, nil)
-	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos}).
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos, fields.DeletedChildren}).
 		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{ghostSpendingData}}, nil)
 	mockStore.On("GetConflictingChildren", mock.Anything, ghostTxHash).
 		Return(([]chainhash.Hash)(nil), errors.NewTxNotFoundError("%v not found", ghostTxHash))
@@ -1174,7 +1295,7 @@ func hashSetMatcher(want ...chainhash.Hash) interface{} {
 func stubCounterConflictingWalk(mockStore *MockUtxostore, rootTx *bt.Tx, spenderTxHash chainhash.Hash) {
 	parentTxHash := *rootTx.Inputs[0].PreviousTxIDChainHash()
 
-	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos}).
+	mockStore.On("Get", mock.Anything, &parentTxHash, []fields.FieldName{fields.Utxos, fields.DeletedChildren}).
 		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&spenderTxHash, 0)}}, nil).Once()
 	mockStore.On("GetConflictingChildren", mock.Anything, spenderTxHash).
 		Return([]chainhash.Hash{}, nil).Once()

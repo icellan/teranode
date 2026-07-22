@@ -6,6 +6,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -320,6 +321,10 @@ func TestProcessConflictingRollback_CascadeDescendants(t *testing.T) {
 	descendantSpends := []*Spend{{TxID: &descendantHash, Vout: 0}}
 	mockStore.On("SetConflicting", mock.Anything, hashSetMatcher(conflictingTxHash, losingTxHash), true).
 		Return(losingSpends, []chainhash.Hash{descendantHash}, nil).Once()
+	// the cascade probes each discovered child before recursing (ghost filter);
+	// the descendant is a live record, so the probe finds it
+	mockStore.On("Get", mock.Anything, &descendantHash, []fields.FieldName{fields.Conflicting}).
+		Return(&meta.Data{}, nil).Once()
 	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{descendantHash}, true).
 		Return(descendantSpends, []chainhash.Hash{}, nil).Once()
 

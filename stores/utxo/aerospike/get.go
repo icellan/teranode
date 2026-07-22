@@ -839,6 +839,16 @@ NEXT_BATCH_RECORD:
 
 				items[idx].Data.ConflictingChildren = res
 
+			case fields.DeletedChildren:
+				res, err := processDeletedChildren(bins)
+				if err != nil {
+					items[idx].Err = errors.NewTxInvalidError("could not process deleted children", err)
+
+					continue NEXT_BATCH_RECORD // because there was an error processing the deleted children.
+				}
+
+				items[idx].Data.DeletedChildren = res
+
 			case fields.UnminedSince:
 				unminedSince, ok := bins[key.String()].(int)
 				if ok {
@@ -1142,6 +1152,35 @@ func processConflictingChildren(bins aerospike.BinMap) (conflictingChildren []ch
 	}
 
 	return conflictingChildren, nil
+}
+
+// processDeletedChildren extracts the deletedChildren map from Aerospike bins.
+// The bin is written by the pruner (addDeletedChildren UDF or MapPutItemsOp
+// fallback) and is keyed by the deleted child's txid in hex string form. An
+// absent bin means no child of this record has been reaped.
+func processDeletedChildren(bins aerospike.BinMap) (map[chainhash.Hash]bool, error) {
+	deletedChildrenIfc, ok := bins[fields.DeletedChildren.String()].(map[interface{}]interface{})
+	if !ok {
+		return nil, nil
+	}
+
+	deletedChildren := make(map[chainhash.Hash]bool, len(deletedChildrenIfc))
+
+	for child := range deletedChildrenIfc {
+		childStr, ok := child.(string)
+		if !ok {
+			return nil, errors.NewStorageError("failed to get deleted child")
+		}
+
+		childHash, err := chainhash.NewHashFromStr(childStr)
+		if err != nil {
+			return nil, errors.NewStorageError("failed to parse deleted child hash", err)
+		}
+
+		deletedChildren[*childHash] = true
+	}
+
+	return deletedChildren, nil
 }
 
 // getAllExtraUTXOs retrieves all UTXOs from child records recursively

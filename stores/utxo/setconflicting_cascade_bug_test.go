@@ -5,9 +5,18 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
+
+// expectLiveChildProbe registers the ghost-filter probe MarkConflictingRecursively
+// performs on every discovered spending child, answering that the record exists.
+func expectLiveChildProbe(mockStore *MockUtxostore, childHash *chainhash.Hash) {
+	mockStore.On("Get", mock.Anything, childHash, []fields.FieldName{fields.Conflicting}).
+		Return(&meta.Data{}, nil)
+}
 
 // TestSetConflicting_MustCascadeToChildren verifies that marking a parent tx
 // conflicting via MarkConflictingRecursively also cascades to all spending children.
@@ -21,6 +30,7 @@ func TestSetConflicting_MustCascadeToChildren(t *testing.T) {
 	parentSpends := []*Spend{{TxID: &parentHash, Vout: 0}}
 	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{parentHash}, true).
 		Return(parentSpends, []chainhash.Hash{childHash}, nil)
+	expectLiveChildProbe(mockStore, &childHash)
 
 	childSpends := []*Spend{{TxID: &childHash, Vout: 0}}
 	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{childHash}, true).
@@ -48,6 +58,7 @@ func TestSetConflicting_CallerMustCascade(t *testing.T) {
 
 	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{parentHash}, true).
 		Return([]*Spend{{TxID: &parentHash, Vout: 0}}, []chainhash.Hash{childHash}, nil)
+	expectLiveChildProbe(mockStore, &childHash)
 
 	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{childHash}, true).
 		Return([]*Spend{{TxID: &childHash, Vout: 0}}, []chainhash.Hash{}, nil)
@@ -70,9 +81,11 @@ func TestMarkConflictingRecursively_DoesCascade(t *testing.T) {
 
 	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{parentHash}, true).
 		Return([]*Spend{{TxID: &parentHash, Vout: 0}}, []chainhash.Hash{childHash}, nil)
+	expectLiveChildProbe(mockStore, &childHash)
 
 	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{childHash}, true).
 		Return([]*Spend{{TxID: &childHash, Vout: 0}}, []chainhash.Hash{grandchildHash}, nil)
+	expectLiveChildProbe(mockStore, &grandchildHash)
 
 	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{grandchildHash}, true).
 		Return([]*Spend{{TxID: &grandchildHash, Vout: 0}}, []chainhash.Hash{}, nil)

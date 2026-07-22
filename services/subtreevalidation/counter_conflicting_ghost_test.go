@@ -51,7 +51,7 @@ func TestCheckCounterConflictingOnCurrentChain_ToleratesGhostSpender(t *testing.
 
 	mockStore.On("Get", mock.Anything, hashMatcher(winningTxHash), []fields.FieldName{fields.Tx}).
 		Return(&meta.Data{Tx: winningTx}, nil)
-	mockStore.On("Get", mock.Anything, hashMatcher(parentTxHash), []fields.FieldName{fields.Utxos}).
+	mockStore.On("Get", mock.Anything, hashMatcher(parentTxHash), []fields.FieldName{fields.Utxos, fields.DeletedChildren}).
 		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&ghostTxHash, 0)}}, nil)
 	mockStore.On("GetConflictingChildren", mock.Anything, ghostTxHash).
 		Return(([]chainhash.Hash)(nil), errors.NewTxNotFoundError("%v not found", ghostTxHash))
@@ -63,7 +63,7 @@ func TestCheckCounterConflictingOnCurrentChain_ToleratesGhostSpender(t *testing.
 	// the surviving counter set is just the tx itself
 	mockStore.On("GetMeta", mock.Anything, hashMatcher(winningTxHash), mock.Anything).
 		Return(&meta.Data{}, nil)
-	mockStore.On("Get", mock.Anything, hashMatcher(winningTxHash), []fields.FieldName{fields.Utxos, fields.ConflictingChildren}).
+	mockStore.On("Get", mock.Anything, hashMatcher(winningTxHash), []fields.FieldName{fields.Utxos, fields.ConflictingChildren, fields.DeletedChildren}).
 		Return(&meta.Data{}, nil)
 
 	u := &Server{utxoStore: mockStore}
@@ -88,7 +88,7 @@ func TestCheckCounterConflictingOnCurrentChain_StillRejectsMinedCounter(t *testi
 
 	mockStore.On("Get", mock.Anything, hashMatcher(conflictingTxHash), []fields.FieldName{fields.Tx}).
 		Return(&meta.Data{Tx: conflictingTx}, nil)
-	mockStore.On("Get", mock.Anything, hashMatcher(parentTxHash), []fields.FieldName{fields.Utxos}).
+	mockStore.On("Get", mock.Anything, hashMatcher(parentTxHash), []fields.FieldName{fields.Utxos, fields.DeletedChildren}).
 		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&counterTxHash, 0)}}, nil)
 	mockStore.On("GetConflictingChildren", mock.Anything, counterTxHash).
 		Return([]chainhash.Hash{}, nil)
@@ -99,9 +99,9 @@ func TestCheckCounterConflictingOnCurrentChain_StillRejectsMinedCounter(t *testi
 	mockStore.On("GetMeta", mock.Anything, hashMatcher(counterTxHash), mock.Anything).
 		Return(&meta.Data{BlockIDs: []uint32{7}}, nil)
 
-	mockStore.On("Get", mock.Anything, hashMatcher(conflictingTxHash), []fields.FieldName{fields.Utxos, fields.ConflictingChildren}).
+	mockStore.On("Get", mock.Anything, hashMatcher(conflictingTxHash), []fields.FieldName{fields.Utxos, fields.ConflictingChildren, fields.DeletedChildren}).
 		Return(&meta.Data{}, nil)
-	mockStore.On("Get", mock.Anything, hashMatcher(counterTxHash), []fields.FieldName{fields.Utxos, fields.ConflictingChildren}).
+	mockStore.On("Get", mock.Anything, hashMatcher(counterTxHash), []fields.FieldName{fields.Utxos, fields.ConflictingChildren, fields.DeletedChildren}).
 		Return(&meta.Data{}, nil)
 
 	u := &Server{utxoStore: mockStore}
