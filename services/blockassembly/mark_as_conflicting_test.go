@@ -10,6 +10,8 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
 	"github.com/bsv-blockchain/teranode/settings"
 	utxoStore "github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/mock"
 )
@@ -43,6 +45,13 @@ func TestMarkAsConflicting_EvictsCascadedDescendants(t *testing.T) {
 	// Level 3: grandchild has no children — BFS terminates
 	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{grandchildHash}, true).
 		Return([]*utxoStore.Spend{{TxID: &grandchildHash, Vout: 0}}, []chainhash.Hash{}, nil)
+
+	// MarkConflictingRecursively probes each discovered child before recursing
+	// (the ghost filter); both descendants are live records, so the probe finds them.
+	mockStore.On("Get", mock.Anything, &childHash, []fields.FieldName{fields.Conflicting}).
+		Return(&meta.Data{}, nil)
+	mockStore.On("Get", mock.Anything, &grandchildHash, []fields.FieldName{fields.Conflicting}).
+		Return(&meta.Data{}, nil)
 
 	mockStp := &subtreeprocessor.MockSubtreeProcessor{}
 	mockStp.On("Remove", mock.Anything, parentHash).Return(nil).Once()
