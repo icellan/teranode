@@ -1072,6 +1072,17 @@ func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) (
 				for _, child := range txMeta.ConflictingChildren {
 					if _, ok := visited[child]; !ok {
 						visited[child] = struct{}{}
+
+						// The frozen / coinbase-placeholder sentinel is a record-less
+						// pseudo-hash marking a frozen output. It must stay in the
+						// result set so callers' frozen-child checks fire, but must
+						// never be recursed into: a Get would return NOT_FOUND and the
+						// ghost tolerance would silently swallow it, defeating frozen-tx
+						// rejection during conflict resolution.
+						if child.Equal(subtree.CoinbasePlaceholderHashValue) {
+							continue
+						}
+
 						reapedByParent[child] = txMeta.DeletedChildren[child]
 						nextLevel = append(nextLevel, child)
 					}
@@ -1084,6 +1095,13 @@ func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) (
 						child := *spendingData.TxID
 						if _, ok := visited[child]; !ok {
 							visited[child] = struct{}{}
+
+							// Frozen output sentinel: keep it in the result for the
+							// caller's frozen check, but do not recurse (see above).
+							if child.Equal(subtree.CoinbasePlaceholderHashValue) {
+								continue
+							}
+
 							reapedByParent[child] = txMeta.DeletedChildren[child]
 							nextLevel = append(nextLevel, child)
 						}

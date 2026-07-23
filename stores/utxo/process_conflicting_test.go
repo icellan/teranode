@@ -1071,6 +1071,35 @@ func TestGetConflictingChildren_FailsClosedOnReapedDescendant(t *testing.T) {
 	mockStore.AssertExpectations(t)
 }
 
+// A frozen output records the record-less frozen/coinbase-placeholder sentinel
+// as its spender. The BFS must surface that sentinel in the result set (so the
+// caller's frozen-child check fires) WITHOUT recursing into it — recursing
+// would Get a NOT_FOUND record that the ghost tolerance then silently swallows,
+// defeating frozen-tx rejection during conflict resolution. The absence of any
+// Get stub for the sentinel proves it is never dereferenced: a recursion would
+// panic the mock as an unexpected call.
+func TestGetConflictingChildren_SurfacesFrozenSentinelWithoutRecursing(t *testing.T) {
+	ctx := context.Background()
+	mockStore := &MockUtxostore{}
+
+	rootHash := createTestHash("frozen-loser-root")
+	frozenSentinel := subtree.CoinbasePlaceholderHashValue
+
+	bfsFields := []fields.FieldName{fields.Utxos, fields.ConflictingChildren, fields.DeletedChildren}
+
+	// the live loser's frozen output points at the sentinel
+	mockStore.On("Get", mock.Anything, &rootHash, bfsFields).
+		Return(&meta.Data{SpendingDatas: []*spend.SpendingData{spend.NewSpendingData(&frozenSentinel, 0)}}, nil)
+	// deliberately NO stub for Get(frozenSentinel, ...): it must not be recursed
+
+	children, err := GetConflictingChildren(ctx, mockStore, rootHash)
+
+	require.NoError(t, err)
+	require.Equal(t, []chainhash.Hash{frozenSentinel}, children,
+		"the frozen sentinel must be returned so the caller's frozen check can fire")
+	mockStore.AssertExpectations(t)
+}
+
 // The cascade discovers children from the SpendingDatas of the records it just
 // marked — which can include a ghost (spends applied, record never created).
 // Feeding the ghost back into SetConflicting would fail NOT_FOUND and wedge
