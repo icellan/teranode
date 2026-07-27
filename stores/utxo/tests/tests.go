@@ -100,14 +100,14 @@ func Store(t *testing.T, db utxostore.Store) {
 	require.Equal(t, testSpend0.TxID.String(), resp.Tx.TxID())
 
 	_, _, err = db.SpendAndCreate(context.Background(), Tx, 1000, utxostore.WithCreateOnly())
-	require.Error(t, err, errors.ErrTxExists)
+	require.ErrorIs(t, err, errors.ErrTxExists)
 
 	_ = spendTx.Inputs[0].PreviousTxIDAdd(Tx.TxIDChainHash())
 	_, _, err = db.SpendAndCreate(context.Background(), spendTx, db.GetBlockHeight()+1, utxostore.WithSpendOnly())
 	require.NoError(t, err)
 
 	_, _, err = db.SpendAndCreate(context.Background(), Tx, 1000, utxostore.WithCreateOnly())
-	require.Error(t, err, errors.ErrSpent)
+	require.ErrorIs(t, err, errors.ErrTxExists)
 }
 
 func Spend(t *testing.T, db utxostore.Store) {

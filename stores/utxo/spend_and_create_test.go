@@ -116,12 +116,41 @@ func TestSequentialSpendAndCreate(t *testing.T) {
 			createErr: errors.NewProcessingError("create blew up"),
 		}
 
-		md, _, err := SequentialSpendAndCreate(ctx, logger, f, tx, 100)
+		md, spends, err := SequentialSpendAndCreate(ctx, logger, f, tx, 100)
 		require.ErrorIs(t, err, errors.ErrProcessing)
 		require.Nil(t, md)
+		require.Nil(t, spends, "rolled-back spends must not be returned as live")
 		require.Equal(t, 1, f.unspendCalls)
 		require.Same(t, f.spends[0], f.unspentWith[0])
 		require.Len(t, f.unspentWith, 2)
+	})
+
+	t.Run("create-only create failure never touches Unspend", func(t *testing.T) {
+		f := &fakeSequentialStore{
+			createErr: errors.NewProcessingError("create blew up"),
+		}
+
+		_, spends, err := SequentialSpendAndCreate(ctx, logger, f, tx, 100, WithCreateOnly())
+		require.ErrorIs(t, err, errors.ErrProcessing)
+		require.Nil(t, spends)
+		require.Equal(t, 0, f.spendCalls)
+		require.Equal(t, 0, f.unspendCalls)
+	})
+
+	t.Run("rollback backoff aborts when the context is cancelled", func(t *testing.T) {
+		cancelledCtx, cancel := context.WithCancel(ctx)
+		cancel()
+
+		f := &fakeSequentialStore{
+			spends:      []*Spend{{}},
+			createErr:   errors.NewProcessingError("create blew up"),
+			unspendErrs: []error{errors.NewStorageError("t1")},
+		}
+
+		_, _, err := SequentialSpendAndCreate(cancelledCtx, logger, f, tx, 100)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "context cancelled")
+		require.Equal(t, 1, f.unspendCalls)
 	})
 
 	t.Run("create ErrTxExists keeps the spends in place", func(t *testing.T) {

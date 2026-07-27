@@ -19,17 +19,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// spendRetrySpyStore wraps NullStore; SpendAndCreate behaviour is scripted per tx hash.
+// spendRetrySpyStore wraps NullStore; spend-phase SpendAndCreate behaviour is
+// scripted per tx hash, while create-phase calls fall through to NullStore so
+// the create leg of createAndSpendUTXOsForBatch stays exercised.
 type spendRetrySpyStore struct {
 	*nullstore.NullStore
 	mu sync.Mutex
-	// failuresLeft[txid] = how many times SpendAndCreate should fail with failErr[txid]
+	// failuresLeft[txid] = how many times a spend-phase call should fail with failErr[txid]
 	failuresLeft map[chainhash.Hash]int
 	failErr      map[chainhash.Hash]error
 	spendCalls   atomic.Int64
 }
 
-func (s *spendRetrySpyStore) SpendAndCreate(_ context.Context, tx *bt.Tx, _ uint32, _ ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
+func (s *spendRetrySpyStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
+	options, err := utxo.ParseCreateOptions(opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if options.CreateOnly {
+		return s.NullStore.SpendAndCreate(ctx, tx, blockHeight, opts...)
+	}
+
 	s.spendCalls.Add(1)
 	h := *tx.TxIDChainHash()
 	s.mu.Lock()

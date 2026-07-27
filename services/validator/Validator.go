@@ -913,6 +913,14 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 				return txMetaData, err
 			}
 		} else if errors.Is(err, errors.ErrTxNotFound) {
+			// PHASE ASSUMPTION: this branch (and the ErrUtxoError branch above) assumes the
+			// error originated in the SPEND phase of SpendAndCreate — today no create path
+			// emits ErrTxNotFound or ErrUtxoError, and no spend path emits ErrTxExists.
+			// An atomic SpendAndCreate implementation (Postgres tx, Aerospike-native) whose
+			// create phase can surface ErrTxNotFound (e.g. an internal parent lookup) MUST
+			// NOT let it escape untagged, or a failed create gets misread here as a
+			// DAH-evicted parent and the tx is wrongly treated as blessed.
+			//
 			// The parent transaction was not found. This can legitimately happen when the parent has been DAH-evicted
 			// long after the child was mined. Only short-circuit if the stored metadata confirms prior full validation:
 			//   - tx has been included in at least one block (BlockIDs non-empty), AND
@@ -1519,7 +1527,12 @@ func (v *Validator) sendTxMetaBatchV2(batch []*txmetaBatchItem) {
 // spends via outpoint lookup without a UTXO-hash comparison.
 func (v *Validator) spendAndCreateInUtxoStore(ctx context.Context, tx *bt.Tx, blockHeight uint32,
 	addToBlockAssembly bool, validationOptions *Options) (*meta.Data, []*utxo.Spend, error) {
-	ctx, span, deferFn := tracing.Tracer("validator").Start(ctx, "spendUtxos",
+	// NOTE: prometheusTransactionSpendUtxos keeps its name for dashboard
+	// continuity but now measures the combined spend+create (and any rollback),
+	// not just the spend. The primary path no longer records
+	// prometheusValidatorSetTxMeta (storeTxInUtxoMap) — that histogram only sees
+	// the conflicting-fallback create via CreateInUtxoStore.
+	ctx, span, deferFn := tracing.Tracer("validator").Start(ctx, "spendAndCreateUtxos",
 		tracing.WithHistogram(prometheusTransactionSpendUtxos),
 	)
 	defer deferFn()

@@ -335,7 +335,9 @@ func WithIgnoreLocked(b bool) CreateOption {
 
 // WithSkipUTXOHashCheck disables the per-input utxo-hash integrity comparison in
 // the spend phase of SpendAndCreate. Set ONLY on the gated below-checkpoint
-// outpoint-only path (see IgnoreFlags.SkipUTXOHashCheck).
+// outpoint-only path (see IgnoreFlags.SkipUTXOHashCheck). The Aerospike store
+// does not implement the outpoint-only fast path and treats this flag as a
+// no-op (see SupportsOutpointOnlySpend).
 func WithSkipUTXOHashCheck(b bool) CreateOption {
 	return func(o *CreateOptions) {
 		o.IgnoreFlags.SkipUTXOHashCheck = b
@@ -436,6 +438,12 @@ type Store interface {
 	//     flows whose outputs are created elsewhere). Returned *meta.Data is nil.
 	//   - On spend failure the returned []*Spend carries per-input Err values for
 	//     caller inspection (conflict detection).
+	//   - When the create phase fails and the spends were rolled back, the
+	//     returned []*Spend is nil; a non-nil slice alongside a non-nil error
+	//     means the spends are still in effect (ErrTxExists, or rollback failure).
+	//   - Transactions with no inputs to spend (synthesized seed txs) must pass
+	//     WithCreateOnly(); backend behaviour for a default-mode spend of a
+	//     zero-input tx is undefined.
 	SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...CreateOption) (*meta.Data, []*Spend, error)
 
 	// Unspend reverses a previous spend operation, marking UTXOs as unspent.

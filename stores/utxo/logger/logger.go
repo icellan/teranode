@@ -167,14 +167,38 @@ func (s *Store) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint3
 	}
 
 	if !skipLogging {
+		inputDetails := make([]string, len(tx.Inputs))
+
+		for i, input := range tx.Inputs {
+			inputDetails[i] = fmt.Sprintf("{Input %d: PreviousTxID %s, PreviousTxOutIndex %d, SequenceNumber %d}",
+				i, input.PreviousTxIDChainHash(), input.PreviousTxOutIndex, input.SequenceNumber)
+		}
+
+		outputDetails := make([]string, len(tx.Outputs))
+
+		for i, output := range tx.Outputs {
+			outputDetails[i] = fmt.Sprintf("{Output %d: Satoshis %d}",
+				i, output.Satoshis)
+		}
+
 		spendDetails := make([]string, len(spends))
 
 		for i, spend := range spends {
 			spendDetails[i] = fmt.Sprintf("{SpendingData: %v, TxID: %s, Vout: %d}", spend.SpendingData, spend.TxID, spend.Vout)
 		}
 
-		s.logger.Debugf("[UTXOStore][logger][SpendAndCreate] tx %s, blockHeight %d, spends: [%s], data %v, err %v : %s",
-			tx.TxIDChainHash(), blockHeight, strings.Join(spendDetails, ", "), data, err, caller())
+		s.logger.Debugf("[UTXOStore][logger][SpendAndCreate] tx %s, inputs: [%s], outputs: [%s], spends: [%s], isCoinbase %t, blockHeight %d, lockTime %d, version %d, data %v, err %v : %s",
+			tx.TxIDChainHash(),
+			strings.Join(inputDetails, ", "),
+			strings.Join(outputDetails, ", "),
+			strings.Join(spendDetails, ", "),
+			tx.IsCoinbase(),
+			blockHeight,
+			tx.LockTime,
+			tx.Version,
+			data,
+			err,
+			caller())
 	}
 
 	return data, spends, err

@@ -52,7 +52,7 @@ func TestHTTPEndpoints(t *testing.T) {
 		}
 		utxoMock.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(metaData, nil)
 
-		// Mock the Spend method with empty slice of *utxo.Spend for the return value
+		// Mock the SpendAndCreate method with empty slice of *utxo.Spend for the return value
 		utxoMock.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, []*utxo.Spend{}, nil)
 
 		// Create a new server
@@ -107,7 +107,7 @@ func TestHTTPEndpoints(t *testing.T) {
 		}
 		utxoMock.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(metaData, nil)
 
-		// Mock the Spend method with empty slice of *utxo.Spend for the return value
+		// Mock the SpendAndCreate method with empty slice of *utxo.Spend for the return value
 		utxoMock.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil, []*utxo.Spend{}, nil)
 
 		// Create a new server

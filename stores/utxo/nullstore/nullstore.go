@@ -169,21 +169,15 @@ func (m *NullStore) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ig
 
 // SpendAndCreate implements utxo.Store as a no-op combination of Spend and Create.
 func (m *NullStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, blockHeight uint32, opts ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
-	options := &utxo.CreateOptions{}
-	for _, opt := range opts {
-		opt(options)
-	}
-
-	if options.CreateOnly && options.SpendOnly {
-		return nil, nil, errors.NewInvalidArgumentError("SpendAndCreate: WithCreateOnly and WithSpendOnly are mutually exclusive")
+	options, err := utxo.ParseCreateOptions(opts...)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	var spends []*utxo.Spend
 
 	if !options.CreateOnly {
-		var err error
-
-		spends, err = m.Spend(ctx, tx, blockHeight)
+		spends, err = m.Spend(ctx, tx, blockHeight, options.IgnoreFlags)
 		if err != nil {
 			return nil, spends, err
 		}
