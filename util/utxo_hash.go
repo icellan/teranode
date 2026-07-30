@@ -49,6 +49,15 @@ func UTXOHashFromInput(input *bt.Input) (*chainhash.Hash, error) {
 }
 
 // UTXOHashFromOutput returns the hash of the UTXO for the given output.
+//
+// output may be nil: the UTXO store encodes "this output is not a live UTXO" as a
+// nil entry in the output vector, so callers resolving an index they did not
+// choose can legitimately arrive here with one. Reject it rather than letting the
+// field access fault before UTXOHashInto's own nil check can report it.
 func UTXOHashFromOutput(hash *chainhash.Hash, output *bt.Output, vOut uint32) (*chainhash.Hash, error) {
+	if output == nil {
+		return nil, errors.NewProcessingError("output is nil")
+	}
+
 	return UTXOHash(hash, vOut, output.LockingScript, output.Satoshis)
 }
