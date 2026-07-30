@@ -169,6 +169,12 @@ func (h *HTTP) getUTXOsByTxID(c echo.Context, mode ReadMode) error {
 
 	g, ctx := errgroup.WithContext(c.Request().Context())
 
+	// Bound the fan-out. The output count comes from the requested transaction,
+	// so an unbounded errgroup spawns one goroutine per output — a single request
+	// for a tx with a very large output set is enough to exhaust the process.
+	// Mirrors GetUTXOs, which caps at the same limit.
+	util.SafeSetLimit(h.logger, g, utxosFanoutLimit)
+
 	// Create a channel to receive the results from the goroutines
 	// that will be created.
 	utxos := make([]*UTXOItem, len(tx.Outputs))
@@ -177,7 +183,17 @@ func (h *HTTP) getUTXOsByTxID(c echo.Context, mode ReadMode) error {
 	for i, output := range tx.Outputs {
 		safeI, safeOutput := i, output
 
-		g.Go(func() error {
+		g.Go(func() (retErr error) {
+			// Echo's middleware.Recover only protects the request goroutine — not
+			// the ones errgroup spawns. Without this defer a per-output panic deep
+			// in a store driver would crash the asset process.
+			defer func() {
+				if r := recover(); r != nil {
+					h.logger.Errorf("[Asset_http:GetUTXOsByTxID] recovered panic on %s:%d: %v", hash.String(), safeI, r)
+					retErr = echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("internal error getting utxo %s:%d", hash.String(), safeI).Error())
+				}
+			}()
+
 			// Get the UTXOHash for this output.
 			//nolint:gosec
 			utxoHash, err := util.UTXOHash(hash, uint32(safeI), safeOutput.LockingScript, safeOutput.Satoshis)
