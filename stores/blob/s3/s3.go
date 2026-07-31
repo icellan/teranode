@@ -28,13 +28,13 @@ import (
 	"net/url"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
@@ -363,11 +363,11 @@ func (g *S3) GetIoReader(ctx context.Context, key []byte, fileType fileformat.Fi
 		Key:    objectKey,
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "NoSuchKey") {
+		if isMissingObject(err) {
 			return nil, errors.ErrNotFound
 		}
 
-		return nil, errors.NewStorageError("[S3][GetIoReader] [%s/%s] failed to get s3 data", g.bucket, objectKey, err)
+		return nil, errors.NewStorageError("[S3][GetIoReader] [%s/%s] failed to get s3 data", g.bucket, aws.ToString(objectKey), err)
 	}
 
 	// Consume the fileformat.Header before returning the rest of the stream.
@@ -414,12 +414,12 @@ func (g *S3) Get(ctx context.Context, key []byte, fileType fileformat.FileType, 
 		Key:    objectKey,
 	})
 	if err != nil {
-		if strings.Contains(err.Error(), "NoSuchKey") {
+		if isMissingObject(err) {
 			span.RecordError(errors.ErrNotFound)
 			return nil, errors.ErrNotFound
 		}
 
-		err = errors.NewStorageError("[S3] [%s/%s] failed to get data", g.bucket, objectKey, err)
+		err = errors.NewStorageError("[S3] [%s/%s] failed to get data", g.bucket, aws.ToString(objectKey), err)
 		span.RecordError(err)
 
 		return nil, err
@@ -441,6 +441,43 @@ func (g *S3) Get(ctx context.Context, key []byte, fileType fileformat.FileType, 
 	return content, err
 }
 
+// isMissingObject reports whether err means "this object is not in the bucket",
+// as opposed to a store failure.
+//
+// S3 surfaces a missing object three ways: a typed *types.NoSuchKey, a typed
+// *types.NotFound, and — in the configurations affected by
+// aws/aws-sdk-go-v2#2084 — a generic API error whose code is NotFound and whose
+// message never mentions NoSuchKey. All three must map to ErrNotFound, because
+// callers use that distinction to decide control flow: stores/utxo/aerospike
+// falls back to the UTXO-set .outputs blob only on a genuine miss, so an
+// unrecognised miss reads as a store failure and aborts an operation that should
+// have succeeded. Equally, a real failure must not be reported as a miss, or
+// that same fallback silently masks an outage.
+func isMissingObject(err error) bool {
+	var (
+		noSuchKey *types.NoSuchKey
+		notFound  *types.NotFound
+	)
+
+	if errors.As(err, &noSuchKey) || errors.As(err, &notFound) {
+		return true
+	}
+
+	// String matching is the fallback for the SDK bug above, where neither typed
+	// error is returned. Anchor on the API error code rather than scanning the
+	// whole message, so an unrelated error that merely mentions NotFound in a
+	// message body is not mistaken for a miss.
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchKey", "NotFound":
+			return true
+		}
+	}
+
+	return false
+}
+
 func (g *S3) Exists(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (bool, error) {
 	ctx, span, endSpan := tracing.Tracer("s3").Start(ctx, "s3:Exists")
 	defer endSpan()
@@ -460,18 +497,11 @@ func (g *S3) Exists(ctx context.Context, key []byte, fileType fileformat.FileTyp
 		Key:    objectKey,
 	})
 	if err != nil {
-		// there was a bug in the s3 library
-		// https://github.com/aws/aws-sdk-go-v2-v2/issues/2084
-		if strings.Contains(err.Error(), "NotFound") {
+		if isMissingObject(err) {
 			return false, nil
 		}
 
-		var noSuchKey *types.NoSuchKey
-		if errors.As(err, &noSuchKey) {
-			return false, nil
-		}
-
-		err = errors.NewStorageError("[S3] [%s/%s] failed to check whether object exists", g.bucket, objectKey, err)
+		err = errors.NewStorageError("[S3] [%s/%s] failed to check whether object exists", g.bucket, aws.ToString(objectKey), err)
 		span.RecordError(err)
 
 		return false, err

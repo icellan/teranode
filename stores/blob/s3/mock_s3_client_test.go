@@ -16,9 +16,16 @@ import (
 )
 
 type mockS3Client struct {
-	mu            sync.RWMutex
-	store         map[string][]byte
+	mu    sync.RWMutex
+	store map[string][]byte
+
 	headObjectErr error
+
+	// getObjectMissErr overrides the error returned for a key that is not in the
+	// store, so a test can reproduce how the real SDK renders a 404 in the
+	// configurations affected by aws/aws-sdk-go-v2#2084 (as NotFound rather than
+	// NoSuchKey).
+	getObjectMissErr error
 }
 
 func newMockS3Client() S3Client {
@@ -52,6 +59,10 @@ func (m *mockS3Client) GetObject(ctx context.Context, input *s3.GetObjectInput) 
 
 	data, ok := m.store[key]
 	if !ok {
+		if m.getObjectMissErr != nil {
+			return nil, m.getObjectMissErr
+		}
+
 		return nil, &types.NoSuchKey{}
 	}
 

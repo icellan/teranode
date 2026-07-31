@@ -1647,6 +1647,29 @@ func (s *Store) GetTxFromExternalStore(ctx context.Context, previousTxHash chain
 	return s.getExternalTransaction(ctx, previousTxHash)
 }
 
+// getExternalTransaction reads an externally-stored transaction, falling back to
+// the UTXO-set (.outputs) representation when the full transaction was never
+// stored.
+//
+// The two representations are not interchangeable, and the caller decides which
+// it can accept:
+//
+//   - .tx is the transaction, byte-faithful.
+//   - .outputs is a UTXO-set snapshot, written by create.go for an input-less
+//     transaction (cmd/seeder bootstrapping from a snapshot). It retains only the
+//     outputs that were live at snapshot time — no inputs, no version, no
+//     locktime, and no record that a spent output ever existed — so the result
+//     has nil entries at the missing indexes and does not hash to its own txid.
+//
+// The fallback exists for getExternalOutpoints, which needs only the satoshis and
+// script at a specific live index and is nil-tolerant. Callers that intend to
+// serialize the result must first reject the nil entries and confirm the tx
+// hashes to the txid they asked for; the reconstruction satisfies neither.
+//
+// The fallback is taken only when the .tx blob is genuinely absent. Any other
+// failure is returned as-is: substituting a snapshot-derived reconstruction for a
+// transaction the store merely failed to read would turn a transient outage into
+// a silently wrong answer.
 func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chainhash.Hash) (*bt.Tx, error) {
 	fileType := fileformat.FileTypeTx
 
@@ -1654,11 +1677,26 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 	// This saves ~50% memory by eliminating the intermediate txBytes buffer
 	reader, err := s.externalStore.GetIoReader(ctx, previousTxHash[:], fileType)
 	if err != nil {
-		// Try to get the data from an output file instead
+		if !errors.Is(err, errors.ErrNotFound) && !errors.Is(err, errors.ErrBlobNotFound) {
+			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] could not get tx from external store", previousTxHash.String(), err)
+		}
+
+		// The full transaction is not stored — fall back to the UTXO-set
+		// representation. Read it directly rather than probing with Exists first:
+		// on a snapshot-seeded node this is the normal path, not the exceptional
+		// one, so a third blob round-trip per read is not worth paying to learn
+		// something the read itself reports.
 		fileType = fileformat.FileTypeOutputs
 
 		reader, err = s.externalStore.GetIoReader(ctx, previousTxHash[:], fileType)
 		if err != nil {
+			// Neither representation is stored. Distinguish that from a failure to
+			// read the one that is, so the caller can tell "this node does not
+			// have it" from "this node could not look".
+			if errors.Is(err, errors.ErrNotFound) || errors.Is(err, errors.ErrBlobNotFound) {
+				return nil, errors.NewTxNotFoundError("[GetTxFromExternalStore][%s] neither tx nor outputs are stored externally", previousTxHash.String(), err)
+			}
+
 			return nil, errors.NewStorageError("[GetTxFromExternalStore][%s] could not get tx from external store", previousTxHash.String(), err)
 		}
 	}
