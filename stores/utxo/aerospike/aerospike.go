@@ -222,11 +222,22 @@ type Store struct {
 	lockedBatcher       batcherIfc[batchLocked]
 	externalStore       blob.Store
 	utxoBatchSize       int
-	externalTxCache     *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
-	externalStoreSem    chan struct{} // Semaphore to limit concurrent external storage operations
-	indexMutex          sync.Mutex    // Mutex for index creation operations
-	indexOnce           sync.Once     // Ensures index creation/wait is only done once per process
-	spendLuaPackages    []string      // Pre-initialized array of Lua package names for spend operations
+
+	// externalTxCache caches the full externally-stored transaction, as returned
+	// by GetTxFromExternalStore.
+	externalTxCache *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
+
+	// externalOutpointsCache caches the outpoint-resolution reconstruction, as
+	// returned by GetOutpointsFromExternalStore. It MUST stay separate from
+	// externalTxCache: that reconstruction has its inputs stripped and its
+	// era-unspendable outputs nil'd, so sharing one cache under the txid key lets
+	// whichever reader arrives first hand the other the wrong shape.
+	externalOutpointsCache *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
+
+	externalStoreSem chan struct{} // Semaphore to limit concurrent external storage operations
+	indexMutex       sync.Mutex    // Mutex for index creation operations
+	indexOnce        sync.Once     // Ensures index creation/wait is only done once per process
+	spendLuaPackages []string      // Pre-initialized array of Lua package names for spend operations
 
 	// batchKeysPool is a per-Store sync.Pool of *[]*aerospike.Key slices reused
 	// across SetMinedMulti calls. Per-Store scoping ensures the Key's intrinsic
@@ -318,9 +329,16 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// the external tx cache is used to cache externally stored transactions for a short time after being read from
 	// the store. Transactions with lots of outputs, being spent at the same time, benefit greatly from this cache,
 	// since external cache takes care of concurrent reads to the same transaction.
-	var externalTxCache *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
+	//
+	// Two separate instances, keyed the same way but never shared: the full
+	// transaction and the outpoint-resolution reconstruction are different shapes
+	// for the same txid, and one cache would let either reader receive the other's
+	// value. See the field comments on Store.
+	var externalTxCache, externalOutpointsCache *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
+
 	if tSettings.UtxoStore.UseExternalTxCache {
 		externalTxCache = util.NewExpiringConcurrentCache[chainhash.Hash, *bt.Tx](10 * time.Second)
+		externalOutpointsCache = util.NewExpiringConcurrentCache[chainhash.Hash, *bt.Tx](10 * time.Second)
 	}
 
 	// Initialize external store semaphore if concurrency limit is set
@@ -337,12 +355,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 		setName:   setName,
 		logger:    logger,
 
-		settings:         tSettings,
-		externalStore:    externalStore,
-		utxoBatchSize:    utxoBatchSize,
-		externalTxCache:  externalTxCache,
-		externalStoreSem: externalStoreSem,
-		batcherWait:      batcherWaitTimeout(tSettings),
+		settings:               tSettings,
+		externalStore:          externalStore,
+		utxoBatchSize:          utxoBatchSize,
+		externalTxCache:        externalTxCache,
+		externalOutpointsCache: externalOutpointsCache,
+		externalStoreSem:       externalStoreSem,
+		batcherWait:            batcherWaitTimeout(tSettings),
 	}
 
 	// Initialize spendLuaPackages array with configurable count
