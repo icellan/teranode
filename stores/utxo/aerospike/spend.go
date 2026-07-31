@@ -462,11 +462,15 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// untouched, since the dispatcher may still be writing to it.
 		result := s.resolveSpendCompletions(ctx, tx, items, true)
 
-		// Roll back the spends we know completed. This path is the strictest case
-		// for the atomicity contract in rollbackPartialSpends: we return nil
-		// spends (the in-flight slots are unsafe to hand back), so the caller has
-		// no handle on the applied spends and could not roll them back itself
-		// even if it wanted to.
+		// Roll back the spends we know completed. This is the WEAKEST case for
+		// the atomicity contract, not the strictest: onlyCompleted=true above
+		// excludes every item whose published flag is not yet set, but the
+		// dispatcher runs on s.ctx (not this now-dead caller ctx) and keeps
+		// writing to those items after we return here, so a straggler that later
+		// succeeds is never rolled back by this call. prometheusUtxoSpendAbortInFlight
+		// counts those skipped items so this residual window is measurable
+		// rather than invisible; closing it needs attempt identity or
+		// create-before-spend ordering, tracked in #1291.
 		s.rollbackPartialSpends(tx, result, "batched mode, after wait error")
 
 		// Do NOT return the live spends slice on the abort path: items still
@@ -519,13 +523,104 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 
 // spendCompletionResult is the outcome of resolveSpendCompletions: which
 // spends succeeded, plus a memo of the "does the spending tx already have a
-// record?" lookup so the rollback decision can reuse it (see
-// rollbackPartialSpends).
+// record?" lookup used only by resolveSpendCompletions' own loop, so a
+// determinate answer within one batch is not looked up twice.
+// rollbackPartialSpends does NOT read this memo — it always issues its own
+// fresh probe (see rollbackPartialSpends for why).
 type spendCompletionResult struct {
 	spentSpends []*utxo.Spend
 
 	spenderChecked bool
 	spenderExists  bool
+
+	// sawTransientLock records that at least one completed spend failed with
+	// ErrTxLocked, which suppresses the rollback (see hasTransientLockFailure).
+	sawTransientLock bool
+}
+
+// rollbackDecision is what the spender-existence probe implies for the spends
+// that succeeded in a failed batch.
+type rollbackDecision int
+
+const (
+	// rollbackFire: the spender has no record, so the successful spends are
+	// dangling refs and must be reverted.
+	rollbackFire rollbackDecision = iota
+	// rollbackSkipSpenderExists: the spender has a record, so the refs are not
+	// dangling and the slots belong to a live tx — leave them alone.
+	rollbackSkipSpenderExists
+	// rollbackSkipIndeterminate: the probe itself failed, so we do not know.
+	// Skip: wrongly clearing a live spender's slot is unrecoverable, while a
+	// surviving dangling ref is at least counted here.
+	rollbackSkipIndeterminate
+	// rollbackSkipTransientLock: at least one spend failed with ErrTxLocked, so a
+	// concurrent attempt at this same txid may be succeeding right now and may
+	// legitimately own the slots we would clear. See hasTransientLockFailure.
+	rollbackSkipTransientLock
+)
+
+// String doubles as the "outcome" label value on
+// prometheusUtxoPartialSpendRollbacks.
+func (d rollbackDecision) String() string {
+	switch d {
+	case rollbackSkipSpenderExists:
+		return "spender_exists"
+	case rollbackSkipIndeterminate:
+		return "indeterminate"
+	case rollbackSkipTransientLock:
+		return "transient_lock"
+	default:
+		return "fired"
+	}
+}
+
+// hasTransientLockFailure reports whether any spend failed with ErrTxLocked.
+//
+// ErrTxLocked is the one failure class that means "try again in a moment": the
+// parent's record is locked only for the two-phase-commit window between its own
+// create and its block-assembly ack, which is milliseconds. A concurrent attempt
+// at the SAME txid (duplicate relay, or a second validator pod behind the same
+// store) can therefore be spending those very inputs successfully while this
+// attempt sees the lock — and because SpendingData is just {TxID, Vin} with no
+// attempt identity, a rollback here cannot tell that winner's slots from its own
+// and would clear them, leaving a live or mined transaction whose input reads
+// unspent. That is the inverse of #1214 and worse: the node would go on to accept
+// and mine a double-spend.
+//
+// So we leave the partial spends in place for this class and accept that the
+// ErrTxLocked flavour of the #1214 dangling ref is not fixed by this rollback.
+// Covering it needs ordering that makes the record exist before any spend
+// (create-first, #1355) or attempt identity in the stored spending data (#1291);
+// neither belongs in an error-path rollback.
+//
+// Every other class is safe to roll back: either this txid can never win (spent,
+// conflicting, frozen, hash mismatch) so no concurrent attempt at it can be a
+// legitimate owner, or the failure is not a "someone else may be winning right
+// now" state at all (missing parent, infrastructure errors).
+func hasTransientLockFailure(spends []*utxo.Spend) bool {
+	for _, spend := range spends {
+		if spend != nil && spend.Err != nil && errors.Is(spend.Err, errors.ErrTxLocked) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// decideRollback maps the existence probe's error to a rollback decision. Only
+// a definitive "not found" authorises reverting the spends: any other error
+// means the answer is unknown, and an unknown answer must not clear a slot that
+// a live spender may own. Kept separate from rollbackPartialSpends so the three
+// branches are unit-testable without faulting a live store's Get.
+func decideRollback(getErr error) rollbackDecision {
+	switch {
+	case getErr == nil:
+		return rollbackSkipSpenderExists
+	case errors.Is(getErr, errors.ErrTxNotFound):
+		return rollbackFire
+	default:
+		return rollbackSkipIndeterminate
+	}
 }
 
 // rollbackPartialSpends undoes the spends that succeeded in a batch that failed
@@ -550,36 +645,93 @@ type spendCompletionResult struct {
 // same-spender idempotency check, so re-validating an existing tx can fail on
 // one parent while succeeding on another.
 //
-// An indeterminate lookup (any error other than "not found") skips the rollback:
-// wrongly clearing a live spender's slot is worse than leaving a ref that the
-// consistency scan can still find.
+// An indeterminate lookup (any error other than "not found") skips the
+// rollback: wrongly clearing a live spender's slot is unrecoverable, whereas a
+// surviving dangling ref is at least detectable afterwards via the
+// "indeterminate" outcome on prometheusUtxoPartialSpendRollbacks below — no
+// automated detector for it exists yet.
 func (s *Store) rollbackPartialSpends(tx *bt.Tx, result *spendCompletionResult, phase string) {
 	if len(result.spentSpends) == 0 {
 		return
 	}
 
-	if !result.spenderChecked {
-		if _, getErr := s.Get(context.Background(), tx.TxIDChainHash()); getErr == nil {
-			result.spenderExists = true
-		} else if !errors.Is(getErr, errors.ErrTxNotFound) {
-			s.logger.Errorf("[SPEND][%s] cannot determine whether spender exists, skipping rollback of %d partial spend(s) (%s): %v",
-				tx.TxID(), len(result.spentSpends), phase, getErr)
-
-			return
+	// A transient lock means a concurrent attempt at this same txid may be the
+	// legitimate owner of these slots, and nothing in the stored spending data
+	// lets a rollback tell the two apart — so do not touch them. See
+	// hasTransientLockFailure for why this class is excluded and what covers it.
+	if result.sawTransientLock {
+		if prometheusUtxoPartialSpendRollbacks != nil {
+			prometheusUtxoPartialSpendRollbacks.WithLabelValues(rollbackSkipTransientLock.String()).Inc()
 		}
 
-		result.spenderChecked = true
-	}
-
-	if result.spenderExists {
 		return
 	}
 
-	// Unspend is ownership-checked (teranode.lua only clears spending_data it
-	// still owns), so this can never wipe another tx's spend.
-	if unspendErr := s.Unspend(context.Background(), result.spentSpends); unspendErr != nil {
-		s.logger.Errorf("error in aerospike unspend (%s): %v", phase, unspendErr)
+	// Always probe fresh here rather than reusing resolveSpendCompletions'
+	// memo: that memo answers a different question (the ErrTxNotFound
+	// "already blessed" fallback), taken under a different ctx, potentially
+	// many round trips earlier. A stale "absent" answer reused here is
+	// exactly what would let this rollback clear a live spender's slot.
+	//
+	// The rollback context is deliberately detached from BOTH the caller's ctx
+	// (already canceled/dead on the abort path this is called from) and s.ctx,
+	// but bounded so a wedged store cannot pin this goroutine forever.
+	//
+	// Not s.ctx: it is canceled when the store shuts down, which would make the
+	// probe below fail as "indeterminate" and skip the rollback altogether —
+	// leaving the dangling refs this function exists to prevent, exactly when a
+	// shutdown races in-flight spends. Cleanup of writes we already made has to
+	// outlive the store's own context; the timeout is what keeps that bounded.
+	rbTimeout := s.settings.UtxoStore.SpendWaitTimeout
+	if rbTimeout <= 0 {
+		rbTimeout = 30 * time.Second
 	}
+
+	rbCtx, cancel := context.WithTimeout(context.Background(), rbTimeout)
+	defer cancel()
+
+	_, getErr := s.Get(rbCtx, tx.TxIDChainHash(), fields.Fee)
+
+	decision := decideRollback(getErr)
+
+	if prometheusUtxoPartialSpendRollbacks != nil {
+		prometheusUtxoPartialSpendRollbacks.WithLabelValues(decision.String()).Inc()
+	}
+
+	switch decision {
+	case rollbackSkipSpenderExists:
+		return
+	case rollbackSkipIndeterminate:
+		s.logger.Errorf("[SPEND][%s] cannot determine whether spender exists, skipping rollback of %d partial spend(s) (%s): %v",
+			tx.TxID(), len(result.spentSpends), phase, getErr)
+
+		return
+	case rollbackFire:
+	}
+
+	// Unspend is ownership-checked (teranode.lua only clears spending_data it
+	// still owns), which stops this from wiping a *different* tx's spend. It
+	// does not answer the question that matters here: SpendingData is just
+	// {TxID, Vin} (stores/utxo/spend/spending_data.go), with no attempt
+	// identity, so the check cannot distinguish two concurrent attempts that
+	// both spend as the SAME txid. A check-then-act window therefore remains
+	// between the probe above and this call. Closing it needs attempt
+	// identity, or creating the spending tx's record before spending its
+	// parents — tracked in #1291; the outcome metrics here make the residual
+	// window measurable in the meantime.
+	unspendErr := s.Unspend(rbCtx, result.spentSpends)
+	if unspendErr != nil {
+		if prometheusUtxoSpendRollbackFailed != nil {
+			prometheusUtxoSpendRollbackFailed.Inc()
+		}
+
+		s.logger.Errorf("[SPEND][%s] failed to fully roll back %d partial spend(s) (%s): %v",
+			tx.TxID(), len(result.spentSpends), phase, unspendErr)
+
+		return
+	}
+
+	s.logger.Warnf("[SPEND][%s] rolled back %d partial spend(s) (%s)", tx.TxID(), len(result.spentSpends), phase)
 }
 
 // resolveSpendCompletions applies the ErrTxNotFound "already blessed"
@@ -602,6 +754,10 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 
 	for _, item := range items {
 		if onlyCompleted && !item.published.Load() {
+			if prometheusUtxoSpendAbortInFlight != nil {
+				prometheusUtxoSpendAbortInFlight.Inc()
+			}
+
 			continue
 		}
 
@@ -612,10 +768,14 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 			// the utxo store. We can check whether the tx already exists, which means it has been validated and
 			// blessed. In this case we can just clear the error.
 			//
-			// The outcome is memoized on result (both ways) so this lookup happens
-			// at most once per batch and rollbackPartialSpends can reuse it.
+			// The outcome is memoized on result (both ways) so a determinate
+			// answer (found, or definitively not-found) is looked up at most once
+			// per batch. A hard lookup failure (indeterminate: neither of those) is
+			// NOT memoized — result.spenderChecked stays false — so it is retried
+			// on the next ErrTxNotFound item in this batch. rollbackPartialSpends
+			// does not read this memo at all; it always probes fresh.
 			if !result.spenderChecked {
-				if _, getErr := s.Get(ctx, tx.TxIDChainHash()); getErr == nil {
+				if _, getErr := s.Get(ctx, tx.TxIDChainHash(), fields.Fee); getErr == nil {
 					s.logger.Warnf("[Validate][%s] parent tx not found, but tx already exists in store, assuming already blessed", tx.TxID())
 
 					result.spenderExists = true
@@ -631,6 +791,10 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 		}
 
 		if spend.Err != nil {
+			if errors.Is(spend.Err, errors.ErrTxLocked) {
+				result.sawTransientLock = true
+			}
+
 			s.logger.Debugf("[SPEND][%s:%d] error in aerospike spend: %+v", spend.TxID.String(), spend.Vout, spend.Err)
 
 			var errSpent *errors.UtxoSpentErrData

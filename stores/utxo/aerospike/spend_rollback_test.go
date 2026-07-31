@@ -64,3 +64,45 @@ func TestResolveSpendCompletionsReportsAllSuccessfulSpends(t *testing.T) {
 		})
 	}
 }
+
+// TestDecideRollback pins the three-way rollback decision, in particular the
+// branch that knowingly leaves a dangling ref behind: when the existence probe
+// itself fails we do NOT roll back, because wrongly clearing a slot a live
+// spender owns is unrecoverable while a surviving ref is at least counted.
+//
+// Only a definitive ErrTxNotFound authorises reverting the spends. Every other
+// error — storage, service-unavailable, timeout, cancellation — must be treated
+// as "unknown", never as "absent". The blob-store case below is the one that
+// mattered in review: probing with the default field set pulled the full
+// transaction, so a blob read failure surfaced as a storage error and silently
+// skipped the rollback; the probe now asks for a single small field.
+func TestDecideRollback(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want rollbackDecision
+	}{
+		{name: "record present", err: nil, want: rollbackSkipSpenderExists},
+		{name: "record definitively absent", err: errors.NewTxNotFoundError("not found"), want: rollbackFire},
+		{name: "external blob read failed", err: errors.NewStorageError("external store read failed"), want: rollbackSkipIndeterminate},
+		{name: "service unavailable", err: errors.NewServiceUnavailableError("batcher closed"), want: rollbackSkipIndeterminate},
+		{name: "context canceled", err: errors.NewContextCanceledError("canceled"), want: rollbackSkipIndeterminate},
+		{name: "processing error", err: errors.NewProcessingError("aerospike client not initialized"), want: rollbackSkipIndeterminate},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, decideRollback(tc.err))
+		})
+	}
+}
+
+// TestRollbackDecisionLabels guards the metric contract: the decision's String
+// is used directly as the "outcome" label value on
+// prometheusUtxoPartialSpendRollbacks, so renaming one silently breaks
+// dashboards and the #1214 invariant alerting built on them.
+func TestRollbackDecisionLabels(t *testing.T) {
+	require.Equal(t, "fired", rollbackFire.String())
+	require.Equal(t, "spender_exists", rollbackSkipSpenderExists.String())
+	require.Equal(t, "indeterminate", rollbackSkipIndeterminate.String())
+}

@@ -1934,9 +1934,20 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			case batchErr = <-errCh:
 				// Batch completed successfully or with error
 			case <-ctx.Done():
+				// Known residual window (#1291, store-level atomic Spend /
+				// reverse-on-abort): this item is still enqueued in the batcher and
+				// will be committed by the callback under the store's own context,
+				// not this caller ctx. A straggler UPDATE can land after we give up
+				// here and after the rollback below has already run, leaving exactly
+				// the #1214 dangling ref. Not fixed here.
 				spends[idx].Err = errors.NewContextCanceledError("[SPEND][%s:%d] context canceled while waiting for batch response", spend.TxID.String(), spend.Vout)
 				return nil
 			case <-timer.C:
+				// Known residual window (#1291, store-level atomic Spend /
+				// reverse-on-abort): same straggler risk as the ctx.Done() arm
+				// above — the item remains enqueued and can still commit under the
+				// store's own context after this per-item wait gives up and after
+				// the rollback below has run. Not fixed here.
 				prometheusUtxoErrors.WithLabelValues("Spend", "BatchTimeout").Inc()
 				spends[idx].Err = errors.NewServiceUnavailableError("[SPEND][%s:%d] batch operation timed out after %s", spend.TxID.String(), spend.Vout, spendTimeout)
 				return nil
@@ -1988,6 +1999,13 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		})
 	}
 
+	// This arm performs no rollback of spentSpends, and is only safe to leave
+	// that way because every g.Go body above unconditionally returns nil —
+	// per-item failures are recorded in spends[idx].Err, never returned to the
+	// errgroup, so g.Wait() never actually observes an error today. If that
+	// invariant ever changes, this arm must route through the same rollback
+	// as the len(spends) != len(spentSpends) branch below, or a batch abort
+	// here will leak partial spends exactly like #1214.
 	if err = g.Wait(); err != nil {
 		return nil, errors.NewError("error in sql spend (batched mode)", err)
 	}
@@ -2002,24 +2020,60 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// Gated on the spending tx having no record: with a record present the ref
 		// is not dangling and the rollback would instead clear a slot a live tx
 		// legitimately owns. An indeterminate lookup skips the rollback.
-		if len(spentSpends) > 0 {
+		//
+		// Also skipped entirely when any spend failed with ErrTxLocked: that class is
+		// transient, so a concurrent attempt at the SAME txid may be spending these
+		// very inputs successfully right now, and spending_data ({TxID, Vin}) carries
+		// no attempt identity for the rollback to tell the two apart. See
+		// hasTransientLockFailure for the full reasoning and what covers the
+		// ErrTxLocked flavour of #1214 instead.
+		if len(spentSpends) > 0 && !hasTransientLockFailure(spends) {
 			rollback := false
 
-			// context.Background(), like the Unspend below: on the context-cancel
-			// path the request ctx is already dead, and that is exactly a case
-			// where the partial spends must still be cleaned up.
+			// Detached from the caller's ctx (on the context-cancel path it is
+			// already dead, and that is exactly a case where the partial spends
+			// must still be cleaned up) but bounded, so a wedged database cannot
+			// pin this goroutine forever. Deliberately not derived from the store's
+			// context either: that is canceled on shutdown, which would make the
+			// probe below fail as "indeterminate" and skip the rollback exactly
+			// when a shutdown races in-flight spends. Mirrors the aerospike store.
+			//
+			// Deliberately re-queried here rather than reusing txAlreadyExists: a
+			// stale "exists" memo is exactly what would let this rollback clear a
+			// slot a live spender still owns, and a stale "not found" memo is
+			// exactly what would leave a dangling ref behind. The extra query is
+			// the price of the freshest possible answer at the one point where
+			// getting it wrong is the failure mode we're rolling back to fix
+			// (#1214). Do not "optimise" this back to the memo.
+			rbTimeout := s.settings.UtxoStore.SpendWaitTimeout
+			if rbTimeout <= 0 {
+				rbTimeout = 30 * time.Second
+			}
+
+			rbCtx, rbCancel := context.WithTimeout(context.Background(), rbTimeout)
+
 			var spendingTxExists bool
-			if scanErr := s.db.QueryRowContext(context.Background(), "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists); scanErr != nil {
+			if scanErr := s.db.QueryRowContext(rbCtx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists); scanErr != nil {
 				s.logger.Errorf("[SPEND][%s] cannot determine whether spender exists, skipping rollback of %d partial spend(s): %v", tx.TxID(), len(spentSpends), scanErr)
+				prometheusUtxoPartialSpendRollbacks.WithLabelValues("indeterminate").Inc()
 			} else {
 				rollback = !spendingTxExists
+
+				if rollback {
+					prometheusUtxoPartialSpendRollbacks.WithLabelValues("fired").Inc()
+				} else {
+					prometheusUtxoPartialSpendRollbacks.WithLabelValues("spender_exists").Inc()
+				}
 			}
 
 			if rollback {
-				if unspendErr := s.Unspend(context.Background(), spentSpends); unspendErr != nil {
+				if unspendErr := s.Unspend(rbCtx, spentSpends); unspendErr != nil {
 					s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
+					prometheusUtxoSpendRollbackFailed.Inc()
 				}
 			}
+
+			rbCancel()
 		}
 
 		var spendErrors error

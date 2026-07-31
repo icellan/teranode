@@ -54,6 +54,9 @@ var (
 	prometheusUtxoDelete prometheus.Counter
 	prometheusUtxoErrors *prometheus.CounterVec
 
+	prometheusUtxoPartialSpendRollbacks *prometheus.CounterVec
+	prometheusUtxoSpendRollbackFailed   prometheus.Counter
+
 	prometheusSQLUtxoGetCounterConflicting prometheus.Histogram
 	prometheusSQLUtxoGetConflicting        prometheus.Histogram
 
@@ -98,6 +101,32 @@ func _initPrometheusMetrics() {
 			Help:      "Number of utxo delete calls done to sql",
 		},
 	)
+	// Mirrors the aerospike counters: rolling back partial spends is a
+	// corruption-prevention invariant (#1214), so its outcome must be observable.
+	// "fired" = spends reverted, "spender_exists" = ref was not dangling and the
+	// slots were left alone, "indeterminate" = the existence probe failed and a
+	// ref may have been left behind.
+	prometheusUtxoPartialSpendRollbacks = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "sql",
+			Name:      "utxo_partial_spend_rollbacks",
+			Help:      "Outcome of rolling back the successful spends of a failed spend batch",
+		},
+		[]string{
+			"outcome", // fired | spender_exists | indeterminate
+		},
+	)
+
+	prometheusUtxoSpendRollbackFailed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "sql",
+			Name:      "utxo_spend_rollback_failed",
+			Help:      "Partial-spend rollbacks that failed, each leaving potential dangling spender refs",
+		},
+	)
+
 	prometheusUtxoErrors = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "teranode",
