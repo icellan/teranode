@@ -328,7 +328,12 @@ func (repo *Repository) GetTransaction(ctx context.Context, hash *chainhash.Hash
 		// The record exists but does not carry the transaction we were asked for
 		// — a nil Tx, or a reconstruction from a UTXO-set snapshot, which retains
 		// no inputs, version or locktime and so cannot reproduce the txid.
-		repo.logger.Warnf("[Repository] GetTransaction: %s found in txmeta store but the full transaction is not retained", hash.String())
+		//
+		// Debug, not Warn: on a snapshot-seeded node this is permanent and true of
+		// every pre-snapshot transaction, and POST /subtree/:hash/txs calls this
+		// once per txid in the request body under a 1024-way fan-out. At Warn a
+		// single request buries the genuinely exceptional err != nil line above.
+		repo.logger.Debugf("[Repository] GetTransaction: %s found in txmeta store but the full transaction is not retained", hash.String())
 	}
 
 	tx, err := repo.TxStore.Get(ctx, hash.CloneBytes(), fileformat.FileTypeTx)
@@ -353,14 +358,17 @@ func (repo *Repository) GetTransaction(ctx context.Context, hash *chainhash.Hash
 //
 // Both checks are required, in this order:
 //
-//   - TxIsSerializable is what rejects every snapshot shape known today, including
-//     the one with no nil hole at all — a seeded coinbase whose trailing output was
-//     spent, which is simply short. All of them are input-less, and that is the
-//     check that catches them. It has to come first regardless, because
+//   - TxIsSerializable is what rejects every *incomplete* snapshot reconstruction,
+//     including the one with no nil hole at all — a seeded coinbase whose trailing
+//     output was spent, which is simply short. All of them are input-less, and that
+//     is the check that catches them. It has to come first regardless, because
 //     TxIDChainHash() dereferences the same nil *bt.Output the predicate rejects.
-//   - The txid comparison is the backstop: it is what actually enforces "this is
-//     the requested transaction" for anything that serializes cleanly, so a future
-//     reconstruction that does carry inputs cannot be served under the wrong txid.
+//   - The txid comparison is a key-vs-value guard, not a second snapshot filter. It
+//     adds no rejection power over a snapshot shape: exactly one carries inputs, a
+//     coinbase restored by cmd/seeder's restoreCoinbaseInput, and the seeder installs
+//     that input only after checking the txid itself — so it is the genuine article
+//     and this comparison correctly passes it. What the comparison does catch is a
+//     complete transaction filed under the wrong key, which nothing else here would.
 func isRequestedTransaction(txMeta *meta.Data, hash *chainhash.Hash) bool {
 	return txMeta.TxIsSerializable() && txMeta.Tx.TxIDChainHash().IsEqual(hash)
 }
