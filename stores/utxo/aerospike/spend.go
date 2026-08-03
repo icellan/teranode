@@ -534,8 +534,18 @@ type spendCompletionResult struct {
 	spenderExists  bool
 
 	// sawTransientLock records that at least one completed spend failed with
-	// ErrTxLocked, which suppresses the rollback (see hasTransientLockFailure).
+	// ErrTxLocked, which suppresses the rollback (see rollbackPartialSpends) —
+	// UNLESS sawUnwinnable is also set.
 	sawTransientLock bool
+
+	// sawUnwinnable records that at least one completed spend failed with an
+	// error class meaning this txid can never win (ErrSpent, ErrTxConflicting,
+	// ErrFrozen, ErrUtxoHashMismatch). When set, it overrides sawTransientLock's
+	// suppression: a concurrent attempt at the SAME txid sees the same
+	// outpoints and hits the same unwinnable failure, so it can never reach
+	// Create either, meaning nobody can be a legitimate owner of the partial
+	// spends and the rollback is both safe and required (#1214).
+	sawUnwinnable bool
 }
 
 // rollbackDecision is what the spender-existence probe implies for the spends
@@ -553,58 +563,28 @@ const (
 	// Skip: wrongly clearing a live spender's slot is unrecoverable, while a
 	// surviving dangling ref is at least counted here.
 	rollbackSkipIndeterminate
-	// rollbackSkipTransientLock: at least one spend failed with ErrTxLocked, so a
-	// concurrent attempt at this same txid may be succeeding right now and may
-	// legitimately own the slots we would clear. See hasTransientLockFailure.
+	// rollbackSkipTransientLock: at least one spend failed with ErrTxLocked and
+	// nothing else in the batch proved the tx unwinnable, so a concurrent
+	// attempt at this same txid may be succeeding right now and may
+	// legitimately own the slots we would clear. See rollbackPartialSpends'
+	// gate (spendCompletionResult.sawTransientLock / sawUnwinnable).
 	rollbackSkipTransientLock
 )
 
 // String doubles as the "outcome" label value on
-// prometheusUtxoPartialSpendRollbacks.
+// prometheusUtxoPartialSpendRollbacks. Returns the utxo package's shared
+// RollbackOutcome* constants so this store and the SQL store cannot drift.
 func (d rollbackDecision) String() string {
 	switch d {
 	case rollbackSkipSpenderExists:
-		return "spender_exists"
+		return utxo.RollbackOutcomeSpenderExists
 	case rollbackSkipIndeterminate:
-		return "indeterminate"
+		return utxo.RollbackOutcomeIndeterminate
 	case rollbackSkipTransientLock:
-		return "transient_lock"
+		return utxo.RollbackOutcomeTransientLock
 	default:
-		return "fired"
+		return utxo.RollbackOutcomeFired
 	}
-}
-
-// hasTransientLockFailure reports whether any spend failed with ErrTxLocked.
-//
-// ErrTxLocked is the one failure class that means "try again in a moment": the
-// parent's record is locked only for the two-phase-commit window between its own
-// create and its block-assembly ack, which is milliseconds. A concurrent attempt
-// at the SAME txid (duplicate relay, or a second validator pod behind the same
-// store) can therefore be spending those very inputs successfully while this
-// attempt sees the lock — and because SpendingData is just {TxID, Vin} with no
-// attempt identity, a rollback here cannot tell that winner's slots from its own
-// and would clear them, leaving a live or mined transaction whose input reads
-// unspent. That is the inverse of #1214 and worse: the node would go on to accept
-// and mine a double-spend.
-//
-// So we leave the partial spends in place for this class and accept that the
-// ErrTxLocked flavour of the #1214 dangling ref is not fixed by this rollback.
-// Covering it needs ordering that makes the record exist before any spend
-// (create-first, #1355) or attempt identity in the stored spending data (#1291);
-// neither belongs in an error-path rollback.
-//
-// Every other class is safe to roll back: either this txid can never win (spent,
-// conflicting, frozen, hash mismatch) so no concurrent attempt at it can be a
-// legitimate owner, or the failure is not a "someone else may be winning right
-// now" state at all (missing parent, infrastructure errors).
-func hasTransientLockFailure(spends []*utxo.Spend) bool {
-	for _, spend := range spends {
-		if spend != nil && spend.Err != nil && errors.Is(spend.Err, errors.ErrTxLocked) {
-			return true
-		}
-	}
-
-	return false
 }
 
 // decideRollback maps the existence probe's error to a rollback decision. Only
@@ -657,9 +637,24 @@ func (s *Store) rollbackPartialSpends(tx *bt.Tx, result *spendCompletionResult, 
 
 	// A transient lock means a concurrent attempt at this same txid may be the
 	// legitimate owner of these slots, and nothing in the stored spending data
-	// lets a rollback tell the two apart — so do not touch them. See
-	// hasTransientLockFailure for why this class is excluded and what covers it.
-	if result.sawTransientLock {
+	// lets a rollback tell the two apart — so do not touch them.
+	//
+	// That exclusion only holds while nothing else in the batch proves the tx
+	// unwinnable. If the batch ALSO contains ErrSpent, ErrTxConflicting,
+	// ErrFrozen or ErrUtxoHashMismatch (sawUnwinnable), this txid can never
+	// reach Create no matter who is racing it: a concurrent attempt sees the
+	// same outpoints and hits the same unwinnable failure, so nobody can be a
+	// legitimate owner of the partial spends and the rollback is both safe and
+	// required — leaving them in place here would be the exact #1214 shape
+	// (a parent naming a record-less spender).
+	//
+	// So the transient-lock-only case is a deliberately uncovered flavour of
+	// #1214: create-first ordering (#1355) covers it by making the record exist
+	// before any spend, and attempt identity in the stored spending data (#1291)
+	// would cover it by letting the ownership check tell two attempts apart.
+	// Neither belongs in an error-path rollback. Mirrors the sql store's
+	// hasTransientLockFailure/hasUnwinnableFailure doc comments — keep in step.
+	if result.sawTransientLock && !result.sawUnwinnable {
 		if prometheusUtxoPartialSpendRollbacks != nil {
 			prometheusUtxoPartialSpendRollbacks.WithLabelValues(rollbackSkipTransientLock.String()).Inc()
 		}
@@ -793,6 +788,14 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 		if spend.Err != nil {
 			if errors.Is(spend.Err, errors.ErrTxLocked) {
 				result.sawTransientLock = true
+			}
+
+			// This txid can never win: every concurrent attempt at it sees the
+			// same outpoints and hits the same unwinnable failure, so nobody
+			// can reach Create either. See rollbackPartialSpends' gate.
+			if errors.Is(spend.Err, errors.ErrSpent) || errors.Is(spend.Err, errors.ErrTxConflicting) ||
+				errors.Is(spend.Err, errors.ErrFrozen) || errors.Is(spend.Err, errors.ErrUtxoHashMismatch) {
+				result.sawUnwinnable = true
 			}
 
 			s.logger.Debugf("[SPEND][%s:%d] error in aerospike spend: %+v", spend.TxID.String(), spend.Vout, spend.Err)

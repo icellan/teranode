@@ -102,7 +102,28 @@ func TestDecideRollback(t *testing.T) {
 // prometheusUtxoPartialSpendRollbacks, so renaming one silently breaks
 // dashboards and the #1214 invariant alerting built on them.
 func TestRollbackDecisionLabels(t *testing.T) {
-	require.Equal(t, "fired", rollbackFire.String())
-	require.Equal(t, "spender_exists", rollbackSkipSpenderExists.String())
-	require.Equal(t, "indeterminate", rollbackSkipIndeterminate.String())
+	require.Equal(t, utxo.RollbackOutcomeFired, rollbackFire.String())
+	require.Equal(t, utxo.RollbackOutcomeSpenderExists, rollbackSkipSpenderExists.String())
+	require.Equal(t, utxo.RollbackOutcomeIndeterminate, rollbackSkipIndeterminate.String())
+	require.Equal(t, utxo.RollbackOutcomeTransientLock, rollbackSkipTransientLock.String())
+
+	// Every decision must map to a value in the shared set, and the shared set
+	// must have no value no decision produces — otherwise a dashboard either
+	// misses an outcome or queries a label that is never emitted. This is the
+	// check that would have caught transient_lock being added to the code but
+	// not to this test.
+	emitted := []string{
+		rollbackFire.String(),
+		rollbackSkipSpenderExists.String(),
+		rollbackSkipIndeterminate.String(),
+		rollbackSkipTransientLock.String(),
+	}
+	require.ElementsMatch(t, utxo.RollbackOutcomes, emitted,
+		"aerospike outcome labels must be exactly utxo.RollbackOutcomes")
+
+	// The literal strings are the dashboard contract; pin them so a rename of a
+	// constant cannot silently change what is exported.
+	require.ElementsMatch(t,
+		[]string{"fired", "spender_exists", "indeterminate", "transient_lock"},
+		utxo.RollbackOutcomes)
 }

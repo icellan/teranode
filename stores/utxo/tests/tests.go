@@ -1576,6 +1576,16 @@ func PartialSpendRollback(t *testing.T, db utxostore.Store) {
 		require.NoError(t, spends[0].Err, "the unlocked parent's spend is expected to succeed")
 		require.ErrorIs(t, spends[1].Err, errors.ErrTxLocked)
 
+		// The sql batch path can attach one item's error to another item's slot, and
+		// both rollback predicates scan per-item errors with errors.Is — so pin that
+		// this pure-lock batch stays free of an unwinnable class. Contamination is
+		// benign for a whole-batch predicate (it can only surface a class genuinely
+		// present somewhere in the batch, which is what the predicate asks anyway),
+		// but these predicates now gate a corruption invariant, so the pure case is
+		// worth asserting rather than assuming.
+		require.False(t, errors.Is(spends[1].Err, errors.ErrSpent),
+			"transient-lock-only batch must not carry an unwinnable class, or the rollback gate flips")
+
 		// Still spent by the child, whose record does not exist: this IS the #1214
 		// shape, left in place on purpose. Asserting it keeps the trade explicit.
 		utxoHash, err := util.UTXOHashFromOutput(good.TxIDChainHash(), good.Outputs[0], 0)
@@ -1614,6 +1624,60 @@ func PartialSpendRollback(t *testing.T, db utxostore.Store) {
 		require.ErrorIs(t, spends[1].Err, errors.ErrTxNotFound)
 
 		requireUnspent(t, good, "partial spend survived a missing-parent failure: parent now names a spender whose record was never created")
+	})
+
+	// Regression guard for a behaviour main HAS and this branch briefly lost: a
+	// batch containing BOTH a transient lock and an "unwinnable" failure must still
+	// roll back.
+	//
+	// The transient-lock exclusion above rests on "a concurrent attempt at this same
+	// txid may be winning right now". That premise dies the moment anything in the
+	// batch proves the tx unwinnable — ErrSpent here, since a rival already owns
+	// taken:0. A concurrent attempt at the same txid sees the same outpoint, hits the
+	// same ErrSpent, and can never reach Create either, so nobody can be a legitimate
+	// owner and the rollback is both safe and required.
+	//
+	// Pre-PR code rolled back here (ErrSpent was in the old error-class allowlist), so
+	// a batch-level lock exclusion is a regression rather than merely an uncovered
+	// case. Verified in both directions: this fails with a batch-level exclusion and
+	// passes on main.
+	t.Run("transient lock plus an unwinnable failure still rolls back", func(t *testing.T) {
+		good := newTestTx(t, 8_100_000)
+		locked := newTestTx(t, 8_200_000)
+		taken := newTestTx(t, 8_300_000)
+
+		for _, parent := range []*bt.Tx{good, locked, taken} {
+			_, _, err := db.SpendAndCreate(ctx, parent, 1000, utxostore.WithCreateOnly())
+			require.NoError(t, err)
+
+			hash := parent.TxIDChainHash()
+
+			defer func() { _ = db.Delete(ctx, hash) }()
+		}
+
+		// A rival takes taken:0, so our child's spend of it comes back ErrSpent and
+		// the child can never be valid.
+		rival := childSpending(t, 1400, taken)
+		rival.Inputs[0].UnlockingScript = dummyUnlockingScript
+
+		_, _, err := db.SpendAndCreate(ctx, rival, db.GetBlockHeight()+1, utxostore.WithSpendOnly())
+		require.NoError(t, err)
+
+		require.NoError(t, db.SetLocked(ctx, []chainhash.Hash{*locked.TxIDChainHash()}, true))
+
+		child := childSpending(t, 1450, good, locked, taken)
+		for _, in := range child.Inputs {
+			in.UnlockingScript = dummyUnlockingScript
+		}
+
+		_, spends, err := db.SpendAndCreate(ctx, child, db.GetBlockHeight()+1, utxostore.WithSpendOnly())
+		require.Error(t, err)
+		require.Len(t, spends, 3)
+		require.NoError(t, spends[0].Err, "the free parent's spend is expected to succeed")
+		require.ErrorIs(t, spends[1].Err, errors.ErrTxLocked)
+		require.ErrorIs(t, spends[2].Err, errors.ErrSpent)
+
+		requireUnspent(t, good, "a transient lock must not suppress the rollback when the batch also proves the tx unwinnable: the child can never exist, so this parent is left naming a record-less spender")
 	})
 
 	// The rollback is scoped to its purpose: it exists to stop a parent naming a

@@ -2021,59 +2021,80 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// is not dangling and the rollback would instead clear a slot a live tx
 		// legitimately owns. An indeterminate lookup skips the rollback.
 		//
-		// Also skipped entirely when any spend failed with ErrTxLocked: that class is
-		// transient, so a concurrent attempt at the SAME txid may be spending these
-		// very inputs successfully right now, and spending_data ({TxID, Vin}) carries
-		// no attempt identity for the rollback to tell the two apart. See
-		// hasTransientLockFailure for the full reasoning and what covers the
+		// Also skipped when any spend failed with ErrTxLocked AND nothing else in
+		// the batch proves the tx unwinnable: ErrTxLocked alone is transient, so a
+		// concurrent attempt at the SAME txid may be spending these very inputs
+		// successfully right now, and spending_data ({TxID, Vin}) carries no
+		// attempt identity for the rollback to tell the two apart. See
+		// hasTransientLockFailure for that reasoning and what covers the
 		// ErrTxLocked flavour of #1214 instead.
-		if len(spentSpends) > 0 && !hasTransientLockFailure(spends) {
-			rollback := false
+		//
+		// That exclusion does not hold once the batch ALSO contains ErrSpent,
+		// ErrTxConflicting, ErrFrozen, or ErrUtxoHashMismatch: a concurrent attempt
+		// at this same txid sees the same outpoints and hits the same unwinnable
+		// failure, so it can never reach Create either — nobody can be a
+		// legitimate owner of the partial spends, and the rollback is both safe
+		// and required. See hasUnwinnableFailure.
+		if len(spentSpends) > 0 && (!hasTransientLockFailure(spends) || hasUnwinnableFailure(spends)) {
+			// Wrapped in a closure so rbCancel can be deferred: Spend has a parent
+			// recover() (see the top of this function), and a panic between
+			// context.WithTimeout and a bare inline rbCancel() call would unwind
+			// past it, leaking the timer until it fires on its own. Scoping the
+			// defer to this closure keeps the leak-proofing without extending
+			// rbCtx's lifetime past this block, as a function-level defer would.
+			func() {
+				rollback := false
 
-			// Detached from the caller's ctx (on the context-cancel path it is
-			// already dead, and that is exactly a case where the partial spends
-			// must still be cleaned up) but bounded, so a wedged database cannot
-			// pin this goroutine forever. Deliberately not derived from the store's
-			// context either: that is canceled on shutdown, which would make the
-			// probe below fail as "indeterminate" and skip the rollback exactly
-			// when a shutdown races in-flight spends. Mirrors the aerospike store.
-			//
-			// Deliberately re-queried here rather than reusing txAlreadyExists: a
-			// stale "exists" memo is exactly what would let this rollback clear a
-			// slot a live spender still owns, and a stale "not found" memo is
-			// exactly what would leave a dangling ref behind. The extra query is
-			// the price of the freshest possible answer at the one point where
-			// getting it wrong is the failure mode we're rolling back to fix
-			// (#1214). Do not "optimise" this back to the memo.
-			rbTimeout := s.settings.UtxoStore.SpendWaitTimeout
-			if rbTimeout <= 0 {
-				rbTimeout = 30 * time.Second
-			}
+				// Detached from the caller's ctx (on the context-cancel path it is
+				// already dead, and that is exactly a case where the partial spends
+				// must still be cleaned up) but bounded, so a wedged database cannot
+				// pin this goroutine forever. Deliberately not derived from the store's
+				// context either: that is canceled on shutdown, which would make the
+				// probe below fail as "indeterminate" and skip the rollback exactly
+				// when a shutdown races in-flight spends. Mirrors the aerospike store.
+				//
+				// Deliberately re-queried here rather than reusing txAlreadyExists: a
+				// stale "exists" memo is exactly what would let this rollback clear a
+				// slot a live spender still owns, and a stale "not found" memo is
+				// exactly what would leave a dangling ref behind. The extra query is
+				// the price of the freshest possible answer at the one point where
+				// getting it wrong is the failure mode we're rolling back to fix
+				// (#1214). Do not "optimise" this back to the memo.
+				rbTimeout := s.settings.UtxoStore.SpendWaitTimeout
+				if rbTimeout <= 0 {
+					rbTimeout = 30 * time.Second
+				}
 
-			rbCtx, rbCancel := context.WithTimeout(context.Background(), rbTimeout)
+				rbCtx, rbCancel := context.WithTimeout(context.Background(), rbTimeout)
+				defer rbCancel()
 
-			var spendingTxExists bool
-			if scanErr := s.db.QueryRowContext(rbCtx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists); scanErr != nil {
-				s.logger.Errorf("[SPEND][%s] cannot determine whether spender exists, skipping rollback of %d partial spend(s): %v", tx.TxID(), len(spentSpends), scanErr)
-				prometheusUtxoPartialSpendRollbacks.WithLabelValues("indeterminate").Inc()
-			} else {
-				rollback = !spendingTxExists
+				var spendingTxExists bool
+				if scanErr := s.db.QueryRowContext(rbCtx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists); scanErr != nil {
+					s.logger.Errorf("[SPEND][%s] cannot determine whether spender exists, skipping rollback of %d partial spend(s): %v", tx.TxID(), len(spentSpends), scanErr)
+					prometheusUtxoPartialSpendRollbacks.WithLabelValues(utxo.RollbackOutcomeIndeterminate).Inc()
+				} else {
+					rollback = !spendingTxExists
+
+					if rollback {
+						prometheusUtxoPartialSpendRollbacks.WithLabelValues(utxo.RollbackOutcomeFired).Inc()
+					} else {
+						prometheusUtxoPartialSpendRollbacks.WithLabelValues(utxo.RollbackOutcomeSpenderExists).Inc()
+					}
+				}
 
 				if rollback {
-					prometheusUtxoPartialSpendRollbacks.WithLabelValues("fired").Inc()
-				} else {
-					prometheusUtxoPartialSpendRollbacks.WithLabelValues("spender_exists").Inc()
+					if unspendErr := s.Unspend(rbCtx, spentSpends); unspendErr != nil {
+						s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
+						prometheusUtxoSpendRollbackFailed.Inc()
+					}
 				}
-			}
-
-			if rollback {
-				if unspendErr := s.Unspend(rbCtx, spentSpends); unspendErr != nil {
-					s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
-					prometheusUtxoSpendRollbackFailed.Inc()
-				}
-			}
-
-			rbCancel()
+			}()
+		} else if len(spentSpends) > 0 {
+			// Transient-lock suppression: record the outcome so this store's
+			// dashboard signal has the same value set as aerospike's — a
+			// suppressed rollback here would otherwise be invisible next to
+			// aerospike's "transient_lock" counter for the identical situation.
+			prometheusUtxoPartialSpendRollbacks.WithLabelValues(utxo.RollbackOutcomeTransientLock).Inc()
 		}
 
 		var spendErrors error

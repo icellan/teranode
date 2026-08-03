@@ -22,17 +22,42 @@ import (
 // worse: the node would go on to accept and mine a double-spend.
 //
 // So the ErrTxLocked flavour of the #1214 dangling ref is NOT fixed by this
-// rollback. Covering it needs ordering that makes the record exist before any
-// spend (create-first, #1355) or attempt identity in the stored spending data
-// (#1291); neither belongs in an error-path rollback.
-//
-// Every other class is safe to roll back: either this txid can never win (spent,
-// conflicting, frozen, hash mismatch), so no concurrent attempt at it can be a
-// legitimate owner, or the failure is not a "someone else may be winning right
-// now" state at all (missing parent, infrastructure errors).
+// rollback on its own — it needs hasUnwinnableFailure below to know when the
+// exclusion must not apply. Covering the ErrTxLocked case unconditionally would
+// need ordering that makes the record exist before any spend (create-first,
+// #1355) or attempt identity in the stored spending data (#1291); neither
+// belongs in an error-path rollback.
 func hasTransientLockFailure(spends []*utxo.Spend) bool {
 	for _, spend := range spends {
 		if spend != nil && spend.Err != nil && errors.Is(spend.Err, errors.ErrTxLocked) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hasUnwinnableFailure reports whether any spend failed with an error class
+// meaning this txid can never win: ErrSpent, ErrTxConflicting, ErrFrozen, or
+// ErrUtxoHashMismatch.
+//
+// Mirrors the aerospike store's sawUnwinnable flag. It exists to override
+// hasTransientLockFailure's suppression of the partial-spend rollback: a
+// concurrent attempt at the SAME txid sees the same outpoints and hits the
+// same unwinnable failure, so it can never reach Create either. That means
+// nobody can be a legitimate owner of the partial spends in this batch, and
+// leaving them in place would be the exact #1214 shape — a parent naming a
+// record-less spender — so the rollback is both safe and required.
+func hasUnwinnableFailure(spends []*utxo.Spend) bool {
+	for _, spend := range spends {
+		if spend == nil || spend.Err == nil {
+			continue
+		}
+
+		if errors.Is(spend.Err, errors.ErrSpent) ||
+			errors.Is(spend.Err, errors.ErrTxConflicting) ||
+			errors.Is(spend.Err, errors.ErrFrozen) ||
+			errors.Is(spend.Err, errors.ErrUtxoHashMismatch) {
 			return true
 		}
 	}
