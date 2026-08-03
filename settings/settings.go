@@ -476,6 +476,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			GetBatcherDurationMillis:                getInt("utxostore_getBatcherDurationMillis", 10, alternativeContext...),
 			DBTimeout:                               getDuration("utxostore_dbTimeoutDuration", 5*time.Second, alternativeContext...),
 			UseExternalTxCache:                      getBool("utxostore_useExternalTxCache", true, alternativeContext...),
+			ExternalTxCacheMaxItems:                 getInt("utxostore_externalTxCacheMaxItems", 1024, alternativeContext...),
 			ExternalizeAllTransactions:              getBool("utxostore_externalizeAllTransactions", false, alternativeContext...),
 			ExternalStoreConcurrency:                getInt("utxostore_externalStoreConcurrency", 16, alternativeContext...),
 			PostgresPool:                            getPostgresPoolSettings("utxostore", alternativeContext...),

@@ -354,9 +354,13 @@ func New(ctx context.Context, logger ulogger.Logger, tSettings *settings.Setting
 	// value. See the field comments on Store.
 	var externalTxCache, externalOutpointsCache *util.ExpiringConcurrentCache[chainhash.Hash, *bt.Tx]
 
+	// Bounded: these hold whole transactions, external storage is the path taken by
+	// the largest ones, and the two instances hold separate copies of the same
+	// output vector. An eviction costs a refetch, not correctness.
 	if tSettings.UtxoStore.UseExternalTxCache {
-		externalTxCache = util.NewExpiringConcurrentCache[chainhash.Hash, *bt.Tx](10 * time.Second)
-		externalOutpointsCache = util.NewExpiringConcurrentCache[chainhash.Hash, *bt.Tx](10 * time.Second)
+		maxItems := tSettings.UtxoStore.ExternalTxCacheMaxItems
+		externalTxCache = util.NewExpiringConcurrentCacheWithMaxSize[chainhash.Hash, *bt.Tx](10*time.Second, maxItems)
+		externalOutpointsCache = util.NewExpiringConcurrentCacheWithMaxSize[chainhash.Hash, *bt.Tx](10*time.Second, maxItems)
 	}
 
 	// Initialize external store semaphore if concurrency limit is set
