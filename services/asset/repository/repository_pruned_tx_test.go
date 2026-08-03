@@ -104,13 +104,14 @@ func TestGetTransaction_SnapshotReconstructionDoesNotPanic(t *testing.T) {
 		"expected a not-found error the HTTP layer maps to 404, got %v", getErr)
 }
 
-// TestGetTransaction_WrongTxidIsRejected covers the shape the nil-output guard
-// alone does not catch: a coinbase seeded from a snapshot whose *trailing*
-// output was spent has no nil hole at all (cmd/seeder's restoreCoinbaseInput
-// declines to restore the input, and PadUTXOsWithNil pads only to maxIndex+1).
-// It serializes cleanly, so without a txid comparison the caller would receive
-// HTTP 200 and a short, bogus transaction that does not hash to what it asked
-// for — strictly worse than the panic.
+// TestGetTransaction_WrongTxidIsRejected pins the second half of the gate. Every
+// snapshot shape known today is input-less and so is already rejected by
+// TxIsSerializable — including the one with no nil hole at all, a seeded coinbase
+// whose trailing output was spent (cmd/seeder's restoreCoinbaseInput declines to
+// restore the input, and PadUTXOsWithNil pads only to maxIndex+1). The txid
+// comparison is what covers everything else: a record that serializes cleanly but
+// is not the transaction that was asked for must not be served as HTTP 200,
+// which would be strictly worse than the panic.
 func TestGetTransaction_WrongTxidIsRejected(t *testing.T) {
 	repo, mockUtxoStore, _ := newRepoWithMockedUtxoStore(t)
 

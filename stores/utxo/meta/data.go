@@ -239,7 +239,7 @@ func (d *Data) TxIsSerializable() bool {
 	// transaction, coinbase included, carries at least one input. Test the
 	// length, not nil-ness — getTxFromBins allocates a non-nil empty slice,
 	// which is enough to make bt.Tx.IsExtended() report true.
-	if d.Tx == nil || len(d.Tx.Inputs) == 0 {
+	if d == nil || d.Tx == nil || len(d.Tx.Inputs) == 0 {
 		return false
 	}
 

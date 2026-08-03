@@ -353,12 +353,14 @@ func (repo *Repository) GetTransaction(ctx context.Context, hash *chainhash.Hash
 //
 // Both checks are required, in this order:
 //
-//   - TxIsSerializable rejects the shapes that panic inside go-bt. It has to come
-//     first, because TxIDChainHash() dereferences the same nil *bt.Output.
-//   - The txid comparison rejects the shapes that serialize cleanly but are still
-//     not the requested transaction — notably a snapshot-seeded coinbase whose
-//     trailing output was spent, which has no nil hole at all and would otherwise
-//     be served as a short, bogus transaction.
+//   - TxIsSerializable is what rejects every snapshot shape known today, including
+//     the one with no nil hole at all — a seeded coinbase whose trailing output was
+//     spent, which is simply short. All of them are input-less, and that is the
+//     check that catches them. It has to come first regardless, because
+//     TxIDChainHash() dereferences the same nil *bt.Output the predicate rejects.
+//   - The txid comparison is the backstop: it is what actually enforces "this is
+//     the requested transaction" for anything that serializes cleanly, so a future
+//     reconstruction that does carry inputs cannot be served under the wrong txid.
 func isRequestedTransaction(txMeta *meta.Data, hash *chainhash.Hash) bool {
 	return txMeta.TxIsSerializable() && txMeta.Tx.TxIDChainHash().IsEqual(hash)
 }

@@ -29,6 +29,13 @@ func TestTxIsSerializable(t *testing.T) {
 		want bool
 	}{
 		{
+			// Every current caller guards txMeta != nil first, but the predicate
+			// must not become a landmine for the next one.
+			name: "nil Data",
+			data: nil,
+			want: false,
+		},
+		{
 			name: "nil Data.Tx",
 			data: &Data{},
 			want: false,
@@ -85,9 +92,10 @@ func TestTxIsSerializable(t *testing.T) {
 			// (cmd/seeder/seeder.go), and PadUTXOsWithNil pads only to
 			// maxIndex+1, so the vector is simply short. All outputs non-nil,
 			// zero inputs, IsCoinbase true. This shape does NOT panic on
-			// serialize, so a predicate that trusts IsCoinbase would hand a
-			// caller a short, wrong-txid transaction and report success — worse
-			// than the panic it was meant to prevent.
+			// serialize, so the zero-input check is the only thing rejecting it:
+			// a predicate that trusts IsCoinbase would hand a caller a short,
+			// wrong-txid transaction and report success — worse than the panic
+			// it was meant to prevent.
 			name: "seeded coinbase, trailing output spent, no nil hole",
 			data: &Data{
 				IsCoinbase: true,
