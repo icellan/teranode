@@ -2,7 +2,10 @@ package tests
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -1479,4 +1482,66 @@ func SpendAndCreateSpendErrorSurfacesPerInput(t *testing.T, db utxostore.Store) 
 func SpendAndCreateInvalidOptions(t *testing.T, db utxostore.Store) {
 	_, _, err := db.SpendAndCreate(context.Background(), Tx, 1000, utxostore.WithCreateOnly(), utxostore.WithSpendOnly())
 	require.ErrorIs(t, err, errors.ErrInvalidArgument)
+}
+
+// SetConflictingAfterCreate exercises SetConflicting(true) on a stored tx that has
+// both inputs and outputs — the shape that used to self-deadlock the SQL store on
+// SQLite.
+//
+// The store's SetConflicting opened a write transaction and then, inside the loop,
+// called s.Get and per-output s.GetSpend, both of which query the connection pool
+// rather than that transaction. On SQLite's single writer lock those reads waited
+// for a connection blocked on the very lock this call stack held, so Commit was
+// never reached. It stayed latent precisely because no dual-backend test covered
+// this path: the only other caller of SetConflicting(..., true) runs against
+// Aerospike and Postgres only. This test is that missing coverage, so the reads
+// cannot drift back inside the transaction unnoticed.
+//
+// The bounded wait is deliberate, with a caveat worth knowing: on regression the
+// store deadlocks holding SQLite's writer lock, so this test's own cleanup blocks
+// too and the package still ends in a test-binary timeout — verified against the
+// pre-fix store, versus ~10ms once the reads are outside the transaction.
+//
+// The diagnosis is written to stderr rather than t.Log because CI runs without -v
+// (`gotestsum --format pkgname -- -race ...`), and without -v the testing package
+// buffers a hanging test's output, so a t.Log/require.Fail message never appears —
+// only "panic: test timed out". Stderr is unbuffered, so the line survives; the
+// panic's goroutine dump naming SetConflicting is the backstop.
+func SetConflictingAfterCreate(t *testing.T, db utxostore.Store) {
+	ctx := context.Background()
+
+	// newTestTx's input references the shared Tx fixture, and marking a tx
+	// conflicting walks its inputs to update the parent's bookkeeping, so the
+	// parent has to exist.
+	if _, _, err := db.SpendAndCreate(ctx, Tx, 1000, utxostore.WithCreateOnly()); err != nil {
+		require.ErrorIs(t, err, errors.ErrTxExists, "parent fixture must either be created here or already present")
+	}
+
+	defer func() { _ = db.Delete(ctx, Tx.TxIDChainHash()) }()
+
+	child := newTestTx(t, 8_400_000)
+
+	_, _, err := db.SpendAndCreate(ctx, child, 1000, utxostore.WithCreateOnly())
+	require.NoError(t, err)
+
+	defer func() { _ = db.Delete(ctx, child.TxIDChainHash()) }()
+
+	done := make(chan error, 1)
+
+	go func() {
+		_, _, setErr := db.SetConflicting(ctx, []chainhash.Hash{*child.TxIDChainHash()}, true)
+		done <- setErr
+	}()
+
+	select {
+	case setErr := <-done:
+		require.NoError(t, setErr)
+	case <-time.After(15 * time.Second):
+		fmt.Fprintf(os.Stderr, "\nSetConflictingAfterCreate: SetConflicting did not return within 15s — the store is deadlocking, reads have moved back inside the write transaction\n")
+		require.Fail(t, "SetConflicting did not return within 15s — the store is deadlocking, reads have moved back inside the write transaction")
+	}
+
+	md, err := db.Get(ctx, child.TxIDChainHash())
+	require.NoError(t, err)
+	require.True(t, md.Conflicting, "conflicting flag must be set after SetConflicting(true)")
 }

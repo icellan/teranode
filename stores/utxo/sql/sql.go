@@ -4298,35 +4298,31 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 	affectedParentSpends := make([]*utxo.Spend, 0, len(txHashes))
 	spendingTxHashes := make([]chainhash.Hash, 0, len(txHashes))
 
-	var (
-		transactionID int
-		utxoHash      *chainhash.Hash
-	)
+	var utxoHash *chainhash.Hash
 
-	// Create a database transaction
-	txn, err := s.db.Begin()
-	if err != nil {
-		return nil, nil, err
-	}
+	// Read pass — resolve every conflicting tx's metadata and current spend state
+	// BEFORE opening the write transaction below.
+	//
+	// s.Get and s.GetSpend both query the connection pool directly; they do not
+	// run on the txn opened further down. Calling them from inside that txn's
+	// loop (as this used to do) self-deadlocks on SQLite: the txn holds SQLite's
+	// single writer lock, s.Get/s.GetSpend block waiting for a connection that is
+	// waiting on that same lock, and the txn — stuck inside this same call
+	// stack — never reaches Commit() to release it. Latent only because the sole
+	// shared-suite caller of SetConflicting(..., true) runs against
+	// Aerospike/Postgres, not SQLite. Doing every read up front, before Begin(),
+	// removes the cross-connection wait entirely rather than papering over it
+	// with a timeout or a second connection.
+	txMetas := make([]*meta.Data, len(txHashes))
 
-	defer func() {
-		_ = txn.Rollback()
-	}()
-
-	for _, conflictingTxHash := range txHashes {
+	for idx, conflictingTxHash := range txHashes {
 		// get the extended tx
 		txMeta, err := s.Get(ctx, &conflictingTxHash)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		if err = txn.QueryRowContext(ctx, qUpdate, conflictingTxHash[:], setValue, deleteAtHeight).Scan(&transactionID); err != nil {
-			return nil, nil, errors.NewStorageError("failed to set conflicting flag for %s", conflictingTxHash, err)
-		}
-
-		if err = s.updateParentConflictingChildren(ctx, transactionID, txMeta.Tx, txn); err != nil {
-			return nil, nil, err
-		}
+		txMetas[idx] = txMeta
 
 		for i, input := range txMeta.Tx.Inputs {
 			utxoHash, err = util.UTXOHashFromInput(input)
@@ -4370,6 +4366,30 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			if spendResponse.Status == int(utxo.Status_SPENT) && spendResponse.SpendingData != nil && spendResponse.SpendingData.TxID != nil {
 				spendingTxHashes = append(spendingTxHashes, *spendResponse.SpendingData.TxID)
 			}
+		}
+	}
+
+	// Write pass — only the UPDATE and its dependent conflicting_children insert
+	// run inside the transaction; both are pure writes plus the id RETURNING from
+	// the UPDATE that updateParentConflictingChildren needs.
+	var transactionID int
+
+	txn, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	defer func() {
+		_ = txn.Rollback()
+	}()
+
+	for idx, conflictingTxHash := range txHashes {
+		if err = txn.QueryRowContext(ctx, qUpdate, conflictingTxHash[:], setValue, deleteAtHeight).Scan(&transactionID); err != nil {
+			return nil, nil, errors.NewStorageError("failed to set conflicting flag for %s", conflictingTxHash, err)
+		}
+
+		if err = s.updateParentConflictingChildren(ctx, transactionID, txMetas[idx].Tx, txn); err != nil {
+			return nil, nil, err
 		}
 	}
 
