@@ -51,7 +51,7 @@ type UTXOItem struct {
 }
 
 // GetUTXOsByTxID creates an HTTP handler for retrieving all UTXOs associated with a transaction.
-// It processes each output concurrently for improved performance.
+// It processes each output concurrently for improved performance, bounded by utxosFanoutLimit.
 //
 // Parameters:
 //   - mode: ReadMode (only JSON mode is supported)
@@ -108,6 +108,7 @@ type UTXOItem struct {
 // Performance:
 //   - Processes all transaction outputs concurrently
 //   - Uses errgroup for parallel UTXO lookups
+//   - Concurrent lookups are bounded by utxosFanoutLimit
 //   - Maintains output order in response
 //
 // Example Usage:
@@ -198,7 +199,7 @@ func (h *HTTP) getUTXOsByTxID(c echo.Context, mode ReadMode) error {
 			//nolint:gosec
 			utxoHash, err := util.UTXOHash(hash, uint32(safeI), safeOutput.LockingScript, safeOutput.Satoshis)
 			if err != nil {
-				return err
+				return echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("[Asset_http][%s] error getting utxo hash for output %d", hash.String(), safeI, err).Error())
 			}
 
 			//nolint:gosec
@@ -234,8 +235,13 @@ func (h *HTTP) getUTXOsByTxID(c echo.Context, mode ReadMode) error {
 		})
 	}
 
+	// Every error from the fan-out is already an echo.HTTPError, so re-wrapping
+	// here would nest one 500 inside another. GetUTXOs and GetTransactions return
+	// the fan-out error as-is for the same reason.
 	if err = g.Wait(); err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("[Asset_http][%s] error getting utxos", hash.String(), err).Error())
+		h.logger.Errorf("[Asset_http:GetUTXOsByTxID][%s] fan-out failed: %s", hash.String(), err.Error())
+
+		return err
 	}
 
 	prometheusAssetHTTPGetUTXO.WithLabelValues("OK", "200").Inc()
