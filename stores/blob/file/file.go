@@ -1084,7 +1084,13 @@ func (s *File) openFileWithFallback(ctx context.Context, merged *options.Options
 
 		fileReader, err := s.longtermClient.GetIoReader(ctx, key, fileType, opts...)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
+			// A longterm backend is another blob store, so it reports a miss with the
+			// ErrNotFound/ErrBlobNotFound sentinel rather than os.ErrNotExist — only a
+			// file:// longterm store returns the latter. Mapping just os.ErrNotExist
+			// classified an S3/HTTP miss as a storage failure. The sentinel survives in
+			// the wrap either way, so callers matching with errors.Is were unaffected,
+			// but the classification is what a caller reads when it reports the error.
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, errors.ErrNotFound) || errors.Is(err, errors.ErrBlobNotFound) {
 				return nil, errors.ErrNotFound
 			}
 

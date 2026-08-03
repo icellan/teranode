@@ -89,18 +89,18 @@ func newOutputsOnlyStore(t *testing.T, liveIndexes ...uint32) (*Store, blob.Stor
 	return s, mem, tx
 }
 
-// TestGetExternalTransaction_OutputsOnlyLeavesNilHoles documents the shape at the
-// root of issue #1306. The .outputs blob retains only the outputs that were live
-// at snapshot time — no inputs, no version, no locktime, and no record that a
-// spent output ever existed — so the reconstruction cannot be the transaction. It
-// is still exactly what the outpoint-decoration callers need, which is why the
-// fallback exists.
-func TestGetExternalTransaction_OutputsOnlyLeavesNilHoles(t *testing.T) {
+// TestGetExternalOutputs_LeavesNilHoles documents the shape at the root of issue
+// 1306. The .outputs blob retains only the outputs that were live at snapshot
+// time — no inputs, no version, no locktime, and no record that a spent output
+// ever existed — so the reconstruction cannot be the transaction. It is still
+// exactly what the outpoint-decoration callers need, which is why the fallback
+// exists.
+func TestGetExternalOutputs_LeavesNilHoles(t *testing.T) {
 	// Output 0 was already spent at snapshot time; 1 and 2 survived, so the hole
 	// at index 0 stays in bounds.
 	s, _, tx := newOutputsOnlyStore(t, 1, 2)
 
-	got, err := s.getExternalTransaction(context.Background(), *tx.TxIDChainHash())
+	got, err := s.getExternalOutputs(context.Background(), *tx.TxIDChainHash())
 	require.NoError(t, err)
 
 	require.Len(t, got.Outputs, 3)
@@ -113,28 +113,80 @@ func TestGetExternalTransaction_OutputsOnlyLeavesNilHoles(t *testing.T) {
 	require.Zero(t, got.Version, "the .outputs blob retains no version")
 
 	// It cannot even be identified: computing its txid means serializing it, and
-	// serialization dereferences the nil hole. This is why callers must gate on
-	// meta.Data.TxIsSerializable() before comparing txids, never the reverse.
+	// serialization dereferences the nil hole. This is why the reconstruction is
+	// reachable only from the outpoint path, which reads a single live index and
+	// never serializes — see TestGetExternalTransaction_NeverFallsBackToOutputs.
 	require.Panics(t, func() { _ = got.TxIDChainHash() },
-		"identifying the reconstruction requires serializing it, which go-bt cannot do with a nil output")
+		"identifying the reconstruction requires serializing it, which go-bt cannot do with a nil output — "+
+			"so no caller may treat it as the transaction")
 
 	// Sanity: the source transaction itself is of course fine.
 	require.NotNil(t, tx.TxIDChainHash())
 }
 
-// TestGetExternalTransaction_FallsBackOnlyOnNotFound is the contract this change
-// establishes. The fallback to the UTXO-set blob is correct when the full
-// transaction is genuinely absent, and wrong for any other failure: silently
-// serving a snapshot-derived reconstruction in place of a transaction the store
-// merely failed to read turns a transient outage into a wrong answer.
-func TestGetExternalTransaction_FallsBackOnlyOnNotFound(t *testing.T) {
+// TestGetExternalTransaction_NeverFallsBackToOutputs is the structural half of the
+// contract: the whole-transaction readers get the transaction or an error, never a
+// UTXO-set reconstruction. Keeping the fallback out of this path is what makes the
+// "callers must not serialize the reconstruction" rule an invariant rather than a
+// comment — BatchDecorate's fields.Tx/fields.Inputs path (get.go) assigns the
+// result straight into meta.Data.Tx and its consumers do serialize it.
+func TestGetExternalTransaction_NeverFallsBackToOutputs(t *testing.T) {
+	t.Run("getExternalTransaction", func(t *testing.T) {
+		s, _, tx := newOutputsOnlyStore(t, 1, 2)
+
+		got, err := s.getExternalTransaction(context.Background(), *tx.TxIDChainHash())
+
+		require.Error(t, err, "the .tx blob is absent, and the .outputs blob is not a substitute for it")
+		require.Nil(t, got)
+		require.True(t, errors.Is(err, errors.ErrTxNotFound),
+			"an absent .tx blob is not-found, got %v", err)
+	})
+
+	t.Run("GetTxFromExternalStore", func(t *testing.T) {
+		s, _, tx := newOutputsOnlyStore(t, 1, 2)
+
+		got, err := s.GetTxFromExternalStore(context.Background(), *tx.TxIDChainHash())
+
+		require.Error(t, err)
+		require.Nil(t, got)
+		require.True(t, errors.Is(err, errors.ErrTxNotFound),
+			"an absent .tx blob is not-found, got %v", err)
+	})
+
+	t.Run("a transient .tx failure is a storage error, not not-found", func(t *testing.T) {
+		s, mem, tx := newOutputsOnlyStore(t, 1, 2)
+
+		s.externalStore = &failingReadStore{
+			Store:        mem,
+			failFileType: fileformat.FileTypeTx,
+			failWith:     errors.NewServiceUnavailableError("read permits exhausted"),
+		}
+
+		got, err := s.getExternalTransaction(context.Background(), *tx.TxIDChainHash())
+
+		require.Error(t, err)
+		require.Nil(t, got)
+		require.False(t, errors.Is(err, errors.ErrTxNotFound),
+			"a failure to read the tx blob must not masquerade as the tx being absent")
+		require.True(t, errors.Is(err, errors.ErrServiceUnavailable),
+			"the original failure must be preserved, got %v", err)
+	})
+}
+
+// TestGetExternalTransactionOrOutputs_FallsBackOnlyOnNotFound is the contract this
+// change establishes for the outpoint path. The fallback to the UTXO-set blob is
+// correct when the full transaction is genuinely absent, and wrong for any other
+// failure: silently serving a snapshot-derived reconstruction in place of a
+// transaction the store merely failed to read turns a transient outage into a
+// wrong answer.
+func TestGetExternalTransactionOrOutputs_FallsBackOnlyOnNotFound(t *testing.T) {
 	t.Run("missing .tx falls back to .outputs", func(t *testing.T) {
 		s, mem, tx := newOutputsOnlyStore(t, 1, 2)
 
 		// memory.New() reports a genuine miss for the absent .tx blob.
 		s.externalStore = mem
 
-		got, err := s.getExternalTransaction(context.Background(), *tx.TxIDChainHash())
+		got, err := s.getExternalTransactionOrOutputs(context.Background(), *tx.TxIDChainHash())
 		require.NoError(t, err)
 		require.Len(t, got.Outputs, 3)
 	})
@@ -149,7 +201,7 @@ func TestGetExternalTransaction_FallsBackOnlyOnNotFound(t *testing.T) {
 			failWith:     injected,
 		}
 
-		got, err := s.getExternalTransaction(context.Background(), *tx.TxIDChainHash())
+		got, err := s.getExternalTransactionOrOutputs(context.Background(), *tx.TxIDChainHash())
 
 		require.Error(t, err, "a store failure must not silently degrade to the UTXO-set reconstruction")
 		require.Nil(t, got)
@@ -169,7 +221,7 @@ func TestGetExternalTransaction_FallsBackOnlyOnNotFound(t *testing.T) {
 			failWith:     errors.NewServiceUnavailableError("read permits exhausted"),
 		}
 
-		got, err := s.getExternalTransaction(context.Background(), *tx.TxIDChainHash())
+		got, err := s.getExternalTransactionOrOutputs(context.Background(), *tx.TxIDChainHash())
 
 		require.Error(t, err)
 		require.Nil(t, got)
@@ -193,7 +245,7 @@ func TestGetExternalTransaction_FallsBackOnlyOnNotFound(t *testing.T) {
 
 		tx := &bt.Tx{Version: 1, Inputs: []*bt.Input{{}}}
 
-		got, err := s.getExternalTransaction(context.Background(), *tx.TxIDChainHash())
+		got, err := s.getExternalTransactionOrOutputs(context.Background(), *tx.TxIDChainHash())
 		require.Error(t, err)
 		require.Nil(t, got)
 		require.True(t, errors.Is(err, errors.ErrTxNotFound),

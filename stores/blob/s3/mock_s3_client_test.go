@@ -200,3 +200,12 @@ func (m *mockS3Client) SetHeadObjectError(err error) {
 	defer m.mu.Unlock()
 	m.headObjectErr = err
 }
+
+// SetGetObjectMissError sets the error GetObject returns for a key that is not in
+// the store. Written under the same lock the read path takes, so a test that
+// injects from one goroutine and reads from another stays race-free.
+func (m *mockS3Client) SetGetObjectMissError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getObjectMissErr = err
+}
