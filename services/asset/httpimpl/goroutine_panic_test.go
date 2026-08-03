@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -28,13 +29,49 @@ import (
 // Without the fix these tests do not fail — they abort the whole test binary,
 // which is exactly what they are asserting cannot happen in production.
 
+// panicMessage is what the injected panics carry. customHTTPErrorHandler returns
+// echo.HTTPError.Message verbatim to the client, so no fragment of this may reach
+// the response body — the panic value belongs in the log only.
+const panicMessage = "runtime error: invalid memory address or nil pointer dereference"
+
+// requireNoPanicLeak asserts the recovered panic value did not make it into the
+// client-facing message. This is the documented property in GetUTXOs.go, and the
+// one a refactor to errors.NewProcessingError("...", r) would silently break.
+func requireNoPanicLeak(t *testing.T, httpErr *echo.HTTPError) {
+	t.Helper()
+
+	body, ok := httpErr.Message.(string)
+	require.True(t, ok, "message must be the string built by the handler, not an opaque value")
+	require.NotContains(t, body, panicMessage)
+	require.NotContains(t, body, "runtime error")
+	require.NotContains(t, body, "nil pointer dereference")
+}
+
+// manyOutputTx returns testTX1 widened to n outputs, so a fan-out over it is
+// wider than one goroutine.
+func manyOutputTx(t *testing.T, n int) *bt.Tx {
+	t.Helper()
+
+	tx, err := bt.NewTxFromBytes(testTX1RawBytes)
+	require.NoError(t, err)
+
+	template := tx.Outputs[0]
+	tx.Outputs = make([]*bt.Output, 0, n)
+
+	for i := 0; i < n; i++ {
+		tx.Outputs = append(tx.Outputs, &bt.Output{Satoshis: template.Satoshis, LockingScript: template.LockingScript})
+	}
+
+	return tx
+}
+
 func TestGetTransactions_PanicInErrgroupGoroutineDoesNotCrashProcess(t *testing.T) {
 	initPrometheusMetrics()
 
 	httpServer, mockRepo, echoContext, _ := GetMockHTTP(t, nil)
 
 	mockRepo.On("GetTransaction", mock.Anything).Run(func(mock.Arguments) {
-		panic("runtime error: invalid memory address or nil pointer dereference")
+		panic(panicMessage)
 	}).Return(nil, nil)
 
 	echoContext.Request().Body = io.NopCloser(bytes.NewReader(testTX1Hash.CloneBytes()))
@@ -46,6 +83,7 @@ func TestGetTransactions_PanicInErrgroupGoroutineDoesNotCrashProcess(t *testing.
 	httpErr := &echo.HTTPError{}
 	require.ErrorAs(t, err, &httpErr)
 	require.Equal(t, http.StatusInternalServerError, httpErr.Code)
+	requireNoPanicLeak(t, httpErr)
 }
 
 // The fan-out cap is the other half of the fix: the output count comes from the
@@ -59,15 +97,7 @@ func TestGetUTXOsByTXID_FanOutIsBounded(t *testing.T) {
 
 	const outputs = utxosFanoutLimit + 64
 
-	tx, err := bt.NewTxFromBytes(testTX1RawBytes)
-	require.NoError(t, err)
-
-	template := tx.Outputs[0]
-	tx.Outputs = make([]*bt.Output, 0, outputs)
-
-	for i := 0; i < outputs; i++ {
-		tx.Outputs = append(tx.Outputs, &bt.Output{Satoshis: template.Satoshis, LockingScript: template.LockingScript})
-	}
+	tx := manyOutputTx(t, outputs)
 
 	var (
 		inFlight, maxInFlight atomic.Int64
@@ -102,7 +132,7 @@ func TestGetUTXOsByTXID_FanOutIsBounded(t *testing.T) {
 		inFlight.Add(-1)
 	}).Return(testUtxo, nil)
 
-	echoContext.SetPath("/utxos/txid/:hash")
+	echoContext.SetPath("/utxos/:hash/json")
 	echoContext.SetParamNames("hash")
 	echoContext.SetParamValues(tx.TxID())
 
@@ -117,14 +147,29 @@ func TestGetUTXOsByTXID_PanicInErrgroupGoroutineDoesNotCrashProcess(t *testing.T
 
 	httpServer, mockRepo, echoContext, _ := GetMockHTTP(t, nil)
 
-	mockRepo.On("GetTransaction", mock.Anything).Return(testTX1RawBytes, nil).Once()
-	mockRepo.On("GetUtxo", mock.Anything).Run(func(mock.Arguments) {
-		panic("runtime error: invalid memory address or nil pointer dereference")
-	}).Return(nil, nil)
+	// Wider than one output, so the panicking index sits alongside siblings that
+	// succeed — a single-output fixture would not exercise the fan-out at all.
+	const (
+		outputs    = 8
+		panicOnOut = 3
+	)
 
-	echoContext.SetPath("/utxos/txid/:hash")
+	tx := manyOutputTx(t, outputs)
+
+	var completed atomic.Int64
+
+	mockRepo.On("GetTransaction", mock.Anything).Return(tx.Bytes(), nil).Once()
+	mockRepo.On("GetUtxo", mock.Anything).Run(func(args mock.Arguments) {
+		if args.Get(0).(*utxo.Spend).Vout == panicOnOut {
+			panic(panicMessage)
+		}
+
+		completed.Add(1)
+	}).Return(testUtxo, nil)
+
+	echoContext.SetPath("/utxos/:hash/json")
 	echoContext.SetParamNames("hash")
-	echoContext.SetParamValues(testTX1Hash.String())
+	echoContext.SetParamValues(tx.TxID())
 
 	err := httpServer.GetUTXOsByTxID(JSON)(echoContext)
 
@@ -133,4 +178,6 @@ func TestGetUTXOsByTXID_PanicInErrgroupGoroutineDoesNotCrashProcess(t *testing.T
 	httpErr := &echo.HTTPError{}
 	require.ErrorAs(t, err, &httpErr)
 	require.Equal(t, http.StatusInternalServerError, httpErr.Code)
+	requireNoPanicLeak(t, httpErr)
+	require.Equal(t, int64(outputs-1), completed.Load(), "one output panicking must not abort its siblings")
 }

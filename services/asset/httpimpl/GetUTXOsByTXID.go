@@ -170,10 +170,14 @@ func (h *HTTP) getUTXOsByTxID(c echo.Context, mode ReadMode) error {
 
 	g, ctx := errgroup.WithContext(c.Request().Context())
 
-	// Bound the fan-out. The output count comes from the requested transaction,
-	// so an unbounded errgroup spawns one goroutine per output — a single request
-	// for a tx with a very large output set is enough to exhaust the process.
-	// Mirrors GetUTXOs, which caps at the same limit.
+	// Bound the concurrent per-output store lookups. The output count comes from
+	// the requested transaction, so an unbounded errgroup spawns one goroutine per
+	// output. Mirrors GetUTXOs, which caps at the same limit.
+	//
+	// This bounds concurrency only, not the per-request heap: the tx is already
+	// materialised twice above (raw bytes plus parsed) and one UTXOItem is
+	// allocated per output below, all before the first lookup starts. Bounding
+	// that needs an output-count threshold, which this does not add.
 	util.SafeSetLimit(h.logger, g, utxosFanoutLimit)
 
 	// Create a channel to receive the results from the goroutines

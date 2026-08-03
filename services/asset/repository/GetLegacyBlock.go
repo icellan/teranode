@@ -68,6 +68,15 @@ func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhas
 
 	g, gCtx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) {
+		// This goroutine outlives the request: the caller gets the pipe reader back
+		// and reads from it after GetLegacyBlockReader has returned, so nothing in
+		// the HTTP layer can recover a panic in here. Fail the pipe on panic too,
+		// otherwise the consumer blocks on bytes that will never arrive.
+		defer util.RecoverToError(repo.logger, &err, func(panicErr error) {
+			_ = w.CloseWithError(panicErr)
+			_ = r.CloseWithError(panicErr)
+		}, "GetLegacyBlockReader %s", block.Hash().String())()
+
 		if err = repo.writeLegacyBlockHeader(w, block, returnWireBlock); err != nil {
 			_ = w.CloseWithError(io.ErrClosedPipe)
 			_ = r.CloseWithError(err)
@@ -319,8 +328,15 @@ func (repo *Repository) writeTransactionsViaSubtreeStoreStreaming(ctx context.Co
 	writeWindow := make(chan struct{}, window)
 
 	g, gCtx := errgroup.WithContext(streamCtx)
-	g.Go(func() error {
+	g.Go(func() (err error) {
 		defer close(resultsChan)
+
+		// Registered after close(resultsChan) so it runs first: err is set before the
+		// channel closes, and the consumer's range then exits into g.Wait() below,
+		// which surfaces the error. A recover on the caller's goroutine cannot see a
+		// panic in here.
+		defer util.RecoverToError(repo.logger, &err, nil, "scheduleSubtreeChunkFetches %s", subtreeHash.String())()
+
 		return repo.scheduleSubtreeChunkFetches(gCtx, bufferedReader, subtreeHash, totalTxs, chunkSize, concurrency, writeWindow, resultsChan)
 	})
 
@@ -421,7 +437,9 @@ func (repo *Repository) scheduleSubtreeChunkFetches(ctx context.Context, subtree
 		chunkIdx := chunkIdx
 		offset := offset
 		chunkHashesForWorker := chunkHashes
-		g.Go(func() error {
+		g.Go(func() (err error) {
+			defer util.RecoverToError(repo.logger, &err, nil, "fetchSubtreeChunk %s chunk %d", subtreeHash.String(), chunkIdx)()
+
 			return repo.fetchSubtreeChunk(gCtx, subtreeHash, chunkIdx, offset, chunkHashesForWorker, resultsChan)
 		})
 	}
@@ -559,7 +577,12 @@ func (repo *Repository) getTxs(ctx context.Context, txHashes []chainhash.Hash, t
 	for i := 0; i < len(txHashes); i += batchSize {
 		i := i // capture range variable for goroutine
 
-		g.Go(func() error {
+		g.Go(func() (err error) {
+			// The innermost fan-out on the streaming path: this is where the store
+			// hands back reconstructed transactions, so it is the closest guard to the
+			// nil *bt.Output holes a partially-present tx carries.
+			defer util.RecoverToError(repo.logger, &err, nil, "getTxs batch at %d", i)()
+
 			end := subtreepkg.Min(i+batchSize, len(txHashes))
 
 			missingTxHashesCompacted := make([]*utxo.UnresolvedMetaData, 0, end-i)
