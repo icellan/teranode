@@ -34,13 +34,14 @@ func TestGetConflictingChildren_ObservesWalkSizeAndDepth(t *testing.T) {
 	tipHash := chainhash.HashH([]byte("metrics-tip"))
 
 	// One .On per hash with a static return — the style the existing walk tests in
-	// process_conflicting_test.go use. The two trailing mock.Anything match the
-	// variadic fields the walk passes (fields.Utxos, fields.ConflictingChildren).
-	mockStore.On("Get", mock.Anything, &rootHash, mock.Anything, mock.Anything).
+	// process_conflicting_test.go use. MockUtxostore.Get passes the variadic
+	// fields to testify as a single slice argument, so one trailing matcher
+	// covers it.
+	mockStore.On("Get", mock.Anything, &rootHash, mock.Anything).
 		Return(&meta.Data{SpendingDatas: []*spendpkg.SpendingData{{TxID: &midHash}}}, nil)
-	mockStore.On("Get", mock.Anything, &midHash, mock.Anything, mock.Anything).
+	mockStore.On("Get", mock.Anything, &midHash, mock.Anything).
 		Return(&meta.Data{SpendingDatas: []*spendpkg.SpendingData{{TxID: &tipHash}}}, nil)
-	mockStore.On("Get", mock.Anything, &tipHash, mock.Anything, mock.Anything).
+	mockStore.On("Get", mock.Anything, &tipHash, mock.Anything).
 		Return(&meta.Data{}, nil)
 
 	nodesBefore, nodesSumBefore := histogramSample(t, prometheusUtxoConflictingWalkNodes)
