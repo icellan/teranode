@@ -467,7 +467,7 @@ func (u *Server) blessMissingTransaction(ctx context.Context, blockHash chainhas
 func (u *Server) checkCounterConflictingOnCurrentChain(ctx context.Context, txHash chainhash.Hash, blockIds map[uint32]bool) error {
 	// the tx is conflicting, check whether the counter-conflicting transactions have already been mined on our chain
 	// first get the parent transactions and check if they were spent
-	counterConflictingTxHashes, err := utxo.GetCounterConflictingTxHashes(ctx, u.utxoStore, txHash)
+	counterConflictingTxHashes, err := utxo.GetCounterConflictingTxHashes(ctx, u.utxoStore, txHash, u.settings.UtxoStore.ConflictingChildrenMaxNodes)
 	if err != nil {
 		return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] failed to get counter conflicting tx hashes", txHash.String(), err)
 	}
@@ -499,17 +499,21 @@ func (u *Server) checkCounterConflictingOnCurrentChain(ctx context.Context, txHa
 		return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] failed to get counter conflicting tx meta", txHash.String(), err)
 	}
 
-	// check whether the child transactions of the counter-conflicting transactions are frozen
-	for _, counterConflictingTxHash := range counterConflictingTxHashes {
-		childTransactionHashes, err := utxo.GetConflictingChildren(ctx, u.utxoStore, counterConflictingTxHash)
-		if err != nil {
-			return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] failed to get child transactions", txHash.String(), err)
-		}
+	// check whether any child transaction of txHash itself is frozen. This is the
+	// only walk the counter-conflicting set does not already cover: every
+	// counter-spender's descendant cone was walked (and frozen-checked) inside
+	// GetCounterConflictingTxHashes above, and any frozen sentinel there already
+	// failed the call. Re-walking each set member re-derived subsets of the same
+	// cones — O(N^2) store reads that wedged the mainnet fleet at 960,827 (issue
+	// 1391) — so only the single winner-cone walk remains.
+	childTransactionHashes, err := utxo.GetConflictingChildren(ctx, u.utxoStore, txHash, u.settings.UtxoStore.ConflictingChildrenMaxNodes)
+	if err != nil {
+		return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] failed to get child transactions", txHash.String(), err)
+	}
 
-		for _, childTransactionHash := range childTransactionHashes {
-			if childTransactionHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] child transaction is frozen", txHash.String())
-			}
+	for _, childTransactionHash := range childTransactionHashes {
+		if childTransactionHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] child transaction is frozen", txHash.String())
 		}
 	}
 

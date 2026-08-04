@@ -4239,7 +4239,10 @@ func (s *Store) GetCounterConflicting(ctx context.Context, hash chainhash.Hash) 
 
 	defer deferFn()
 
-	return utxo.GetCounterConflictingTxHashes(ctx, s, hash)
+	// unbounded: this is the conflict-demotion path (ProcessConflicting), which
+	// must always walk the full descendant set to completion — a budget failure
+	// here would wedge block assembly on the block forever (issue 1391)
+	return utxo.GetCounterConflictingTxHashes(ctx, s, hash, 0)
 }
 
 // GetConflictingChildren returns a list of conflicting transactions for a given transaction hash.
@@ -4250,7 +4253,7 @@ func (s *Store) GetConflictingChildren(ctx context.Context, hash chainhash.Hash)
 
 	defer deferFn()
 
-	return utxo.GetConflictingChildren(ctx, s, hash)
+	return utxo.GetConflictingChildren(ctx, s, hash, s.settings.UtxoStore.ConflictingChildrenMaxNodes)
 }
 
 // SetConflicting marks a list of transactions as conflicting.

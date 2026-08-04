@@ -985,7 +985,14 @@ func GetAndLockChildren(ctx context.Context, s Store, hash chainhash.Hash) ([]ch
 	return children, nil
 }
 
-func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) ([]chainhash.Hash, error) {
+// GetConflictingChildren walks the descendant graph of the given transaction —
+// every recorded spender plus explicit conflicting children — and returns all
+// reachable transaction hashes (excluding the root). maxNodes bounds the walk:
+// when the total number of visited transactions (including the root) would
+// exceed it, the walk fails closed with ERR_UTXO_WALK_LIMIT_EXCEEDED. A
+// maxNodes <= 0 disables the bound; the conflict-demotion path relies on this
+// to always run to completion (issue 1391).
+func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash, maxNodes int) ([]chainhash.Hash, error) {
 	ctx, _, deferFn := tracing.Tracer("utxo").Start(ctx, "GetConflictingChildren")
 
 	defer deferFn()
@@ -999,9 +1006,34 @@ func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) (
 	visited[hash] = struct{}{}
 	currentLevel := []chainhash.Hash{hash}
 
+	// visit adds a child to the walk. The frozen sentinel stays in the result set
+	// (callers check for it) but is never enqueued — it is not a real record. The
+	// budget counts every visited transaction including the root; the check runs
+	// per insert so a single wide level cannot overshoot it.
+	var nextLevel []chainhash.Hash
+
+	visit := func(child chainhash.Hash) error {
+		if _, ok := visited[child]; ok {
+			return nil
+		}
+
+		visited[child] = struct{}{}
+
+		if maxNodes > 0 && len(visited) > maxNodes {
+			return errors.NewUtxoWalkLimitExceededError("[GetConflictingChildren][%s] conflicting-descendant walk exceeded %d transactions (utxostore_conflictingChildrenMaxNodes)", hash.String(), maxNodes)
+		}
+
+		if !child.Equal(subtree.FrozenBytesTxHash) {
+			nextLevel = append(nextLevel, child)
+		}
+
+		return nil
+	}
+
 	for len(currentLevel) > 0 {
 		results := make([]*meta.Data, len(currentLevel))
 		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(128)
 
 		for i, current := range currentLevel {
 			i := i
@@ -1020,7 +1052,8 @@ func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) (
 			return nil, err
 		}
 
-		var nextLevel []chainhash.Hash
+		nextLevel = nil
+
 		for _, txMeta := range results {
 			if txMeta == nil {
 				continue
@@ -1028,9 +1061,8 @@ func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) (
 
 			if txMeta.ConflictingChildren != nil {
 				for _, child := range txMeta.ConflictingChildren {
-					if _, ok := visited[child]; !ok {
-						visited[child] = struct{}{}
-						nextLevel = append(nextLevel, child)
+					if err := visit(child); err != nil {
+						return nil, err
 					}
 				}
 			}
@@ -1038,10 +1070,8 @@ func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) (
 			if txMeta.SpendingDatas != nil {
 				for _, spendingData := range txMeta.SpendingDatas {
 					if spendingData != nil {
-						child := *spendingData.TxID
-						if _, ok := visited[child]; !ok {
-							visited[child] = struct{}{}
-							nextLevel = append(nextLevel, child)
+						if err := visit(*spendingData.TxID); err != nil {
+							return nil, err
 						}
 					}
 				}
@@ -1061,7 +1091,12 @@ func GetConflictingChildren(ctx context.Context, s Store, hash chainhash.Hash) (
 	return conflictingChildren, nil
 }
 
-func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhash.Hash) ([]chainhash.Hash, error) {
+// GetCounterConflictingTxHashes returns the given transaction plus, for every
+// input, the transaction the store records as spending that same output (the
+// counter-conflicting transaction) and that spender's full descendant set.
+// maxNodes bounds each descendant walk (see GetConflictingChildren); <= 0
+// means unbounded.
+func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhash.Hash, maxNodes int) ([]chainhash.Hash, error) {
 	ctx, _, deferFn := tracing.Tracer("utxo").Start(ctx, "GetCounterConflictingTxHashes")
 
 	defer deferFn()
@@ -1103,6 +1138,14 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 		parentTxs[*parentTxHash] = spendingTxIDs
 	}
 
+	// validate every input and collect the unique counter-spenders in first-seen
+	// input order; several inputs are typically spent by the same counter tx and
+	// its descendant walk must run only once, not once per input. Dedupe on a
+	// dedicated set: counterConflictingMap is seeded with txHash, and a spender
+	// equal to txHash itself must still be walked.
+	seenSpenders := make(map[chainhash.Hash]struct{}, len(txMeta.Tx.Inputs))
+	uniqueSpendingTxIDs := make([]chainhash.Hash, 0, len(txMeta.Tx.Inputs))
+
 	for _, input := range txMeta.Tx.Inputs {
 		parenTxIDS, ok := parentTxs[*input.PreviousTxIDChainHash()]
 		if ok {
@@ -1116,19 +1159,28 @@ func GetCounterConflictingTxHashes(ctx context.Context, s Store, txHash chainhas
 			if spendingTxID != nil {
 				counterConflictingMap[*spendingTxID] = struct{}{}
 
-				childHashes, err := s.GetConflictingChildren(ctx, *spendingTxID)
-				if err != nil {
-					return nil, err
-				}
-
-				for _, childHash := range childHashes {
-					if childHash.Equal(subtree.FrozenBytesTxHash) {
-						return nil, errors.NewProcessingError("[GetCounterConflictingTxHashes][%s] tx has frozen child", spendingTxID.String())
-					}
-
-					counterConflictingMap[childHash] = struct{}{}
+				if _, ok := seenSpenders[*spendingTxID]; !ok {
+					seenSpenders[*spendingTxID] = struct{}{}
+					uniqueSpendingTxIDs = append(uniqueSpendingTxIDs, *spendingTxID)
 				}
 			}
+		}
+	}
+
+	for _, spendingTxID := range uniqueSpendingTxIDs {
+		// call the package-level walk directly (not the Store method) so the
+		// caller-chosen maxNodes budget flows into the BFS
+		childHashes, err := GetConflictingChildren(ctx, s, spendingTxID, maxNodes)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, childHash := range childHashes {
+			if childHash.Equal(subtree.FrozenBytesTxHash) {
+				return nil, errors.NewProcessingError("[GetCounterConflictingTxHashes][%s] tx has frozen child", spendingTxID.String())
+			}
+
+			counterConflictingMap[childHash] = struct{}{}
 		}
 	}
 
