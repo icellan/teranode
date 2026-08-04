@@ -62,6 +62,12 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// conflictingConeWarnThreshold is the counter-conflicting set size above which the
+// cone is worth a log line. The set is the loser's full descendant closure, which
+// keeps growing for as long as the node cannot advance past the block that would
+// demote it (#1391), so its size is the leading indicator of that condition.
+const conflictingConeWarnThreshold = 1000
+
 // missingTx represents a transaction that needs to be retrieved and its position in the subtree.
 //
 // This structure pairs a transaction with its index in the original subtree transaction list,
@@ -470,6 +476,10 @@ func (u *Server) checkCounterConflictingOnCurrentChain(ctx context.Context, txHa
 	counterConflictingTxHashes, err := utxo.GetCounterConflictingTxHashes(ctx, u.utxoStore, txHash, u.settings.UtxoStore.ConflictingChildrenMaxNodes)
 	if err != nil {
 		return errors.NewProcessingError("[checkCounterConflictingOnCurrentChain][%s] failed to get counter conflicting tx hashes", txHash.String(), err)
+	}
+
+	if len(counterConflictingTxHashes) > conflictingConeWarnThreshold {
+		u.logger.Warnf("[checkCounterConflictingOnCurrentChain][%s] counter-conflicting set is %d transactions", txHash.String(), len(counterConflictingTxHashes))
 	}
 
 	g, gCtx := errgroup.WithContext(ctx)
