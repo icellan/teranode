@@ -106,6 +106,17 @@ func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhas
 			subtreeDataReader io.ReadCloser
 		)
 
+		// Backstop for the panic path: subtreeDataReader is a *semaphoreReadCloser
+		// whose Close is the only thing that returns the file store's global read
+		// permit, and the explicit closes below are all skipped when a panic unwinds
+		// through the loop. Each of them nils the reference out, so this fires only
+		// when one is genuinely still open — no redundant second Close.
+		defer func() {
+			if subtreeDataReader != nil {
+				_ = subtreeDataReader.Close()
+			}
+		}()
+
 		// Write the coinbase first before processing subtrees
 		if _, err = block.CoinbaseTx.WriteTo(w); err != nil {
 			_ = w.CloseWithError(io.ErrClosedPipe)
@@ -145,6 +156,7 @@ func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhas
 						// close the pipe so the consumer's Read returns instead of
 						// hanging forever waiting for bytes that will never arrive.
 						_ = subtreeDataReader.Close()
+						subtreeDataReader = nil
 						_ = w.CloseWithError(io.ErrClosedPipe)
 						_ = r.CloseWithError(err)
 
@@ -164,6 +176,7 @@ func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhas
 						// Close the underlying reader so the file-store read permit
 						// is released. The pipe close below already wakes the consumer.
 						_ = subtreeDataReader.Close()
+						subtreeDataReader = nil
 						_ = w.CloseWithError(io.ErrClosedPipe)
 						_ = r.CloseWithError(err)
 
@@ -178,6 +191,7 @@ func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhas
 
 				// close the subtree data reader after processing all transactions
 				_ = subtreeDataReader.Close()
+				subtreeDataReader = nil
 
 				// move to the next subtree
 				continue

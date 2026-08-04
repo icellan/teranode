@@ -172,6 +172,70 @@ func TestGetLegacyBlockReader_PanicInDetachedStreamerFailsTheStream(t *testing.T
 	require.NotContains(t, readErr.Error(), repoPanicMessage, "the panic value belongs in the log, not in the stream error")
 }
 
+// panicOnReadCloser panics on first Read and records whether it was closed.
+type panicOnReadCloser struct {
+	closed atomic.Bool
+}
+
+func (p *panicOnReadCloser) Read([]byte) (int, error) { panic(repoPanicMessage) }
+
+func (p *panicOnReadCloser) Close() error {
+	p.closed.Store(true)
+
+	return nil
+}
+
+// Recovering the panic is only half the job on this path: the subtree-data reader
+// is a *semaphoreReadCloser, and its Close is the only thing that returns the file
+// store's process-global read permit (768 of them; once exhausted every blob read
+// waits 25s and then 503s). A recover that skips the Close trades a crash — which
+// a restart resets — for a process that quietly bleeds read capacity for its
+// lifetime, which is worse.
+func TestGetLegacyBlockReader_PanicInSubtreeDataLoopStillClosesTheReader(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	tc := setup(t)
+	block, subtree := newBlock(tc, t, params)
+
+	blockchainClientMock := tc.repo.BlockchainClient.(*blockchain.Mock)
+	blockchainClientMock.On("GetBlock", mock.Anything, mock.Anything).Return(block, nil).Once()
+
+	// Pre-write a non-empty SubtreeData so Exists() is true and the inline
+	// streaming branch — the one that owns a reader — is taken.
+	subtreeData := subtreepkg.NewSubtreeData(subtree)
+
+	for i, tx := range params.txs {
+		if i != 0 {
+			require.NoError(t, subtreeData.AddTx(tx, i))
+		}
+	}
+
+	subtreeDataBytes, err := subtreeData.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, tc.repo.SubtreeStore.Set(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeDataBytes))
+
+	// Panic where the PR says the hazard is: deserialising store-sourced bytes.
+	panicking := &panicOnReadCloser{}
+	tc.repo.SubtreeStore = &subtreeStoreFakeReader{
+		Memory:     tc.repo.SubtreeStore.(*memory_blob.Memory),
+		targetKey:  subtree.RootHash()[:],
+		targetType: fileformat.FileTypeSubtreeData,
+		reader:     panicking,
+	}
+
+	r, err := tc.repo.GetLegacyBlockReader(t.Context(), &chainhash.Hash{})
+	require.NoError(t, err)
+
+	defer func() {
+		_ = r.Close()
+	}()
+
+	_, readErr := io.ReadAll(r)
+	require.Error(t, readErr, "consumer must see a failed stream")
+	require.True(t, panicking.closed.Load(),
+		"the subtree-data reader must be closed on the panic path too, or the file-store read permit leaks for the life of the process")
+}
+
 // GetLegacyBlock.go:322 — the chunk scheduler, one level below the streamer.
 // A recover on the outer goroutine cannot observe this one.
 func TestWriteTransactionsViaSubtreeStoreStreaming_PanicInChunkSchedulerIsSurfaced(t *testing.T) {

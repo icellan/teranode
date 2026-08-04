@@ -1,6 +1,8 @@
 package util
 
 import (
+	"runtime/debug"
+
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
@@ -28,8 +30,18 @@ import (
 // consumer is blocked on, or aborting a half-written blob. It does not run on a
 // normal return, so a goroutine's own error paths keep their existing handling.
 //
+// args are format parameters for format and nothing else. A trailing error is
+// dropped rather than passed on: errors.New would extract it as the wrapped cause
+// and render it into the message, folding internal detail into the client-facing
+// error this helper exists to keep clean.
+//
+// The panic site is recoverable from the logged stack only. The error's own
+// location metadata (file/line/function) points at this helper, because that is
+// where it is constructed — not at the goroutine that panicked, and not at the
+// panicking frame.
+//
 // Parameters:
-//   - logger: receives the panic value and the fan-out site label
+//   - logger: receives the fan-out site label, the panic value and the stack
 //   - retErr: named return of the fan-out goroutine, set only on panic
 //   - onPanic: optional panic-only cleanup, receives the error stored in retErr
 //   - format, args: identifies the fan-out site in both the log and the error
@@ -40,7 +52,16 @@ func RecoverToError(logger ulogger.Logger, retErr *error, onPanic func(err error
 			return
 		}
 
-		logger.Errorf("recovered panic in "+format+": %v", append(args, r)...)
+		if n := len(args); n > 0 {
+			if _, isErr := args[n-1].(error); isErr {
+				args = args[:n-1]
+			}
+		}
+
+		// Built on a fresh slice: appending into args would write the panic value
+		// past the length a caller handed in, scribbling on an array it still owns.
+		logArgs := append(append(make([]any, 0, len(args)+2), args...), r, debug.Stack())
+		logger.Errorf("recovered panic in "+format+": %v\n%s", logArgs...)
 
 		err := errors.NewProcessingError("internal error in "+format, args...)
 		*retErr = err
