@@ -484,10 +484,14 @@ func TestValidate_BlockAssemblyError(t *testing.T) {
 	require.Error(t, err)
 	require.Nil(t, txMetaData)
 
-	// the tx should be stored in the utxo store as locked
+	// The tx was already durably persisted with its inputs spent before
+	// sendToBlockAssembler failed. It must NOT be left Locked: validateInternal
+	// never sends it to block assembly, and nothing else will ever clear the
+	// flag, so a stuck Locked record here means the tx is spent, persisted, and
+	// permanently un-spendable and un-retryable.
 	txMeta, err := utxoStore.Get(t.Context(), tx.TxIDChainHash())
 	require.NoError(t, err)
-	assert.Equal(t, true, txMeta.Locked)
+	assert.Equal(t, false, txMeta.Locked, "tx must be unlocked even though sendToBlockAssembler failed, or it is stuck forever")
 
 	// check the kafka channels, nothing should have been sent, since the tx never was sent correctly to the block assembly
 	require.Equal(t, 0, len(txmetaKafkaProducerClient.PublishChannel()), "txMetaKafkaChan should be empty")
@@ -1295,6 +1299,105 @@ func TestValidator_TwoPhaseCommitTransaction_AlreadySpendable(t *testing.T) {
 	err = utxoStore.GetMeta(ctx, tx.TxIDChainHash(), metaData)
 	require.NoError(t, err)
 	assert.False(t, metaData.Locked, "TX should remain spendable after 2-phase commit")
+}
+
+// TestValidator_UnlockLockedTxOnExit_ClearsLockOnError is the direct, white-box
+// regression test for the mechanism validateInternal now defers immediately
+// after a tx is durably persisted+spent+Locked (see the two error returns in the
+// addToBlockAssembly block: building tx inpoints via subtree.NewTxInpointsFromTx,
+// and sendToBlockAssembler). Both paths return an error before validateInternal
+// otherwise ever reaches the two-phase-commit unlock, which - pre-fix - left the
+// tx Locked forever. unlockLockedTxOnExit is the single place both paths (and the
+// success path) now route through to release the lock.
+//
+// subtree.NewTxInpointsFromTx cannot currently be made to return an error (its
+// implementation is infallible in the pinned go-subtree version), so that
+// specific call site cannot be forced end-to-end without changing production
+// code paths outside validateInternal's control. This test instead calls the
+// shared cleanup function directly with an already-set error, which is exactly
+// the state validateInternal is in on both of those return paths: it proves the
+// tx is unlocked (Locked -> false) while the original, more informative error is
+// preserved rather than being overwritten by the (successful) unlock.
+func TestValidator_UnlockLockedTxOnExit_ClearsLockOnError(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	tx, err := bt.NewTxFromString("010000000000000000ef01b136c673a9b815af2bfdeccc9479deec3273ee98a188c26d3c14b5e6bfcbca0b010000006b48304502200241ac9536c536f21e522dec152e69674094b371b14c26edf706e1db0e6487190221008ee66bdafc7d39ee041e1425a7b2df780702e9b066c3a1e9715b03b23fbd99be41210373c9cb2feaa59dd208ad90dc4c8f32dac7a30a65e590fa16e2a421637927ae63feffffff4004fb0b000000001976a91471902a65346b0d951358ec9a1b306ecd36d284ae88ac0280969800000000001976a914dd37ee4ce93278fbc398abcda001d1d855841e0788ac3cd35d0b000000001976a914d04ad25d93764cf83aca0ca0c7cbb7ba8850f75888ac00000000")
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test_unlock_on_exit_clears_lock")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	// Mirrors what spendAndCreateInUtxoStore leaves behind on the addToBlockAssembly
+	// path: the tx durably persisted, spent, and Locked.
+	txMetaData, err := utxoStore.Create(ctx, tx, 100, utxostore.WithLocked(true))
+	require.NoError(t, err)
+	require.True(t, txMetaData.Locked)
+
+	v := &Validator{
+		logger:      ulogger.TestLogger{},
+		utxoStore:   utxoStore,
+		settings:    tSettings,
+		txValidator: NewTxValidator(ulogger.TestLogger{}, tSettings),
+		stats:       gocore.NewStat("validator"),
+	}
+
+	ctx, _, endSpan := tracing.Tracer("validator").Start(context.Background(), "Test")
+	defer endSpan()
+
+	// Simulate validateInternal already holding an error (e.g. the tx-inpoints or
+	// sendToBlockAssembler failure) when the deferred cleanup runs.
+	originalErr := errors.NewProcessingError("[Validate][%s] error getting tx inpoints", tx.TxID())
+	deferredErr := error(originalErr)
+
+	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr)
+
+	assert.False(t, txMetaData.Locked, "unlockLockedTxOnExit must clear the in-memory Locked flag")
+	assert.Same(t, originalErr, deferredErr, "the original, more informative error must not be overwritten by a successful unlock")
+
+	storedMeta := &meta.Data{}
+	err = utxoStore.GetMeta(ctx, tx.TxIDChainHash(), storedMeta)
+	require.NoError(t, err)
+	assert.False(t, storedMeta.Locked, "the store record must be unlocked, or the tx is stuck: persisted, spent, and Locked forever")
+}
+
+// TestValidator_UnlockLockedTxOnExit_SuccessPathSetsErrOnUnlockFailure covers the
+// pure-success-path behaviour that predates this fix: if the tx was never Locked
+// to begin with, unlockLockedTxOnExit must be a no-op (SetLocked must not be
+// called at all). This is the SkipUtxoCreation / not-added-to-block-assembly case.
+func TestValidator_UnlockLockedTxOnExit_NoopWhenNotLocked(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	tx, err := bt.NewTxFromString("010000000000000000ef01b136c673a9b815af2bfdeccc9479deec3273ee98a188c26d3c14b5e6bfcbca0b010000006b48304502200241ac9536c536f21e522dec152e69674094b371b14c26edf706e1db0e6487190221008ee66bdafc7d39ee041e1425a7b2df780702e9b066c3a1e9715b03b23fbd99be41210373c9cb2feaa59dd208ad90dc4c8f32dac7a30a65e590fa16e2a421637927ae63feffffff4004fb0b000000001976a91471902a65346b0d951358ec9a1b306ecd36d284ae88ac0280969800000000001976a914dd37ee4ce93278fbc398abcda001d1d855841e0788ac3cd35d0b000000001976a914d04ad25d93764cf83aca0ca0c7cbb7ba8850f75888ac00000000")
+	require.NoError(t, err)
+
+	utxoStore := NewFailingUtxoStore(t) // any SetLocked call would error here, proving it was never called
+	_, err = utxoStore.Create(context.Background(), tx, 100, utxostore.WithLocked(false))
+	require.NoError(t, err)
+
+	v := &Validator{
+		logger:      ulogger.TestLogger{},
+		utxoStore:   utxoStore,
+		settings:    test.CreateBaseTestSettings(t),
+		txValidator: NewTxValidator(ulogger.TestLogger{}, test.CreateBaseTestSettings(t)),
+		stats:       gocore.NewStat("validator"),
+	}
+
+	ctx, _, endSpan := tracing.Tracer("validator").Start(context.Background(), "Test")
+	defer endSpan()
+
+	txMetaData := &meta.Data{Locked: false}
+	var deferredErr error
+
+	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr)
+
+	assert.NoError(t, deferredErr)
 }
 
 // FailingUtxoStore provides a test double that simulates UTXO store failures.
