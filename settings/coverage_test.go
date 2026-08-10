@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/bsv-blockchain/go-chaincfg"
@@ -54,9 +55,69 @@ func TestMetadataCoverage(t *testing.T) {
 	t.Logf("Category distribution: %+v", categoryCounts)
 }
 
-// TestNoMissingTags verifies that no fields have "Not in descriptions.go" comments.
+// noTagExemptFields lists Settings fields (dotted path from the Settings
+// root, e.g. "Kafka.BlocksValidate") that intentionally carry no "key" tag
+// and are therefore not exported via ExportMetadata:
+//   - Commit, Version, Context, IsAllInOneMode are populated at runtime
+//     (build info, config context, process topology), not read from
+//     configuration.
+//   - Kafka.BlocksValidate is an unused internal field (see its own
+//     "not directly configured" comment in kafka_settings.go).
+var noTagExemptFields = map[string]bool{
+	"Commit":               true,
+	"Version":              true,
+	"Context":              true,
+	"IsAllInOneMode":       true,
+	"Kafka.BlocksValidate": true,
+}
+
+// TestNoMissingTags walks the Settings struct via reflection and fails if any
+// leaf (non-struct) field lacks the "key" struct tag that extractFields (see
+// export.go) relies on to expose settings via ExportMetadata. Nested structs
+// declared within the settings package are walked recursively; structs from
+// other packages (e.g. *chaincfg.Params) are opaque and left unchecked, since
+// they are not ours to tag. Fields listed in noTagExemptFields are skipped.
 func TestNoMissingTags(t *testing.T) {
-	// This test serves as documentation that migration is complete
-	// All fields should now have struct tags, no "Not in descriptions.go" comments should remain
-	t.Log("Migration complete: All 398 configurable fields have struct tags")
+	settingsPkgPath := reflect.TypeOf(Settings{}).PkgPath()
+
+	var missing []string
+
+	var walk func(typ reflect.Type, prefix string)
+	walk = func(typ reflect.Type, prefix string) {
+		for i := 0; i < typ.NumField(); i++ {
+			field := typ.Field(i)
+			fieldName := prefix + field.Name
+
+			if field.Tag.Get("key") != "" {
+				continue
+			}
+
+			if noTagExemptFields[fieldName] {
+				continue
+			}
+
+			fieldType := field.Type
+			if fieldType.Kind() == reflect.Pointer {
+				fieldType = fieldType.Elem()
+			}
+
+			if fieldType.Kind() == reflect.Struct {
+				// Structs declared outside the settings package (e.g.
+				// *chaincfg.Params) are opaque - they are not ours to tag,
+				// so neither recurse into them nor flag them as missing.
+				if fieldType.PkgPath() != settingsPkgPath {
+					continue
+				}
+
+				walk(fieldType, fieldName+".")
+				continue
+			}
+
+			missing = append(missing, fieldName)
+		}
+	}
+
+	walk(reflect.TypeOf(Settings{}), "")
+
+	require.Empty(t, missing, `settings field(s) missing a "key" struct tag (add one, or add the field to noTagExemptFields if it is genuinely exempt)`)
 }
