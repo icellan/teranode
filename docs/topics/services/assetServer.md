@@ -11,26 +11,27 @@
         - [4.1.1. getTransaction() and getTransactions()](#411-gettransaction-and-gettransactions)
         - [4.1.2. GetTransactionMeta()](#412-gettransactionmeta)
         - [4.1.3. GetBlockByHash()](#413-getblockbyhash)
-        - [4.1.4. GetBlocks()](#414-getblocks)
-        - [4.1.5. GetLastNBlocks()](#415-getlastnblocks)
-        - [4.1.6. GetBlockStats()](#416-getblockstats)
-        - [4.1.7. GetBlockGraphData()](#417-getblockgraphdata)
-        - [4.1.8. GetBlockForks()](#418-getblockforks)
-        - [4.1.9. GetLegacyBlock()](#419-getlegacyblock)
-        - [4.1.10. GetLegacyBlockREST()](#4110-getlegacyblockrest)
-        - [4.1.11. GetBlockHeader() and GetBestBlockHeader()](#4111-getblockheader-and-getbestblockheader)
-        - [4.1.12. GetHeaders()](#4112-getheaders)
-        - [4.1.13. GetHeadersFromCommonAncestor()](#4113-getheadersfromcommonancestor)
-        - [4.1.14. GetBlockLocator()](#4114-getblocklocator)
-        - [4.1.15. GetSubtree()](#4115-getsubtree)
-        - [4.1.16. GetSubtreeData()](#4116-getsubtreedata)
-        - [4.1.17. GetSubtreeTransactions()](#4117-getsubtreetransactions)
-        - [4.1.18. GetBlockSubtrees()](#4118-getblocksubtrees)
-        - [4.1.19. GetUTXO() and GetUTXOsByTXID()](#4119-getutxo-and-getutxosbytxid)
-        - [4.1.20. Search()](#4120-search)
-        - [4.1.21. FSM State Management](#4121-fsm-state-management)
-        - [4.1.22. Block Validation Management](#4122-block-validation-management)
-        - [4.1.23. Health and Liveness Endpoints](#4123-health-and-liveness-endpoints)
+        - [4.1.4. GetBlockByHash(), GetBlocks and GetLastNBlocks()](#414-getblockbyhash-getblocks-and-getlastnblocks)
+        - [4.1.5. GetBlocks()](#415-getblocks)
+        - [4.1.6. GetLastNBlocks()](#416-getlastnblocks)
+        - [4.1.7. GetBlockStats()](#417-getblockstats)
+        - [4.1.8. GetBlockGraphData()](#418-getblockgraphdata)
+        - [4.1.9. GetBlockForks()](#419-getblockforks)
+        - [4.1.10. GetLegacyBlock()](#4110-getlegacyblock)
+        - [4.1.11. GetLegacyBlockREST()](#4111-getlegacyblockrest)
+        - [4.1.12. GetBlockHeader() and GetBestBlockHeader()](#4112-getblockheader-and-getbestblockheader)
+        - [4.1.13. GetHeaders()](#4113-getheaders)
+        - [4.1.14. GetHeadersFromCommonAncestor()](#4114-getheadersfromcommonancestor)
+        - [4.1.15. GetBlockLocator()](#4115-getblocklocator)
+        - [4.1.16. GetSubtree()](#4116-getsubtree)
+        - [4.1.17. GetSubtreeData()](#4117-getsubtreedata)
+        - [4.1.18. GetSubtreeTransactions()](#4118-getsubtreetransactions)
+        - [4.1.19. GetBlockSubtrees()](#4119-getblocksubtrees)
+        - [4.1.20. GetUTXO() and GetUTXOsByTXID()](#4120-getutxo-and-getutxosbytxid)
+        - [4.1.21. Search()](#4121-search)
+        - [4.1.22. FSM State Management](#4122-fsm-state-management)
+        - [4.1.23. Block Validation Management](#4123-block-validation-management)
+        - [4.1.24. Health and Liveness Endpoints](#4124-health-and-liveness-endpoints)
     - [4.2. WebSocket Real-time Updates](#42-websocket-real-time-updates)
 5. [Technology](#5-technology)
 6. [Directory Structure and Main Files](#6-directory-structure-and-main-files)
@@ -170,7 +171,7 @@ Retrieves a single block by its hash.
 
 ![asset_server_http_get_block_header.svg](img/plantuml/assetserver/asset_server_http_get_block_header.svg)
 
-### 4.1.5. GetBlockByHash(), GetBlocks and GetLastNBlocks()
+### 4.1.4. GetBlockByHash(), GetBlocks and GetLastNBlocks()
 
 **GetBlockByHash** - Get a single block by hash:
 
@@ -210,7 +211,7 @@ Retrieves a single block by its hash.
 
 Supports multiple response formats through URL path suffixes. Binary response returns raw block data, hex returns hexadecimal string, and JSON returns structured block data with metadata.
 
-### 4.1.4. GetBlocks()
+### 4.1.5. GetBlocks()
 
 Retrieves a paginated list of blocks.
 
@@ -226,7 +227,7 @@ Retrieves a paginated list of blocks.
 
 Returns blocks with comprehensive metadata including miner information, coinbase value, transaction count, and block size.
 
-### 4.1.5. GetLastNBlocks()
+### 4.1.6. GetLastNBlocks()
 
 Retrieves the most recent blocks in the blockchain.
 
@@ -244,7 +245,7 @@ Retrieves the most recent blocks in the blockchain.
 
 Returns recent blocks in descending order (newest first) with comprehensive metadata including miner information, coinbase value, transaction count, and block size.
 
-### 4.1.6. GetBlockStats()
+### 4.1.7. GetBlockStats()
 
 Retrieves block statistics.
 
@@ -255,7 +256,7 @@ Retrieves block statistics.
 
 ![asset_server_http_get_block_stats.svg](img/plantuml/assetserver/asset_server_http_get_block_stats.svg)
 
-### 4.1.7. GetBlockGraphData()
+### 4.1.8. GetBlockGraphData()
 
 Retrieves block graph data for a given period
 
@@ -266,7 +267,7 @@ Retrieves block graph data for a given period
 
 ![asset_server_http_get_block_graph_data.svg](img/plantuml/assetserver/asset_server_http_get_block_graph_data.svg)
 
-### 4.1.8. GetBlockForks()
+### 4.1.9. GetBlockForks()
 
 Retrieves information about block forks
 
@@ -277,7 +278,7 @@ Retrieves information about block forks
 
 ![asset_server_http_get_block_forks.svg](img/plantuml/assetserver/asset_server_http_get_block_forks.svg)
 
-### 4.1.9. GetLegacyBlock()
+### 4.1.10. GetLegacyBlock()
 
 Retrieves a block in legacy format, and as a binary stream.
 
@@ -288,7 +289,7 @@ Retrieves a block in legacy format, and as a binary stream.
 
 ![asset_server_http_get_legacy_block.svg](img/plantuml/assetserver/asset_server_http_get_legacy_block.svg)
 
-### 4.1.10. GetLegacyBlockREST()
+### 4.1.11. GetLegacyBlockREST()
 
 Legacy REST endpoint for block retrieval in binary format.
 
@@ -301,7 +302,7 @@ Legacy REST endpoint for block retrieval in binary format.
 
 Maintains backward compatibility with legacy Bitcoin clients. Returns blocks in the original Bitcoin binary format.
 
-### 4.1.11. GetBlockHeader() and GetBestBlockHeader()
+### 4.1.12. GetBlockHeader() and GetBestBlockHeader()
 
 - **URL**: `/header/:hash` (single with `/hex`, `/json` variants), `/bestblockheader` (best block with `/hex`, `/json` variants)
 - **Method**: GET
@@ -312,7 +313,7 @@ Maintains backward compatibility with legacy Bitcoin clients. Returns blocks in 
 
 Supports multiple response formats through URL path suffixes for both endpoints.
 
-### 4.1.12. GetHeaders()
+### 4.1.13. GetHeaders()
 
 Retrieves multiple consecutive block headers starting from a specific block hash.
 
@@ -328,7 +329,7 @@ Retrieves multiple consecutive block headers starting from a specific block hash
 
 Supports multiple response formats through URL path suffixes. Binary response returns concatenated 80-byte headers, hex returns hexadecimal string, and JSON returns structured header data with metadata.
 
-### 4.1.13. GetHeadersFromCommonAncestor()
+### 4.1.14. GetHeadersFromCommonAncestor()
 
 Retrieves block headers from a common ancestor point for chain synchronization.
 
@@ -345,7 +346,7 @@ Retrieves block headers from a common ancestor point for chain synchronization.
 
 Useful for chain synchronization after forks. Finds the common ancestor between the local chain and the provided locator hashes, then returns headers from that point.
 
-### 4.1.14. GetBlockLocator()
+### 4.1.15. GetBlockLocator()
 
 Retrieves block locator hashes for efficient blockchain synchronization.
 
@@ -362,7 +363,7 @@ Retrieves block locator hashes for efficient blockchain synchronization.
 
 Returns a strategically selected set of block hashes used by peers to efficiently identify blockchain state and find common ancestors. Uses exponential backoff (first 10 blocks, then doubles) and always includes the genesis block.
 
-### 4.1.15. GetSubtree()
+### 4.1.16. GetSubtree()
 
 - **URL**: `/subtree/:hash` (with `/hex`, `/json` variants)
 - **Method**: GET
@@ -373,7 +374,7 @@ Returns a strategically selected set of block hashes used by peers to efficientl
 
 Supports multiple response formats through URL path suffixes.
 
-### 4.1.16. GetSubtreeData()
+### 4.1.17. GetSubtreeData()
 
 Retrieves raw subtree transaction data as a binary stream.
 
@@ -386,7 +387,7 @@ Retrieves raw subtree transaction data as a binary stream.
 
 This endpoint streams all transactions within a subtree as raw binary data, optimized for efficient data transfer without JSON overhead.
 
-### 4.1.17. GetSubtreeTransactions()
+### 4.1.18. GetSubtreeTransactions()
 
 Retrieves transaction details from a subtree with pagination support.
 
@@ -403,7 +404,7 @@ Retrieves transaction details from a subtree with pagination support.
 
 Returns detailed transaction information including transaction ID, input/output counts, size, and fees. Missing transactions are skipped in the response.
 
-### 4.1.18. GetBlockSubtrees()
+### 4.1.19. GetBlockSubtrees()
 
 Retrieves subtrees for a block in JSON format
 
@@ -414,7 +415,7 @@ Retrieves subtrees for a block in JSON format
 
 ![asset_server_http_get_block_subtrees.svg](img/plantuml/assetserver/asset_server_http_get_block_subtrees.svg)
 
-### 4.1.19. GetUTXO() and GetUTXOsByTXID()
+### 4.1.20. GetUTXO() and GetUTXOsByTXID()
 
 - **URL**: `/utxo/:hash` (single UTXO with `/hex`, `/json` variants), `/utxos/:hash/json` (UTXOs by transaction ID)
 - **Method**: GET
@@ -427,7 +428,7 @@ Retrieves subtrees for a block in JSON format
 
 - For getting UTXOs by a transaction ID (`/utxos/:hash/json`), the HTTP Server requests transaction meta data from the UTXO Store using a transaction hash. Then for each output in the transaction, it queries the UtxoStore to get UTXO data for the corresponding output hash.
 
-### 4.1.20. Search()
+### 4.1.21. Search()
 
 Generic hash or block height search. The server searches for a hash in the blockchain, UTXO store, and subtree store, or retrieves a block by height.
 
@@ -443,7 +444,7 @@ Generic hash or block height search. The server searches for a hash in the block
 
 Returns the entity type (`block`, `tx`, or `subtree`) and hash of the found item.
 
-### 4.1.21. FSM State Management
+### 4.1.22. FSM State Management
 
 The Asset Server provides an interface to the Finite State Machine (FSM) of the blockchain service. These endpoints allow for monitoring and controlling the blockchain state:
 
@@ -454,7 +455,7 @@ The Asset Server provides an interface to the Finite State Machine (FSM) of the 
 - **GET /api/v1/fsm/events**: Lists all available FSM events
 - **GET /api/v1/fsm/states**: Lists all possible FSM states
 
-### 4.1.22. Block Validation Management
+### 4.1.23. Block Validation Management
 
 The Asset Server offers endpoints for block validation control:
 
@@ -464,7 +465,7 @@ The Asset Server offers endpoints for block validation control:
 - **POST /api/v1/block/revalidate**: Revalidates a previously invalidated block
 - **GET /api/v1/blocks/invalid**: Retrieves a list of invalid blocks
 
-### 4.1.23. Health and Liveness Endpoints
+### 4.1.24. Health and Liveness Endpoints
 
 The Asset Server provides health check endpoints for monitoring and orchestration systems like Kubernetes:
 
