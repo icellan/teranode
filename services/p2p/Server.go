@@ -474,6 +474,8 @@ func NewServer(
 ) (*Server, error) {
 	logger.Debugf("Creating P2P service")
 
+	initPrometheusMetrics()
+
 	p2pPort := tSettings.P2P.Port
 	if p2pPort == 0 {
 		return nil, errors.NewConfigurationError("p2p_port not set in config")
@@ -1019,6 +1021,7 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 					// Get current peer addresses from the P2P node
 					peers := s.P2PClient.GetPeers()
 					s.logger.Debugf("P2P node currently connected to %d peers", len(peers))
+					prometheusP2PConnectedPeers.Set(float64(len(peers)))
 
 					// Log our advertised addresses (these should include observed addresses)
 					// The go-p2p library should be handling this via libp2p's Identify protocol
@@ -2881,6 +2884,7 @@ func (s *Server) onPeerBanned(peerID, reason string) {
 	}
 	until := time.Now().Add(banDuration)
 	s.logger.Infof("[onPeerBanned] Peer %s banned until %s for reason: %s", peerID, until.Format(time.RFC3339), reason)
+	prometheusP2PBanEvents.WithLabelValues(reason).Inc()
 
 	// Make the ban effective for gossip filtering immediately, without waiting
 	// for the cached IsPeerBanned=false entry to expire.
