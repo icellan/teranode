@@ -445,6 +445,14 @@ func (t *websocketTransport) Close(_ centrifuge.Disconnect) error {
 	return t.conn.Close()
 }
 
+// TODO: this fallback (used only when WebsocketConfig.CheckOrigin is nil) is
+// currently non-functional: checkSameHost below is stubbed to always return
+// nil, and even the commented-out real implementation has an inverted
+// condition (sameHostOriginCheck returns err != nil, i.e. true only when
+// checkSameHost fails). centrifuge.go's Start() always passes an explicit
+// CheckOrigin so this dead path isn't reachable in production today, but it
+// should be fixed or removed separately.
+
 // sameHostOriginCheck creates a function to verify the origin of WebSocket connections.
 //
 // Returns:

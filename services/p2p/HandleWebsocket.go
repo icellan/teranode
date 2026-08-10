@@ -4,12 +4,17 @@ package p2p
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/gorilla/websocket"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/labstack/echo/v4"
 )
 
@@ -90,12 +95,20 @@ func (cm *clientChannelMap) add(ch chan []byte) {
 	cm.Lock()
 	defer cm.Unlock()
 	cm.channels[ch] = struct{}{}
+
+	if prometheusP2PWebSocketConnections != nil {
+		prometheusP2PWebSocketConnections.Set(float64(len(cm.channels)))
+	}
 }
 
 func (cm *clientChannelMap) remove(ch chan []byte) {
 	cm.Lock()
 	defer cm.Unlock()
 	delete(cm.channels, ch)
+
+	if prometheusP2PWebSocketConnections != nil {
+		prometheusP2PWebSocketConnections.Set(float64(len(cm.channels)))
+	}
 }
 
 // maxConcurrentBroadcasts caps the number of in-flight broadcast goroutines so a
@@ -181,13 +194,149 @@ const (
 	isoFormat = "2006-01-02T15:04:05Z"
 )
 
-var (
-	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
+// wsConnCapCapacity bounds the number of distinct per-IP connection counters
+// retained by wsConnLimiter, mirroring the LRU-bounded design used for the
+// Asset service's rate limiter (services/asset/httpimpl/rate_limiter.go):
+// without a bound, an attacker rotating source IPs could grow the tracking
+// map without limit.
+const wsConnCapCapacity = 50_000
+
+// websocketCheckOrigin returns a CheckOrigin function for the websocket
+// upgrader. It replaces the previous "always allow any origin" check, which
+// made the endpoint trivially embeddable by any third-party page for
+// cross-site WebSocket hijacking.
+//
+// Rules:
+//   - No Origin header (non-browser clients, e.g. server-to-server tooling) -
+//     always allowed, since CheckOrigin only exists to stop browsers from
+//     silently including credentials on a cross-origin request.
+//   - Origin host matches the request Host (same-host) - always allowed.
+//   - Anything else - allowed only if present in allowedOrigins.
+func websocketCheckOrigin(allowedOrigins []string) func(r *http.Request) bool {
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		o = strings.ToLower(strings.TrimSpace(o))
+		if o != "" {
+			allowed[o] = struct{}{}
+		}
 	}
-)
+
+	return func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+
+		if u, err := url.Parse(origin); err == nil && u.Host != "" && strings.EqualFold(u.Host, r.Host) {
+			return true
+		}
+
+		_, ok := allowed[strings.ToLower(strings.TrimSpace(origin))]
+
+		return ok
+	}
+}
+
+// wsConnKey normalises a source IP for use as a connection-cap/rate-limit
+// bucket key. IPv4 is kept full-precision; IPv6 is collapsed to its /64
+// prefix so an attacker rotating addresses within a single /64 can't
+// trivially evade the per-IP cap.
+func wsConnKey(rawIP string) string {
+	ip := net.ParseIP(rawIP)
+	if ip == nil {
+		return rawIP
+	}
+
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String()
+	}
+
+	mask := net.CIDRMask(64, 128)
+
+	return ip.Mask(mask).String()
+}
+
+// wsConnLimiter enforces a global and a per-IP cap on concurrent /p2p-ws
+// connections, checked before the HTTP connection is upgraded to WebSocket
+// (and before the per-connection channel/goroutine are allocated), so a
+// connection flood can't exhaust file descriptors, memory, or goroutines.
+type wsConnLimiter struct {
+	maxGlobal int
+	maxPerIP  int
+	global    atomic.Int64
+	perIP     *lru.Cache[string, *atomic.Int64]
+}
+
+// newWSConnLimiter creates a wsConnLimiter. maxGlobal <= 0 disables the
+// global cap; maxPerIP <= 0 disables the per-IP cap.
+func newWSConnLimiter(maxGlobal, maxPerIP int) *wsConnLimiter {
+	cache, _ := lru.New[string, *atomic.Int64](wsConnCapCapacity)
+
+	return &wsConnLimiter{
+		maxGlobal: maxGlobal,
+		maxPerIP:  maxPerIP,
+		perIP:     cache,
+	}
+}
+
+// acquire reserves a connection slot for ip. If ok is false, the global or
+// per-IP cap has been reached and the caller must reject the connection
+// without upgrading it. If ok is true, release must be called exactly once
+// when the connection ends.
+func (l *wsConnLimiter) acquire(ip string) (release func(), ok bool) {
+	if l.maxGlobal > 0 {
+		if l.global.Add(1) > int64(l.maxGlobal) {
+			l.global.Add(-1)
+			return nil, false
+		}
+	}
+
+	var ipCounter *atomic.Int64
+
+	if l.maxPerIP > 0 {
+		ipCounter = l.perIPCounter(ip)
+
+		if ipCounter.Add(1) > int64(l.maxPerIP) {
+			ipCounter.Add(-1)
+
+			if l.maxGlobal > 0 {
+				l.global.Add(-1)
+			}
+
+			return nil, false
+		}
+	}
+
+	return func() {
+		if l.maxGlobal > 0 {
+			l.global.Add(-1)
+		}
+
+		if ipCounter != nil {
+			ipCounter.Add(-1)
+		}
+	}, true
+}
+
+// perIPCounter returns the (possibly freshly created) counter for ip's
+// bucket key. Uses load-then-store so a race-losing goroutine's allocation
+// doesn't get stranded.
+func (l *wsConnLimiter) perIPCounter(rawIP string) *atomic.Int64 {
+	key := wsConnKey(rawIP)
+
+	if counter, ok := l.perIP.Get(key); ok {
+		return counter
+	}
+
+	counter := &atomic.Int64{}
+	l.perIP.Add(key, counter)
+
+	if existing, ok := l.perIP.Get(key); ok {
+		return existing
+	}
+
+	return counter
+}
 
 // broadcastMessage sends a message to all connected clients
 func (s *Server) broadcastMessage(data []byte, clientChannels *clientChannelMap) {
@@ -313,13 +462,34 @@ func (s *Server) HandleWebSocket(notificationCh chan *notificationMsg) func(c ec
 
 	go s.startNotificationProcessor(clientChannels, newClientCh, deadClientCh, notificationCh, serverCtx)
 
+	var allowedOrigins []string
+
+	maxConns, maxConnsPerIP := 0, 0
+
+	if s.settings != nil {
+		allowedOrigins = s.settings.P2P.WSAllowedOrigins
+		maxConns = s.settings.P2P.WSMaxConnections
+		maxConnsPerIP = s.settings.P2P.WSMaxConnectionsPerIP
+	}
+
+	wsUpgrader := websocket.Upgrader{
+		CheckOrigin: websocketCheckOrigin(allowedOrigins),
+	}
+	connLimiter := newWSConnLimiter(maxConns, maxConnsPerIP)
+
 	return func(c echo.Context) error {
+		release, ok := connLimiter.acquire(c.RealIP())
+		if !ok {
+			return c.String(http.StatusServiceUnavailable, "too many websocket connections")
+		}
+		defer release()
+
 		connCtx, connCancel := context.WithCancel(serverCtx)
 		defer connCancel()
 
 		ch := make(chan []byte, 100)
 
-		ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
+		ws, err := wsUpgrader.Upgrade(c.Response(), c.Request(), nil)
 		if err != nil {
 			return err
 		}

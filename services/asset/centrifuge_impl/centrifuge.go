@@ -245,6 +245,50 @@ func (c *Centrifuge) Init(_ context.Context) (err error) {
 	return c.centrifugeNode.Run()
 }
 
+// wsAllowedOrigins returns the operator-configured extra allowed origins for
+// the /connection/websocket endpoint, or nil if settings are unavailable.
+func (c *Centrifuge) wsAllowedOrigins() []string {
+	if c.settings == nil {
+		return nil
+	}
+
+	return c.settings.Asset.WSAllowedOrigins
+}
+
+// checkWebsocketOrigin returns a CheckOrigin function for the Centrifuge
+// WebSocket upgrader. It replaces a previous "always allow any origin"
+// check, which made the endpoint trivially embeddable by any third-party
+// page for cross-site WebSocket hijacking.
+//
+// Rules mirror services/p2p/HandleWebsocket.go's websocketCheckOrigin:
+//   - No Origin header (non-browser clients) - always allowed.
+//   - Origin host matches the request Host (same-host) - always allowed.
+//   - Anything else - allowed only if present in allowedOrigins.
+func checkWebsocketOrigin(allowedOrigins []string) func(r *http.Request) bool {
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		o = strings.ToLower(strings.TrimSpace(o))
+		if o != "" {
+			allowed[o] = struct{}{}
+		}
+	}
+
+	return func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+
+		if u, err := url.Parse(origin); err == nil && u.Host != "" && strings.EqualFold(u.Host, r.Host) {
+			return true
+		}
+
+		_, ok := allowed[strings.ToLower(strings.TrimSpace(origin))]
+
+		return ok
+	}
+}
+
 // Start begins the Centrifuge server operation, setting up WebSocket handlers
 // and starting the P2P listener. It handles client connections and message routing.
 //
@@ -265,9 +309,7 @@ func (c *Centrifuge) Start(ctx context.Context, addr string) error {
 	websocketHandler := NewWebsocketHandler(c.centrifugeNode, WebsocketConfig{
 		ReadBufferSize:     1024,
 		UseWriteBufferPool: true,
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
+		CheckOrigin:        checkWebsocketOrigin(c.wsAllowedOrigins()),
 	})
 	_ = c.httpServer.AddHTTPHandler("/connection/websocket", c.authMiddleware(websocketHandler))
 	_ = c.httpServer.AddHTTPHandler("/client/", http.FileServer(http.Dir("./client")))

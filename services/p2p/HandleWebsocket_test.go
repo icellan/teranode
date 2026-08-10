@@ -1259,3 +1259,205 @@ func TestHandleNodeStatusNotification_PublishBudgetSurvivesSlowCompute(t *testin
 		t.Fatal("Publish was never called")
 	}
 }
+
+// TestWebsocketCheckOrigin covers the /p2p-ws origin check: same-host and
+// no-Origin requests are always allowed, everything else must be explicitly
+// allowlisted. This replaces the previous CheckOrigin that unconditionally
+// returned true for any origin.
+func TestWebsocketCheckOrigin(t *testing.T) {
+	tests := []struct {
+		name           string
+		allowedOrigins []string
+		origin         string
+		host           string
+		want           bool
+	}{
+		{
+			name: "no origin header is allowed",
+			host: "node.example.com",
+			want: true,
+		},
+		{
+			name:   "same-host origin is allowed",
+			origin: "https://node.example.com",
+			host:   "node.example.com",
+			want:   true,
+		},
+		{
+			name:   "same-host origin with different scheme is allowed",
+			origin: "http://node.example.com",
+			host:   "node.example.com",
+			want:   true,
+		},
+		{
+			name:   "cross-origin request is denied by default",
+			origin: "https://evil.example.com",
+			host:   "node.example.com",
+			want:   false,
+		},
+		{
+			name:           "cross-origin request in the allowlist is allowed",
+			allowedOrigins: []string{"https://dashboard.example.com"},
+			origin:         "https://dashboard.example.com",
+			host:           "node.example.com",
+			want:           true,
+		},
+		{
+			name:           "cross-origin request not in the allowlist is denied",
+			allowedOrigins: []string{"https://dashboard.example.com"},
+			origin:         "https://evil.example.com",
+			host:           "node.example.com",
+			want:           false,
+		},
+		{
+			name:           "allowlist match is case-insensitive",
+			allowedOrigins: []string{"https://Dashboard.Example.Com"},
+			origin:         "https://dashboard.example.com",
+			host:           "node.example.com",
+			want:           true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checkOrigin := websocketCheckOrigin(tt.allowedOrigins)
+
+			req := httptest.NewRequest(http.MethodGet, "http://"+tt.host+"/p2p-ws", nil)
+			req.Host = tt.host
+
+			if tt.origin != "" {
+				req.Header.Set("Origin", tt.origin)
+			}
+
+			require.Equal(t, tt.want, checkOrigin(req))
+		})
+	}
+}
+
+// TestWSConnLimiter_GlobalCap verifies that acquire rejects connections once
+// the global cap is reached, and that release frees the slot back up.
+func TestWSConnLimiter_GlobalCap(t *testing.T) {
+	limiter := newWSConnLimiter(2, 0)
+
+	release1, ok := limiter.acquire("10.0.0.1")
+	require.True(t, ok)
+
+	release2, ok := limiter.acquire("10.0.0.2")
+	require.True(t, ok)
+
+	_, ok = limiter.acquire("10.0.0.3")
+	require.False(t, ok, "third connection should be rejected once the global cap is reached")
+
+	release1()
+
+	release3, ok := limiter.acquire("10.0.0.3")
+	require.True(t, ok, "releasing a slot should allow a new connection")
+
+	release2()
+	release3()
+}
+
+// TestWSConnLimiter_PerIPCap verifies that acquire rejects connections from
+// the same IP once the per-IP cap is reached, while a different IP is
+// unaffected.
+func TestWSConnLimiter_PerIPCap(t *testing.T) {
+	limiter := newWSConnLimiter(0, 1)
+
+	release1, ok := limiter.acquire("10.0.0.1")
+	require.True(t, ok)
+
+	_, ok = limiter.acquire("10.0.0.1")
+	require.False(t, ok, "second connection from the same IP should be rejected once the per-IP cap is reached")
+
+	release2, ok := limiter.acquire("10.0.0.2")
+	require.True(t, ok, "a different IP must not be affected by another IP's cap")
+
+	release1()
+
+	release3, ok := limiter.acquire("10.0.0.1")
+	require.True(t, ok, "releasing the slot should allow the same IP to reconnect")
+
+	release2()
+	release3()
+}
+
+// TestWSConnLimiter_IPv6NormalisedToSlash64 verifies IPv6 addresses within
+// the same /64 share a per-IP bucket, preventing trivial evasion of the
+// per-IP cap by rotating addresses within one prefix.
+func TestWSConnLimiter_IPv6NormalisedToSlash64(t *testing.T) {
+	limiter := newWSConnLimiter(0, 1)
+
+	release1, ok := limiter.acquire("2001:db8::1")
+	require.True(t, ok)
+
+	_, ok = limiter.acquire("2001:db8::2")
+	require.False(t, ok, "a different address within the same /64 should share the cap")
+
+	release1()
+}
+
+// TestWSConnLimiter_ZeroDisablesCap verifies that a non-positive limit
+// disables the corresponding cap entirely.
+func TestWSConnLimiter_ZeroDisablesCap(t *testing.T) {
+	limiter := newWSConnLimiter(0, 0)
+
+	var releases []func()
+
+	for i := 0; i < 1000; i++ {
+		release, ok := limiter.acquire("10.0.0.1")
+		require.True(t, ok, "cap of 0 must not reject any connection")
+		releases = append(releases, release)
+	}
+
+	for _, release := range releases {
+		release()
+	}
+}
+
+// TestHandleWebSocket_ConnectionCap verifies that once the configured global
+// connection cap is reached, a new /p2p-ws connection attempt is rejected
+// with HTTP 503 before the upgrade (and its per-connection channel/goroutine)
+// is even attempted.
+func TestHandleWebSocket_ConnectionCap(t *testing.T) {
+	s := &Server{
+		gCtx:   t.Context(),
+		logger: &ulogger.TestLogger{},
+		settings: &settings.Settings{
+			P2P: settings.P2PSettings{
+				ListenMode:       settings.ListenModeFull,
+				EnableNAT:        false,
+				WSMaxConnections: 1,
+			},
+		},
+	}
+
+	notificationCh := make(chan *notificationMsg, 1)
+	handler := s.HandleWebSocket(notificationCh)
+
+	e := echo.New()
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c := e.NewContext(r, w)
+		_ = handler(c)
+	}))
+	defer httpServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http")
+
+	// First connection takes the only slot and stays open.
+	ws1, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer ws1.Close()
+
+	require.NoError(t, ws1.SetReadDeadline(time.Now().Add(2*time.Second)))
+	_, _, err = ws1.ReadMessage()
+	require.NoError(t, err, "should receive the initial node_status message")
+
+	// Second attempt must be rejected while the cap is held, without ever
+	// reaching the websocket upgrade.
+	resp, err := http.Get(httpServer.URL) //nolint:noctx // test-only, short-lived
+	require.NoError(t, err)
+
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+}

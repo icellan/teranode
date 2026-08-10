@@ -233,6 +233,8 @@ func NewServer(
 	subtreeKafkaProducerClient kafka.KafkaAsyncProducerI,
 	blocksKafkaProducerClient kafka.KafkaAsyncProducerI,
 ) (*Server, error) {
+	initPrometheusMetrics()
+
 	logger.Debugf("Creating P2P service")
 
 	listenAddresses := tSettings.P2P.ListenAddresses
@@ -712,6 +714,13 @@ func (s *Server) setupHTTPServer() *echo.Echo {
 		AllowOrigins: []string{"*"},
 		AllowMethods: []string{echo.GET},
 	}))
+
+	httpRateLimit := 0
+	if s.settings != nil {
+		httpRateLimit = s.settings.P2P.HTTPRateLimit
+	}
+
+	e.Use(newIPRateLimiter(httpRateLimit).Middleware())
 
 	e.GET("/health", func(c echo.Context) error {
 		return c.String(http.StatusOK, "OK")
