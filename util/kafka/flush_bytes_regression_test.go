@@ -58,7 +58,9 @@ func startRedpanda(t *testing.T, ctx context.Context) (brokerAddr string, cleanu
 		ContainerRequest: req,
 		Started:          true,
 	})
-	require.NoError(t, err)
+	if err != nil {
+		t.Skipf("Skipping: Redpanda container not available (%v)", err)
+	}
 
 	return fmt.Sprintf("localhost:%d", port), func() {
 		_ = container.Terminate(context.Background())

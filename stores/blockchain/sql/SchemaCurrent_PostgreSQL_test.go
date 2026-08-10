@@ -37,6 +37,7 @@ func newSchemaTestDB(t *testing.T) (*url.URL, *usql.DB) {
 				WithStartupTimeout(5*time.Minute),
 		),
 	)
+	test.SkipIfContainerUnavailable(t, err)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = pgContainer.Terminate(context.Background()) })
 

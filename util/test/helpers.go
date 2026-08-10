@@ -3,6 +3,7 @@ package test
 import (
 	"net/url"
 	"os"
+	"testing"
 
 	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/settings"
@@ -53,4 +54,14 @@ func CreateBaseTestSettings(t TestingT) *settings.Settings {
 	}
 
 	return tSettings
+}
+
+// SkipIfContainerUnavailable skips the current test with a clear reason when
+// starting a TestContainers-backed dependency (Docker/OrbStack) failed,
+// instead of letting the test fail hard when no container runtime is
+// reachable. Pass the error returned directly from the container-start call.
+func SkipIfContainerUnavailable(t *testing.T, err error) {
+	if err != nil {
+		t.Skipf("skipping: container runtime unavailable: %v", err)
+	}
 }

@@ -77,7 +77,7 @@ func MustStartEnv(t testing.TB, ctx context.Context) *Env {
 		Started:          true,
 	})
 	if err != nil {
-		t.Fatalf("kafkatest: start redpanda: %v", err)
+		t.Skipf("kafkatest: Redpanda container not available (%v)", err)
 	}
 
 	env := &Env{

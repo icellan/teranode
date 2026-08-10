@@ -36,6 +36,7 @@ func setupPostgresStore(t *testing.T) (*Store, context.Context) {
 				WithStartupTimeout(5*time.Minute),
 		),
 	)
+	test.SkipIfContainerUnavailable(t, err)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		assert.NoError(t, pgContainer.Terminate(ctx))

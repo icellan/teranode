@@ -24,7 +24,9 @@ func TestExternalTransactionPruning(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	require.NoError(t, err)
+	if err != nil {
+		t.Skipf("Skipping: Aerospike container not available (%v)", err)
+	}
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)
@@ -122,7 +124,9 @@ func TestExternalTransactionOutputsOnlyPruning(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	require.NoError(t, err)
+	if err != nil {
+		t.Skipf("Skipping: Aerospike container not available (%v)", err)
+	}
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)
@@ -212,7 +216,9 @@ func TestMultiRecordExternalTransactionPruning(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	require.NoError(t, err)
+	if err != nil {
+		t.Skipf("Skipping: Aerospike container not available (%v)", err)
+	}
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)
@@ -345,7 +351,9 @@ func TestExternalFileAlreadyDeleted(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	require.NoError(t, err)
+	if err != nil {
+		t.Skipf("Skipping: Aerospike container not available (%v)", err)
+	}
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)
@@ -425,7 +433,9 @@ func TestMixedExternalAndNormalTransactions(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	require.NoError(t, err)
+	if err != nil {
+		t.Skipf("Skipping: Aerospike container not available (%v)", err)
+	}
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)

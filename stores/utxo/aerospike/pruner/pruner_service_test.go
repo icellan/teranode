@@ -38,7 +38,9 @@ func TestCleanupServiceLogicWithoutProcessor(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	require.NoError(t, err)
+	if err != nil {
+		t.Skipf("Skipping: Aerospike container not available (%v)", err)
+	}
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)
@@ -229,7 +231,9 @@ func TestServiceStartStop(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	require.NoError(t, err)
+	if err != nil {
+		t.Skipf("Skipping: Aerospike container not available (%v)", err)
+	}
 
 	host, err := container.Host(ctx)
 	require.NoError(t, err)
@@ -276,7 +280,9 @@ func TestDeleteAtHeight(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	require.NoError(t, err)
+	if err != nil {
+		t.Skipf("Skipping: Aerospike container not available (%v)", err)
+	}
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)

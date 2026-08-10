@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/util/test"
 	_ "github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -36,6 +37,7 @@ func newPostgresTestDB(t *testing.T) *DB {
 				WithStartupTimeout(5*time.Minute),
 		),
 	)
+	test.SkipIfContainerUnavailable(t, err)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = pgContainer.Terminate(context.Background()) })
 
