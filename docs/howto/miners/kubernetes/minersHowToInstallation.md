@@ -14,6 +14,7 @@ Last modified: 29-October-2025
     - [Deploy Teranode](#deploy-teranode)
 - [Verifying the Deployment](#verifying-the-deployment)
 - [Production Considerations](#production-considerations)
+    - [Scaling the Propagation Service](#scaling-the-propagation-service)
 - [Other Resources](#other-resources)
 
 ## Introduction
@@ -284,6 +285,31 @@ For production deployments, consider:
 - Setting up proper backup and disaster recovery procedures
 
 An example CR for a mainnet deployment is available in [kubernetes/teranode/teranode-cr-mainnet.yaml](https://github.com/bsv-blockchain/teranode/blob/main/deploy/kubernetes/teranode/teranode-cr-mainnet.yaml).
+
+### Scaling the Propagation Service
+
+The propagation service (and every other service in the Cluster CR) is
+horizontally scalable: set `propagation.spec.deploymentOverrides.replicas` in
+`teranode-cr.yaml` (or `teranode-cr-mainnet.yaml`) to the desired pod count and
+re-apply the CR.
+
+There is currently no supported way to put a `HorizontalPodAutoscaler` in front
+of the operator-managed propagation Deployment. The Teranode Operator's
+`Propagation` custom resource does declare a Kubernetes `/scale` subresource,
+which is the mechanism an HPA would normally use to target a custom resource
+directly. In practice this doesn't hold up: the parent `Cluster` controller
+reconciles every child resource, including `Propagation`, both on a fixed
+one-minute timer and whenever the `Propagation` object's spec changes (which an
+HPA writing to `/scale` would trigger). On each of those reconciles it
+overwrites the entire `Propagation` spec — including the replica count — with
+whatever is stored in the `Cluster` CR itself. Any replica count an HPA sets
+gets reverted within at most a minute, so autoscaling would silently flap
+rather than converge.
+
+Until the operator changes this reconcile behavior (e.g. by leaving
+externally-managed replica counts alone), manual scaling via
+`deploymentOverrides.replicas` remains the supported way to size the
+propagation service.
 
 ## Related Documentation
 
