@@ -18,7 +18,9 @@ package blockchain
 import (
 	"container/ring"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
@@ -532,12 +534,37 @@ func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		return errors.WrapGRPC(err)
 	}
 
+	apiKey := b.settings.GRPCAdminAPIKey
+	if apiKey == "" {
+		// Generate a random API key if not provided so SendNotification can't
+		// be reached without a key that's actually known to any caller.
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			return errors.WrapGRPC(errors.NewServiceNotStartedError("[Blockchain][Start] failed to generate API key", err))
+		}
+
+		apiKey = hex.EncodeToString(key)
+
+		b.logger.Warnf("[Blockchain] grpc_admin_api_key is not set; a random key was generated so SendNotification is unreachable until a key is configured")
+	}
+
+	// Only SendNotification is protected here: it's the RPC the Halborn audit
+	// flagged as an unauthenticated flood vector. The rest of the blockchain
+	// gRPC service is still unauthenticated by default (relies on cluster
+	// network isolation); broadening this is a separate follow-up.
+	authOptions := &util.AuthOptions{
+		APIKey: apiKey,
+		ProtectedMethods: map[string]bool{
+			"/blockchain_api.BlockchainAPI/SendNotification": true,
+		},
+	}
+
 	// this will block
 	if err := util.StartGRPCServer(ctx, b.logger, b.settings, "blockchain", b.settings.BlockChain.GRPCListenAddress, func(server *grpc.Server) {
 		blockchain_api.RegisterBlockchainAPIServer(server, b)
 		blockchain_api.RegisterPeerRegistryServiceServer(server, b)
 		closeOnce.Do(func() { close(readyCh) })
-	}, nil); err != nil {
+	}, authOptions); err != nil {
 		return errors.WrapGRPC(errors.NewServiceNotStartedError("[Blockchain][Start] can't start GRPC server", err))
 	}
 
@@ -2505,6 +2532,24 @@ func (b *Blockchain) RevalidateBlock(ctx context.Context, request *blockchain_ap
 //   - *emptypb.Empty: Empty response indicating successful notification queuing
 //   - error: Any error encountered during notification processing
 func (b *Blockchain) SendNotification(ctx context.Context, req *blockchain_api.Notification) (*emptypb.Empty, error) {
+	if req == nil {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][SendNotification] request is nil"))
+	}
+
+	if _, ok := model.NotificationType_name[int32(req.GetType())]; !ok {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][SendNotification] unrecognized notification type %d", req.GetType()))
+	}
+
+	// PING (heartbeat) notifications carry no hash; every other type must
+	// reference a real block/subtree hash.
+	if req.GetType() == model.NotificationType_PING {
+		if len(req.GetHash()) != 0 {
+			return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][SendNotification] PING notification must not carry a hash"))
+		}
+	} else if len(req.GetHash()) != chainhash.HashSize {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][SendNotification] hash must be %d bytes, got %d", chainhash.HashSize, len(req.GetHash())))
+	}
+
 	_, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "RevalidateBlock",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainSendNotification),
@@ -2512,7 +2557,13 @@ func (b *Blockchain) SendNotification(ctx context.Context, req *blockchain_api.N
 	)
 	defer deferFn()
 
-	b.notifications <- req
+	// Use a select with default to avoid blocking the RPC handler if the
+	// notifications channel is full (see broadcastHeartbeat for the same pattern).
+	select {
+	case b.notifications <- req:
+	default:
+		b.logger.Warnf("[Blockchain][SendNotification] Notifications channel full, dropping %s notification", req.Type.String())
+	}
 
 	return &emptypb.Empty{}, nil
 }

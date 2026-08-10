@@ -118,10 +118,15 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 
 	retries := 0
 
+	// Include the admin API key so the protected SendNotification RPC (see
+	// [Blockchain][Start]) accepts calls made through this client.
+	apiKey := tSettings.GRPCAdminAPIKey
+
 	for {
 		baConn, err = util.GetGRPCClient(ctx, address, &util.ConnectionOptions{
 			MaxRetries:   tSettings.GRPCMaxRetries,
 			RetryBackoff: tSettings.GRPCRetryBackoff,
+			APIKey:       apiKey,
 			CallerName:   "blockchain",
 		}, tSettings)
 		if err != nil {
