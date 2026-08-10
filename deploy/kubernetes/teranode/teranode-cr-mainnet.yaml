@@ -26,11 +26,6 @@ spec:
           requests:
             cpu: 1
             memory: 1Gi
-      grpcIngress:
-        annotations:
-          traefik.ingress.kubernetes.io/router.entrypoints: ast-grpc
-        className: traefik-internal
-        host: mainnet-eu-1.example.com
       httpIngress:
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: web

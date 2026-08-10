@@ -24,11 +24,6 @@ spec:
           requests:
             cpu: 100m
             memory: 256Mi
-      grpcIngress:
-        annotations:
-          traefik.ingress.kubernetes.io/router.entrypoints: ast-grpc
-        className: traefik-internal
-        host: teranode.local
       httpIngress:
         annotations:
           traefik.ingress.kubernetes.io/router.entrypoints: web
