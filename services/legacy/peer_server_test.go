@@ -192,6 +192,29 @@ func (m *mockServerPeer) QueueInventory(invVect *wire.InvVect) {
 	m.Called(invVect)
 }
 
+// TestHandleRelayBlockInvMsg verifies that a newly-relayed block is announced
+// via a plain inventory message to peers that have NOT negotiated sendheaders.
+// handleRelayInvMsg only special-cases InvTypeBlock when sp.WantsHeaders() is
+// true (sending a headers message via handleRelayBlockMsg); peers that never
+// sent "sendheaders" must still get the block via QueueInventory, or they get
+// no announcement for the block at all.
+func TestHandleRelayBlockInvMsg(t *testing.T) {
+	sp := &mockServerPeer{}
+
+	blockHash := chainhash.Hash{0x0a, 0x0b, 0x0c}
+	invVect := wire.NewInvVect(wire.InvTypeBlock, &blockHash)
+
+	msg := relayMsg{invVect: invVect}
+
+	s := &server{}
+
+	sp.Mock.On("QueueInventory", invVect).Return()
+
+	s.handleRelayBlockInvMsg(sp, msg)
+
+	sp.AssertCalled(t, "QueueInventory", invVect)
+}
+
 // TestHandleRelayTxMsg tests the handleRelayTxMsg function's behavior with various fee filter scenarios
 func TestHandleRelayTxMsg(t *testing.T) {
 	tests := []struct {

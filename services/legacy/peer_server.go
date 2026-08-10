@@ -2523,6 +2523,13 @@ func (s *server) handleRelayInvMsg(state *peerState, msg relayMsg) {
 			return
 		}
 
+		// Peers that have not negotiated sendheaders still need the block
+		// announced via a plain inventory message.
+		if msg.invVect.Type == wire.InvTypeBlock {
+			s.handleRelayBlockInvMsg(sp, msg)
+			return
+		}
+
 		if msg.invVect.Type == wire.InvTypeTx {
 			// Don't relay the transaction to the peer when it has
 			// transaction relaying disabled.
@@ -2603,6 +2610,13 @@ func (s *server) handleRelayBlockMsg(sp *serverPeer, msg relayMsg) {
 	}
 
 	sp.QueueMessage(msgHeaders, nil)
+}
+
+// handleRelayBlockInvMsg queues a plain inventory vector for a block to a peer
+// that has not negotiated sendheaders. Peers that did negotiate sendheaders are
+// announced via a headers message instead, in handleRelayBlockMsg.
+func (s *server) handleRelayBlockInvMsg(sp serverPeerQueueInventory, msg relayMsg) {
+	sp.QueueInventory(msg.invVect)
 }
 
 // handleBroadcastMsg deals with broadcasting messages to peers.  It is invoked
