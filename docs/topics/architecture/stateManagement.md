@@ -17,6 +17,7 @@
     - [3.4.2. FSM Event: Catch up Blocks](#342-fsm-event-catch-up-blocks)
     - [3.4.3. FSM Event: Stop](#343-fsm-event-stop)
     - [3.5. Waiting on State Machine Transitions](#35-waiting-on-state-machine-transitions)
+    - [3.6. Health Check Status Codes](#36-health-check-status-codes)
 4. [Other Resources](#4-other-resources)
 
 ## 1. Introduction
@@ -221,6 +222,21 @@ The following services wait for the FSM to transition from the `Idle` state befo
 - Subtree Validation
 - UTXO Persister
 - Validator
+
+### 3.6. Health Check Status Codes
+
+Each service's `/health` HTTP endpoint (and the corresponding gRPC health check) reports the blockchain FSM state via `CheckFSM` (`services/blockchain/fsm.go`), mapping it to an HTTP status code:
+
+| FSM State        | HTTP Status                    | Meaning                                                        |
+|------------------|---------------------------------|-----------------------------------------------------------------|
+| `Idle`           | 200 `StatusOK`                  | Healthy, but not yet processing transactions/blocks.             |
+| `Running`        | 200 `StatusOK`                  | Healthy and actively participating in the network.               |
+| `CatchingBlocks` | 200 `StatusOK`                  | Healthy and catching up on blocks.                                |
+| Unknown/unlisted | 503 `StatusServiceUnavailable`  | Unrecognized FSM state, or the FSM state query itself failed.    |
+
+Note that `Idle` reports 200, not 503: an idle node is healthy, just not yet running — returning 503 would cause orchestrators (e.g. Kubernetes readiness probes) to restart-loop a node that is intentionally idle (for example, before its operator issues the `Run` event).
+
+Readiness for actual work is enforced separately, by each service's own startup gate described in [3.5. Waiting on State Machine Transitions](#35-waiting-on-state-machine-transitions) (`WaitUntilFSMTransitionFromIdleState`), not by the health-check status code. An operator monitoring only the `/health` status code should not read "200 while idle" as "the node is doing work" — check the reported FSM state string alongside the status code to distinguish `Idle` from `Running`/`CatchingBlocks`.
 
 ---
 
