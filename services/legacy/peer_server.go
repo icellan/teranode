@@ -538,9 +538,9 @@ func (sp *serverPeer) pushAddrMsg(addresses []*wire.NetAddress) {
 // disconnected.
 func (sp *serverPeer) addBanScore(persistent, transient uint32, reason string) {
 	// No warning is logged and no score is calculated if banning is disabled.
-	// if cfg.DisableBanning {
-	//	return
-	// }
+	if cfg.DisableBanning {
+		return
+	}
 	if sp.isWhitelisted {
 		sp.server.logger.Debugf("Misbehaving whitelisted peer %s: %s", sp, reason)
 		return

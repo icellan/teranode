@@ -891,6 +891,53 @@ func TestServerPeerAddBanScoreExists(t *testing.T) {
 	assert.NotNil(t, sp.addBanScore)
 }
 
+// TestServerPeerAddBanScoreRespectsDisableBanning verifies that addBanScore
+// honours cfg.DisableBanning (the --nobanning flag) by leaving the ban score
+// untouched when banning is disabled, and that it still accumulates normally
+// when banning is enabled.
+func TestServerPeerAddBanScoreRespectsDisableBanning(t *testing.T) {
+	// cfg is a package-level variable read by addBanScore; save/restore it so
+	// this test doesn't leak state into other tests in the package.
+	origCfg := cfg
+	defer func() { cfg = origCfg }()
+
+	tests := []struct {
+		name            string
+		disableBanning  bool
+		expectIncreased bool
+	}{
+		{
+			name:            "banning enabled: score accumulates",
+			disableBanning:  false,
+			expectIncreased: true,
+		},
+		{
+			name:            "banning disabled: score does not accumulate",
+			disableBanning:  true,
+			expectIncreased: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg = &config{
+				DisableBanning: tt.disableBanning,
+				BanThreshold:   100,
+			}
+
+			sp := &serverPeer{}
+
+			sp.addBanScore(1, 0, "test")
+
+			if tt.expectIncreased {
+				assert.NotZero(t, sp.banScore.Int())
+			} else {
+				assert.Zero(t, sp.banScore.Int())
+			}
+		})
+	}
+}
+
 // TestServerOutboundGroupCountExists tests the OutboundGroupCount method exists
 func TestServerOutboundGroupCountExists(t *testing.T) {
 	// This method requires complex channel setup and peer state management
