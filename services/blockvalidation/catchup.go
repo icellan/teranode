@@ -894,9 +894,12 @@ func (u *Server) verifyCheckpointsInHeaderChain(catchupCtx *CatchupContext) erro
 //   - int: Number of checkpoints successfully verified
 //   - error: If checkpoint verification fails (hash mismatch)
 func (u *Server) verifyCheckpointsAgainstHeaders(catchupCtx *CatchupContext) (int, error) {
-	// Get the highest checkpoint height for reference
-	highestCheckpointHeight := blockchain.HighestCheckpointHeight(catchupCtx.checkpoints)
-	catchupCtx.highestCheckpointHeight = highestCheckpointHeight
+	// Track the highest checkpoint height actually verified (hash-matched) in this run.
+	// Quick validation eligibility must be bound to what was genuinely proven this run,
+	// not to the highest checkpoint in the globally configured list - a checkpoint that
+	// is merely configured but falls outside the current catchup range (or is never
+	// reached by the loop below) provides no cryptographic guarantee for this session.
+	var highestVerifiedCheckpointHeight uint32
 
 	firstBlockHeight := catchupCtx.commonAncestorMeta.Height + 1
 	lastBlockHeight := catchupCtx.commonAncestorMeta.Height + uint32(len(catchupCtx.blockHeaders))
@@ -929,8 +932,14 @@ func (u *Server) verifyCheckpointsAgainstHeaders(catchupCtx *CatchupContext) (in
 
 			u.logger.Infof("[catchup][%s] Verified checkpoint at height %d with hash %s", catchupCtx.blockUpTo.Hash().String(), checkpointHeight, checkpoint.Hash.String())
 			checkpointsChecked++
+
+			if checkpointHeight > highestVerifiedCheckpointHeight {
+				highestVerifiedCheckpointHeight = checkpointHeight
+			}
 		}
 	}
+
+	catchupCtx.highestCheckpointHeight = highestVerifiedCheckpointHeight
 
 	return checkpointsChecked, nil
 }
