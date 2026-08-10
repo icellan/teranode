@@ -117,10 +117,6 @@ build-teranode-ci: set_debug_flags set_txmetacache_flag
 build-chainintegrity: set_debug_flags
 	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -o chainintegrity.run ./compose/cmd/chainintegrity/
 
-.PHONY: build-tx-blaster
-build-tx-blaster: set_debug_flags
-	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) go build --trimpath -ldflags="-X main.commit=${GIT_COMMIT} -X main.version=${GIT_VERSION}" -gcflags "all=${DEBUG_FLAGS}" -o blaster.run ./cmd/txblaster/
-
 .PHONY: build-teranode-cli
 build-teranode-cli:
 	CGO_ENABLED=$(CGO_ENABLED) GOOS=$(GOOS) GOARCH=$(GOARCH) go build -mod=readonly -o teranode-cli ./cmd/teranodecli

@@ -103,7 +103,6 @@ This Makefile facilitates a variety of development and build tasks for the Teran
 ### Building Tools and Utilities
 
 - **build-chainintegrity**: Builds the chain integrity testing tool at `./compose/cmd/chainintegrity/`.
-- **build-tx-blaster**: Builds the transaction blaster performance testing tool at `./cmd/txblaster/`. **Note:** the `./cmd/txblaster/` source directory does not currently exist; this target will fail if invoked.
 - **build-blockchainstatus**: Builds the blockchain status utility at `./cmd/blockchainstatus/`. **Note:** the `./cmd/blockchainstatus/` source directory does not currently exist; this target will fail if invoked.
 
 ### Testing
