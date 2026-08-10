@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1243,6 +1244,96 @@ func TestBanPeer(t *testing.T) {
 		inPeer.WaitForDisconnect()
 		outPeer.WaitForDisconnect()
 	}
+}
+
+// flakyWriter wraps an io.Writer and starts failing all writes once armed,
+// used to simulate a write error on an otherwise healthy connection.
+type flakyWriter struct {
+	w    io.Writer
+	fail atomic.Bool
+}
+
+func (f *flakyWriter) Write(p []byte) (int, error) {
+	if f.fail.Load() {
+		return 0, errors.New("simulated write error")
+	}
+
+	return f.w.Write(p)
+}
+
+// TestOutHandlerDisconnectsOnWriteError verifies that outHandler disconnects
+// the peer when writeMessage fails, rather than leaving the peer marked as
+// connected with a permanently stalled send queue.
+func TestOutHandlerDisconnectsOnWriteError(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	verack := make(chan struct{}, 4)
+	cfg := &peer.Config{
+		Listeners: peer.MessageListeners{
+			OnVerAck: func(p *peer.Peer, msg *wire.MsgVerAck) {
+				verack <- struct{}{}
+			},
+			OnWrite: func(p *peer.Peer, bytesWritten int, msg wire.Message, err error) {
+				if _, ok := msg.(*wire.MsgVerAck); ok {
+					verack <- struct{}{}
+				}
+			},
+		},
+		UserAgentName:          "peer",
+		UserAgentVersion:       "1.0",
+		UserAgentComments:      []string{"comment"},
+		ChainParams:            &chaincfg.MainNetParams,
+		Services:               0,
+		TrickleInterval:        time.Second * 10,
+		TstAllowSelfConnection: true,
+	}
+
+	inR, outW := io.Pipe()
+	outR, inW := io.Pipe()
+
+	fw := &flakyWriter{w: outW}
+
+	inConn := &conn{raddr: "10.0.0.1:8333", Reader: inR, Writer: inW, Closer: inW}
+	outConn := &conn{raddr: "10.0.0.2:8333", Reader: outR, Writer: fw, Closer: outW}
+
+	inPeer := peer.NewInboundPeer(ulogger.TestLogger{}, tSettings, cfg)
+	inPeer.AssociateConnection(inConn)
+
+	outPeer, err := peer.NewOutboundPeer(ulogger.TestLogger{}, tSettings, cfg, "10.0.0.2:8333")
+	require.NoError(t, err)
+	outPeer.AssociateConnection(outConn)
+
+	for i := 0; i < 4; i++ {
+		select {
+		case <-verack:
+		case <-time.After(2 * time.Second):
+			t.Fatal("verack timeout")
+		}
+	}
+
+	require.True(t, outPeer.Connected())
+
+	// Arm the write failure only after the handshake has completed so the
+	// negotiation itself is unaffected.
+	fw.fail.Store(true)
+
+	outPeer.QueueMessage(wire.NewMsgPing(1), nil)
+
+	disconnected := make(chan struct{})
+	go func() {
+		outPeer.WaitForDisconnect()
+		close(disconnected)
+	}()
+
+	select {
+	case <-disconnected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("peer did not disconnect after a write error")
+	}
+
+	require.False(t, outPeer.Connected())
+
+	inPeer.DisconnectWithInfo("test cleanup")
+	inPeer.WaitForDisconnect()
 }
 
 func NewTestServer(t *testing.T) (*legacy.Server, error) {

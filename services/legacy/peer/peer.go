@@ -2365,6 +2365,7 @@ out:
 				if msg.doneChan != nil {
 					msg.doneChan <- struct{}{}
 				}
+				p.DisconnectWithWarning("write error")
 				continue
 			}
 

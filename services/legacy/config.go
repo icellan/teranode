@@ -28,17 +28,26 @@ import (
 )
 
 const (
-	defaultDataDir                 = "data"
-	defaultMaxPeers                = 125
-	defaultMaxPeersPerIP           = 5
-	defaultBanDuration             = time.Hour * 24
-	defaultBanThreshold            = 100
-	defaultConnectTimeout          = time.Second * 30
-	defaultFreeTxRelayLimit        = 15.0
-	defaultTrickleInterval         = peer.DefaultTrickleInterval
-	defaultExcessiveBlockSize      = math.MaxUint64
-	defaultBlockMinSize            = 0
-	defaultBlockMaxSize            = defaultExcessiveBlockSize - 1000
+	defaultDataDir            = "data"
+	defaultMaxPeers           = 125
+	defaultMaxPeersPerIP      = 5
+	defaultBanDuration        = time.Hour * 24
+	defaultBanThreshold       = 100
+	defaultConnectTimeout     = time.Second * 30
+	defaultFreeTxRelayLimit   = 15.0
+	defaultTrickleInterval    = peer.DefaultTrickleInterval
+	defaultExcessiveBlockSize = math.MaxUint64
+	// maxWireMessagePayload is the largest message payload the wire protocol
+	// path can actually relay (set via wire.SetLimits in Server.go's Init).
+	// ExcessiveBlockSize is clamped to this value so the advertised EB never
+	// promises more than the transport can deliver.
+	maxWireMessagePayload = 4_000_000_000
+	defaultBlockMinSize   = 0
+	// defaultBlockMaxSize is derived from maxWireMessagePayload, not
+	// defaultExcessiveBlockSize: ExcessiveBlockSize is clamped to
+	// maxWireMessagePayload in loadConfig, so the default block max size must
+	// stay within that same ceiling or the sanity check below rejects it.
+	defaultBlockMaxSize            = maxWireMessagePayload - 1000
 	blockMaxSizeMin                = 1000
 	defaultGenerate                = false
 	defaultSigCacheMaxSize         = 100000
@@ -119,19 +128,17 @@ func minUint64(a, b uint64) uint64 {
 	return b
 }
 
+// clampExcessiveBlockSize caps a configured (or defaulted) ExcessiveBlockSize
+// at maxWireMessagePayload, the largest payload the wire protocol path can
+// actually relay (see wire.SetLimits in Server.go's Init). Values at or below
+// the ceiling are returned unchanged.
+func clampExcessiveBlockSize(v uint64) uint64 {
+	return minUint64(v, maxWireMessagePayload)
+}
+
 // maxUint32 is a helper function to return the maximum of two uint32s.
 // This avoids a math import and the need to cast to floats.
 func maxUint32(a, b uint32) uint32 {
-	if a > b {
-		return a
-	}
-
-	return b
-}
-
-// maxUint64 is a helper function to return the maximum of two uint64s.
-// This avoids a math import and the need to cast to floats.
-func maxUint64(a, b uint64) uint64 {
 	if a > b {
 		return a
 	}
@@ -611,8 +618,9 @@ func loadConfig(logger ulogger.Logger) (*config, []string, error) {
 		return nil, nil, err
 	}
 
-	// Excessive blocksize cannot be set less than the default, but it can be higher.
-	cfg.ExcessiveBlockSize = maxUint64(cfg.ExcessiveBlockSize, defaultExcessiveBlockSize)
+	// Excessive blocksize can never advertise more than the wire protocol can
+	// actually relay, regardless of what was configured (or defaulted to).
+	cfg.ExcessiveBlockSize = clampExcessiveBlockSize(cfg.ExcessiveBlockSize)
 
 	// Limit the max block size to a sane value.
 	blockMaxSizeMax := cfg.ExcessiveBlockSize - 1000

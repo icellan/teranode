@@ -2,6 +2,7 @@ package legacy
 
 import (
 	"io/ioutil"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -48,6 +49,59 @@ func TestExcessiveBlockSizeUserAgentComment(t *testing.T) {
 	//	if uac != uacExpected {
 	//		t.Fatalf("Expected UserAgentComments to contain %s but got %s", uacExpected, uac)
 	//	}
+}
+
+// TestClampExcessiveBlockSizeRespectsValueBelowWireCapacity confirms a
+// configured ExcessiveBlockSize below the wire protocol's actual relay
+// capacity is respected as-is, rather than being floored up to some other
+// value.
+//
+// Note: this exercises clampExcessiveBlockSize directly rather than going
+// through loadConfig's os.Args-based flag parsing. That CLI parsing path is
+// already dead code in this file (the flags.NewIniParser/parser.Parse calls
+// are commented out), so loadConfig always builds cfg from its hard-coded
+// struct defaults regardless of os.Args -- exercising the clamp via os.Args
+// would silently test nothing.
+func TestClampExcessiveBlockSizeRespectsValueBelowWireCapacity(t *testing.T) {
+	const belowCapacity uint64 = 64000000
+
+	got := clampExcessiveBlockSize(belowCapacity)
+	if got != belowCapacity {
+		t.Fatalf("Expected ExcessiveBlockSize to be respected at %d, got %d", belowCapacity, got)
+	}
+}
+
+// TestClampExcessiveBlockSizeCapsValueAboveWireCapacity confirms a configured
+// (or defaulted) ExcessiveBlockSize above what the wire protocol can
+// actually relay gets clamped down to that ceiling, instead of being
+// advertised as an essentially-infinite value the transport can't back up.
+func TestClampExcessiveBlockSizeCapsValueAboveWireCapacity(t *testing.T) {
+	// Above the wire capacity ceiling.
+	if got := clampExcessiveBlockSize(5000000000); got != maxWireMessagePayload {
+		t.Fatalf("Expected ExcessiveBlockSize to be clamped to %d, got %d", maxWireMessagePayload, got)
+	}
+
+	// The old math.MaxUint64 default should also be clamped down.
+	if got := clampExcessiveBlockSize(math.MaxUint64); got != maxWireMessagePayload {
+		t.Fatalf("Expected default ExcessiveBlockSize to be clamped to %d, got %d", maxWireMessagePayload, got)
+	}
+}
+
+// TestLoadConfigClampsDefaultExcessiveBlockSize confirms the clamp is wired
+// up in loadConfig: since the CLI flag parser is disabled, cfg always starts
+// from defaultExcessiveBlockSize (math.MaxUint64), which must come back
+// clamped to the wire capacity ceiling.
+func TestLoadConfigClampsDefaultExcessiveBlockSize(t *testing.T) {
+	os.Args = []string{"bsvd"}
+
+	cfg, _, err := loadConfig(ulogger.TestLogger{})
+	if err != nil {
+		t.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	if cfg.ExcessiveBlockSize != maxWireMessagePayload {
+		t.Fatalf("Expected default ExcessiveBlockSize to be clamped to %d, got %d", maxWireMessagePayload, cfg.ExcessiveBlockSize)
+	}
 }
 
 func TestCreateDefaultConfigFile(t *testing.T) {
