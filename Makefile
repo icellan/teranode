@@ -68,7 +68,7 @@ dev-dashboard:
 	npm install --prefix ./ui/dashboard && npm run dev --prefix ./ui/dashboard
 
 .PHONY: build
-# build-blockchainstatus build-tx-blaster build-propagation-blaster build-aerospiketest build-blockassembly-blaster build-utxostore-blaster build-s3-blaster build-chainintegrity
+# build-propagation-blaster build-aerospiketest build-blockassembly-blaster build-utxostore-blaster build-s3-blaster build-chainintegrity
 build: update_config build-teranode-with-dashboard build-teranode-cli clean_backup
 
 .PHONY: update_config
@@ -140,10 +140,6 @@ build-teranode-dev:
 # .PHONY: build-blockassembly-blaster
 # build-blockassembly-blaster: set_debug_flags
 # 	go build --trimpath -ldflags="-X main.commit=${GITHUB_SHA} -X main.version=MANUAL" -gcflags "all=${DEBUG_FLAGS}" -o blockassemblyblaster.run ./cmd/blockassembly_blaster/main.go
-
-.PHONY: build-blockchainstatus
-build-blockchainstatus:
-	go build -o blockchainstatus.run ./cmd/blockchainstatus/
 
 # .PHONY: build-aerospiketest
 # build-aerospiketest:
@@ -494,8 +490,6 @@ clean_gen:
 .PHONY: clean
 clean:
 	rm -f ./teranode_*.tar.gz
-	rm -f blaster.run
-	rm -f blockchainstatus.run
 	rm -rf build/
 	rm -f coverage.out
 

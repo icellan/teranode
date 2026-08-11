@@ -103,7 +103,6 @@ This Makefile facilitates a variety of development and build tasks for the Teran
 ### Building Tools and Utilities
 
 - **build-chainintegrity**: Builds the chain integrity testing tool at `./compose/cmd/chainintegrity/`.
-- **build-blockchainstatus**: Builds the blockchain status utility at `./cmd/blockchainstatus/`. **Note:** the `./cmd/blockchainstatus/` source directory does not currently exist; this target will fail if invoked.
 
 ### Testing
 
@@ -190,7 +189,6 @@ The chain integrity test suite validates that multiple Teranode instances mainta
 - **clean**: Cleans up built artifacts:
 
     - Removes `.tar.gz` archives
-    - Removes binary executables (`blaster.run`, `blockchainstatus.run`)
     - Removes build directory
     - Removes coverage output files
 
