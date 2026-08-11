@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/gorilla/websocket"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/labstack/echo/v4"
@@ -467,7 +468,11 @@ func (s *Server) HandleWebSocket(notificationCh chan *notificationMsg) func(c ec
 	maxConns, maxConnsPerIP := 0, 0
 
 	if s.settings != nil {
-		allowedOrigins = s.settings.P2P.WSAllowedOrigins
+		// The dashboard's Vite dev-server origins are always permitted so
+		// `make dev` keeps working under this default-deny origin check
+		// (mirrors services/asset/centrifuge_impl/centrifuge.go).
+		allowedOrigins = append(allowedOrigins, s.settings.P2P.WSAllowedOrigins...)
+		allowedOrigins = append(allowedOrigins, util.DevServerOrigins(s.settings.Dashboard.DevServerPorts)...)
 		maxConns = s.settings.P2P.WSMaxConnections
 		maxConnsPerIP = s.settings.P2P.WSMaxConnectionsPerIP
 	}

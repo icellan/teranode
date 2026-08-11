@@ -18,6 +18,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/retry"
 	"github.com/centrifugal/centrifuge"
 	"github.com/google/uuid"
@@ -246,13 +247,20 @@ func (c *Centrifuge) Init(_ context.Context) (err error) {
 }
 
 // wsAllowedOrigins returns the operator-configured extra allowed origins for
-// the /connection/websocket endpoint, or nil if settings are unavailable.
+// the /connection/websocket endpoint, plus the dashboard's Vite dev-server
+// origins (settings.Dashboard.DevServerPorts) so `make dev` keeps working
+// under the default-deny origin check below. Returns nil if settings are
+// unavailable.
 func (c *Centrifuge) wsAllowedOrigins() []string {
 	if c.settings == nil {
 		return nil
 	}
 
-	return c.settings.Asset.WSAllowedOrigins
+	origins := make([]string, 0, len(c.settings.Asset.WSAllowedOrigins))
+	origins = append(origins, c.settings.Asset.WSAllowedOrigins...)
+	origins = append(origins, util.DevServerOrigins(c.settings.Dashboard.DevServerPorts)...)
+
+	return origins
 }
 
 // checkWebsocketOrigin returns a CheckOrigin function for the Centrifuge

@@ -1461,3 +1461,53 @@ func TestHandleWebSocket_ConnectionCap(t *testing.T) {
 
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 }
+
+// TestHandleWebSocket_DevServerOriginAllowedByDefault verifies that the
+// dashboard's Vite dev-server origin is accepted even when
+// p2p_wsAllowedOrigins is unset, so `make dev` keeps working under the
+// default-deny origin check, while an unrelated foreign origin is still
+// rejected.
+func TestHandleWebSocket_DevServerOriginAllowedByDefault(t *testing.T) {
+	s := &Server{
+		gCtx:   t.Context(),
+		logger: &ulogger.TestLogger{},
+		settings: &settings.Settings{
+			P2P: settings.P2PSettings{
+				ListenMode: settings.ListenModeFull,
+				EnableNAT:  false,
+			},
+			Dashboard: settings.DashboardSettings{
+				DevServerPorts: []int{5173, 4173},
+			},
+		},
+	}
+
+	notificationCh := make(chan *notificationMsg, 1)
+	handler := s.HandleWebSocket(notificationCh)
+
+	e := echo.New()
+	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c := e.NewContext(r, w)
+		_ = handler(c)
+	}))
+	defer httpServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http")
+
+	t.Run("dev server origin is allowed", func(t *testing.T) {
+		header := http.Header{}
+		header.Set("Origin", "http://localhost:5173")
+
+		ws, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+		require.NoError(t, err)
+		defer ws.Close()
+	})
+
+	t.Run("foreign origin is rejected", func(t *testing.T) {
+		header := http.Header{}
+		header.Set("Origin", "http://evil.example.com")
+
+		_, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+		require.Error(t, err)
+	})
+}
