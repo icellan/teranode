@@ -484,14 +484,15 @@ func TestValidate_BlockAssemblyError(t *testing.T) {
 	require.Error(t, err)
 	require.Nil(t, txMetaData)
 
-	// The tx was already durably persisted with its inputs spent before
-	// sendToBlockAssembler failed. It must NOT be left Locked: validateInternal
-	// never sends it to block assembly, and nothing else will ever clear the
-	// flag, so a stuck Locked record here means the tx is spent, persisted, and
-	// permanently un-spendable and un-retryable.
+	// The tx is durably persisted with its inputs spent, but sendToBlockAssembler
+	// failed, so it is NOT in block assembly. It must stay Locked: unlocking an
+	// undelivered tx would let a child spending it enter this node's mining
+	// template without its parent. The block assembler's unmined-transaction
+	// loader heals this in the safe order - add to the subtree processor first,
+	// clear Locked second.
 	txMeta, err := utxoStore.Get(t.Context(), tx.TxIDChainHash())
 	require.NoError(t, err)
-	assert.Equal(t, false, txMeta.Locked, "tx must be unlocked even though sendToBlockAssembler failed, or it is stuck forever")
+	assert.Equal(t, true, txMeta.Locked)
 
 	// check the kafka channels, nothing should have been sent, since the tx never was sent correctly to the block assembly
 	require.Equal(t, 0, len(txmetaKafkaProducerClient.PublishChannel()), "txMetaKafkaChan should be empty")
@@ -1301,14 +1302,15 @@ func TestValidator_TwoPhaseCommitTransaction_AlreadySpendable(t *testing.T) {
 	assert.False(t, metaData.Locked, "TX should remain spendable after 2-phase commit")
 }
 
-// TestValidator_UnlockLockedTxOnExit_ClearsLockOnError is the direct, white-box
-// regression test for the mechanism validateInternal now defers immediately
-// after a tx is durably persisted+spent+Locked (see the two error returns in the
+// TestValidator_UnlockLockedTxOnExit_KeepsLockOnError is the direct, white-box
+// test for the mechanism validateInternal defers immediately after a tx is
+// durably persisted+spent+Locked (see the two error returns in the
 // addToBlockAssembly block: building tx inpoints via subtree.NewTxInpointsFromTx,
-// and sendToBlockAssembler). Both paths return an error before validateInternal
-// otherwise ever reaches the two-phase-commit unlock, which - pre-fix - left the
-// tx Locked forever. unlockLockedTxOnExit is the single place both paths (and the
-// success path) now route through to release the lock.
+// and sendToBlockAssembler). On both paths the tx never reaches block assembly,
+// so the 2PC lock must NOT be released: an unlocked-but-undelivered parent lets a
+// child enter the mining template without it. Staying locked is the documented
+// safe failure mode, and the block assembler's unmined-transaction loader heals
+// it in the correct order (add to subtree processor, then unlock).
 //
 // subtree.NewTxInpointsFromTx cannot currently be made to return an error (its
 // implementation is infallible in the pinned go-subtree version), so that
@@ -1316,9 +1318,8 @@ func TestValidator_TwoPhaseCommitTransaction_AlreadySpendable(t *testing.T) {
 // code paths outside validateInternal's control. This test instead calls the
 // shared cleanup function directly with an already-set error, which is exactly
 // the state validateInternal is in on both of those return paths: it proves the
-// tx is unlocked (Locked -> false) while the original, more informative error is
-// preserved rather than being overwritten by the (successful) unlock.
-func TestValidator_UnlockLockedTxOnExit_ClearsLockOnError(t *testing.T) {
+// record stays locked and the original, more informative error is preserved.
+func TestValidator_UnlockLockedTxOnExit_KeepsLockOnError(t *testing.T) {
 	tracing.SetupMockTracer()
 
 	tx, err := bt.NewTxFromString("010000000000000000ef01b136c673a9b815af2bfdeccc9479deec3273ee98a188c26d3c14b5e6bfcbca0b010000006b48304502200241ac9536c536f21e522dec152e69674094b371b14c26edf706e1db0e6487190221008ee66bdafc7d39ee041e1425a7b2df780702e9b066c3a1e9715b03b23fbd99be41210373c9cb2feaa59dd208ad90dc4c8f32dac7a30a65e590fa16e2a421637927ae63feffffff4004fb0b000000001976a91471902a65346b0d951358ec9a1b306ecd36d284ae88ac0280969800000000001976a914dd37ee4ce93278fbc398abcda001d1d855841e0788ac3cd35d0b000000001976a914d04ad25d93764cf83aca0ca0c7cbb7ba8850f75888ac00000000")
@@ -1358,13 +1359,60 @@ func TestValidator_UnlockLockedTxOnExit_ClearsLockOnError(t *testing.T) {
 
 	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr)
 
-	assert.False(t, txMetaData.Locked, "unlockLockedTxOnExit must clear the in-memory Locked flag")
-	assert.Same(t, originalErr, deferredErr, "the original, more informative error must not be overwritten by a successful unlock")
+	require.True(t, txMetaData.Locked, "an undelivered tx must stay locked, or a child can be mined without its parent")
+	require.Same(t, originalErr, deferredErr, "the original, more informative error must be preserved")
 
 	storedMeta := &meta.Data{}
 	err = utxoStore.GetMeta(ctx, tx.TxIDChainHash(), storedMeta)
 	require.NoError(t, err)
-	assert.False(t, storedMeta.Locked, "the store record must be unlocked, or the tx is stuck: persisted, spent, and Locked forever")
+	require.True(t, storedMeta.Locked, "the store record must stay locked until the unmined-transaction loader delivers it to block assembly")
+}
+
+// TestValidator_UnlockLockedTxOnExit_ClearsLockOnSuccess is the counterpart: when
+// validateInternal is returning success the tx has reached block assembly, so the
+// 2PC lock is released - in memory and in the store.
+func TestValidator_UnlockLockedTxOnExit_ClearsLockOnSuccess(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	tx, err := bt.NewTxFromString("010000000000000000ef01b136c673a9b815af2bfdeccc9479deec3273ee98a188c26d3c14b5e6bfcbca0b010000006b48304502200241ac9536c536f21e522dec152e69674094b371b14c26edf706e1db0e6487190221008ee66bdafc7d39ee041e1425a7b2df780702e9b066c3a1e9715b03b23fbd99be41210373c9cb2feaa59dd208ad90dc4c8f32dac7a30a65e590fa16e2a421637927ae63feffffff4004fb0b000000001976a91471902a65346b0d951358ec9a1b306ecd36d284ae88ac0280969800000000001976a914dd37ee4ce93278fbc398abcda001d1d855841e0788ac3cd35d0b000000001976a914d04ad25d93764cf83aca0ca0c7cbb7ba8850f75888ac00000000")
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test_unlock_on_exit_clears_lock_on_success")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	txMetaData, err := utxoStore.Create(ctx, tx, 100, utxostore.WithLocked(true))
+	require.NoError(t, err)
+	require.True(t, txMetaData.Locked)
+
+	v := &Validator{
+		logger:      ulogger.TestLogger{},
+		utxoStore:   utxoStore,
+		settings:    tSettings,
+		txValidator: NewTxValidator(ulogger.TestLogger{}, tSettings),
+		stats:       gocore.NewStat("validator"),
+	}
+
+	ctx, _, endSpan := tracing.Tracer("validator").Start(context.Background(), "Test")
+	defer endSpan()
+
+	var deferredErr error
+
+	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr)
+
+	require.NoError(t, deferredErr)
+	require.False(t, txMetaData.Locked, "a delivered tx must be unlocked on the success path")
+
+	storedMeta := &meta.Data{}
+	err = utxoStore.GetMeta(ctx, tx.TxIDChainHash(), storedMeta)
+	require.NoError(t, err)
+	require.False(t, storedMeta.Locked, "the store record must be unlocked on the success path")
 }
 
 // TestValidator_UnlockLockedTxOnExit_SuccessPathSetsErrOnUnlockFailure covers the

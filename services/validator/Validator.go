@@ -946,13 +946,14 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 
 	// From this point on the tx has been durably persisted with its inputs spent and,
 	// when addToBlockAssembly is set, its own record marked Locked (the 2PC
-	// in-progress marker). Every return path below - success or error - must release
-	// that lock, or the tx is stuck forever: persisted, spent, Locked, and never
-	// delivered to block assembly. This is deliberately separate from spend rollback:
-	// reverseSpends only ever applies before persistence, and spends must stand once
-	// the tx is durably created (see spendAndCreateInUtxoStore). The argument
-	// (txMetaData) is captured now, by value of the pointer, so a later `return nil,
-	// err` in this function does not affect what the deferred call unlocks.
+	// in-progress marker). Routing every return path below through one deferred
+	// cleanup keeps the release in a single place instead of only on the tail of the
+	// happy path. It does NOT unlock on error: see unlockLockedTxOnExit for why an
+	// undelivered tx must stay locked. This is deliberately separate from spend
+	// rollback: spend rollback only ever applies before persistence, and spends must
+	// stand once the tx is durably created (see spendAndCreateInUtxoStore). The
+	// argument (txMetaData) is captured now, by value of the pointer, so a later
+	// `return nil, err` in this function does not affect what the deferred call sees.
 	defer v.unlockLockedTxOnExit(decoupledCtx, tx, txID, txMetaData, &err)
 
 	if validationOptions.SkipUtxoCreation {
@@ -1019,35 +1020,49 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 }
 
 // unlockLockedTxOnExit is the single point that releases a tx's two-phase-commit
-// Locked flag on the way out of validateInternal. It is deferred immediately after
-// the tx has been durably persisted with its inputs spent (see validateInternal),
-// so it runs on every return from there on - success or error - and not just the
-// happy path. Without it, an error returned between persistence and the end of
-// the function (e.g. building tx inpoints, or sendToBlockAssembler failing) would
-// leave the tx persisted, spent, and Locked forever, since nothing else ever
-// clears the flag.
+// Locked flag on the way out of validateInternal. It is deferred immediately
+// after the tx has been durably persisted with its inputs spent (see
+// validateInternal), so the release lives in one place rather than only on the
+// tail of the happy path.
 //
-// It does not reverse the spend: that is reverseSpends' job, and it only applies
-// before persistence (see spendAndCreateInUtxoStore) - once the tx is durably
-// created it is valid and its spends must stand.
+// It releases the lock ONLY when validateInternal is returning success. The 2PC
+// invariant is that a tx is unlocked after it has reached block assembly, never
+// before (docs/topics/features/two_phase_commit.md). On the error paths between
+// persistence and the end of the function - building tx inpoints, or
+// sendToBlockAssembler failing - the tx is persisted and spent but is NOT in
+// block assembly, so unlocking it here would let a child spending it validate
+// and enter this node's mining template without its parent, producing a block
+// other implementations reject.
 //
-// If err is nil on entry (the pure success path) and the unlock itself fails, err
-// is set to the unlock error so the caller is told the tx still needs the
-// fallback recovery ("marked as spendable on next block"). If err is already
-// non-nil (an earlier failure in validateInternal), the unlock is still attempted
-// and its failure only logged, so the tx's original, more informative error is
-// not masked by a lock-release problem.
+// Staying locked is the documented safe failure mode ("money temporarily can't
+// be spent") and it is self-healing, in the right order: the block assembler's
+// unmined-transaction loader adds such a tx to the subtree processor and only
+// then clears its Locked flag (see BlockAssembler.loadUnminedTransactions).
+//
+// It does not reverse the spend: spend rollback only applies before persistence
+// (see spendAndCreateInUtxoStore) - once the tx is durably created it is valid
+// and its spends must stand.
+//
+// On the success path, if the unlock itself fails, err is set to the unlock error
+// so the caller is told the tx still needs the fallback recovery ("marked as
+// spendable on next block").
 func (v *Validator) unlockLockedTxOnExit(ctx context.Context, tx *bt.Tx, txID string, txMetaData *meta.Data, err *error) {
 	if txMetaData == nil || !txMetaData.Locked {
+		return
+	}
+
+	// Not delivered to block assembly - leave it locked for the unmined-transaction
+	// loader to heal, and keep the original, more informative error.
+	if *err != nil {
+		v.logger.Warnf("[Validate][%s] tx stays locked, it was not delivered to block assembly: %v", txID, *err)
+
 		return
 	}
 
 	if unlockErr := v.twoPhaseCommitTransaction(ctx, tx, txID); unlockErr != nil {
 		v.logger.Warnf("[Validate][%s] error during two phase commit, transaction will be marked as spendable on next block: %v", txID, unlockErr)
 
-		if *err == nil {
-			*err = unlockErr
-		}
+		*err = unlockErr
 
 		return
 	}
