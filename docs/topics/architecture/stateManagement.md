@@ -234,6 +234,8 @@ Each service's `/health` HTTP endpoint (and the corresponding gRPC health check)
 | `CatchingBlocks` | 200 `StatusOK`                  | Healthy and catching up on blocks.                                |
 | Unknown/unlisted | 503 `StatusServiceUnavailable`  | Unrecognized FSM state, or the FSM state query itself failed.    |
 
+The mapping above is for the FSM check in isolation: `/health` runs all of a service's registered `health.Check` entries through `health.CheckAll` (`util/health/health.go`), and the endpoint returns 503 if _any_ check fails, so the FSM state is only one contributor to the overall status.
+
 Note that `Idle` reports 200, not 503: an idle node is healthy, just not yet running — returning 503 would cause orchestrators (e.g. Kubernetes readiness probes) to restart-loop a node that is intentionally idle (for example, before its operator issues the `Run` event).
 
 Readiness for actual work is enforced separately, by each service's own startup gate described in [3.5. Waiting on State Machine Transitions](#35-waiting-on-state-machine-transitions) (`WaitUntilFSMTransitionFromIdleState`), not by the health-check status code. An operator monitoring only the `/health` status code should not read "200 while idle" as "the node is doing work" — check the reported FSM state string alongside the status code to distinguish `Idle` from `Running`/`CatchingBlocks`.
