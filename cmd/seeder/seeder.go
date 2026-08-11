@@ -309,6 +309,7 @@ func processHeaders(ctx context.Context, logger ulogger.Logger, blockchainStore 
 
 	var (
 		headersProcessed uint64
+		recordsRead      uint64
 		txCount          uint64
 	)
 
@@ -331,6 +332,8 @@ func processHeaders(ctx context.Context, logger ulogger.Logger, blockchainStore 
 
 			return errors.NewProcessingError("failed to read UTXO", err)
 		}
+
+		recordsRead++
 
 		if blockIndex.Height == 0 {
 			// The genesis block is already in the store
@@ -362,6 +365,20 @@ func processHeaders(ctx context.Context, logger ulogger.Logger, blockchainStore 
 		if blockIndex.Height%10000 == 0 {
 			fmt.Printf("Processed to block height %d\n", blockIndex.Height)
 		}
+	}
+
+	// The read loop above only knows the record stream ended - it cannot tell
+	// a clean end-of-records boundary apart from a file truncated mid-record
+	// (see the doc comment on readUTXOWrapperFile for why). Unlike utxo-set
+	// files, utxo-headers files carry no trailing footer, but WriteHeadersToStore
+	// always writes exactly one record per height from genesis (0) up to the
+	// tip height already read above, so that tip height is an independent
+	// ground truth we can validate the read count against without any file
+	// format change.
+	if recordsRead != uint64(height)+1 {
+		return errors.NewProcessingError(
+			"utxo-headers file truncated: expected %d header records (heights 0..%d), read %d",
+			uint64(height)+1, height, recordsRead)
 	}
 
 	logger.Infof("FINISHED  %16s headers with %16s transactions", formatNumber(headersProcessed), formatNumber(txCount))
@@ -740,12 +757,24 @@ func loadCoinbaseTxs(logger ulogger.Logger, headersFile string) (map[chainhash.H
 		return coinbaseTxs, nil
 	}
 
-	// Skip the tip hash (32 bytes) and height (4 bytes) preamble that precedes
-	// the per-block BlockIndex entries.
-	var preamble [36]byte
-	if _, err = io.ReadFull(reader, preamble[:]); err != nil {
+	// Skip the tip hash (32 bytes) preamble, then read the tip height: unlike
+	// utxo-set files, utxo-headers files carry no trailing footer, so this tip
+	// height - which WriteHeadersToStore always sets to exactly one record per
+	// height from genesis (0) up to the tip - is the only independent ground
+	// truth available to validate the read loop against below.
+	var tipHashBytes [32]byte
+	if _, err = io.ReadFull(reader, tipHashBytes[:]); err != nil {
 		return nil, errors.NewProcessingError(errMsgFailedToReadUTXO, err)
 	}
+
+	var tipHeightBytes [4]byte
+	if _, err = io.ReadFull(reader, tipHeightBytes[:]); err != nil {
+		return nil, errors.NewProcessingError(errMsgFailedToReadUTXO, err)
+	}
+
+	tipHeight := binary.LittleEndian.Uint32(tipHeightBytes[:])
+
+	var recordsRead uint64
 
 	for {
 		var blockIndex *utxopersister.BlockIndex
@@ -759,9 +788,23 @@ func loadCoinbaseTxs(logger ulogger.Logger, headersFile string) (map[chainhash.H
 			return nil, errors.NewProcessingError("failed to read UTXO header", err)
 		}
 
+		recordsRead++
+
 		if blockIndex.CoinbaseTx != nil {
 			coinbaseTxs[*blockIndex.CoinbaseTx.TxIDChainHash()] = blockIndex.CoinbaseTx
 		}
+	}
+
+	// The read loop above only knows the record stream ended - it cannot tell
+	// a clean end-of-records boundary apart from a file truncated mid-record
+	// (see the doc comment on readUTXOWrapperFile for why). Validate against
+	// the tip height read above so a genuinely truncated headers file is
+	// reported as an error rather than silently yielding a partial coinbase
+	// map.
+	if recordsRead != uint64(tipHeight)+1 {
+		return nil, errors.NewProcessingError(
+			"utxo-headers file %s truncated: expected %d header records (heights 0..%d), read %d",
+			headersFile, uint64(tipHeight)+1, tipHeight, recordsRead)
 	}
 
 	return coinbaseTxs, nil
