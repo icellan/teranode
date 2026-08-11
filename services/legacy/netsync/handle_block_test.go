@@ -389,20 +389,25 @@ func TestSyncManager_extendTransactions(t *testing.T) {
 	err = sm.extendTransactions(context.Background(), testBlockIdent(block), txOrder, txMap, false)
 	require.NoError(t, err)
 
-	sawExtendedInput := false
+	// Assert on SomeParentsInBlock rather than on PreviousTxScript: it is set
+	// only by phase 1 (extendFromTxMap) when a parent is found in the same
+	// block via txMap, and phase 2 never touches it. PreviousTxScript is not a
+	// valid signal here because NullStore.PreviousOutputsDecorate (invoked by
+	// phase 2's BatchPreviousOutputsDecorate) unconditionally overwrites it on
+	// every input regardless of what phase 1 did, so checking it would pass
+	// even if phase 1 were completely broken.
+	sawInBlockParent := false
 
 	for _, txHash := range txOrder[1:] {
 		wrapper, found := txMap.Get(txHash)
 		require.True(t, found)
 
-		for _, in := range wrapper.Tx.Inputs {
-			if in.PreviousTxScript != nil {
-				sawExtendedInput = true
-			}
+		if wrapper.SomeParentsInBlock {
+			sawInBlockParent = true
 		}
 	}
 
-	assert.True(t, sawExtendedInput, "at least one input should have been extended from an in-block parent")
+	assert.True(t, sawInBlockParent, "at least one transaction should have had an in-block parent resolved via phase 1 (extendFromTxMap)")
 }
 
 // Test createUtxos to increase coverage
