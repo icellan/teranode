@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	aeroTest "github.com/bsv-blockchain/testcontainers-aerospike-go"
 	"github.com/stretchr/testify/assert"
@@ -24,9 +25,7 @@ func TestExternalTransactionPruning(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	if err != nil {
-		t.Skipf("Skipping: Aerospike container not available (%v)", err)
-	}
+	test.SkipIfContainerUnavailable(t, err)
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)
@@ -124,9 +123,7 @@ func TestExternalTransactionOutputsOnlyPruning(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	if err != nil {
-		t.Skipf("Skipping: Aerospike container not available (%v)", err)
-	}
+	test.SkipIfContainerUnavailable(t, err)
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)
@@ -216,9 +213,7 @@ func TestMultiRecordExternalTransactionPruning(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	if err != nil {
-		t.Skipf("Skipping: Aerospike container not available (%v)", err)
-	}
+	test.SkipIfContainerUnavailable(t, err)
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)
@@ -351,9 +346,7 @@ func TestExternalFileAlreadyDeleted(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	if err != nil {
-		t.Skipf("Skipping: Aerospike container not available (%v)", err)
-	}
+	test.SkipIfContainerUnavailable(t, err)
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)
@@ -433,9 +426,7 @@ func TestMixedExternalAndNormalTransactions(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	if err != nil {
-		t.Skipf("Skipping: Aerospike container not available (%v)", err)
-	}
+	test.SkipIfContainerUnavailable(t, err)
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)

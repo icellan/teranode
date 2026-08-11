@@ -985,9 +985,7 @@ func TestExtendedTxa1f6a4ffcfd7bb4775790932aff1f82ac6a9b3b3e76c8faf8b11328e948af
 	ctx := context.Background()
 
 	container, err := aeroTest.RunContainer(ctx)
-	if err != nil {
-		t.Skipf("Skipping: Aerospike container not available (%v)", err)
-	}
+	test.SkipIfContainerUnavailable(t, err)
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)

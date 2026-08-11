@@ -9,6 +9,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/aerospike/pruner"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/bsv-blockchain/teranode/util/uaerospike"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -19,9 +20,7 @@ func TestCreateIndexIfNotExists(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := runAerospikeTestContainer(ctx)
-	if err != nil {
-		t.Skipf("Skipping: Aerospike container not available (%v)", err)
-	}
+	test.SkipIfContainerUnavailable(t, err)
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)
@@ -77,9 +76,7 @@ func TestWaitForIndexReady(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := runAerospikeTestContainer(ctx)
-	if err != nil {
-		t.Skipf("Skipping: Aerospike container not available (%v)", err)
-	}
+	test.SkipIfContainerUnavailable(t, err)
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)
@@ -136,9 +133,7 @@ func TestIndexWaiterAdapter(t *testing.T) {
 	ctx := context.Background()
 
 	container, err := runAerospikeTestContainer(ctx)
-	if err != nil {
-		t.Skipf("Skipping: Aerospike container not available (%v)", err)
-	}
+	test.SkipIfContainerUnavailable(t, err)
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)

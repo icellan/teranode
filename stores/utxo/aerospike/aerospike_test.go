@@ -137,9 +137,7 @@ func TestUnmined(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 
 	container, err := runAerospikeTestContainer(ctx)
-	if err != nil {
-		t.Skipf("Skipping: Aerospike container not available (%v)", err)
-	}
+	test.SkipIfContainerUnavailable(t, err)
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)
@@ -366,9 +364,7 @@ func TestLargeTxStoresExternally(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 
 	container, err := runAerospikeTestContainer(ctx)
-	if err != nil {
-		t.Skipf("Skipping: Aerospike container not available (%v)", err)
-	}
+	test.SkipIfContainerUnavailable(t, err)
 
 	t.Cleanup(func() {
 		err = container.Terminate(ctx)
