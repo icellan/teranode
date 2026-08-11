@@ -615,10 +615,14 @@ func (sp *serverPeer) OnVersion(p *peer.Peer, msg *wire.MsgVersion) *wire.MsgRej
 	// This prevents connections from BCH/BTC/BTG and other incompatible forks
 	userAgent := msg.UserAgent
 	if !strings.Contains(userAgent, "Bitcoin SV") && !strings.Contains(userAgent, "BSV") {
-		sp.server.logger.Warnf("Rejecting and banning peer %s with non-BSV user agent: %s", sp.Peer, userAgent)
-
-		// Ban the peer to prevent repeated connection attempts from incompatible clients
-		sp.server.BanPeer(sp)
+		// Ban the peer to prevent repeated connection attempts from incompatible
+		// clients, unless banning is disabled. The peer is rejected either way.
+		if cfg.DisableBanning {
+			sp.server.logger.Warnf("Rejecting peer %s with non-BSV user agent (banning disabled): %s", sp.Peer, userAgent)
+		} else {
+			sp.server.logger.Warnf("Rejecting and banning peer %s with non-BSV user agent: %s", sp.Peer, userAgent)
+			sp.server.BanPeer(sp)
+		}
 
 		reason := "Only BSV Blockchain clients are supported"
 

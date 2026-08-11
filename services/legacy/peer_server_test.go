@@ -892,9 +892,11 @@ func TestServerPeerAddBanScoreExists(t *testing.T) {
 }
 
 // TestServerPeerAddBanScoreRespectsDisableBanning verifies that addBanScore
-// honours cfg.DisableBanning (the --nobanning flag) by leaving the ban score
-// untouched when banning is disabled, and that it still accumulates normally
-// when banning is enabled.
+// honours cfg.DisableBanning by leaving the ban score untouched when banning is
+// disabled, and that it still accumulates normally when banning is enabled.
+// cfg.DisableBanning is set from the `legacy_config_DisableBanning` setting via
+// setConfigValuesFromSettings; the `nobanning` struct tag is inert because the
+// legacy command line parser is commented out.
 func TestServerPeerAddBanScoreRespectsDisableBanning(t *testing.T) {
 	// cfg is a package-level variable read by addBanScore; save/restore it so
 	// this test doesn't leak state into other tests in the package.
@@ -930,9 +932,79 @@ func TestServerPeerAddBanScoreRespectsDisableBanning(t *testing.T) {
 			sp.addBanScore(1, 0, "test")
 
 			if tt.expectIncreased {
-				assert.NotZero(t, sp.banScore.Int())
+				require.NotZero(t, sp.banScore.Int())
 			} else {
-				assert.Zero(t, sp.banScore.Int())
+				require.Zero(t, sp.banScore.Int())
+			}
+		})
+	}
+}
+
+// TestServerPeerOnVersionRespectsDisableBanning verifies that the non-BSV user
+// agent check in OnVersion honours cfg.DisableBanning: the peer is rejected
+// either way, but it is only added to the ban list when banning is enabled.
+func TestServerPeerOnVersionRespectsDisableBanning(t *testing.T) {
+	// cfg is a package-level variable read by OnVersion; save/restore it so
+	// this test doesn't leak state into other tests in the package.
+	origCfg := cfg
+	defer func() { cfg = origCfg }()
+
+	tSettings := test.CreateBaseTestSettings(t)
+
+	tests := []struct {
+		name           string
+		disableBanning bool
+		expectBanned   bool
+	}{
+		{
+			name:           "banning enabled: peer is banned",
+			disableBanning: false,
+			expectBanned:   true,
+		},
+		{
+			name:           "banning disabled: peer is rejected but not banned",
+			disableBanning: true,
+			expectBanned:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg = &config{
+				DisableBanning: tt.disableBanning,
+				BanThreshold:   100,
+			}
+
+			// banPeers is buffered so BanPeer does not block without the
+			// peer handler running.
+			s := &server{
+				logger:   ulogger.TestLogger{},
+				settings: tSettings,
+				banPeers: make(chan *serverPeer, 1),
+			}
+
+			sp := &serverPeer{
+				ctx:    context.Background(),
+				server: s,
+				Peer:   peer.NewInboundPeer(ulogger.TestLogger{}, tSettings, &peer.Config{}),
+			}
+
+			msg := &wire.MsgVersion{
+				ProtocolVersion: int32(wire.ProtocolVersion),
+				UserAgent:       "/Bitcoin Cash Node:27.0.0/",
+			}
+
+			reject := sp.OnVersion(sp.Peer, msg)
+
+			// The peer is rejected regardless: disabling banning only
+			// suppresses the ban, not the fork-client rejection.
+			require.NotNil(t, reject)
+			require.Equal(t, wire.RejectNonstandard, reject.Code)
+
+			if tt.expectBanned {
+				require.Len(t, s.banPeers, 1)
+			} else {
+				require.Empty(t, s.banPeers)
 			}
 		})
 	}
