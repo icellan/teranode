@@ -137,8 +137,9 @@ All RPC commands require a valid username and password for authentication. The s
 For GRPC services, certain administrative operations require additional API key authentication. The following methods require an API key:
 
 - **Ban/Unban Operations**: `BanPeer` and `UnbanPeer` methods in both P2P and Legacy services require API key authentication for security.
+- **Blockchain admin operations**: state-mutating RPCs on the Blockchain service (including `SendNotification`, `ReportPeerFailure`, `SetBlockSubtreesSet`, `AddBlock`, `InvalidateBlock`, and the peer-registry mutation RPCs) require API key authentication.
 
-The API key is configured via the `grpc_admin_api_key` setting and must be included in GRPC requests as metadata with the key `x-api-key`. Source it from an environment variable or secret store rather than committing it to configuration; a *configured* key is currently echoed in the node's startup settings dump, so treat startup logs as sensitive. Well-known placeholders such as `testkey` or `changeme` are ignored at startup (logged and treated as unset). If no API key is provided, the server generates a random key at startup; this generated key is never logged and leaves these admin operations unreachable (fail-closed) until an operator configures a shared key that both the server and its internal clients read.
+The API key is configured via the `grpc_admin_api_key` setting. If no API key is provided, admin authentication is disabled entirely and the protected RPCs above are reachable without any key; each service logs a single startup warning naming this exposure. The API key must be included in GRPC requests as metadata with the key `x-api-key`. Source it from an environment variable or secret store rather than committing it to configuration. Well-known placeholder values (e.g. `testkey`, `changeme`) are rejected at startup as a configuration error.
 
 ## 2. Architecture
 
