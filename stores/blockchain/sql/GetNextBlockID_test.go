@@ -171,7 +171,6 @@ func TestGetNextBlockID_Postgres(t *testing.T) {
 			),
 		)
 		test.SkipIfContainerUnavailable(t, err)
-		require.NoError(t, err)
 		defer func() {
 			assert.NoError(t, pgContainer.Terminate(ctx))
 		}()
@@ -220,7 +219,6 @@ func TestGetNextBlockID_Postgres(t *testing.T) {
 			),
 		)
 		test.SkipIfContainerUnavailable(t, err)
-		require.NoError(t, err)
 		defer func() {
 			assert.NoError(t, pgContainer.Terminate(ctx))
 		}()
@@ -274,7 +272,6 @@ func TestGetNextBlockID_Postgres(t *testing.T) {
 			),
 		)
 		test.SkipIfContainerUnavailable(t, err)
-		require.NoError(t, err)
 		defer func() {
 			assert.NoError(t, pgContainer.Terminate(ctx))
 		}()
@@ -337,7 +334,6 @@ func TestGetNextBlockID_Postgres(t *testing.T) {
 			),
 		)
 		test.SkipIfContainerUnavailable(t, err)
-		require.NoError(t, err)
 		defer func() {
 			assert.NoError(t, pgContainer.Terminate(ctx))
 		}()

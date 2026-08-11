@@ -74,6 +74,39 @@ func setupTest(t *testing.T) (*nodehelpers.BlockchainDaemon, *BlockAssembly, con
 	return nil, nil, nil, nil, nil
 }
 
+// startAttemptTimeout bounds how long attemptSetupTest waits, after readyCh
+// closes, for an error that Start's launcher goroutine may still be in the
+// process of delivering. Mirrors cleanupFn's own bounded wait below.
+const startAttemptTimeout = 200 * time.Millisecond
+
+// waitForEarlyStartErr waits for readyCh to close, then waits up to timeout
+// for a value on startErrCh.
+//
+// Start's own defer closes readyCh as Start itself is returning (see
+// Server.go's `defer closeOnce.Do(func() { close(readyCh) })`) - strictly
+// before its launcher goroutine resumes and sends the result on startErrCh.
+// Closing a channel only guarantees the receiver unblocks after the close; it
+// gives no guarantee about when the closing goroutine's later statements
+// (the send on startErrCh) execute relative to what the receiver does next.
+// A non-blocking check right after <-readyCh can therefore race ahead of
+// that send and miss a genuine startup failure. Bounding the wait gives the
+// launcher goroutine a window to deliver the error while still returning
+// promptly on the common (successful-start) path, where Start never returns
+// during the wait (it blocks in g.Wait() until shutdown).
+//
+// found is false when nothing arrived within timeout, which callers must
+// treat as "Start is still running", not "Start failed silently".
+func waitForEarlyStartErr(readyCh <-chan struct{}, startErrCh chan error, timeout time.Duration) (err error, found bool) {
+	<-readyCh
+
+	select {
+	case err = <-startErrCh:
+		return err, true
+	case <-time.After(timeout):
+		return nil, false
+	}
+}
+
 // attemptSetupTest performs a single setup attempt, returning an error instead
 // of failing the test outright so setupTest can retry on a port-bind race. Any
 // resource it created before failing is cleaned up before returning the error.
@@ -165,13 +198,15 @@ func attemptSetupTest(t *testing.T) (daemon *nodehelpers.BlockchainDaemon, ba *B
 		startErrCh <- startErr
 	}()
 
-	<-readyCh // Wait for service to be ready (always closed, even on startup failure)
-
-	// A failed bind closes readyCh without the gRPC server ever listening; catch
-	// that here (bounded wait, Start already returned by the time readyCh closed
-	// on the failure path) rather than only in cleanup, so setupTest can retry.
-	select {
-	case startErr := <-startErrCh:
+	// A failed bind closes readyCh without the gRPC server ever listening. Start
+	// has not necessarily returned by the time readyCh closes on the failure
+	// path - its own defer closes readyCh as Start is in the process of
+	// returning, strictly before the launcher goroutine above resumes and sends
+	// on startErrCh - so waitForEarlyStartErr bounds the wait for that send
+	// instead of checking non-blockingly, which would race ahead of it and
+	// miss real startup failures. Catching it here (rather than only in
+	// cleanup) lets setupTest retry.
+	if startErr, found := waitForEarlyStartErr(readyCh, startErrCh, startAttemptTimeout); found {
 		if startErr != nil {
 			cancel()
 			blockchainDaemon.Stop()
@@ -181,8 +216,6 @@ func attemptSetupTest(t *testing.T) (daemon *nodehelpers.BlockchainDaemon, ba *B
 		// nil error: Start returned successfully. Re-buffer it so cleanup's own
 		// receive below still finds it.
 		startErrCh <- startErr
-	default:
-		// Start is still running (the common case): nothing to catch yet.
 	}
 
 	// Check for startup errors in cleanup, not in the goroutine
@@ -209,6 +242,65 @@ func attemptSetupTest(t *testing.T) (daemon *nodehelpers.BlockchainDaemon, ba *B
 	}
 
 	return blockchainDaemon, newBA, ctx, cancel, cleanupFn, nil
+}
+
+// TestWaitForEarlyStartErr_CatchesErrorSentShortlyAfterReadyClose reproduces
+// the exact ordering attemptSetupTest relies on: Start's own defer closes
+// readyCh as Start is returning, strictly before its launcher goroutine
+// resumes and sends the failure on startErrCh (see Server.go's
+// `defer closeOnce.Do(func() { close(readyCh) })`). A caller that checks
+// startErrCh non-blockingly immediately after <-readyCh can therefore race
+// ahead of that send and wrongly conclude "still starting" for a startup
+// that has, in fact, already failed. This test forces exactly that ordering
+// deterministically via a barrier channel (no reliance on real scheduler
+// timing) and asserts the failure is still caught within a bounded wait.
+func TestWaitForEarlyStartErr_CatchesErrorSentShortlyAfterReadyClose(t *testing.T) {
+	readyCh := make(chan struct{}, 1)
+	startErrCh := make(chan error, 1)
+	releaseSend := make(chan struct{})
+	wantErr := errors.NewProcessingError("simulated bind failure")
+
+	go func() {
+		close(readyCh) // simulates Start's deferred close(readyCh) on the failure path
+		<-releaseSend  // simulates the scheduling gap before the launcher goroutine resumes
+		startErrCh <- wantErr
+	}()
+
+	resultCh := make(chan struct {
+		err   error
+		found bool
+	}, 1)
+
+	go func() {
+		err, found := waitForEarlyStartErr(readyCh, startErrCh, 200*time.Millisecond)
+		resultCh <- struct {
+			err   error
+			found bool
+		}{err, found}
+	}()
+
+	// Give waitForEarlyStartErr a moment to reach its check before the send is
+	// released, so we know it genuinely waited rather than winning by luck.
+	time.Sleep(20 * time.Millisecond)
+	close(releaseSend)
+
+	result := <-resultCh
+	require.True(t, result.found, "expected the delayed startup error to be caught within the bounded wait")
+	require.ErrorIs(t, result.err, wantErr)
+}
+
+// TestWaitForEarlyStartErr_TreatsNoErrorWithinBoundAsStillStarting mirrors the
+// successful-start path, where Start never returns during setup (it blocks in
+// g.Wait()), so nothing is ever sent on startErrCh. waitForEarlyStartErr must
+// treat that as "still starting", not as a missed error.
+func TestWaitForEarlyStartErr_TreatsNoErrorWithinBoundAsStillStarting(t *testing.T) {
+	readyCh := make(chan struct{}, 1)
+	startErrCh := make(chan error, 1)
+	close(readyCh)
+
+	err, found := waitForEarlyStartErr(readyCh, startErrCh, 30*time.Millisecond)
+	require.False(t, found, "expected no early error to be reported when Start is still running")
+	require.NoError(t, err)
 }
 
 // TestHealth verifies the health check functionality of the block assembly service.

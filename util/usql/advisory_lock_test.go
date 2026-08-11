@@ -38,7 +38,6 @@ func newPostgresTestDB(t *testing.T) *DB {
 		),
 	)
 	test.SkipIfContainerUnavailable(t, err)
-	require.NoError(t, err)
 	t.Cleanup(func() { _ = pgContainer.Terminate(context.Background()) })
 
 	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
