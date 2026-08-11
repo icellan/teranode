@@ -20,6 +20,10 @@ spec:
   asset:
     enabled: true
     spec:
+      # No grpcIngress here: the asset service serves HTTP and WebSocket only
+      # and starts no gRPC server. Omitting the field is not a statement about
+      # the other services — several of them do run gRPC listeners and simply
+      # keep them cluster-internal.
       deploymentOverrides:
         replicas: 1
         resources:
