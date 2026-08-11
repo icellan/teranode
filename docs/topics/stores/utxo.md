@@ -349,7 +349,7 @@ The cache handles concurrent reads efficiently, preventing multiple simultaneous
 
 #### Lock Record Pattern for Multi-Record Transactions
 
-When a transaction has more than 20,000 outputs (configurable via `utxo_store_batch_size`), it must be split across multiple Aerospike records. The lock record pattern ensures these multi-record operations complete atomically, preventing data corruption from partial writes or concurrent access.
+When a transaction has more outputs than `utxostore_utxoBatchSize` (default 128), it must be split across multiple Aerospike records. The lock record pattern ensures these multi-record operations complete atomically, preventing data corruption from partial writes or concurrent access.
 
 **Key Components:**
 
@@ -606,7 +606,7 @@ UTXO Store Package Structure (stores/utxo)
 The UTXO Store is a data store component that is used by various services. It is not run independently. To use the UTXO Store locally, run services that depend on it, such as the Validator or UTXO Persister:
 
 ```shell
-SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] go run . -validator=1 
+SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] go run . -validator=1
 ```
 
 Please refer to the [Locally Running Services Documentation](../../howto/locallyRunningServices.md) document for more information on running services locally.

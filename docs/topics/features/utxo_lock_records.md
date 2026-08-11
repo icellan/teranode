@@ -24,7 +24,7 @@
 
 ## 1. Overview
 
-The Lock Record Pattern is a distributed consistency mechanism used by Teranode's UTXO store to safely handle transactions with more than 20,000 outputs. When a transaction exceeds the Aerospike record size limit, it must be split across multiple records. The lock record pattern ensures these multi-record operations complete atomically, preventing data corruption from partial writes or concurrent access.
+The Lock Record Pattern is a distributed consistency mechanism used by Teranode's UTXO store to safely handle transactions with more outputs than `utxostore_utxoBatchSize` (default 128). Such a transaction does not fit in a single record and must be split across multiple records. The lock record pattern ensures these multi-record operations complete atomically, preventing data corruption from partial writes or concurrent access.
 
 The pattern uses two key mechanisms:
 
@@ -99,7 +99,7 @@ end
 
 ### 3.3. Record Layout
 
-For a transaction with >20,000 outputs, records are organized as:
+For a transaction with more outputs than `utxostore_utxoBatchSize` (default 128), records are organized as:
 
 ```text
 Transaction with N batches:
@@ -112,14 +112,14 @@ Transaction with N batches:
 ┌─────────────────────┐
 │   Master Record     │  Index: 0
 │   - Metadata        │  - TxID, version, fees, etc.
-│   - UTXOs 0-19999   │  - First batch of outputs
+│   - UTXOs 0-127     │  - First batch of outputs (utxoBatchSize)
 │   - TotalExtraRecs  │  - Count of additional records
 │   - Creating flag   │
 └─────────────────────┘
 
 ┌─────────────────────┐
 │   Child Record 1    │  Index: 1
-│   - UTXOs 20000+    │  - Second batch of outputs
+│   - UTXOs 128+      │  - Second batch of outputs
 │   - Creating flag   │
 └─────────────────────┘
 
@@ -331,9 +331,9 @@ The lock record pattern uses these configuration settings:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `utxo_store_batch_size` | 20000 | UTXOs per record (triggers multi-record) |
-| `utxo_store_externalize_all_transactions` | false | Force external storage for all transactions |
-| `utxo_store_max_tx_size_in_store` | 1MB | Size threshold for external storage |
+| `utxostore_utxoBatchSize` | 128 | UTXOs per record (more outputs than this triggers multi-record) |
+| `utxostore_externalizeAllTransactions` | false | Force external storage for all transactions |
+| `MaxTxSizeInStoreInBytes` (compile-time constant, not a setting) | 32KB | Size threshold for external storage |
 
 **Batch Size Impact:**
 
