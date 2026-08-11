@@ -21,6 +21,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
 )
 
 // TestListenerKey tests the listenerKey function with various inputs
@@ -736,4 +740,144 @@ func TestStartGRPCServerErrors(t *testing.T) {
 	CleanupListeners("test-error-1")
 	CleanupListeners("test-error-2")
 	CleanupListeners("test-error-3")
+}
+
+// dialAndCheckHealth dials addr and calls the standard gRPC health Check RPC,
+// optionally attaching an x-api-key header, returning the resulting error (if
+// any). Used to exercise the real auth interceptor end-to-end rather than
+// calling it directly, so these tests pin the behaviour services rely on:
+// StartGRPCServer only enforces AuthOptions.ProtectedMethods when
+// AuthOptions.APIKey is non-empty.
+func dialAndCheckHealth(t *testing.T, addr string, apiKey string) error {
+	t.Helper()
+
+	// "passthrough:///" pins the resolver regardless of the package-level
+	// default scheme other tests in this package may have changed (e.g.
+	// TestInitGRPCResolverK8sResolver switches it to "k8s" and never resets
+	// it), so this test isn't order-dependent on test execution order.
+	conn, err := grpc.NewClient("passthrough:///"+addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+
+	defer func() { _ = conn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if apiKey != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "x-api-key", apiKey)
+	}
+
+	client := grpc_health_v1.NewHealthClient(conn)
+	_, err = client.Check(ctx, &grpc_health_v1.HealthCheckRequest{})
+
+	return err
+}
+
+// TestStartGRPCServer_EmptyAPIKeyDisablesAuth pins the contract that an empty
+// AuthOptions.APIKey means no auth interceptor is installed at all, so a
+// "protected" RPC is reachable with no x-api-key header. Services rely on
+// this to implement "empty grpc_admin_api_key disables admin auth" without
+// fabricating a key nobody can present.
+func TestStartGRPCServer_EmptyAPIKeyDisablesAuth(t *testing.T) {
+	tSettings := settings.NewSettings()
+	tSettings.Context = "test-empty-key-auth"
+	tSettings.SecurityLevelGRPC = 0
+
+	logger := mocklogger.NewTestLogger()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	authOptions := &AuthOptions{
+		APIKey: "",
+		ProtectedMethods: map[string]bool{
+			grpc_health_v1.Health_Check_FullMethodName: true,
+		},
+	}
+
+	healthSrv := health.NewServer()
+	healthSrv.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+
+	serverReady := make(chan struct{})
+	registerFunc := func(server *grpc.Server) {
+		grpc_health_v1.RegisterHealthServer(server, healthSrv)
+		close(serverReady)
+	}
+
+	go func() {
+		_ = StartGRPCServer(ctx, logger, tSettings, "empty-key-service", "localhost:0", registerFunc, authOptions)
+	}()
+
+	select {
+	case <-serverReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not start in time")
+	}
+
+	_, addr, _, err := GetListener(tSettings.Context, "empty-key-service", "", "localhost:0")
+	require.NoError(t, err)
+
+	// No API key header at all: with APIKey=="" the interceptor is never
+	// installed, so the "protected" method must still succeed.
+	err = dialAndCheckHealth(t, addr, "")
+	require.NoError(t, err, "protected RPC must be reachable when no admin API key is configured")
+
+	cancel()
+	CleanupListeners(tSettings.Context)
+}
+
+// TestStartGRPCServer_NonEmptyAPIKeyEnforcesAuth is the counterpart to
+// TestStartGRPCServer_EmptyAPIKeyDisablesAuth: once an admin API key is
+// configured, a protected RPC is rejected without the header and accepted
+// with it.
+func TestStartGRPCServer_NonEmptyAPIKeyEnforcesAuth(t *testing.T) {
+	tSettings := settings.NewSettings()
+	tSettings.Context = "test-nonempty-key-auth"
+	tSettings.SecurityLevelGRPC = 0
+
+	logger := mocklogger.NewTestLogger()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	const apiKey = "configured-admin-key"
+
+	authOptions := &AuthOptions{
+		APIKey: apiKey,
+		ProtectedMethods: map[string]bool{
+			grpc_health_v1.Health_Check_FullMethodName: true,
+		},
+	}
+
+	healthSrv := health.NewServer()
+	healthSrv.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+
+	serverReady := make(chan struct{})
+	registerFunc := func(server *grpc.Server) {
+		grpc_health_v1.RegisterHealthServer(server, healthSrv)
+		close(serverReady)
+	}
+
+	go func() {
+		_ = StartGRPCServer(ctx, logger, tSettings, "nonempty-key-service", "localhost:0", registerFunc, authOptions)
+	}()
+
+	select {
+	case <-serverReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not start in time")
+	}
+
+	_, addr, _, err := GetListener(tSettings.Context, "nonempty-key-service", "", "localhost:0")
+	require.NoError(t, err)
+
+	err = dialAndCheckHealth(t, addr, "")
+	require.Error(t, err, "protected RPC must be rejected without the admin API key")
+
+	err = dialAndCheckHealth(t, addr, "wrong-key")
+	require.Error(t, err, "protected RPC must be rejected with the wrong admin API key")
+
+	err = dialAndCheckHealth(t, addr, apiKey)
+	require.NoError(t, err, "protected RPC must succeed with the correct admin API key")
+
+	cancel()
+	CleanupListeners(tSettings.Context)
 }
