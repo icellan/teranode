@@ -59,11 +59,13 @@ func TestCreateUTXOSet_NilLastBlockHash(t *testing.T) {
 // the wrong UTXOs.
 //
 // Test scenario: a "previous" UTXO set file for hash P is staged in a
-// memory store, containing just the 68-byte header records (current
-// block hash = P, height, parent hash) and zero wrappers — so the
-// OUTER loop hits a clean io.EOF after the metadata. A consolidator
-// pointing at P as the firstPreviousBlockHash should consolidate
-// successfully and produce a new UTXO set for the current block.
+// memory store, containing the 68-byte header records (current block
+// hash = P, height, parent hash), zero wrappers, and the 16-byte
+// zero-count footer every real writer appends — so the OUTER loop hits
+// the footer boundary immediately after the metadata and the counts
+// agree (0 read, 0 expected). A consolidator pointing at P as the
+// firstPreviousBlockHash should consolidate successfully and produce a
+// new UTXO set for the current block.
 func TestCreateUTXOSet_PreviousSetReadDoesNotDoubleReadMagic(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.TestLogger{}
@@ -74,16 +76,18 @@ func TestCreateUTXOSet_PreviousSetReadDoesNotDoubleReadMagic(t *testing.T) {
 	currentBlockHash := chainhash.HashH([]byte("current-block-hash-for-double-read-test"))
 	grandparentHash := chainhash.HashH([]byte("grandparent-block-hash-for-double-read-test"))
 
-	// Stage the previous UTXO set file with just its 68-byte metadata
+	// Stage the previous UTXO set file with its 68-byte metadata
 	// (matching the layout CreateUTXOSet writes: current block hash +
-	// 4-byte height + previous block hash). memory.Set prepends the
-	// fileformat magic, so we only provide post-header bytes.
+	// 4-byte height + previous block hash) followed by the 16-byte
+	// zero-count footer (no wrappers were written). memory.Set prepends
+	// the fileformat magic, so we only provide post-header bytes.
 	var heightBuf [4]byte
 	binary.LittleEndian.PutUint32(heightBuf[:], 42)
-	body := make([]byte, 0, len(previousBlockHash)+len(heightBuf)+len(grandparentHash))
+	body := make([]byte, 0, len(previousBlockHash)+len(heightBuf)+len(grandparentHash)+FooterSize)
 	body = append(body, previousBlockHash[:]...)
 	body = append(body, heightBuf[:]...)
 	body = append(body, grandparentHash[:]...)
+	body = append(body, make([]byte, FooterSize)...) // txCount=0, utxoCount=0
 	require.NoError(t, blockStore.Set(ctx, previousBlockHash[:], fileformat.FileTypeUtxoSet, body))
 
 	// Consolidator: firstPreviousBlockHash = P drives the read of the
@@ -205,6 +209,151 @@ func TestCreateUTXOSet_PreviousSetWithFooterTerminatesCleanly(t *testing.T) {
 
 	err = us.CreateUTXOSet(ctx, c)
 	require.NoError(t, err, "CreateUTXOSet must terminate the previous-set read at the 16-byte footer; the pre-fix loop crashed here with \"failed to read txid, expected 32 bytes got 16\"")
+}
+
+// TestCreateUTXOSet_PreviousSetTruncatedMidTxID_ReturnsError is the
+// regression test for the silent-truncation-laundering bug: a previous UTXO
+// set cut off partway through a second record's 32-byte TxID - with no
+// footer at all - must fail the consolidation loudly instead of being
+// treated as a clean end of the record stream and used to write a new,
+// self-consistent but truncated snapshot.
+func TestCreateUTXOSet_PreviousSetTruncatedMidTxID_ReturnsError(t *testing.T) {
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	tSettings := test.CreateBaseTestSettings(t)
+	blockStore := memory.New()
+
+	previousBlockHash := chainhash.HashH([]byte("previous-block-hash-for-midtxid-test"))
+	currentBlockHash := chainhash.HashH([]byte("current-block-hash-for-midtxid-test"))
+	grandparentHash := chainhash.HashH([]byte("grandparent-block-hash-for-midtxid-test"))
+
+	wrapper := &UTXOWrapper{
+		TxID:   chainhash.HashH([]byte("wrapper-a-for-midtxid-test")),
+		Height: 42,
+		UTXOs:  []*UTXO{{Index: 0, Value: 1000, Script: []byte{0x76, 0xa9, 0x88, 0xac}}},
+	}
+
+	secondTxID := chainhash.HashH([]byte("wrapper-b-for-midtxid-test"))
+
+	var heightBuf [4]byte
+	binary.LittleEndian.PutUint32(heightBuf[:], 42)
+
+	body := make([]byte, 0, len(previousBlockHash)+len(heightBuf)+len(grandparentHash)+len(wrapper.Bytes())+10)
+	body = append(body, previousBlockHash[:]...)
+	body = append(body, heightBuf[:]...)
+	body = append(body, grandparentHash[:]...)
+	body = append(body, wrapper.Bytes()...)
+	// Cut 10 bytes into the second record's 32-byte TxID - a genuine
+	// mid-record truncation, with no footer appended at all.
+	body = append(body, secondTxID[:10]...)
+	require.NoError(t, blockStore.Set(ctx, previousBlockHash[:], fileformat.FileTypeUtxoSet, body))
+
+	c := NewConsolidator(logger, tSettings, nil, nil, blockStore, &previousBlockHash)
+	c.lastBlockHash = &currentBlockHash
+	c.lastBlockHeight = 43
+	c.previousBlockHash = &previousBlockHash
+
+	us, err := GetUTXOSet(ctx, logger, tSettings, blockStore, &currentBlockHash)
+	require.NoError(t, err)
+
+	err = us.CreateUTXOSet(ctx, c)
+	require.Error(t, err, "a previous UTXO set truncated mid-TxID must not be silently accepted as a complete record stream")
+}
+
+// TestCreateUTXOSet_PreviousSetMissingFooter_ReturnsError covers the second
+// traced laundering path: a previous UTXO set cut exactly after a complete
+// UTXOWrapper record, with the trailing 16-byte footer missing entirely. The
+// read of the next record's TxID then sees a clean io.EOF (zero bytes
+// available), not a short read. Every writer in this package appends the
+// footer unconditionally, so this shape can only happen from truncation and
+// must always be rejected - it must not be confused with a legitimate,
+// footer-terminated end of the stream.
+func TestCreateUTXOSet_PreviousSetMissingFooter_ReturnsError(t *testing.T) {
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	tSettings := test.CreateBaseTestSettings(t)
+	blockStore := memory.New()
+
+	previousBlockHash := chainhash.HashH([]byte("previous-block-hash-for-missing-footer-test"))
+	currentBlockHash := chainhash.HashH([]byte("current-block-hash-for-missing-footer-test"))
+	grandparentHash := chainhash.HashH([]byte("grandparent-block-hash-for-missing-footer-test"))
+
+	wrapper := &UTXOWrapper{
+		TxID:   chainhash.HashH([]byte("wrapper-a-for-missing-footer-test")),
+		Height: 42,
+		UTXOs:  []*UTXO{{Index: 0, Value: 1000, Script: []byte{0x76, 0xa9, 0x88, 0xac}}},
+	}
+
+	var heightBuf [4]byte
+	binary.LittleEndian.PutUint32(heightBuf[:], 42)
+
+	body := make([]byte, 0, len(previousBlockHash)+len(heightBuf)+len(grandparentHash)+len(wrapper.Bytes()))
+	body = append(body, previousBlockHash[:]...)
+	body = append(body, heightBuf[:]...)
+	body = append(body, grandparentHash[:]...)
+	body = append(body, wrapper.Bytes()...)
+	// No footer at all: the file ends exactly on a wrapper boundary.
+	require.NoError(t, blockStore.Set(ctx, previousBlockHash[:], fileformat.FileTypeUtxoSet, body))
+
+	c := NewConsolidator(logger, tSettings, nil, nil, blockStore, &previousBlockHash)
+	c.lastBlockHash = &currentBlockHash
+	c.lastBlockHeight = 43
+	c.previousBlockHash = &previousBlockHash
+
+	us, err := GetUTXOSet(ctx, logger, tSettings, blockStore, &currentBlockHash)
+	require.NoError(t, err)
+
+	err = us.CreateUTXOSet(ctx, c)
+	require.Error(t, err, "a previous UTXO set with a missing footer must not be silently accepted as complete")
+}
+
+// TestCreateUTXOSet_PreviousSetFooterMismatch_ReturnsError pins the counts
+// check itself: a footer that decodes cleanly but whose counts don't match
+// what the loop actually read must still be rejected, not just a footer that
+// is structurally malformed or absent.
+func TestCreateUTXOSet_PreviousSetFooterMismatch_ReturnsError(t *testing.T) {
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	tSettings := test.CreateBaseTestSettings(t)
+	blockStore := memory.New()
+
+	previousBlockHash := chainhash.HashH([]byte("previous-block-hash-for-footer-mismatch-test"))
+	currentBlockHash := chainhash.HashH([]byte("current-block-hash-for-footer-mismatch-test"))
+	grandparentHash := chainhash.HashH([]byte("grandparent-block-hash-for-footer-mismatch-test"))
+
+	wrapper := &UTXOWrapper{
+		TxID:   chainhash.HashH([]byte("wrapper-a-for-footer-mismatch-test")),
+		Height: 42,
+		UTXOs:  []*UTXO{{Index: 0, Value: 1000, Script: []byte{0x76, 0xa9, 0x88, 0xac}}},
+	}
+
+	var heightBuf [4]byte
+	binary.LittleEndian.PutUint32(heightBuf[:], 42)
+
+	// Footer claims 2 transactions/2 utxos, but only 1 wrapper (1 utxo) is
+	// actually present in the body.
+	var footer [16]byte
+	binary.LittleEndian.PutUint64(footer[0:8], 2)
+	binary.LittleEndian.PutUint64(footer[8:16], 2)
+
+	body := make([]byte, 0, len(previousBlockHash)+len(heightBuf)+len(grandparentHash)+len(wrapper.Bytes())+len(footer))
+	body = append(body, previousBlockHash[:]...)
+	body = append(body, heightBuf[:]...)
+	body = append(body, grandparentHash[:]...)
+	body = append(body, wrapper.Bytes()...)
+	body = append(body, footer[:]...)
+	require.NoError(t, blockStore.Set(ctx, previousBlockHash[:], fileformat.FileTypeUtxoSet, body))
+
+	c := NewConsolidator(logger, tSettings, nil, nil, blockStore, &previousBlockHash)
+	c.lastBlockHash = &currentBlockHash
+	c.lastBlockHeight = 43
+	c.previousBlockHash = &previousBlockHash
+
+	us, err := GetUTXOSet(ctx, logger, tSettings, blockStore, &currentBlockHash)
+	require.NoError(t, err)
+
+	err = us.CreateUTXOSet(ctx, c)
+	require.Error(t, err, "a footer whose counts disagree with what was actually read must be rejected")
 }
 
 var (
