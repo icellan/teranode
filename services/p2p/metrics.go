@@ -31,6 +31,10 @@ var (
 	// prometheusP2PCatchupSuccesses counts successful catchups completed from peers.
 	prometheusP2PCatchupSuccesses prometheus.Counter
 
+	// prometheusP2PCatchupFailures counts failed catchup attempts against peers,
+	// labelled by normalized failure kind (e.g. "generic", "block_incomplete").
+	prometheusP2PCatchupFailures *prometheus.CounterVec
+
 	// prometheusP2PWebsocketConnections tracks the number of currently connected
 	// websocket notification subscribers.
 	prometheusP2PWebsocketConnections prometheus.Gauge
@@ -123,6 +127,16 @@ func _initPrometheusMetrics() {
 			Name:      "catchup_successes_total",
 			Help:      "Total number of successful catchups completed from peers",
 		},
+	)
+
+	prometheusP2PCatchupFailures = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "p2p",
+			Name:      "catchup_failures_total",
+			Help:      "Total number of failed catchup attempts against peers, labelled by failure kind",
+		},
+		[]string{"kind"},
 	)
 
 	prometheusP2PWebsocketConnections = promauto.NewGauge(

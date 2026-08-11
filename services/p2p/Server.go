@@ -968,7 +968,6 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 					// Get current peer addresses from the P2P node
 					peers := s.P2PClient.GetPeers()
 					s.logger.Debugf("P2P node currently connected to %d peers", len(peers))
-					prometheusP2PConnectedPeers.Set(float64(len(peers)))
 
 					// Log our advertised addresses (these should include observed addresses)
 					// The go-p2p library should be handling this via libp2p's Identify protocol
@@ -981,6 +980,10 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 			}
 		}
 	}()
+
+	// Keep the connected-peers gauge current on its own ticker, independent of
+	// the NAT-diagnostics logging goroutine above (see startConnectedPeersMonitor).
+	s.startConnectedPeersMonitor(ctx, connectedPeersPollInterval)
 
 	// Start the peer-registry batcher before the topic subscriptions that feed it
 	if s.registryBatcher != nil {

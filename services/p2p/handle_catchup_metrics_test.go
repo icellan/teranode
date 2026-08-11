@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -215,6 +216,35 @@ func TestRecordCatchupFailure_BlockIncomplete_DoesNotBanPeer(t *testing.T) {
 	banned, err := s.peerRegistry.IsPeerBanned(context.Background(), pid.String())
 	require.NoError(t, err)
 	require.False(t, banned)
+}
+
+// TestRecordCatchupFailure_IncrementsFailureCounter confirms both the generic
+// and block-incomplete failure paths increment the prometheusP2PCatchupFailures
+// counter, labelled by the normalized failure kind, so an operator can alert on
+// catchup failures the same way they already can for attempts/successes.
+func TestRecordCatchupFailure_IncrementsFailureCounter(t *testing.T) {
+	initPrometheusMetrics()
+
+	genericBefore := testutil.ToFloat64(prometheusP2PCatchupFailures.WithLabelValues(catchupFailureKindGeneric))
+	blockIncompleteBefore := testutil.ToFloat64(prometheusP2PCatchupFailures.WithLabelValues(catchupFailureKindBlockIncomplete))
+
+	s, reg, pid := freshTestServer(t)
+	reg.Register(&blockchain.PeerInfo{ID: pid.String()})
+
+	resp, err := s.RecordCatchupFailure(context.Background(), &p2p_api.RecordCatchupFailureRequest{PeerId: pid.String()})
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+	require.Equal(t, genericBefore+1, testutil.ToFloat64(prometheusP2PCatchupFailures.WithLabelValues(catchupFailureKindGeneric)))
+
+	blockHash := chainhash.HashH([]byte("counter-block-incomplete"))
+	resp, err = s.RecordCatchupFailure(context.Background(), &p2p_api.RecordCatchupFailureRequest{
+		PeerId:      pid.String(),
+		FailureKind: catchupFailureKindBlockIncomplete,
+		BlockHash:   blockHash.String(),
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Ok)
+	require.Equal(t, blockIncompleteBefore+1, testutil.ToFloat64(prometheusP2PCatchupFailures.WithLabelValues(catchupFailureKindBlockIncomplete)))
 }
 
 func TestRecordCatchupFailure_UnknownFailureKind_Generic(t *testing.T) {
