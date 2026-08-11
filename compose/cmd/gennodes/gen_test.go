@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -87,4 +88,29 @@ func TestWriteAll_RendersCompleteBundle(t *testing.T) {
 		require.True(t, ok, "compose missing service %q", want)
 	}
 	require.Len(t, doc.Services, 1+3+4+4, "unexpected service count")
+}
+
+func TestWriteAll_MinerRolesAreNotSuperuser(t *testing.T) {
+	keys, err := loadKeys(4)
+	require.NoError(t, err)
+	s := buildSpec(keys)
+
+	dir := t.TempDir()
+	require.NoError(t, writeAll(dir, s))
+
+	sqlBytes, err := os.ReadFile(filepath.Join(dir, "postgres", "init-multinode.sql"))
+	require.NoError(t, err)
+	sql := string(sqlBytes)
+
+	// No bare SUPERUSER attribute anywhere - NOSUPERUSER embeds the substring,
+	// so match on a word boundary before it.
+	bareSuperuser := regexp.MustCompile(`(?:^|[^A-Z])SUPERUSER`)
+	require.NotRegexp(t, bareSuperuser, sql, "init-multinode.sql grants SUPERUSER")
+
+	// Every miner role must be provisioned with the NOSUPERUSER attribute clause.
+	require.Equal(t, 4, strings.Count(sql, "NOSUPERUSER INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION;"),
+		"expected one NOSUPERUSER attribute clause per miner role")
+	for i := 1; i <= 4; i++ {
+		require.Contains(t, sql, "CREATE ROLE miner"+strconv.Itoa(i)+" LOGIN")
+	}
 }
