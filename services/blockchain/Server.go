@@ -18,9 +18,7 @@ package blockchain
 import (
 	"container/ring"
 	"context"
-	"crypto/rand"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
@@ -473,6 +471,85 @@ func (b *Blockchain) Init(ctx context.Context) error {
 //
 // Returns:
 // - Error if any part of the startup sequence fails, nil on successful startup
+
+// resolveAdminAPIKey returns the configured admin API key for the blockchain
+// gRPC server (which also serves PeerRegistryService on the same listener).
+// An empty key is returned as-is rather than replaced with a generated one:
+// util.StartGRPCServer only installs the auth interceptor when the key is
+// non-empty, so a generated key no client could ever learn would just mask
+// the fact that the RPCs in protectedMethods() are unauthenticated. A single
+// warning is logged in that case so the exposure is visible.
+func (b *Blockchain) resolveAdminAPIKey() string {
+	apiKey := b.settings.GRPCAdminAPIKey
+	if apiKey == "" {
+		b.logger.Warnf("[Blockchain] grpc_admin_api_key is not set; admin-protected RPCs (SendNotification, ReportPeerFailure, SetBlockSubtreesSet, AddBlock, InvalidateBlock, and other state-mutating RPCs) are unauthenticated - set grpc_admin_api_key to secure them")
+	}
+
+	return apiKey
+}
+
+// protectedMethods returns the full gRPC method paths of every state-mutating
+// RPC on BlockchainAPI and PeerRegistryService (both served on the same
+// listener, see [Blockchain][Start]); the auth interceptor requires the
+// admin API key for these. Read-only queries stay unauthenticated because
+// other services call them without admin credentials. SendNotification,
+// ReportPeerFailure and SetBlockSubtreesSet are protected together: the
+// latter two call b.SendNotification as a plain Go method, bypassing
+// SendNotification's own gRPC boundary, so leaving them public would let an
+// attacker reach the same b.notifications flood vector without ever calling
+// SendNotification. Any new mutating RPC must be added here; the
+// classification is enforced by TestProtectedMethodsCoverAllRPCs.
+func protectedMethods() map[string]bool {
+	return map[string]bool{
+		// BlockchainAPI - state mutation.
+		"/blockchain_api.BlockchainAPI/AddBlock":                   true,
+		"/blockchain_api.BlockchainAPI/InvalidateBlock":            true,
+		"/blockchain_api.BlockchainAPI/RevalidateBlock":            true,
+		"/blockchain_api.BlockchainAPI/SendNotification":           true,
+		"/blockchain_api.BlockchainAPI/SetState":                   true,
+		"/blockchain_api.BlockchainAPI/AssignBlockID":              true,
+		"/blockchain_api.BlockchainAPI/SetBlockMinedSet":           true,
+		"/blockchain_api.BlockchainAPI/ClearBlockMinedSet":         true,
+		"/blockchain_api.BlockchainAPI/SetBlockSubtreesSet":        true,
+		"/blockchain_api.BlockchainAPI/SetBlockPersistedAt":        true,
+		"/blockchain_api.BlockchainAPI/SetBlockProcessedAt":        true,
+		"/blockchain_api.BlockchainAPI/SendFSMEvent":               true,
+		"/blockchain_api.BlockchainAPI/Run":                        true,
+		"/blockchain_api.BlockchainAPI/CatchUpBlocks":              true,
+		"/blockchain_api.BlockchainAPI/Idle":                       true,
+		"/blockchain_api.BlockchainAPI/ReportPeerFailure":          true,
+		"/blockchain_api.BlockchainAPI/ScheduleBlobDeletion":       true,
+		"/blockchain_api.BlockchainAPI/CancelBlobDeletion":         true,
+		"/blockchain_api.BlockchainAPI/RemoveBlobDeletion":         true,
+		"/blockchain_api.BlockchainAPI/IncrementBlobDeletionRetry": true,
+		"/blockchain_api.BlockchainAPI/CompleteBlobDeletions":      true,
+		"/blockchain_api.BlockchainAPI/AcquireBlobDeletionBatch":   true,
+		"/blockchain_api.BlockchainAPI/CompleteBlobDeletionBatch":  true,
+
+		// PeerRegistryService - state mutation.
+		"/blockchain_api.PeerRegistryService/RegisterPeer":                true,
+		"/blockchain_api.PeerRegistryService/UpdatePeerMetrics":           true,
+		"/blockchain_api.PeerRegistryService/RemovePeer":                  true,
+		"/blockchain_api.PeerRegistryService/AddBanScore":                 true,
+		"/blockchain_api.PeerRegistryService/ClearBannedPeers":            true,
+		"/blockchain_api.PeerRegistryService/UpdateConnectionState":       true,
+		"/blockchain_api.PeerRegistryService/UpdateLastMessageTime":       true,
+		"/blockchain_api.PeerRegistryService/UpdateStorage":               true,
+		"/blockchain_api.PeerRegistryService/RecordSyncAttempt":           true,
+		"/blockchain_api.PeerRegistryService/ClearAllSyncAttempts":        true,
+		"/blockchain_api.PeerRegistryService/RecordBlockReceived":         true,
+		"/blockchain_api.PeerRegistryService/RecordSubtreeReceived":       true,
+		"/blockchain_api.PeerRegistryService/RecordTransactionReceived":   true,
+		"/blockchain_api.PeerRegistryService/RecordCatchupError":          true,
+		"/blockchain_api.PeerRegistryService/RecordCatchupAttempt":        true,
+		"/blockchain_api.PeerRegistryService/RecordCatchupSuccess":        true,
+		"/blockchain_api.PeerRegistryService/RecordCatchupFailure":        true,
+		"/blockchain_api.PeerRegistryService/ResetReputation":             true,
+		"/blockchain_api.PeerRegistryService/ReconsiderBadPeers":          true,
+		"/blockchain_api.PeerRegistryService/RecordValidatedPeerProgress": true,
+	}
+}
+
 func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	var closeOnce sync.Once
 	defer closeOnce.Do(func() { close(readyCh) })
@@ -534,29 +611,9 @@ func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		return errors.WrapGRPC(err)
 	}
 
-	apiKey := b.settings.GRPCAdminAPIKey
-	if apiKey == "" {
-		// Generate a random API key if not provided so SendNotification can't
-		// be reached without a key that's actually known to any caller.
-		key := make([]byte, 32)
-		if _, err := rand.Read(key); err != nil {
-			return errors.WrapGRPC(errors.NewServiceNotStartedError("[Blockchain][Start] failed to generate API key", err))
-		}
-
-		apiKey = hex.EncodeToString(key)
-
-		b.logger.Warnf("[Blockchain] grpc_admin_api_key is not set; a random key was generated so SendNotification is unreachable until a key is configured")
-	}
-
-	// Only SendNotification is protected here: it's the RPC the Halborn audit
-	// flagged as an unauthenticated flood vector. The rest of the blockchain
-	// gRPC service is still unauthenticated by default (relies on cluster
-	// network isolation); broadening this is a separate follow-up.
 	authOptions := &util.AuthOptions{
-		APIKey: apiKey,
-		ProtectedMethods: map[string]bool{
-			"/blockchain_api.BlockchainAPI/SendNotification": true,
-		},
+		APIKey:           b.resolveAdminAPIKey(),
+		ProtectedMethods: protectedMethods(),
 	}
 
 	// this will block
@@ -2550,7 +2607,7 @@ func (b *Blockchain) SendNotification(ctx context.Context, req *blockchain_api.N
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][SendNotification] hash must be %d bytes, got %d", chainhash.HashSize, len(req.GetHash())))
 	}
 
-	_, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "RevalidateBlock",
+	_, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "SendNotification",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainSendNotification),
 		tracing.WithLogMessage(b.logger, "[SendNotification] called for %s notification type %s", util.ReverseAndHexEncodeSlice(req.Hash), req.Type.String()),

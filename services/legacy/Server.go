@@ -25,8 +25,6 @@ package legacy
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"net/http"
 	"sync"
 	"time"
@@ -625,6 +623,22 @@ func (s *Server) logPeerStats(ctx context.Context) {
 //
 // Returns an error if any component fails to start, particularly if the blockchain
 // service isn't ready or the gRPC server fails to initialize
+
+// resolveAdminAPIKey returns the configured admin API key for the legacy
+// gRPC server. An empty key is returned as-is rather than replaced with a
+// generated one: util.StartGRPCServer only installs the auth interceptor
+// when the key is non-empty, so a generated key no client could ever learn
+// would just mask the fact that BanPeer/UnbanPeer are unauthenticated. A
+// single warning is logged in that case so the exposure is visible.
+func (s *Server) resolveAdminAPIKey() string {
+	apiKey := s.settings.GRPCAdminAPIKey
+	if apiKey == "" {
+		s.logger.Warnf("[Legacy] grpc_admin_api_key is not set; admin-protected RPCs (BanPeer, UnbanPeer) are unauthenticated - set grpc_admin_api_key to secure them")
+	}
+
+	return apiKey
+}
+
 func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	var closeOnce sync.Once
 	defer closeOnce.Do(func() { close(readyCh) })
@@ -648,25 +662,7 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	go s.logPeerStats(ctx)
 	s.logger.Infof("[Legacy Server] Started peer statistics logging")
 
-	apiKey := s.settings.GRPCAdminAPIKey
-	if util.ValidateAdminAPIKey(s.logger, "Legacy", apiKey, s.settings.Legacy.GRPCListenAddress, s.settings.SecurityLevelGRPC) {
-		// Configured key is a well-known placeholder; ignore it and fall back to
-		// the random-key path below rather than trusting a world-readable value.
-		apiKey = ""
-	}
-
-	if apiKey == "" {
-		// Generate a random API key if not provided
-		key := make([]byte, 32)
-		if _, err := rand.Read(key); err != nil {
-			return errors.WrapGRPC(errors.NewServiceNotStartedError("[Legacy] failed to generate API key", err))
-		}
-
-		apiKey = hex.EncodeToString(key)
-		// Never log the key itself; a random key means admin RPCs are
-		// intentionally unreachable until an operator configures one.
-		s.logger.Warnf("[Legacy] grpc_admin_api_key is not set; a random key was generated so admin RPCs (ban, unban) are unreachable until a key is configured")
-	}
+	apiKey := s.resolveAdminAPIKey()
 
 	// Define protected methods - use the full gRPC method path
 	protectedMethods := map[string]bool{
