@@ -50,25 +50,25 @@
                   "index": 2,
                   "text": "Resetting"
                 },
-                "3": {
-                  "color": "blue",
-                  "index": 3,
-                  "text": "GetMiningCandidate"
-                },
                 "4": {
                   "color": "purple",
-                  "index": 4,
+                  "index": 3,
                   "text": "BlockchainSubscription"
                 },
                 "5": {
                   "color": "red",
-                  "index": 5,
+                  "index": 4,
                   "text": "Reorging"
                 },
                 "6": {
                   "color": "light-blue",
-                  "index": 6,
+                  "index": 5,
                   "text": "MovingUp"
+                },
+                "7": {
+                  "color": "blue",
+                  "index": 6,
+                  "text": "Reconciling"
                 }
               },
               "type": "value"
@@ -354,25 +354,25 @@
                   "index": 2,
                   "text": "Resetting"
                 },
-                "3": {
-                  "color": "blue",
-                  "index": 3,
-                  "text": "GetMiningCandidate"
-                },
                 "4": {
                   "color": "purple",
-                  "index": 4,
+                  "index": 3,
                   "text": "BlockchainSubscription"
                 },
                 "5": {
                   "color": "red",
-                  "index": 5,
+                  "index": 4,
                   "text": "Reorging"
                 },
                 "6": {
                   "color": "light-blue",
-                  "index": 6,
+                  "index": 5,
                   "text": "MovingUp"
+                },
+                "7": {
+                  "color": "blue",
+                  "index": 6,
+                  "text": "Reconciling"
                 }
               },
               "type": "value"
