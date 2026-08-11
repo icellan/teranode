@@ -53,7 +53,7 @@ type CatchupContext struct {
 	blockHeaders            []*model.BlockHeader
 	headersFetchResult      *catchup.Result
 	useQuickValidation      bool   // Whether to use quick validation for checkpointed blocks
-	highestCheckpointHeight uint32 // Highest checkpoint height for validation checks
+	highestCheckpointHeight uint32 // Highest checkpoint height hash-verified in THIS catchup run (not the highest configured checkpoint)
 	catchupError            error  // Any error encountered during catchup
 	incompleteBlockHash     string // Block hash reported when a peer serves an incomplete block
 

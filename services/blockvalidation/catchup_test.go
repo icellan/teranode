@@ -3767,7 +3767,7 @@ func TestQuickValidationBoundToActuallyVerifiedCheckpoint(t *testing.T) {
 	// The core assertion: highestCheckpointHeight must reflect only the checkpoint that
 	// was ACTUALLY verified this run (height 5), not the globally highest CONFIGURED
 	// checkpoint (height 50) which was never checked in this catchup range.
-	assert.Equal(t, uint32(5), catchupCtx.highestCheckpointHeight,
+	require.Equal(t, uint32(5), catchupCtx.highestCheckpointHeight,
 		"highestCheckpointHeight must be bound to the checkpoint actually verified in this run, not the globally configured maximum")
 
 	// A block above the verified checkpoint (5) but below the merely-configured higher
@@ -3779,7 +3779,7 @@ func TestQuickValidationBoundToActuallyVerifiedCheckpoint(t *testing.T) {
 	shouldTryNormal, err := suite.Server.tryQuickValidation(
 		suite.Ctx, blockAboveVerifiedCheckpoint, catchupCtx, "", "http://test", nil)
 	require.NoError(t, err)
-	assert.True(t, shouldTryNormal,
+	require.True(t, shouldTryNormal,
 		"block above the verified checkpoint but below the merely-configured checkpoint must fall back to normal validation")
 }
 
