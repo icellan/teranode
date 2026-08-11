@@ -2358,14 +2358,25 @@ out:
 
 			err := p.writeMessage(msg.msg, msg.encoding)
 			if err != nil {
+				// Pick the log level before disconnecting: the disconnect sets
+				// p.disconnect, which makes shouldLogWriteError suppress
+				// everything from then on. An ordinary remote close is not
+				// worth a warning.
+				logFunc := p.logger.Debugf
 				if p.shouldLogWriteError(err) {
-					p.logger.Errorf("Failed to send message to "+
-						"%s: %v", p, err)
+					logFunc = p.logger.Warnf
 				}
+
+				// Disconnect before anything else, as upstream btcd does, so a
+				// caller that queued a message and stopped receiving on its
+				// done channel cannot wedge this handler before the peer is
+				// torn down.
+				p.DisconnectWithLogFunc(fmt.Sprintf("write error: %v", err), logFunc)
+
 				if msg.doneChan != nil {
 					msg.doneChan <- struct{}{}
 				}
-				p.DisconnectWithWarning("write error")
+
 				continue
 			}
 
@@ -2529,11 +2540,15 @@ func (p *Peer) DisconnectWithLogFunc(reason string, logFunc func(format string, 
 	// n := runtime.Stack(buf, false)
 	// stackTrace := string(buf[:n])
 	// p.logger.Debugf("Disconnecting (%s) reason: %s\nStack trace:\n%s", p, reason, stackTrace)
-	logFunc("Disconnecting (%s) reason: %s", p, reason)
 
+	// Only the call that actually disconnects logs, so repeated disconnects for
+	// the same peer - one per message still queued on a dead connection, for
+	// example - do not each add a log line.
 	if atomic.AddInt32(&p.disconnect, 1) != 1 {
 		return
 	}
+
+	logFunc("Disconnecting (%s) reason: %s", p, reason)
 
 	if atomic.LoadInt32(&p.connected) != 0 {
 		p.conn.Close()

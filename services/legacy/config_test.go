@@ -2,7 +2,6 @@ package legacy
 
 import (
 	"io/ioutil"
-	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,13 +9,14 @@ import (
 
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExcessiveBlockSizeUserAgentComment(t *testing.T) {
 	// Wipe test args.
 	os.Args = []string{"bsvd"}
 
-	cfg, _, err := loadConfig(ulogger.TestLogger{})
+	cfg, _, err := loadConfig(ulogger.TestLogger{}, 4294967296)
 	if err != nil {
 		t.Fatal("Failed to load configuration")
 	}
@@ -34,7 +34,7 @@ func TestExcessiveBlockSizeUserAgentComment(t *testing.T) {
 	// Custom excessive block size.
 	os.Args = []string{"bsvd", "--excessiveblocksize=64000000"}
 
-	cfg, _, err = loadConfig(ulogger.TestLogger{})
+	cfg, _, err = loadConfig(ulogger.TestLogger{}, 4294967296)
 	if err != nil {
 		t.Fatal("Failed to load configuration")
 	}
@@ -51,57 +51,59 @@ func TestExcessiveBlockSizeUserAgentComment(t *testing.T) {
 	//	}
 }
 
-// TestClampExcessiveBlockSizeRespectsValueBelowWireCapacity confirms a
-// configured ExcessiveBlockSize below the wire protocol's actual relay
-// capacity is respected as-is, rather than being floored up to some other
-// value.
+// TestAdvertisedExcessiveBlockSizeTracksEnforcedPolicy confirms the advertised
+// excessive block size is derived from the limit block validation actually
+// enforces (settings.Policy.ExcessiveBlockSize), capped at the largest block
+// message the legacy wire path accepts, so the user agent can never claim a
+// block size this node would reject.
+func TestAdvertisedExcessiveBlockSizeTracksEnforcedPolicy(t *testing.T) {
+	tests := []struct {
+		name     string
+		policy   int
+		expected uint64
+	}{
+		{"policy below the wire block payload cap is advertised verbatim", 64000000, 64000000},
+		{"policy equal to the wire block payload cap", maxWireBlockPayload, maxWireBlockPayload},
+		{"policy above the wire block payload cap is capped", 10737418240, maxWireBlockPayload},
+		{"the 4GiB settings default is capped", 4294967296, maxWireBlockPayload},
+		{"a disabled policy limit falls back to the wire block payload cap", 0, maxWireBlockPayload},
+		{"a negative policy limit falls back to the wire block payload cap", -1, maxWireBlockPayload},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.expected, advertisedExcessiveBlockSize(tt.policy))
+		})
+	}
+}
+
+// TestLoadConfigAdvertisesEnforcedExcessiveBlockSize confirms the derivation is
+// wired into loadConfig, i.e. that the EB user agent comment follows the
+// enforced policy limit rather than a hard-coded constant.
 //
-// Note: this exercises clampExcessiveBlockSize directly rather than going
-// through loadConfig's os.Args-based flag parsing. That CLI parsing path is
-// already dead code in this file (the flags.NewIniParser/parser.Parse calls
-// are commented out), so loadConfig always builds cfg from its hard-coded
-// struct defaults regardless of os.Args -- exercising the clamp via os.Args
-// would silently test nothing.
-func TestClampExcessiveBlockSizeRespectsValueBelowWireCapacity(t *testing.T) {
-	const belowCapacity uint64 = 64000000
-
-	got := clampExcessiveBlockSize(belowCapacity)
-	if got != belowCapacity {
-		t.Fatalf("Expected ExcessiveBlockSize to be respected at %d, got %d", belowCapacity, got)
-	}
-}
-
-// TestClampExcessiveBlockSizeCapsValueAboveWireCapacity confirms a configured
-// (or defaulted) ExcessiveBlockSize above what the wire protocol can
-// actually relay gets clamped down to that ceiling, instead of being
-// advertised as an essentially-infinite value the transport can't back up.
-func TestClampExcessiveBlockSizeCapsValueAboveWireCapacity(t *testing.T) {
-	// Above the wire capacity ceiling.
-	if got := clampExcessiveBlockSize(5000000000); got != maxWireMessagePayload {
-		t.Fatalf("Expected ExcessiveBlockSize to be clamped to %d, got %d", maxWireMessagePayload, got)
-	}
-
-	// The old math.MaxUint64 default should also be clamped down.
-	if got := clampExcessiveBlockSize(math.MaxUint64); got != maxWireMessagePayload {
-		t.Fatalf("Expected default ExcessiveBlockSize to be clamped to %d, got %d", maxWireMessagePayload, got)
-	}
-}
-
-// TestLoadConfigClampsDefaultExcessiveBlockSize confirms the clamp is wired
-// up in loadConfig: since the CLI flag parser is disabled, cfg always starts
-// from defaultExcessiveBlockSize (math.MaxUint64), which must come back
-// clamped to the wire capacity ceiling.
-func TestLoadConfigClampsDefaultExcessiveBlockSize(t *testing.T) {
+// Note: the enforced limit is passed in rather than set via os.Args, because
+// loadConfig's CLI parsing path is dead code (the flags.NewIniParser and
+// parser.Parse calls are commented out), so loadConfig always builds cfg from
+// its hard-coded struct defaults regardless of os.Args.
+func TestLoadConfigAdvertisesEnforcedExcessiveBlockSize(t *testing.T) {
+	// Wipe test args.
 	os.Args = []string{"bsvd"}
 
-	cfg, _, err := loadConfig(ulogger.TestLogger{})
-	if err != nil {
-		t.Fatalf("Failed to load configuration: %v", err)
-	}
+	// A policy limit below the wire cap is what gets advertised.
+	cfg, _, err := loadConfig(ulogger.TestLogger{}, 64000000)
+	require.NoError(t, err)
+	require.Equal(t, uint64(64000000), cfg.ExcessiveBlockSize)
+	require.Equal(t, []string{"EB64.0"}, cfg.UserAgentComments)
 
-	if cfg.ExcessiveBlockSize != maxWireMessagePayload {
-		t.Fatalf("Expected default ExcessiveBlockSize to be clamped to %d, got %d", maxWireMessagePayload, cfg.ExcessiveBlockSize)
-	}
+	// Blocks we mine must stay inside the size we accept.
+	require.LessOrEqual(t, cfg.BlockMaxSize, cfg.ExcessiveBlockSize-1000)
+
+	// The 4GiB settings default exceeds the largest block message the legacy
+	// wire path accepts, so the advertisement is capped there.
+	cfg, _, err = loadConfig(ulogger.TestLogger{}, 4294967296)
+	require.NoError(t, err)
+	require.Equal(t, uint64(maxWireBlockPayload), cfg.ExcessiveBlockSize)
+	require.Equal(t, []string{"EB4000.0"}, cfg.UserAgentComments)
 }
 
 func TestCreateDefaultConfigFile(t *testing.T) {

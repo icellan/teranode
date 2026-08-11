@@ -1261,10 +1261,13 @@ func (f *flakyWriter) Write(p []byte) (int, error) {
 	return f.w.Write(p)
 }
 
-// TestOutHandlerDisconnectsOnWriteError verifies that outHandler disconnects
-// the peer when writeMessage fails, rather than leaving the peer marked as
-// connected with a permanently stalled send queue.
-func TestOutHandlerDisconnectsOnWriteError(t *testing.T) {
+// connectedPeerPairWithFlakyWriter wires an in-memory peer pair whose outbound
+// side writes through a flakyWriter, waits for the handshake to complete and
+// arms the write failure. The returned cleanup function tears the inbound peer
+// down.
+func connectedPeerPairWithFlakyWriter(t *testing.T) (outPeer *peer.Peer, cleanup func()) {
+	t.Helper()
+
 	tSettings := test.CreateBaseTestSettings(t)
 	verack := make(chan struct{}, 4)
 	cfg := &peer.Config{
@@ -1316,6 +1319,19 @@ func TestOutHandlerDisconnectsOnWriteError(t *testing.T) {
 	// negotiation itself is unaffected.
 	fw.fail.Store(true)
 
+	return outPeer, func() {
+		inPeer.DisconnectWithInfo("test cleanup")
+		inPeer.WaitForDisconnect()
+	}
+}
+
+// TestOutHandlerDisconnectsOnWriteError verifies that outHandler disconnects
+// the peer when writeMessage fails, rather than leaving the peer marked as
+// connected with a permanently stalled send queue.
+func TestOutHandlerDisconnectsOnWriteError(t *testing.T) {
+	outPeer, cleanup := connectedPeerPairWithFlakyWriter(t)
+	defer cleanup()
+
 	outPeer.QueueMessage(wire.NewMsgPing(1), nil)
 
 	disconnected := make(chan struct{})
@@ -1331,9 +1347,64 @@ func TestOutHandlerDisconnectsOnWriteError(t *testing.T) {
 	}
 
 	require.False(t, outPeer.Connected())
+}
 
-	inPeer.DisconnectWithInfo("test cleanup")
-	inPeer.WaitForDisconnect()
+// TestOutHandlerDisconnectsBeforeSignallingDoneChan verifies outHandler
+// disconnects before it signals the message's done channel, matching upstream
+// btcd. A caller that queued a message with an unbuffered done channel and is
+// not yet receiving on it must not be able to wedge outHandler before the peer
+// is torn down.
+func TestOutHandlerDisconnectsBeforeSignallingDoneChan(t *testing.T) {
+	outPeer, cleanup := connectedPeerPairWithFlakyWriter(t)
+	defer cleanup()
+
+	// Deliberately unbuffered and not received from until the disconnect has
+	// been observed below.
+	doneChan := make(chan struct{})
+	outPeer.QueueMessage(wire.NewMsgPing(1), doneChan)
+
+	disconnected := make(chan struct{})
+	go func() {
+		outPeer.WaitForDisconnect()
+		close(disconnected)
+	}()
+
+	select {
+	case <-disconnected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("peer did not disconnect after a write error before signalling doneChan")
+	}
+
+	require.False(t, outPeer.Connected())
+
+	// Release outHandler now that the disconnect has been observed.
+	select {
+	case <-doneChan:
+	case <-time.After(3 * time.Second):
+		t.Fatal("outHandler never signalled doneChan")
+	}
+}
+
+// TestDisconnectLogsOnceForRepeatedCalls verifies the disconnect reason is
+// logged by the call that actually disconnects the peer and not by the
+// subsequent no-op calls. Repeated write errors - one per message still queued
+// on a dead connection - must not each add a log line.
+func TestDisconnectLogsOnceForRepeatedCalls(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	p := peer.NewInboundPeer(ulogger.TestLogger{}, tSettings, &peer.Config{
+		ChainParams: &chaincfg.MainNetParams,
+	})
+
+	logged := 0
+	logFunc := func(format string, args ...interface{}) {
+		logged++
+	}
+
+	p.DisconnectWithLogFunc("write error: first", logFunc)
+	p.DisconnectWithLogFunc("write error: second", logFunc)
+	p.DisconnectWithLogFunc("write error: third", logFunc)
+
+	require.Equal(t, 1, logged, "only the call that actually disconnects the peer should log")
 }
 
 func NewTestServer(t *testing.T) (*legacy.Server, error) {
