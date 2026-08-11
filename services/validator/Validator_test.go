@@ -1415,10 +1415,10 @@ func TestValidator_UnlockLockedTxOnExit_ClearsLockOnSuccess(t *testing.T) {
 	require.False(t, storedMeta.Locked, "the store record must be unlocked on the success path")
 }
 
-// TestValidator_UnlockLockedTxOnExit_SuccessPathSetsErrOnUnlockFailure covers the
-// pure-success-path behaviour that predates this fix: if the tx was never Locked
-// to begin with, unlockLockedTxOnExit must be a no-op (SetLocked must not be
-// called at all). This is the SkipUtxoCreation / not-added-to-block-assembly case.
+// TestValidator_UnlockLockedTxOnExit_NoopWhenNotLocked covers the case where the
+// tx was never Locked to begin with: unlockLockedTxOnExit must be a no-op
+// (SetLocked must not be called at all). This is the SkipUtxoCreation /
+// not-added-to-block-assembly case.
 func TestValidator_UnlockLockedTxOnExit_NoopWhenNotLocked(t *testing.T) {
 	tracing.SetupMockTracer()
 
@@ -1446,6 +1446,43 @@ func TestValidator_UnlockLockedTxOnExit_NoopWhenNotLocked(t *testing.T) {
 	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr)
 
 	assert.NoError(t, deferredErr)
+}
+
+// TestValidator_UnlockLockedTxOnExit_SetsErrOnUnlockFailure covers the
+// success-path-so-far case: the tx was Locked and delivered to block assembly
+// (incoming deferred error is nil), but the unlock (SetLocked(false) via the
+// two-phase commit) itself fails. unlockLockedTxOnExit must surface that
+// failure by setting the deferred error to the unlock error, and must leave
+// the in-memory Locked flag untouched (it stays true) since the store record
+// was never actually unlocked.
+func TestValidator_UnlockLockedTxOnExit_SetsErrOnUnlockFailure(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	tx, err := bt.NewTxFromString("010000000000000000ef01b136c673a9b815af2bfdeccc9479deec3273ee98a188c26d3c14b5e6bfcbca0b010000006b48304502200241ac9536c536f21e522dec152e69674094b371b14c26edf706e1db0e6487190221008ee66bdafc7d39ee041e1425a7b2df780702e9b066c3a1e9715b03b23fbd99be41210373c9cb2feaa59dd208ad90dc4c8f32dac7a30a65e590fa16e2a421637927ae63feffffff4004fb0b000000001976a91471902a65346b0d951358ec9a1b306ecd36d284ae88ac0280969800000000001976a914dd37ee4ce93278fbc398abcda001d1d855841e0788ac3cd35d0b000000001976a914d04ad25d93764cf83aca0ca0c7cbb7ba8850f75888ac00000000")
+	require.NoError(t, err)
+
+	utxoStore := NewFailingUtxoStore(t) // SetLocked always errors here
+	_, err = utxoStore.Create(context.Background(), tx, 100, utxostore.WithLocked(true))
+	require.NoError(t, err)
+
+	v := &Validator{
+		logger:      ulogger.TestLogger{},
+		utxoStore:   utxoStore,
+		settings:    test.CreateBaseTestSettings(t),
+		txValidator: NewTxValidator(ulogger.TestLogger{}, test.CreateBaseTestSettings(t)),
+		stats:       gocore.NewStat("validator"),
+	}
+
+	ctx, _, endSpan := tracing.Tracer("validator").Start(context.Background(), "Test")
+	defer endSpan()
+
+	txMetaData := &meta.Data{Locked: true}
+	var deferredErr error
+
+	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr)
+
+	require.Error(t, deferredErr, "the unlock failure must be surfaced via the deferred error")
+	require.True(t, txMetaData.Locked, "the in-memory Locked flag must not be cleared when the unlock itself fails")
 }
 
 // FailingUtxoStore provides a test double that simulates UTXO store failures.
