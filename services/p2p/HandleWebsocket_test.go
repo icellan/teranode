@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1412,6 +1413,64 @@ func TestWSConnLimiter_ZeroDisablesCap(t *testing.T) {
 	for _, release := range releases {
 		release()
 	}
+}
+
+// TestWSConnLimiter_PerIPCap_ConcurrentFirstTouch verifies that the per-IP
+// cap holds even when many goroutines race to acquire a slot for the same,
+// previously-unseen IP at the same time. perIPCounter's Get/Add/Get sequence
+// on the LRU cache is not atomic: two goroutines that both miss the cache can
+// each end up incrementing a different *atomic.Int64 (only one of which is
+// ever observed again via Get), letting the group of first-touch racers
+// collectively exceed maxPerIP.
+func TestWSConnLimiter_PerIPCap_ConcurrentFirstTouch(t *testing.T) {
+	const (
+		maxPerIP   = 2
+		goroutines = 16
+		trials     = 500
+	)
+
+	var peakGranted int64
+
+	for trial := 0; trial < trials; trial++ {
+		limiter := newWSConnLimiter(0, maxPerIP)
+
+		var (
+			ready   sync.WaitGroup
+			start   sync.WaitGroup
+			done    sync.WaitGroup
+			granted int64
+		)
+
+		start.Add(1)
+
+		for g := 0; g < goroutines; g++ {
+			ready.Add(1)
+			done.Add(1)
+
+			go func() {
+				defer done.Done()
+
+				ready.Done()
+				start.Wait()
+
+				if _, ok := limiter.acquire("10.0.0.1"); ok {
+					atomic.AddInt64(&granted, 1)
+				}
+			}()
+		}
+
+		ready.Wait()
+		start.Done()
+		done.Wait()
+
+		if granted > peakGranted {
+			peakGranted = granted
+		}
+	}
+
+	require.LessOrEqual(t, peakGranted, int64(maxPerIP),
+		"peak simultaneous grants (%d) exceeded the per-IP cap (%d) across %d trials of %d racing goroutines",
+		peakGranted, maxPerIP, trials, goroutines)
 }
 
 // TestHandleWebSocket_ConnectionCap verifies that once the configured global

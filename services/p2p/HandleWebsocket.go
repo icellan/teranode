@@ -320,20 +320,20 @@ func (l *wsConnLimiter) acquire(ip string) (release func(), ok bool) {
 }
 
 // perIPCounter returns the (possibly freshly created) counter for ip's
-// bucket key. Uses load-then-store so a race-losing goroutine's allocation
-// doesn't get stranded.
+// bucket key. Uses PeekOrAdd, which atomically checks-and-inserts, so
+// concurrent first-time callers for the same key are guaranteed to converge
+// on the same *atomic.Int64 before any of them increments it. A plain
+// Get-then-Add-then-Get sequence is not atomic: two goroutines that both
+// miss the cache at the same time would each publish their own counter, and
+// only the last Add would survive in the LRU, letting the loser's counter
+// (and every connection it tracks) go unaccounted for the life of the
+// connection.
 func (l *wsConnLimiter) perIPCounter(rawIP string) *atomic.Int64 {
 	key := wsConnKey(rawIP)
-
-	if counter, ok := l.perIP.Get(key); ok {
-		return counter
-	}
-
 	counter := &atomic.Int64{}
-	l.perIP.Add(key, counter)
 
-	if existing, ok := l.perIP.Get(key); ok {
-		return existing
+	if previous, ok, _ := l.perIP.PeekOrAdd(key, counter); ok {
+		return previous
 	}
 
 	return counter
