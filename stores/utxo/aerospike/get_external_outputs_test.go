@@ -124,30 +124,24 @@ func TestGetExternalOutputs_LeavesNilHoles(t *testing.T) {
 	require.NotNil(t, tx.TxIDChainHash())
 }
 
-// TestGetExternalTransaction_NeverFallsBackToOutputs is the structural half of the
-// contract: the whole-transaction readers get the transaction or an error, never a
-// UTXO-set reconstruction. Keeping the fallback out of this path is what makes the
-// "callers must not serialize the reconstruction" rule an invariant rather than a
-// comment — BatchDecorate's fields.Tx/fields.Inputs path (get.go) assigns the
-// result straight into meta.Data.Tx and its consumers do serialize it.
-func TestGetExternalTransaction_NeverFallsBackToOutputs(t *testing.T) {
-	t.Run("getExternalTransaction", func(t *testing.T) {
+// TestGetExternalTransaction_ReadsOnlyTheTxBlob pins the contract of the .tx
+// reader itself: it reports what the .tx blob holds, and reaching for the
+// UTXO-set representation is the composing function's job, not its own.
+//
+// Note what is deliberately NOT asserted here: that the public
+// GetTxFromExternalStore refuses the reconstruction. It does not, and must not —
+// services/validator/Validator.go reads a parent's outputs through it to extend a
+// child, and a snapshot-seeded parent has no .tx blob at all. What keeps the
+// reconstruction away from the callers that cannot survive it is
+// meta.Data.TxIsSerializable, which they check. See
+// TestExternalOutputsOnlyParentIsReadableForExtension.
+func TestGetExternalTransaction_ReadsOnlyTheTxBlob(t *testing.T) {
+	t.Run("an absent .tx blob is not-found", func(t *testing.T) {
 		s, _, tx := newOutputsOnlyStore(t, 1, 2)
 
 		got, err := s.getExternalTransaction(context.Background(), *tx.TxIDChainHash())
 
-		require.Error(t, err, "the .tx blob is absent, and the .outputs blob is not a substitute for it")
-		require.Nil(t, got)
-		require.True(t, errors.Is(err, errors.ErrTxNotFound),
-			"an absent .tx blob is not-found, got %v", err)
-	})
-
-	t.Run("GetTxFromExternalStore", func(t *testing.T) {
-		s, _, tx := newOutputsOnlyStore(t, 1, 2)
-
-		got, err := s.GetTxFromExternalStore(context.Background(), *tx.TxIDChainHash())
-
-		require.Error(t, err)
+		require.Error(t, err, "this reader speaks only for the .tx blob, which is absent")
 		require.Nil(t, got)
 		require.True(t, errors.Is(err, errors.ErrTxNotFound),
 			"an absent .tx blob is not-found, got %v", err)
@@ -173,6 +167,40 @@ func TestGetExternalTransaction_NeverFallsBackToOutputs(t *testing.T) {
 	})
 }
 
+// TestGetTxInpointsFromExternalStore_MissIsNotAStoreFailure covers the third
+// external read. There is no fallback to offer — inpoints are inputs and the
+// .outputs blob retains none — but the miss/failure distinction still has to hold,
+// and on a snapshot-seeded node an .outputs-only parent makes the miss routine.
+func TestGetTxInpointsFromExternalStore_MissIsNotAStoreFailure(t *testing.T) {
+	t.Run("absent .tx reports not-found", func(t *testing.T) {
+		s, _, tx := newOutputsOnlyStore(t, 1, 2)
+
+		_, err := s.GetTxInpointsFromExternalStore(context.Background(), *tx.TxIDChainHash())
+
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errors.ErrTxNotFound),
+			"an absent .tx blob is not-found, not a store failure, got %v", err)
+	})
+
+	t.Run("a transient failure stays a store failure", func(t *testing.T) {
+		s, mem, tx := newOutputsOnlyStore(t, 1, 2)
+
+		s.externalStore = &failingReadStore{
+			Store:        mem,
+			failFileType: fileformat.FileTypeTx,
+			failWith:     errors.NewServiceUnavailableError("read permits exhausted"),
+		}
+
+		_, err := s.GetTxInpointsFromExternalStore(context.Background(), *tx.TxIDChainHash())
+
+		require.Error(t, err)
+		require.False(t, errors.Is(err, errors.ErrTxNotFound),
+			"a store failure must not masquerade as the tx being absent")
+		require.True(t, errors.Is(err, errors.ErrServiceUnavailable),
+			"the original failure must be preserved, got %v", err)
+	})
+}
+
 // TestGetExternalTransactionOrOutputs_FallsBackOnlyOnNotFound is the contract this
 // change establishes for the outpoint path. The fallback to the UTXO-set blob is
 // correct when the full transaction is genuinely absent, and wrong for any other
@@ -189,6 +217,21 @@ func TestGetExternalTransactionOrOutputs_FallsBackOnlyOnNotFound(t *testing.T) {
 		got, err := s.getExternalTransactionOrOutputs(context.Background(), *tx.TxIDChainHash())
 		require.NoError(t, err)
 		require.Len(t, got.Outputs, 3)
+	})
+
+	t.Run("the public reader falls back too", func(t *testing.T) {
+		// The regression this guards: routing GetTxFromExternalStore at the .tx
+		// reader alone left the validator's parent-extension read with no way to
+		// reach a snapshot-seeded parent, since such a parent has only .outputs.
+		// TestExternalOutputsOnlyParentIsReadableForExtension covers the same
+		// contract through a real store; this keeps it pinned without a container.
+		s, mem, tx := newOutputsOnlyStore(t, 1, 2)
+		s.externalStore = mem
+
+		got, err := s.GetTxFromExternalStore(context.Background(), *tx.TxIDChainHash())
+		require.NoError(t, err, "a seeded parent must stay readable through the public entry point")
+		require.Len(t, got.Outputs, 3)
+		require.NotNil(t, got.Outputs[1], "the live indexes are what the extension path reads")
 	})
 
 	t.Run("transient .tx read failure is surfaced, not masked", func(t *testing.T) {

@@ -56,6 +56,13 @@ import (
 //
 // The implementation handles proper file formatting with headers and provides efficient
 // streaming operations for large blobs.
+//
+// Known gap, unchanged by this type's current behaviour: the bucket itself is never
+// verified. S3 answers a HEAD against a missing or misconfigured bucket with a
+// bodyless 404, indistinguishable from a missing key once the SDK has derived the
+// error code (see isMissingObject), so Exists reports "not stored" for every key
+// rather than failing loudly. A one-time HeadBucket at construction would turn that
+// into a startup error; it is not done here.
 type S3 struct {
 	// client is the S3 client interface for interacting with the S3 service
 	client S3Client
@@ -470,9 +477,17 @@ func isMissingObject(err error) bool {
 	// Matching on the code covers the bodyless-404 case too, so no status-code
 	// check is needed: the S3 deserializers pass UseStatusCode, so s3shared
 	// derives the code "NotFound" from the status text when the response carries
-	// no error body. Widening to "any 404" would be wrong in any case —
-	// NoSuchBucket is also a 404, and reporting a bucket misconfiguration as a
-	// miss would send every caller down its not-found path.
+	// no error body. Widening to "any 404" would gain nothing and lose the one
+	// distinction there is to keep on a GET: NoSuchBucket is also a 404, arrives
+	// with a body naming it, and must stay a failure rather than read as a miss.
+	//
+	// That distinction does NOT survive on a HEAD. A HEAD response carries no body
+	// at all, so a wrong or missing bucket reaches us as the same derived
+	// "NotFound" as a missing key, and Exists reports (false, nil) for every key in
+	// a misconfigured bucket. Pre-existing — the previous strings.Contains match had
+	// it too — and not something this helper can resolve, since by then the
+	// distinguishing information is gone. Catching it needs a bucket-level check at
+	// construction; see the note on the S3 type.
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
