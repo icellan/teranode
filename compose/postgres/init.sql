@@ -1,3 +1,12 @@
+-- Postgres roles and databases for the local compose/test stacks.
+-- Roles are deliberately NOSUPERUSER; Teranode owns its databases and needs no
+-- superuser rights.
+--
+-- This file runs only when the postgres data directory is empty. A stack brought
+-- up before the NOSUPERUSER change keeps its superuser roles on the existing
+-- volume. Either recreate it ('docker compose down -v') or, as the postgres
+-- superuser, run 'ALTER ROLE <role> NOSUPERUSER;' for each role below.
+
 CREATE ROLE miner1 LOGIN
   PASSWORD 'miner1'
   NOSUPERUSER INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION;
