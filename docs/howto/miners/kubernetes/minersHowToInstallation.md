@@ -288,10 +288,19 @@ An example CR for a mainnet deployment is available in [kubernetes/teranode/tera
 
 ### Scaling the Propagation Service
 
-The propagation service (and every other service in the Cluster CR) is
-horizontally scalable: set `propagation.spec.deploymentOverrides.replicas` in
-`teranode-cr.yaml` (or `teranode-cr-mainnet.yaml`) to the desired pod count and
-re-apply the CR.
+The propagation service is stateless and horizontally scalable: set
+`propagation.enabled: true` (both shipped example CRs ship it disabled) and
+`propagation.spec.deploymentOverrides.replicas` in `teranode-cr.yaml` (or
+`teranode-cr-mainnet.yaml`) to the desired pod count, then re-apply the CR. If
+the propagation spec has no `deploymentOverrides` block yet — as in
+`teranode-cr.yaml` — add one.
+
+Not every service in the Cluster CR can be scaled this way. The validator can:
+`teranode-cr-mainnet.yaml` runs it with 8 replicas. Services such as block
+assembly and blockchain are single-instance — block assembly holds the mining
+jobs handed to miners and its assembler state per process, so a second replica
+would lose solved blocks and clobber that state. That is why the example CRs set
+`replicas: 1` for every service except the validator.
 
 There is currently no supported way to put a `HorizontalPodAutoscaler` in front
 of the operator-managed propagation Deployment. The Teranode Operator's
