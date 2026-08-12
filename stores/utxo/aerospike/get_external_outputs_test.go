@@ -15,6 +15,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
 )
@@ -112,15 +113,19 @@ func TestGetExternalOutputs_LeavesNilHoles(t *testing.T) {
 	require.Empty(t, got.Inputs, "the .outputs blob retains no inputs")
 	require.Zero(t, got.Version, "the .outputs blob retains no version")
 
-	// It cannot even be identified: computing its txid means serializing it, and
-	// serialization dereferences the nil hole. This is why the reconstruction is
-	// reachable only from the outpoint path, which reads a single live index and
-	// never serializes — see TestGetExternalTransaction_NeverFallsBackToOutputs.
-	require.Panics(t, func() { _ = got.TxIDChainHash() },
-		"identifying the reconstruction requires serializing it, which go-bt cannot do with a nil output — "+
-			"so no caller may treat it as the transaction")
+	// It cannot even be identified: computing its txid would mean serializing it,
+	// and serialization dereferences the nil hole — go-bt's Output.Size() and
+	// appendTo() both fault, and TxIDChainHash() reaches them. That crash is the
+	// reason meta.Data.TxIsSerializable exists, so assert the predicate the callers
+	// actually gate on rather than the panic itself: a future go-bt that returned an
+	// error instead of faulting would break a require.Panics here for a good reason,
+	// while this assertion would keep meaning what it says.
+	require.False(t, (&meta.Data{Tx: got}).TxIsSerializable(),
+		"the reconstruction must fail the gate that every serializing caller checks")
 
-	// Sanity: the source transaction itself is of course fine.
+	// Sanity: the source transaction is serializable, so the predicate is
+	// discriminating rather than always-false.
+	require.True(t, (&meta.Data{Tx: tx}).TxIsSerializable())
 	require.NotNil(t, tx.TxIDChainHash())
 }
 

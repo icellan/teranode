@@ -1741,8 +1741,13 @@ func (s *Store) getExternalTransaction(ctx context.Context, previousTxHash chain
 // only the outputs that were live at snapshot time — no inputs, no version, no
 // locktime, and no record that a spent output ever existed — so it carries nil
 // entries at the missing indexes and does not hash to its own txid. Serializing it
-// panics in go-bt on the first nil output, so it is reachable only from
-// getExternalTransactionOrOutputs, whose single caller reads one live index.
+// panics in go-bt on the first nil output, so every caller that serializes must
+// first reject it with meta.Data.TxIsSerializable.
+//
+// This is the large-transaction route to that shape. A seeded parent below
+// MaxTxSizeInStoreInBytes is stored inline and arrives by getTxFromBins, which
+// leaves the same holes — the two paths are deliberately symmetric, and the
+// predicate above is what both are gated by.
 func (s *Store) getExternalOutputs(ctx context.Context, previousTxHash chainhash.Hash) (*bt.Tx, error) {
 	reader, err := s.externalStore.GetIoReader(ctx, previousTxHash[:], fileformat.FileTypeOutputs)
 	if err != nil {
@@ -1789,7 +1794,9 @@ func (s *Store) getExternalOutputs(ctx context.Context, previousTxHash chainhash
 	}
 
 	if s.logger != nil {
-		s.logger.Debugf("[getExternalOutputs] Stream-parsed external outputs %s: %d outputs", previousTxHash.String(), len(tx.Outputs))
+		// Both counts: len(tx.Outputs) spans the nil holes, so on its own it reads
+		// as more outputs than the blob actually holds.
+		s.logger.Debugf("[getExternalOutputs] Stream-parsed external outputs %s: %d live of %d indexes", previousTxHash.String(), len(uw.UTXOs), len(tx.Outputs))
 	}
 
 	return tx, nil

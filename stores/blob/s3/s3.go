@@ -57,12 +57,23 @@ import (
 // The implementation handles proper file formatting with headers and provides efficient
 // streaming operations for large blobs.
 //
-// Known gap, unchanged by this type's current behaviour: the bucket itself is never
-// verified. S3 answers a HEAD against a missing or misconfigured bucket with a
-// bodyless 404, indistinguishable from a missing key once the SDK has derived the
-// error code (see isMissingObject), so Exists reports "not stored" for every key
-// rather than failing loudly. A one-time HeadBucket at construction would turn that
-// into a startup error; it is not done here.
+// Two deployment preconditions, neither enforced in code, both silent when unmet:
+//
+//   - The IAM principal needs s3:ListBucket on the bucket, not only s3:GetObject.
+//     Without it S3 answers a GET for a key that does not exist with 403
+//     AccessDenied instead of 404 NoSuchKey, to avoid disclosing existence. That is
+//     indistinguishable from a genuine permission fault, so isMissingObject
+//     deliberately reports it as a failure rather than a miss — which is correct in
+//     isolation but means callers that branch on not-found never see it. A node
+//     whose externalStore points here and relies on that branch (stores/utxo/aerospike
+//     falls back to the .outputs blob on a miss) loses the fallback for every object
+//     under such a policy.
+//   - The bucket itself is never verified. S3 answers a HEAD against a missing or
+//     misconfigured bucket with a bodyless 404, indistinguishable from a missing key
+//     once the SDK has derived the error code (see isMissingObject), so Exists
+//     reports "not stored" for every key rather than failing loudly. A one-time
+//     HeadBucket at construction would turn that into a startup error; it is not
+//     done here.
 type S3 struct {
 	// client is the S3 client interface for interacting with the S3 service
 	client S3Client

@@ -1091,7 +1091,10 @@ func (s *File) openFileWithFallback(ctx context.Context, merged *options.Options
 			// the wrap either way, so callers matching with errors.Is were unaffected,
 			// but the classification is what a caller reads when it reports the error.
 			if errors.Is(err, os.ErrNotExist) || errors.Is(err, errors.ErrNotFound) || errors.Is(err, errors.ErrBlobNotFound) {
-				return nil, errors.ErrNotFound
+				// Classified as not-found, but keep the key and the fact that the
+				// longterm tier is where it was missing: the bare sentinel matches
+				// errors.Is identically and tells whoever reads the log nothing.
+				return nil, errors.NewNotFoundError("[File][openFileWithFallback] [%s] not found in longterm storage", fileName, err)
 			}
 
 			return nil, errors.NewStorageError("[File][openFileWithFallback] [%s] unable to open longterm storage file", fileName, err)

@@ -78,6 +78,43 @@ func TestS3_Get_MissingKeyMapsToErrNotFound(t *testing.T) {
 	}
 }
 
+// TestS3_Get_MissingKeyFromTransferManagerMapsToErrNotFound is the shape that
+// matters most in production, and the one the mock's Download-delegates-to-GetObject
+// wiring cannot reach on its own.
+//
+// The real client does not implement Download in terms of GetObject: s3client.go
+// calls transfermanager.GetObject, which issues its own HeadObject on the
+// concurrent/ranged path and returns the SDK error unwrapped. So a genuine miss
+// arrives at S3.Get as *types.NotFound, whose message never contains "NoSuchKey" —
+// exactly what the previous strings.Contains check missed. Injecting at the
+// Download boundary exercises that path rather than a delegation artefact.
+func TestS3_Get_MissingKeyFromTransferManagerMapsToErrNotFound(t *testing.T) {
+	for _, tt := range missingKeyErrors() {
+		t.Run(tt.name, func(t *testing.T) {
+			s3Store, mock := setupTestS3(t)
+			mock.SetDownloadError(tt.err)
+
+			_, err := s3Store.Get(context.Background(), []byte("missing"), fileformat.FileTypeTx)
+
+			require.Error(t, err)
+			require.True(t, errors.Is(err, errors.ErrNotFound),
+				"a miss surfaced by the transfer manager must map to ErrNotFound, got %v", err)
+		})
+	}
+
+	t.Run("a real failure from the transfer manager is not a miss", func(t *testing.T) {
+		s3Store, mock := setupTestS3(t)
+		mock.SetDownloadError(&smithy.GenericAPIError{Code: "AccessDenied", Message: "Access Denied"})
+
+		_, err := s3Store.Get(context.Background(), []byte("missing"), fileformat.FileTypeTx)
+
+		require.Error(t, err)
+		require.False(t, errors.Is(err, errors.ErrNotFound),
+			"AccessDenied must stay a failure — S3 returns it for a missing key when the "+
+				"principal lacks s3:ListBucket, and guessing would mask a real permission fault")
+	})
+}
+
 // TestS3_Exists_MissingKeyIsNotAnError covers the path that carried the
 // aws/aws-sdk-go-v2#2084 workaround before this change. Exists is the most
 // behaviourally sensitive of the three: it reports a miss as (false, nil), so a
