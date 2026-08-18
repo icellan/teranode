@@ -118,16 +118,21 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 
 	retries := 0
 
-	// Include the admin API key so the protected SendNotification RPC (see
-	// [Blockchain][Start]) accepts calls made through this client.
+	// Include the admin API key so the protected RPCs (see protectedMethods()
+	// in Server.go) accept calls made through this client. It is attached only
+	// to those methods: this connection carries thousands of read-only calls a
+	// second and the transport is plaintext unless SecurityLevelGRPC is on, so
+	// stamping the credential on every one of them would put it on the wire
+	// orders of magnitude more often than it needs to be.
 	apiKey := tSettings.GRPCAdminAPIKey
 
 	for {
 		baConn, err = util.GetGRPCClient(ctx, address, &util.ConnectionOptions{
-			MaxRetries:   tSettings.GRPCMaxRetries,
-			RetryBackoff: tSettings.GRPCRetryBackoff,
-			APIKey:       apiKey,
-			CallerName:   "blockchain",
+			MaxRetries:    tSettings.GRPCMaxRetries,
+			RetryBackoff:  tSettings.GRPCRetryBackoff,
+			APIKey:        apiKey,
+			APIKeyMethods: protectedMethods(),
+			CallerName:    "blockchain",
 		}, tSettings)
 		if err != nil {
 			return nil, errors.NewServiceError("failed to init blockchain service connection for '%s'", source, err)
