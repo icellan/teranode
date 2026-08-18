@@ -19,8 +19,10 @@ package seeder
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -57,6 +59,12 @@ import (
 
 const (
 	errMsgFailedToReadUTXO = "failed to read UTXO set header"
+
+	// checksumSidecarExtension matches the sidecar extension the blob file
+	// store writes alongside every blob it stores (stores/blob/file), so a
+	// snapshot produced by the UTXO persister and copied into inputDir
+	// carries its checksum sidecar with it.
+	checksumSidecarExtension = ".sha256"
 )
 
 // utxoSetTip identifies the block at which an imported UTXO set is complete.
@@ -135,12 +143,20 @@ func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir stri
 		if _, err := os.Stat(headerFile); os.IsNotExist(err) {
 			usage(fmt.Sprintf("Headers file %s does not exist", headerFile))
 		}
+
+		if err := verifyChecksum(logger, headerFile); err != nil {
+			return errors.NewProcessingError("checksum verification failed for headers file %s", headerFile, err)
+		}
 	}
 
 	if !skipUTXOs {
 		// Check the UTXO file exists
 		if _, err := os.Stat(utxoFile); os.IsNotExist(err) {
 			usage(fmt.Sprintf("UTXO file %s does not exist", utxoFile))
+		}
+
+		if err := verifyChecksum(logger, utxoFile); err != nil {
+			return errors.NewProcessingError("checksum verification failed for UTXO file %s", utxoFile, err)
 		}
 	}
 
@@ -815,6 +831,64 @@ func writeBlockAssemblerState(ctx context.Context, logger ulogger.Logger, store 
 	}
 
 	logger.Infof("Set BlockAssembler state to utxo-set tip %s at height %d", tip.hash.String(), tip.height)
+
+	return nil
+}
+
+// verifyChecksum checks a snapshot file against its "<file>.sha256" checksum
+// sidecar, matching the sidecar format the blob file store (stores/blob/file)
+// writes alongside every blob: hex-encoded SHA-256, optionally followed by
+// whitespace and the filename (the standard sha256sum layout).
+//
+// If no sidecar is present — e.g. an older snapshot predating checksum
+// sidecars, or one fetched from a source that doesn't produce one — the
+// import proceeds with only a warning logged: mandating a sidecar for every
+// possible snapshot source is not realistic. If a sidecar IS present but
+// doesn't match the file's actual content, the import is refused: a
+// corrupted-but-count-consistent file must never be silently imported.
+func verifyChecksum(logger ulogger.Logger, filePath string) error {
+	sidecarPath := filePath + checksumSidecarExtension
+
+	sidecar, err := os.ReadFile(sidecarPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			logger.Warnf("[verifyChecksum] no checksum sidecar %s found for %s; proceeding without checksum verification", sidecarPath, filePath)
+			return nil
+		}
+
+		return errors.NewStorageError("failed to read checksum sidecar %s", sidecarPath, err)
+	}
+
+	fields := strings.Fields(string(sidecar))
+	if len(fields) == 0 {
+		return errors.NewProcessingError("checksum sidecar %s is empty", sidecarPath)
+	}
+
+	expected := strings.ToLower(fields[0])
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return errors.NewStorageError("failed to open %s for checksum verification", filePath, err)
+	}
+
+	defer func() {
+		_ = f.Close()
+	}()
+
+	h := sha256.New()
+
+	if _, err = io.Copy(h, f); err != nil {
+		return errors.NewStorageError("failed to read %s for checksum verification", filePath, err)
+	}
+
+	actual := hex.EncodeToString(h.Sum(nil))
+
+	if actual != expected {
+		return errors.NewProcessingError("checksum mismatch for %s: sidecar %s says %s, actual content hashes to %s (file may be corrupted)",
+			filePath, sidecarPath, expected, actual)
+	}
+
+	logger.Infof("[verifyChecksum] checksum verified for %s against %s", filePath, sidecarPath)
 
 	return nil
 }
