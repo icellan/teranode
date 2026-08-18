@@ -18,7 +18,11 @@
 6. [Scalability and Performance](#6-scalability-and-performance)
 7. [Impact on End-Users and Developers](#7-impact-on-end-users-and-developers)
 8. [Glossary of Terms](#8-glossary-of-terms)
-9. [Related Resources](#9-related-resources)
+9. [End-to-End Architecture Reference](#9-end-to-end-architecture-reference)
+    - [9.1 The Transaction and Block Journey](#91-the-transaction-and-block-journey)
+    - [9.2 Reorganization, Conflicts and Catchup](#92-reorganization-conflicts-and-catchup)
+    - [9.3 Synchronous vs Asynchronous Boundaries](#93-synchronous-vs-asynchronous-boundaries)
+10. [Related Resources](#10-related-resources)
 
 ## 1. Introduction
 
@@ -215,7 +219,47 @@ The Teranode architecture offers several benefits:
 
 Please check the [Teranode BSV Glossary](../../references/glossary.md) for more terms and definitions.
 
-## 9. Related Resources
+## 9. End-to-End Architecture Reference
+
+The sections above, the [Teranode Microservices Overview](teranode-microservices-overview.md), and the individual service docs each cover part of the system in detail. None of them, on its own, walks the full path a transaction or block takes from ingress to long-term storage, or says which document to open for a given stage. This section is that index — connective tissue, not a replacement for the detailed docs it links to.
+
+### 9.1 The Transaction and Block Journey
+
+| Stage | Primary service(s) | Detail doc(s) |
+|---|---|---|
+| Transaction ingress (gRPC/HTTP/UDP) | Propagation Service | [Propagation](../services/propagation.md) |
+| Consensus validation, UTXO create/spend | Validator Service | [Validator](../services/validator.md) |
+| Subtree assembly, block template, mining candidates | Block Assembly Service | [Block Assembly](../services/blockAssembly.md) |
+| Subtree propagation and validation (peer nodes) | Subtree Validation Service | [Subtree Validation](../services/subtreeValidation.md) |
+| Peer discovery and message transport | P2P Service | [P2P](../services/p2p.md) |
+| Block validation | Block Validation Service | [Block Validation](../services/blockValidation.md) |
+| Chain state, FSM, reorg coordination | Blockchain Service | [Blockchain](../services/blockchain.md), [State Management](stateManagement.md) |
+| Long-term block/tx persistence | Block Persister Service | [Block Persister](../services/blockPersister.md) |
+| UTXO set snapshotting | UTXO Persister Service | [UTXO Persister](../services/utxoPersister.md) |
+| UTXO pruning (bounding store growth) | Pruner Service | [Pruner](../services/pruner.md) |
+| Bridging to pre-Teranode BSV nodes | Legacy Service | [Legacy](../services/legacy.md) |
+| External data access (HTTP/WebSocket, Bitcoin RPC) | Asset Server, RPC Service | [Asset Server](../services/assetServer.md), [RPC](../services/rpc.md) |
+| Network-wide alerts, freeze/unfreeze, ban/invalidate | Alert Service | [Alert](../services/alert.md) |
+| Service startup/dependency ordering | Daemon | [Daemon Reference](../../references/teranodeDaemonReference.md) |
+
+For the storage layer underneath these services, see the [Blob Store](../stores/blob.md) and [UTXO Store](../stores/utxo.md) docs, and for the messaging layer see [Kafka](../kafka/kafka.md).
+
+### 9.2 Reorganization, Conflicts and Catchup
+
+Chain reorganization and double-spend/conflict handling are cross-cutting: they involve Block Validation, the Blockchain Service's FSM, Subtree Validation, and the UTXO Store together, rather than a single service. Rather than duplicate that detail here:
+
+- [Understanding Double Spends and Conflict Resolution](understandingDoubleSpends.md) covers first-seen detection, conflicting-transaction tracking, and the reorg phases (mark-conflicting → unspend → reprocess → cleanup).
+- [State Management in Teranode](stateManagement.md) covers the FSM states (`Idle`, `Running`, `CatchingBlocks`) that drive catchup after a missing parent block, and how services wait on state transitions.
+
+### 9.3 Synchronous vs Asynchronous Boundaries
+
+Services communicate through a mix of synchronous gRPC calls and asynchronous Kafka topics; the [Interaction Patterns](teranode-microservices-overview.md#6-interaction-patterns) and [Kafka topics](teranode-microservices-overview.md#51-kafka-message-broker) sections describe which hops use which mechanism.
+
+One open documentation gap: there is no stated **maximum** synchronous call-chain length across services — a guardrail against runaway synchronous fan-out during a single protocol operation. This document deliberately does not invent one; a maximum like that is an architectural decision the team should make and justify explicitly, not a number a doc should assert unilaterally.
+
+As an observation only (not a policy): tracing the current pipeline, the longest synchronous, in-request gRPC chain occurs when Block Validation checks a block's subtrees and encounters transactions it hasn't validated yet — Block Validation → Subtree Validation → Validator — three services deep before the outermost call returns. (The last hop collapses to an in-process call rather than a network hop when the node is configured with `Validator.UseLocalValidator`, but the logical dependency chain is unchanged.) This is noted here as a data point for that future decision, not as an established rule or limit.
+
+## 10. Related Resources
 
 - [Teranode Microservices Overview](teranode-microservices-overview.md)
 - [Extended Transactions](../datamodel/transaction_data_model.md): Include additional metadata to facilitate processing.
