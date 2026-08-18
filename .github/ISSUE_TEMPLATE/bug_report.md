@@ -7,6 +7,14 @@ assignees: ''
 
 ---
 
+## Severity (required)
+
+Select one and delete the others:
+
+- severity:critical
+- severity:major
+- severity:minor
+
 ## Describe the bug
 
 A clear and concise description of what the bug is.
@@ -32,7 +40,7 @@ If applicable, add screenshots to help explain your problem.
 
 When did the bug first occur, or when did you first notice it?
 
-## Desktop (please complete the following information):
+## Desktop (please complete the following information)
 
 - OS: [e.g. iOS]
 - Browser [e.g. chrome, safari]
