@@ -499,6 +499,81 @@ func TestValidate_BlockAssemblyError(t *testing.T) {
 	require.Equal(t, 0, len(rejectedTxKafkaProducerClient.PublishChannel()), "rejectedTxKafkaChan should have 1 message")
 }
 
+// TestValidate_PanicDuringBlockAssemblyDeliveryKeepsLock covers the specific
+// failure mode unlockLockedTxOnExit's `delivered` flag exists to close: a panic
+// unwinding from inside the addToBlockAssembly window (after the tx is durably
+// persisted and Locked, before sendToBlockAssembler returns), rather than an
+// ordinary error return. On main, before the deferred-unlock refactor, a panic
+// there simply skipped the tail-of-function unlock statement, so the tx stayed
+// Locked. If the deferred helper used `err == nil` as its proxy for "delivered",
+// this would incorrectly unlock the tx, since err is nil for the entire window
+// regardless of whether a panic occurs. Gating on an explicit `delivered` flag
+// that is only set true after sendToBlockAssembler actually returns keeps this
+// panic-safe.
+func TestValidate_PanicDuringBlockAssemblyDeliveryKeepsLock(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	txHex := "010000000000000000ef01febe0cbd7d87d44cbd4b5adac0a5bfcdbd2b672c9113f5d74a6459a2b85569db010000008b48304502207ec38d0a4ef79c3a4286ba3e5a5b6ede1fa678af9242465140d78a901af9e4e0022100c26c377d44b761469cf0bdcdbf4931418f2c5a02ce6b72bbb7af52facd7228c1014104bc9eb4fe4cb53e35df7e7734c4c3cd91c6af7840be80f4a1fff283e2cd6ae8f7713cb263a4590263240e3c01ec36bc603c32281ac08773484dc69b8152e48cecffffffff60b74700000000001976a9148ac9bdc626352d16e18c26f431e834f9aae30e2888ac0230424700000000001976a9148ac9bdc626352d16e18c26f431e834f9aae30e2888ac1027000000000000166a148ac9bdc626352d16e18c26f431e834f9aae30e2800000000"
+	tx, err := bt.NewTxFromString(txHex)
+	require.NoError(t, err)
+
+	parenTxHex := "010000000000000000ef01154d5d31268f7ea94c80a7bf6de54e47812712feec25c17b8feceb570dfd9daf000000008b4830450220612b3ec065ec2b2a1757d97b7f57fba3c363645355cf6e1a5a1834411e6ab425022100bd071b90d391eb75dc9e2eea8b6774f36bf9c55439a971f0d1f4470b6448aef601410426e4e0654f72721b97a03c8170417c9ddabadcef97fe8ea626176ea62665b55ca2ff485f84df12ddec171e01ee8f9c7472c6c8467b0cf74ae8b3b614ed16cbdbffffffff008a6600000000001976a91429be45311cc66a5a6cc4a42516dbb7c9b126a3c188ac0280841e00000000001976a914996ed5e55d68aef653c85339f83873fac1321f0788ac60b74700000000001976a9148ac9bdc626352d16e18c26f431e834f9aae30e2888ac00000000"
+
+	parentTx, err := bt.NewTxFromString(parenTxHex)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	logger := ulogger.NewErrorTestLogger(t)
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.ChainCfgParams = &chaincfg.MainNetParams
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test_panic_during_block_assembly")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	_ = utxoStore.SetBlockHeight(257727)
+	//nolint:gosec
+	_ = utxoStore.SetMedianBlockTime(uint32(time.Now().Unix()))
+
+	_, err = utxoStore.Create(context.Background(), parentTx, 257726, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 1, BlockHeight: 257726, SubtreeIdx: 0}))
+	require.NoError(t, err)
+
+	initPrometheusMetrics()
+
+	blockAssembler := &MockBlockAssemblyStore{panicOnStore: true}
+
+	v := &Validator{
+		logger:                        logger,
+		settings:                      tSettings,
+		txValidator:                   NewTxValidator(logger, tSettings),
+		utxoStore:                     utxoStore,
+		blockAssembler:                blockAssembler,
+		stats:                         gocore.NewStat("validator"),
+		txmetaKafkaProducerClient:     kafka.NewKafkaAsyncProducerMock(),
+		rejectedTxKafkaProducerClient: kafka.NewKafkaAsyncProducerMock(),
+	}
+
+	func() {
+		defer func() {
+			r := recover()
+			require.NotNil(t, r, "the mock must actually panic for this test to exercise anything")
+		}()
+
+		_, _ = v.Validate(t.Context(), tx, 257727, WithSkipPolicyChecks(true))
+	}()
+
+	// The tx was durably persisted, spent, and Locked before the panic. It was
+	// never delivered to block assembly (the panic unwound from inside
+	// sendToBlockAssembler), so it must stay Locked - exactly as it would on the
+	// ordinary sendToBlockAssembler-returns-an-error path.
+	txMeta, err := utxoStore.Get(t.Context(), tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.True(t, txMeta.Locked, "a tx must stay locked when a panic unwinds before it was actually delivered to block assembly")
+}
+
 // TestValidate_ConsensusRejectsUnconfirmedParent: a tx whose parent exists in
 // the UTXO store but has no recorded BlockHeights (i.e. parent UTXO is not yet
 // confirmed) must be rejected in consensus mode with
@@ -907,12 +982,19 @@ type txFeeSize struct {
 
 // MockBlockAssemblyStore provides a test double for block assembly storage operations.
 type MockBlockAssemblyStore struct {
-	returnError error
-	storedTxs   []txFeeSize
-	removedTxs  []chainhash.Hash
+	returnError  error
+	panicOnStore bool
+	storedTxs    []txFeeSize
+	removedTxs   []chainhash.Hash
 }
 
 func (s *MockBlockAssemblyStore) Store(_ context.Context, hash *chainhash.Hash, fee, size uint64, txInpoints subtree.TxInpoints) (bool, error) {
+	if s.panicOnStore {
+		// Simulates a nil/misconfigured block-assembly client panicking mid-delivery,
+		// e.g. inside the real gRPC client's Store() call.
+		panic("simulated panic: block assembler Store()")
+	}
+
 	if s.returnError != nil {
 		return false, s.returnError
 	}
@@ -1356,8 +1438,9 @@ func TestValidator_UnlockLockedTxOnExit_KeepsLockOnError(t *testing.T) {
 	// sendToBlockAssembler failure) when the deferred cleanup runs.
 	originalErr := errors.NewProcessingError("[Validate][%s] error getting tx inpoints", tx.TxID())
 	deferredErr := error(originalErr)
+	delivered := false
 
-	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr)
+	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr, &delivered)
 
 	require.True(t, txMetaData.Locked, "an undelivered tx must stay locked, or a child can be mined without its parent")
 	require.Same(t, originalErr, deferredErr, "the original, more informative error must be preserved")
@@ -1404,7 +1487,9 @@ func TestValidator_UnlockLockedTxOnExit_ClearsLockOnSuccess(t *testing.T) {
 
 	var deferredErr error
 
-	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr)
+	delivered := true
+
+	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr, &delivered)
 
 	require.NoError(t, deferredErr)
 	require.False(t, txMetaData.Locked, "a delivered tx must be unlocked on the success path")
@@ -1426,8 +1511,6 @@ func TestValidator_UnlockLockedTxOnExit_NoopWhenNotLocked(t *testing.T) {
 	require.NoError(t, err)
 
 	utxoStore := NewFailingUtxoStore(t) // any SetLocked call would error here, proving it was never called
-	_, err = utxoStore.Create(context.Background(), tx, 100, utxostore.WithLocked(false))
-	require.NoError(t, err)
 
 	v := &Validator{
 		logger:      ulogger.TestLogger{},
@@ -1443,9 +1526,11 @@ func TestValidator_UnlockLockedTxOnExit_NoopWhenNotLocked(t *testing.T) {
 	txMetaData := &meta.Data{Locked: false}
 	var deferredErr error
 
-	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr)
+	delivered := true
 
-	assert.NoError(t, deferredErr)
+	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr, &delivered)
+
+	require.NoError(t, deferredErr)
 }
 
 // TestValidator_UnlockLockedTxOnExit_SetsErrOnUnlockFailure covers the
@@ -1479,7 +1564,9 @@ func TestValidator_UnlockLockedTxOnExit_SetsErrOnUnlockFailure(t *testing.T) {
 	txMetaData := &meta.Data{Locked: true}
 	var deferredErr error
 
-	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr)
+	delivered := true
+
+	v.unlockLockedTxOnExit(ctx, tx, tx.TxID(), txMetaData, &deferredErr, &delivered)
 
 	require.Error(t, deferredErr, "the unlock failure must be surfaced via the deferred error")
 	require.True(t, txMetaData.Locked, "the in-memory Locked flag must not be cleared when the unlock itself fails")
@@ -1601,6 +1688,63 @@ func TestValidator_LockedFlagChangedIfBlockAssemblyStoreSucceeds(t *testing.T) {
 	err = utxoStore.GetMeta(ctx, txs[1].TxIDChainHash(), metaData)
 	require.NoError(t, err)
 	assert.False(t, metaData.Locked, "Flag should be unset after successful block assembly")
+}
+
+// TestValidator_ValidateWithOptions_ReturnsUnlockFailureError drives the real
+// ValidateWithOptions entry point end-to-end with a store whose SetLocked fails,
+// and asserts the RETURNED error reflects the unlock failure - rather than
+// invoking unlockLockedTxOnExit directly, as the other unlock tests do. This
+// exercises the named-return/defer mechanism itself (err is a named return at
+// validateInternal's signature, and the deferred call writes to it through the
+// *error argument): a test that only calls the helper directly would still pass
+// even if that plumbing were broken (e.g. the signature changed to unnamed
+// returns), which would silently swallow unlock failures on the success path.
+func TestValidator_ValidateWithOptions_ReturnsUnlockFailureError(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	ctx := context.Background()
+
+	utxoStore := NewFailingUtxoStore(t) // SetLocked always errors here
+
+	txs := transactions.CreateTestTransactionChainWithCount(t, 3)
+
+	_, err := utxoStore.Create(
+		ctx,
+		txs[0],
+		1,
+		utxostore.WithLocked(false),
+	)
+	require.NoError(t, err)
+
+	blockAsmMock := blockassembly.NewMock()
+
+	settings := test.CreateBaseTestSettings(t)
+	settings.BlockAssembly.Disabled = false
+
+	v := &Validator{
+		logger:         ulogger.TestLogger{},
+		utxoStore:      utxoStore,
+		blockAssembler: blockAsmMock,
+		settings:       settings,
+		txValidator:    NewTxValidator(ulogger.TestLogger{}, test.CreateBaseTestSettings(t)),
+		stats:          gocore.NewStat("validator"),
+	}
+
+	blockAsmMock.On("Store", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(true, nil).Times(1)
+
+	require.NoError(t, utxoStore.SetBlockHeight(2))
+	require.NoError(t, utxoStore.SetMedianBlockTime(1700000000))
+
+	opts := &Options{AddTXToBlockAssembly: true}
+
+	_, err = v.ValidateWithOptions(ctx, txs[1], 2, opts)
+	require.Error(t, err, "the unlock failure must be surfaced through the real named-return/defer path, not swallowed")
+
+	metaData := &meta.Data{}
+	err = utxoStore.GetMeta(ctx, txs[1].TxIDChainHash(), metaData)
+	require.NoError(t, err)
+	require.True(t, metaData.Locked, "the tx was delivered to block assembly but the unlock itself failed, so it must stay locked in the store")
 }
 
 func TestValidator_LockedFlagNotChangedIfBlockAssemblyDidNotStoreTx(t *testing.T) {
