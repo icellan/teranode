@@ -10,6 +10,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/utxopersister"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	utxosql "github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/stretchr/testify/require"
@@ -135,7 +136,7 @@ func TestSeederImport_RoundTripsRealSnapshotFile(t *testing.T) {
 	gotA, err := store.Get(ctx, &txA)
 	require.NoError(t, err)
 	require.NotNil(t, gotA.Tx)
-	require.Len(t, gotA.Tx.Outputs, 2, "output at index 1 must be present without a leading nil hole")
+	require.Len(t, gotA.Tx.Outputs, 2, "both outputs must be present; txA has no padded holes")
 	require.Equal(t, uint64(1234), gotA.Tx.Outputs[0].Satoshis)
 	require.Equal(t, []byte{0x76, 0xa9, 0x14}, gotA.Tx.Outputs[0].LockingScript.Bytes())
 	require.Equal(t, uint64(5678), gotA.Tx.Outputs[1].Satoshis)
@@ -147,10 +148,24 @@ func TestSeederImport_RoundTripsRealSnapshotFile(t *testing.T) {
 	// txB's only UTXO is at index 2; the store keeps only real (non-nil)
 	// outputs, so the padded holes at indices 0 and 1 (PadUTXOsWithNil) are
 	// not themselves stored - only the surviving output's value and script
-	// round-trip.
+	// round-trip. Content alone isn't enough to prove this: the store's
+	// compacted read view would return the same slice whether the UTXO was
+	// written at index 2 (correct) or index 0 (an index-computation bug), so
+	// assert against the actual on-disk index directly via GetSpend, which
+	// queries by (txid, vout) rather than by position in a compacted slice.
 	require.Len(t, gotB.Tx.Outputs, 1)
 	require.Equal(t, uint64(999999), gotB.Tx.Outputs[0].Satoshis)
 	require.Equal(t, []byte{0x6a, 0x01, 0x02, 0x03}, gotB.Tx.Outputs[0].LockingScript.Bytes())
+
+	spendAtCorrectIndex, err := store.GetSpend(ctx, &utxo.Spend{TxID: &txB, Vout: 2})
+	require.NoError(t, err)
+	require.Equal(t, int(utxo.Status_OK), spendAtCorrectIndex.Status,
+		"the UTXO must be recorded at vout 2, its real index")
+
+	spendAtWrongIndex, err := store.GetSpend(ctx, &utxo.Spend{TxID: &txB, Vout: 0})
+	require.NoError(t, err)
+	require.Equal(t, int(utxo.Status_NOT_FOUND), spendAtWrongIndex.Status,
+		"the UTXO must not have been mis-indexed to vout 0, the first padded hole")
 }
 
 // TestSeederImport_CompleteFile_FinishesCleanly feeds the seeder a
