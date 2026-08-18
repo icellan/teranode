@@ -2635,22 +2635,20 @@ func (stp *SubtreeProcessor) Remove(ctx context.Context, hash chainhash.Hash) er
 	return nil
 }
 
-func (stp *SubtreeProcessor) removeTxFromSubtrees(ctx context.Context, hash chainhash.Hash) error {
-	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "removeTxFromSubtrees",
-		tracing.WithParentStat(stp.stats),
-		tracing.WithHistogram(prometheusSubtreeProcessorRemoveTx),
-		tracing.WithLogMessage(stp.logger, "[SubtreeProcessor][removeTxFromSubtrees][%s] removing transaction from subtrees", hash),
-	)
-
-	defer deferFn()
-
-	// find the transaction in the current and all chained subtrees
-	foundIndex := stp.currentSubtree.Load().NodeIndex(hash)
-	foundSubtreeIndex := -1
+// locateTxInSubtrees finds hash in the current subtree or one of the chained
+// subtrees, returning the node index within that subtree and which chained
+// subtree it was found in (-1 if it was found in the current subtree, or if
+// it was not found at all, in which case foundIndex is also -1).
+//
+// When DiskTxMap is active, currentTxMap.SubtreeIndex (stored as chainedIdx+1,
+// so >0 means assigned) gives an O(1) shortcut straight to the chained subtree
+// that holds the hash, avoiding a linear scan across every chained subtree.
+// Otherwise, or if that lookup misses, it falls back to scanning them all.
+func (stp *SubtreeProcessor) locateTxInSubtrees(hash chainhash.Hash) (foundIndex, foundSubtreeIndex int) {
+	foundIndex = stp.currentSubtree.Load().NodeIndex(hash)
+	foundSubtreeIndex = -1
 
 	if foundIndex == -1 {
-		// Use SubtreeIndex for O(1) lookup when DiskTxMap is active.
-		// SubtreeIndex is stored as chainedIdx+1, so >0 means assigned.
 		if stp.diskTxMap != nil {
 			if inpoints, found := stp.currentTxMap.Get(hash); found && inpoints.SubtreeIndex > 0 {
 				chainedIdx := int(inpoints.SubtreeIndex - 1)
@@ -2675,6 +2673,21 @@ func (stp *SubtreeProcessor) removeTxFromSubtrees(ctx context.Context, hash chai
 			}
 		}
 	}
+
+	return foundIndex, foundSubtreeIndex
+}
+
+func (stp *SubtreeProcessor) removeTxFromSubtrees(ctx context.Context, hash chainhash.Hash) error {
+	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "removeTxFromSubtrees",
+		tracing.WithParentStat(stp.stats),
+		tracing.WithHistogram(prometheusSubtreeProcessorRemoveTx),
+		tracing.WithLogMessage(stp.logger, "[SubtreeProcessor][removeTxFromSubtrees][%s] removing transaction from subtrees", hash),
+	)
+
+	defer deferFn()
+
+	// find the transaction in the current and all chained subtrees
+	foundIndex, foundSubtreeIndex := stp.locateTxInSubtrees(hash)
 
 	if foundIndex >= 0 {
 		// Save to deleted backup map before removing (for Server fallback during async storage)
@@ -2746,19 +2759,7 @@ func (stp *SubtreeProcessor) removeTxsFromSubtrees(ctx context.Context, hashes [
 
 	for _, hash := range hashes {
 		// find the transaction in the current and all chained subtrees
-		foundIndex := stp.currentSubtree.Load().NodeIndex(hash)
-		foundSubtreeIndex := -1
-
-		if foundIndex == -1 {
-			// not found in the current subtree, check chained subtrees
-			for subtreeIndex, subtree := range stp.chainedSubtrees {
-				idx := subtree.NodeIndex(hash)
-				if idx >= 0 {
-					foundSubtreeIndex = subtreeIndex
-					foundIndex = idx
-				}
-			}
-		}
+		foundIndex, foundSubtreeIndex := stp.locateTxInSubtrees(hash)
 
 		if foundIndex >= 0 {
 			removedAny = true
