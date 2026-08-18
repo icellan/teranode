@@ -460,9 +460,15 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 	// the output-only representation rather than failing the whole import.
 	coinbaseTxs, err := loadCoinbaseTxs(logger, headersFile)
 	if err != nil {
-		logger.Warnf("[processUTXOs] could not load coinbase transactions from %s; coinbases will be stored without their input: %v", headersFile, err)
+		// loadCoinbaseTxs still returns whatever it managed to read (e.g. a
+		// truncated file yields the coinbases up to the truncation point);
+		// keep that partial map rather than discarding it, so a damaged
+		// headers file degrades to "most coinbases restored" instead of none.
+		logger.Warnf("[processUTXOs] could not fully load coinbase transactions from %s; some coinbases may be stored without their input: %v", headersFile, err)
 
-		coinbaseTxs = map[chainhash.Hash]*bt.Tx{}
+		if coinbaseTxs == nil {
+			coinbaseTxs = map[chainhash.Hash]*bt.Tx{}
+		}
 	}
 
 	logger.Infof("[processUTXOs] loaded %s coinbase transactions for input restoration", formatNumber(uint64(len(coinbaseTxs))))
@@ -802,7 +808,13 @@ func loadCoinbaseTxs(logger ulogger.Logger, headersFile string) (map[chainhash.H
 	// reported as an error rather than silently yielding a partial coinbase
 	// map.
 	if recordsRead != uint64(tipHeight)+1 {
-		return nil, errors.NewProcessingError(
+		// Return the partial map alongside the error rather than discarding it:
+		// the caller's best-effort fallback (see the doc comment above
+		// processUTXOs' call to loadCoinbaseTxs) treats any error here as
+		// "restore no coinbase inputs at all", so returning nil would turn a
+		// file truncated at, say, 90% into a total loss of every coinbase
+		// input instead of the ~90% that were actually read successfully.
+		return coinbaseTxs, errors.NewProcessingError(
 			"utxo-headers file %s truncated: expected %d header records (heights 0..%d), read %d",
 			headersFile, uint64(tipHeight)+1, tipHeight, recordsRead)
 	}

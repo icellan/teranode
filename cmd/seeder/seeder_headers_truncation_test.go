@@ -109,6 +109,77 @@ func TestLoadCoinbaseTxs_TruncatedFile_ReturnsError(t *testing.T) {
 	require.Error(t, err, "a truncated utxo-headers file must not be reported as a successful import")
 }
 
+// TestLoadCoinbaseTxs_TruncatedFile_ReturnsPartialMap is the regression test
+// for the caller-visible fallout of the truncation fix: loadCoinbaseTxs must
+// still hand back whatever coinbases it read before hitting the truncation,
+// not discard them. Before this fix, the function returned (nil, err) on
+// truncation, and the sole caller (processUTXOs) replaced that with a
+// completely empty map on any error - so a headers file truncated after the
+// first several blocks lost every coinbase input, not just the ones past the
+// cut. Returning the partial map alongside the error preserves the
+// pre-truncation-fix best-effort behaviour (use whatever was read) while
+// still surfacing the truncation via a non-nil error.
+func TestLoadCoinbaseTxs_TruncatedFile_ReturnsPartialMap(t *testing.T) {
+	store := newTestBlockchainStore(t)
+	ctx := context.Background()
+
+	genesis, err := store.GetBlockByID(ctx, 0)
+	require.NoError(t, err)
+
+	genesisRecord, err := blockToIndexBytes(t, genesis, genesis.Header.Hash())
+	require.NoError(t, err)
+
+	coinbase1 := makeCoinbaseTx(t, 1, 1)
+	block1 := &model.Block{
+		Header: &model.BlockHeader{
+			Version:        1,
+			Timestamp:      1700000001,
+			Nonce:          1,
+			HashPrevBlock:  genesis.Header.Hash(),
+			HashMerkleRoot: coinbase1.TxIDChainHash(),
+			Bits:           genesis.Header.Bits,
+		},
+		CoinbaseTx:       coinbase1,
+		TransactionCount: 1,
+		Height:           1,
+	}
+	block1Record, err := blockToIndexBytes(t, block1, block1.Header.Hash())
+	require.NoError(t, err)
+
+	coinbase2 := makeCoinbaseTx(t, 2, 2)
+	block2 := &model.Block{
+		Header: &model.BlockHeader{
+			Version:        1,
+			Timestamp:      1700000002,
+			Nonce:          2,
+			HashPrevBlock:  block1.Header.Hash(),
+			HashMerkleRoot: coinbase2.TxIDChainHash(),
+			Bits:           genesis.Header.Bits,
+		},
+		CoinbaseTx:       coinbase2,
+		TransactionCount: 1,
+		Height:           2,
+	}
+	block2Record, err := blockToIndexBytes(t, block2, block2.Header.Hash())
+	require.NoError(t, err)
+
+	// The file claims a tip height of 2 (3 records: heights 0, 1, 2), but
+	// block2's record is cut off 10 bytes into its hash field - block1's
+	// coinbase was fully read before the truncation hits.
+	path := writeUtxoHeadersFile(t, 2, genesisRecord, block1Record, block2Record[:10])
+
+	coinbaseTxs, err := loadCoinbaseTxs(ulogger.TestLogger{}, path)
+	require.Error(t, err, "a truncated utxo-headers file must still be reported as an error")
+	require.NotNil(t, coinbaseTxs, "the partial map read before truncation must not be discarded")
+
+	got, ok := coinbaseTxs[*coinbase1.TxIDChainHash()]
+	require.True(t, ok, "block1's coinbase was fully read before the truncation and must survive in the partial map")
+	require.Equal(t, coinbase1.TxIDChainHash().String(), got.TxIDChainHash().String())
+
+	_, ok = coinbaseTxs[*coinbase2.TxIDChainHash()]
+	require.False(t, ok, "block2's coinbase was never fully read and must not appear")
+}
+
 // TestProcessHeaders_CompleteFile_FinishesCleanly is the positive-path
 // counterpart to the truncation regression test above: a well-formed,
 // complete utxo-headers file (tip height matches the number of records
