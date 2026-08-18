@@ -12,13 +12,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// daemonServicesFile is the source file whose shouldStart() call sites define the
-// authoritative set of services the daemon can start.
-const daemonServicesFile = "daemon_services.go"
+// daemonPackageDir is the directory scanned for d.shouldStart(...) call sites,
+// which define the authoritative set of services the daemon can start. Scanning
+// the whole package (rather than just daemon_services.go) catches dispatch calls
+// that live elsewhere, such as daemon.go's "wait_for_postgres" switch.
+const daemonPackageDir = "."
+
+// daemonReceiverIdent is the receiver name a call must use to be treated as a
+// daemon method call (e.g. d.shouldStart(...)), so that an unrelated same-named
+// method or field on another type in the package isn't folded into the inventory.
+const daemonReceiverIdent = "d"
 
 // daemonServiceNames maps the identifier of every "Formal" service-name constant
 // that startServices() dispatches to that constant's value. The identifiers are
-// cross-checked against the real shouldStart() call sites in daemonServicesFile, so
+// cross-checked against the real shouldStart() call sites in the daemon package, so
 // this map cannot drift from the code in either direction.
 var daemonServiceNames = map[string]string{
 	"serviceAlertFormal":             serviceAlertFormal,
@@ -38,19 +45,23 @@ var daemonServiceNames = map[string]string{
 }
 
 // nonServiceShouldStartArgs holds shouldStart() arguments that are command-line
-// switches rather than services, and so are exempt from the inventory.
+// switches rather than services, and so are exempt from the inventory. Both
+// identifier names (e.g. serviceHelp) and string-literal switches (e.g.
+// wait_for_postgres) are looked up here, keyed by their literal text.
 var nonServiceShouldStartArgs = map[string]struct{}{
 	// -help only prints usage; it starts nothing and has no services/ package.
 	"serviceHelp": {},
+	// wait_for_postgres (daemon.go) is a startup gate, not a service.
+	"wait_for_postgres": {},
 }
 
-// TestServiceInventory_MatchesServicesDirectory guards against documentation and
-// code drift in both directions: the set of services startServices() can dispatch is
-// derived from the actual shouldStart() call sites in daemon_services.go, so a
-// service added to (or removed from) that function without being added to (or
-// removed from) daemonServiceNames fails the test. Every inventoried service must
-// also have a source package under services/<name>, which is what the architecture
-// docs enumerate.
+// TestServiceInventory_MatchesServicesDirectory guards the daemon's service dispatch
+// against the services/ layout in both directions: the set of services
+// startServices() can dispatch is derived from the actual shouldStart() call sites
+// in the daemon package, so a service added to (or removed from) that dispatch
+// without being added to (or removed from) daemonServiceNames fails the test. Every
+// inventoried service must also have a source package under services/<name>. This
+// does not check the architecture docs — those still need a manual pass.
 func TestServiceInventory_MatchesServicesDirectory(t *testing.T) {
 	dispatched := shouldStartServiceIdents(t)
 
@@ -58,8 +69,8 @@ func TestServiceInventory_MatchesServicesDirectory(t *testing.T) {
 	for ident := range dispatched {
 		_, listed := daemonServiceNames[ident]
 		require.True(t, listed,
-			"%s dispatches shouldStart(%s) but %s is missing from daemonServiceNames: add it here and add its services/<name> package",
-			daemonServicesFile, ident, ident)
+			"daemon package dispatches shouldStart(%s) but %s is missing from daemonServiceNames: add it here and add its services/<name> package",
+			ident, ident)
 	}
 
 	// Direction 2: nothing in the inventory may be a service the daemon no longer
@@ -67,8 +78,8 @@ func TestServiceInventory_MatchesServicesDirectory(t *testing.T) {
 	for ident := range daemonServiceNames {
 		_, ok := dispatched[ident]
 		require.True(t, ok,
-			"daemonServiceNames lists %s but %s never passes it to shouldStart: remove it here or restore the dispatch",
-			ident, daemonServicesFile)
+			"daemonServiceNames lists %s but the daemon package never passes it to shouldStart: remove it here or restore the dispatch",
+			ident)
 	}
 
 	// Every dispatched service must have a source package under services/<name>.
@@ -84,46 +95,77 @@ func TestServiceInventory_MatchesServicesDirectory(t *testing.T) {
 	}
 }
 
-// shouldStartServiceIdents parses daemonServicesFile and returns the identifiers
-// passed as the first argument to every d.shouldStart(...) call, minus the
-// non-service switches. Deriving the set from the source rather than restating it
-// keeps the guard bidirectional.
+// shouldStartServiceIdents parses every non-test .go file in daemonPackageDir and
+// returns the identifiers passed as the first argument to every
+// daemonReceiverIdent.shouldStart(...) call, minus the non-service switches.
+// Deriving the set from the source rather than restating it keeps the guard
+// bidirectional. Scanning the whole package (rather than just daemon_services.go)
+// catches dispatch calls that live elsewhere. shouldStart must be called directly
+// (e.g. d.shouldStart(...)); a method value taken as ss := d.shouldStart and
+// invoked as ss(...) is not visible to this AST match.
 func shouldStartServiceIdents(t *testing.T) map[string]struct{} {
 	t.Helper()
 
 	fset := token.NewFileSet()
 
-	file, err := parser.ParseFile(fset, daemonServicesFile, nil, 0)
-	require.NoError(t, err, "failed to parse %s", daemonServicesFile)
+	entries, err := os.ReadDir(daemonPackageDir)
+	require.NoError(t, err, "failed to read %s", daemonPackageDir)
 
 	idents := make(map[string]struct{})
+	found := false
 
-	ast.Inspect(file, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
 		}
 
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "shouldStart" || len(call.Args) == 0 {
+		path := filepath.Join(daemonPackageDir, name)
+
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		require.NoError(t, err, "failed to parse %s", path)
+
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "shouldStart" || len(call.Args) == 0 {
+				return true
+			}
+
+			recv, ok := sel.X.(*ast.Ident)
+			if !ok || recv.Name != daemonReceiverIdent {
+				return true
+			}
+
+			found = true
+
+			switch arg := call.Args[0].(type) {
+			case *ast.Ident:
+				if _, exempt := nonServiceShouldStartArgs[arg.Name]; exempt {
+					return true
+				}
+
+				idents[arg.Name] = struct{}{}
+			case *ast.BasicLit:
+				lit := strings.Trim(arg.Value, `"`)
+				_, exempt := nonServiceShouldStartArgs[lit]
+				require.True(t, exempt,
+					"shouldStart(%s) at %s is not in nonServiceShouldStartArgs: add it there if it isn't a service",
+					arg.Value, fset.Position(call.Lparen))
+			default:
+				t.Fatalf("shouldStart is called with an unrecognized argument kind at %s: this guard can only inventory constant identifiers and string literals", fset.Position(call.Lparen))
+			}
+
 			return true
-		}
+		})
+	}
 
-		ident, ok := call.Args[0].(*ast.Ident)
-		require.True(t, ok,
-			"shouldStart is called with a non-constant service name at %s: this guard can only inventory constant identifiers",
-			fset.Position(call.Lparen))
-
-		if _, exempt := nonServiceShouldStartArgs[ident.Name]; exempt {
-			return true
-		}
-
-		idents[ident.Name] = struct{}{}
-
-		return true
-	})
-
-	require.NotEmpty(t, idents, "found no shouldStart call sites in %s: has the service dispatch moved?", daemonServicesFile)
+	require.True(t, found, "found no %s.shouldStart call sites in %s: has the service dispatch moved?", daemonReceiverIdent, daemonPackageDir)
+	require.NotEmpty(t, idents, "found no service identifiers among %s.shouldStart call sites in %s", daemonReceiverIdent, daemonPackageDir)
 
 	return idents
 }

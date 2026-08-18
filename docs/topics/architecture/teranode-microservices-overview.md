@@ -429,7 +429,7 @@ The Pruner Service is an event-driven overlay service that removes stale UTXO da
 
 **Key Responsibilities:**
 
-- Respond to `BlockPersisted` (or `Block`, as a fallback) notifications instead of polling
+- Respond to `BlockPersisted` or `Block` notifications — selected by `pruner_block_trigger` — instead of polling
 - Preserve parent transactions of old unmined transactions so they remain available for resubmission
 - Remove UTXO records marked for deletion once they reach their delete-at-height
 - Coordinate with the Block Persister so transaction data stays accessible until `.subtree_data` files are created
