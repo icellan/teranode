@@ -65,7 +65,10 @@ with TLS, access logging, rate limits, and source restrictions.
 ## PostgreSQL Role Privileges
 
 Teranode's PostgreSQL role (`teranode`) owns the `teranode` database and needs no
-superuser rights. New deployments provision it as `NOSUPERUSER`.
+superuser rights. Deployments provisioned from this repository's Compose and
+Kubernetes manifests create it as `NOSUPERUSER`. The `teranode-quickstart` stack
+still creates it as `SUPERUSER`; until that is updated, apply the remediation
+below regardless of when your node was provisioned.
 
 Existing deployments are not fixed by an update. The role is created by the
 `init.sql` that the `postgres` image runs only when its data directory is empty,

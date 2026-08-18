@@ -4,8 +4,10 @@
 --
 -- This file runs only when the postgres data directory is empty. A stack brought
 -- up before the NOSUPERUSER change keeps its superuser roles on the existing
--- volume. Either recreate it ('docker compose down -v') or, as the postgres
--- superuser, run 'ALTER ROLE <role> NOSUPERUSER;' for each role below.
+-- volume. Recreate the storage ('docker compose down -v' for named volumes, or
+-- delete the bind-mounted host directory, e.g. 'data/postgres', for stacks that
+-- bind-mount instead), or, as the postgres superuser, run
+-- 'ALTER ROLE <role> NOSUPERUSER;' for each role below.
 
 CREATE ROLE miner1 LOGIN
   PASSWORD 'miner1'
