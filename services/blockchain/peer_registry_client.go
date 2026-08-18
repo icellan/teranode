@@ -142,7 +142,10 @@ func NewPeerRegistryClient(ctx context.Context, address string, tSettings *setti
 	// Include the admin API key so the admin-protected PeerRegistryService
 	// RPCs (see protectedMethods() in Server.go) accept calls made through
 	// this client.
-	conn, err := util.GetGRPCClient(ctx, address, &util.ConnectionOptions{APIKey: tSettings.GRPCAdminAPIKey}, tSettings)
+	conn, err := util.GetGRPCClient(ctx, address, &util.ConnectionOptions{
+		APIKey:        tSettings.GRPCAdminAPIKey,
+		APIKeyMethods: protectedMethods(),
+	}, tSettings)
 	if err != nil {
 		return nil, err
 	}
