@@ -133,41 +133,17 @@ Transition Matrix: running → reorging: 0.05/sec
 
 ### Alerting Rules
 
-**Example Prometheus alerts:**
+The block-assembler alert rules (stuck-state, slow tip advance, frequent
+reorgs) are loaded by Prometheus from
+[`deploy/docker/base/blockassembly.rules.yml`](../../../deploy/docker/base/blockassembly.rules.yml),
+referenced via `rule_files` in
+[`deploy/docker/base/prometheus.yml`](../../../deploy/docker/base/prometheus.yml).
+Edit that file to change the rules — this README no longer carries a copy.
 
-`teranode_blockassembly_current_state` is a numeric gauge, so compare it against
-the state number (`running` is `1`) — a string comparison such as
-`!= "running"` is not valid PromQL.
-
-```yaml
-# Alert if stuck in any non-running state for >30s
-- alert: BlockAssemblerStuckInState
-  expr: |
-    teranode_blockassembly_current_state != 1
-    and
-    (time() - timestamp(teranode_blockassembly_current_state) > 30)
-  for: 1m
-  annotations:
-    summary: "BlockAssembler stuck in non-running state"
-
-# Alert if movingUp P95 > 1s
-- alert: SlowTipAdvance
-  expr: |
-    histogram_quantile(0.95,
-      sum(rate(teranode_blockassembly_state_duration_seconds_bucket{state="movingUp"}[5m])) by (le)
-    ) > 1
-  for: 5m
-  annotations:
-    summary: "Block assembly tip advance is slow (P95 > 1s)"
-
-# Alert if reorg frequency is high
-- alert: FrequentReorgs
-  expr: |
-    sum(rate(teranode_blockassembly_state_transitions_total{to="reorging"}[5m])) > 0.1
-  for: 5m
-  annotations:
-    summary: "Reorgs happening more than once per 10 seconds"
-```
+Note: `teranode_blockassembly_current_state` is a numeric gauge, so the
+`BlockAssemblerStuckInState` rule compares it against the state number
+(`running` is `1`) — a string comparison such as `!= "running"` is not valid
+PromQL.
 
 ### Import Instructions
 

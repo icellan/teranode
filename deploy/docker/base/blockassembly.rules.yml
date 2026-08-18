@@ -1,0 +1,30 @@
+groups:
+  - name: blockassembly
+    rules:
+      # teranode_blockassembly_current_state is a numeric gauge, so compare it
+      # against the state number (`running` is `1`) — a string comparison such
+      # as `!= "running"` is not valid PromQL.
+      - alert: BlockAssemblerStuckInState
+        expr: |
+          teranode_blockassembly_current_state != 1
+          and
+          (time() - timestamp(teranode_blockassembly_current_state) > 30)
+        for: 1m
+        annotations:
+          summary: "BlockAssembler stuck in non-running state"
+
+      - alert: SlowTipAdvance
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(teranode_blockassembly_state_duration_seconds_bucket{state="movingUp"}[5m])) by (le)
+          ) > 1
+        for: 5m
+        annotations:
+          summary: "Block assembly tip advance is slow (P95 > 1s)"
+
+      - alert: FrequentReorgs
+        expr: |
+          sum(rate(teranode_blockassembly_state_transitions_total{to="reorging"}[5m])) > 0.1
+        for: 5m
+        annotations:
+          summary: "Reorgs happening more than once per 10 seconds"
