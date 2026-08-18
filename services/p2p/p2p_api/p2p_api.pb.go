@@ -4,6 +4,10 @@
 // 	protoc        v7.35.1
 // source: services/p2p/p2p_api/p2p_api.proto
 
+// Version: v1 (implicit). This package has no version suffix because it has
+// never had a breaking change. When a breaking change is introduced, bump to
+// package p2p_api.v1 (or the next version) at that time -- not before.
+
 package p2p_api
 
 import (

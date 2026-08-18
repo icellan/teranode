@@ -3,6 +3,9 @@ syntax = "proto3";
 option go_package = "./;peer_api";
 import "google/protobuf/empty.proto";
 
+// Version: v1 (implicit). This package has no version suffix because it has
+// never had a breaking change. When a breaking change is introduced, bump to
+// package peer_api.v1 (or the next version) at that time -- not before.
 package peer_api;
 
 // Add new message types for peer information
@@ -95,7 +98,7 @@ message Peer {
       string addr = 1;
       int64 until = 2;
   }
-  
+
   message BanPeerResponse {
       bool ok = 1;
   }
@@ -123,7 +126,7 @@ message Peer {
   message ClearBannedResponse {
       bool ok = 1;
   }
-  
+
   // Add new service for peer operations
   service PeerService {
     rpc GetPeers(google.protobuf.Empty) returns (GetPeersResponse) {}
@@ -134,4 +137,3 @@ message Peer {
     rpc ClearBanned(google.protobuf.Empty) returns (ClearBannedResponse) {}
     rpc GetPeerCount(google.protobuf.Empty) returns (GetPeerCountResponse) {}
   }
-  
