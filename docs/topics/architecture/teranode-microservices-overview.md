@@ -41,6 +41,8 @@ This architectural approach provides several key advantages:
 - **Fault Isolation**: Issues in one service are contained and don't cascade to affect the entire system
 - **Technology Flexibility**: Each service can use the most appropriate technology stack and storage backend for its specific requirements
 
+**Exception:** the Block Assembly Service does not follow this pattern. It runs as a stateful, active-passive singleton rather than a horizontally scaled service — see [2.6 Block Assembly Service](#26-block-assembly-service) for why.
+
 This document provides an overview of each microservice, its responsibilities, and how it interacts with other components in the system.
 
 ## 2. Core Services
@@ -200,6 +202,8 @@ You can read more about this service in the [Block Validation Service documentat
 ### 2.6 Block Assembly Service
 
 This service is responsible for creating subtrees and assembling block templates for miners.
+
+**Deployment model:** unlike most other Teranode services, Block Assembly is not horizontally scalable. It runs as a stateful, active-passive singleton (a single active replica per node): it holds the in-memory mining-candidate and subtree-assembler state, and the outstanding mining jobs handed to miners, per process. A second concurrently active replica would maintain a divergent copy of that state, so a submitted/solved block could be lost or the assembler state clobbered. Scale Teranode's overall throughput by scaling the stateless services upstream (e.g. Propagation, Validator) instead.
 
 **Key Responsibilities:**
 

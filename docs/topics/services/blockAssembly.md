@@ -35,6 +35,8 @@ The Block Assembly Service is responsible for assembling new blocks and adding t
 
 **No Mempool Design**: Unlike traditional Bitcoin nodes that maintain a mempool (memory pool) to store unconfirmed transactions, Teranode's Block Assembly service processes transactions directly through a validation and subtree assembly pipeline. Transactions are immediately validated and organized into subtrees for efficient block creation, rather than being held in an intermediate memory pool. This design enables higher throughput and more efficient resource utilization for large-scale transaction processing.
 
+**Deployment Model**: unlike most other Teranode services, Block Assembly does not scale horizontally. It runs as a stateful, active-passive singleton: its in-memory mining-candidate and subtree-assembler state, and the outstanding mining jobs handed to miners, live in a single active process. Running more than one active replica would let each accumulate a divergent copy of that state, risking lost solved blocks or clobbered assembler state. See the [Teranode Microservices Overview](../architecture/teranode-microservices-overview.md#26-block-assembly-service) for how this fits the rest of the architecture, and the [Kubernetes miners installation guide](../../howto/miners/kubernetes/minersHowToInstallation.md) for why every example Cluster CR pins its replica count to 1.
+
 The block assembly process involves the following steps:
 
 1. **Receiving Transactions from the TX Validator Service**:
