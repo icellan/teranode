@@ -88,6 +88,8 @@ All metrics are CounterVec type with labels: `function` (handler function name),
 | `teranode_blockassembly_add_directly_seconds`                             | Histogram    | Time taken for individual AddDirectly calls to subtree processor                |
 | `teranode_blockassembly_add_directly_total`                               | Counter      | Total number of transactions added directly to subtree processor                |
 | `teranode_blockassembly_add_directly_batch_seconds`                       | Histogram    | Time taken to add all unmined transactions to subtree processor                 |
+| `teranode_blockassembly_tip_lag_blocks`                                   | Gauge        | Number of blocks block assembly is behind the blockchain tip (0 when caught up); sustained non-zero values indicate the mining-candidate refresh has fallen behind and block assembly is stuck |
+| `teranode_blockassembly_processing_stuck_total`                          | CounterVec   | Count of block assembly catch-up/reorg/move-forward failures that left the assembler behind the tip, labelled by reason (`reason`); a useful signal for stall alerting |
 
 ## Blockchain Service Metrics
 
