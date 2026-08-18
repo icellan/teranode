@@ -17,14 +17,17 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test/mocklogger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // TestListenerKey tests the listenerKey function with various inputs
@@ -880,4 +883,151 @@ func TestStartGRPCServer_NonEmptyAPIKeyEnforcesAuth(t *testing.T) {
 
 	cancel()
 	CleanupListeners(tSettings.Context)
+}
+
+// TestClientAPIKeyIsScopedToProtectedMethods pins that the client interceptor
+// only puts the credential on the wire for methods that actually require it.
+// The transport is plaintext by default, so attaching it to every call widened
+// the exposure by orders of magnitude once the blockchain client started
+// carrying a key.
+func TestClientAPIKeyIsScopedToProtectedMethods(t *testing.T) {
+	const (
+		apiKey           = "scoped-client-key"
+		protectedMethod  = "/blockchain_api.BlockchainAPI/SendNotification"
+		unprotectedCheck = "/grpc.health.v1.Health/Check"
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logger := ulogger.TestLogger{}
+	tSettings := settings.NewSettings()
+	tSettings.Context = "scoped-client-key-test"
+
+	seen := make(chan []string, 4)
+
+	serverReady := make(chan struct{})
+	healthSrv := health.NewServer()
+
+	authOptions := &AuthOptions{
+		ExtraUnaryInterceptors: []grpc.UnaryServerInterceptor{
+			func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+				md, _ := metadata.FromIncomingContext(ctx)
+				seen <- md.Get(apiKeyHeader)
+
+				return handler(ctx, req)
+			},
+		},
+	}
+
+	go func() {
+		_ = StartGRPCServer(ctx, logger, tSettings, "scoped-key-service", "localhost:0", func(server *grpc.Server) {
+			grpc_health_v1.RegisterHealthServer(server, healthSrv)
+			close(serverReady)
+		}, authOptions)
+	}()
+
+	select {
+	case <-serverReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not start in time")
+	}
+
+	_, addr, _, err := GetListener(tSettings.Context, "scoped-key-service", "", "localhost:0")
+	require.NoError(t, err)
+
+	defer CleanupListeners(tSettings.Context)
+
+	// The health Check method is NOT in APIKeyMethods, so no header must go out.
+	conn, err := GetGRPCClient(ctx, "passthrough:///"+addr, &ConnectionOptions{
+		APIKey:        apiKey,
+		APIKeyMethods: map[string]bool{protectedMethod: true},
+	}, tSettings)
+	require.NoError(t, err)
+
+	defer func() { _ = conn.Close() }()
+
+	callCtx, callCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer callCancel()
+
+	_, err = grpc_health_v1.NewHealthClient(conn).Check(callCtx, &grpc_health_v1.HealthCheckRequest{})
+	require.NoError(t, err)
+
+	select {
+	case keys := <-seen:
+		require.Empty(t, keys, "the API key must not be attached to a method outside APIKeyMethods")
+	case <-time.After(2 * time.Second):
+		t.Fatal("server interceptor did not observe the call")
+	}
+
+	// With APIKeyMethods unset, the key goes on every call (previous behaviour).
+	allConn, err := GetGRPCClient(ctx, "passthrough:///"+addr, &ConnectionOptions{APIKey: apiKey}, tSettings)
+	require.NoError(t, err)
+
+	defer func() { _ = allConn.Close() }()
+
+	_, err = grpc_health_v1.NewHealthClient(allConn).Check(callCtx, &grpc_health_v1.HealthCheckRequest{})
+	require.NoError(t, err)
+
+	select {
+	case keys := <-seen:
+		require.Equal(t, []string{apiKey}, keys)
+	case <-time.After(2 * time.Second):
+		t.Fatal("server interceptor did not observe the second call")
+	}
+}
+
+// TestValidateAdminAPIKey pins that known-placeholder credentials are refused
+// while a real key and the explicitly-disabled empty case are accepted. A
+// placeholder is worse than no key: it installs the auth interceptor, so the
+// service reports protection it does not have.
+func TestValidateAdminAPIKey(t *testing.T) {
+	require.NoError(t, ValidateAdminAPIKey(""), "empty means admin auth is explicitly disabled")
+	require.NoError(t, ValidateAdminAPIKey("a-real-32-character-secret-value"))
+
+	for _, key := range []string{"testkey", "TESTKEY", " testkey ", "test", "changeme", "secret", "password", "admin"} {
+		require.Error(t, ValidateAdminAPIKey(key), "placeholder %q must be refused", key)
+	}
+}
+
+// TestPanicRecoveryInterceptors covers the structural fix for the
+// slice-to-array panic class: grpc-go does not recover handler panics, so
+// without these interceptors a single malformed request kills the process.
+func TestPanicRecoveryInterceptors(t *testing.T) {
+	logger := ulogger.TestLogger{}
+
+	t.Run("unary panic becomes Internal", func(t *testing.T) {
+		interceptor := CreatePanicRecoveryUnaryInterceptor(logger, "test")
+
+		resp, err := interceptor(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/svc/Method"},
+			func(ctx context.Context, req any) (any, error) {
+				panic("boom")
+			})
+
+		require.Nil(t, resp)
+		require.Equal(t, codes.Internal, status.Code(err))
+	})
+
+	t.Run("unary success passes through", func(t *testing.T) {
+		interceptor := CreatePanicRecoveryUnaryInterceptor(logger, "test")
+
+		resp, err := interceptor(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/svc/Method"},
+			func(ctx context.Context, req any) (any, error) {
+				return "ok", nil
+			})
+
+		require.NoError(t, err)
+		require.Equal(t, "ok", resp)
+	})
+
+	t.Run("stream panic becomes Internal", func(t *testing.T) {
+		interceptor := CreatePanicRecoveryStreamInterceptor(logger, "test")
+
+		err := interceptor(nil, nil, &grpc.StreamServerInfo{FullMethod: "/svc/Stream"},
+			func(srv any, stream grpc.ServerStream) error {
+				panic("boom")
+			})
+
+		require.Equal(t, codes.Internal, status.Code(err))
+	})
 }
