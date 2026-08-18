@@ -4,6 +4,10 @@
 // 	protoc        v7.34.1
 // source: services/blockvalidation/blockvalidation_api/blockvalidation_api.proto
 
+// Version: v1 (implicit). This package has no version suffix because it has
+// never had a breaking change. When a breaking change is introduced, bump to
+// package blockvalidation_api.v1 (or the next version) at that time -- not before.
+
 package blockvalidation_api
 
 import (

@@ -6,6 +6,9 @@ syntax = "proto3";
 // capabilities for the BSV network.
 option go_package = "./;propagation_api";
 
+// Version: v1 (implicit). This package has no version suffix because it has
+// never had a breaking change. When a breaking change is introduced, bump to
+// package propagation_api.v1 (or the next version) at that time -- not before.
 package propagation_api;
 
 import "google/protobuf/timestamp.proto";
