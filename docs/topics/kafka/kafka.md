@@ -38,6 +38,8 @@ It's important to note that Kafka is a third-party dependency in Teranode. As su
 
 **Development Mode**: Development and test contexts use in-memory Kafka by default (`KAFKA_SCHEMA.dev = memory`), requiring no external Kafka setup. For production-like testing with Docker Kafka, see [Kafka Settings Reference](../../references/settings/kafka_settings.md).
 
+**Choosing Kafka vs. gRPC for a new path**: see [§6.1 Choosing gRPC vs. Kafka for a New Communication Path](../architecture/teranode-microservices-overview.md#61-choosing-grpc-vs-kafka-for-a-new-communication-path) in the microservices overview.
+
 ## 2. Use Cases
 
 ### Propagation Service

@@ -27,6 +27,7 @@
         - [5.1 Kafka Message Broker](#51-kafka-message-broker)
         - [5.2 Miners](#52-miners)
     - [6. Interaction Patterns](#6-interaction-patterns)
+        - [6.1 Choosing gRPC vs. Kafka for a New Communication Path](#61-choosing-grpc-vs-kafka-for-a-new-communication-path)
     - [7. Related Resources](#7-related-resources)
 
 ## 1. Introduction
@@ -552,6 +553,43 @@ The Teranode microservices communicate through a combination of synchronous gRPC
 - Asset Server provides a unified HTTP/WebSocket interface for querying blockchain data, acting as a facade over the UTXO Store, Blob Store, and Blockchain Store
 - UTXO Store serves as a central state management component, interacting with multiple services (Validator, Block Assembly, Block Validation) for UTXO operations and double-spend prevention
 - Blob Store provides persistent storage for transactions and subtrees, accessed by Asset Server, Block Assembly, and Block Validation services
+
+### 6.1 Choosing gRPC vs. Kafka for a New Communication Path
+
+When adding a new communication path between services, pick the transport based on
+whether the caller needs an immediate answer, not on convenience or precedent alone:
+
+- **Use gRPC** when the call is synchronous request/response and the caller cannot make
+  progress until it gets a result (success/failure, or a value it needs right now).
+  Examples already in the codebase:
+    - Validator &rarr; Block Assembly `Store()`: the Validator calls Block Assembly directly over
+      gRPC (not Kafka) because the transaction must land in the current mining candidate
+      without delay, and the caller needs to know the call succeeded.
+    - Block Validation / Block Assembly &rarr; Blockchain `AddBlock`: the caller needs to know
+      whether the block was accepted before proceeding (e.g. to mark it mined).
+    - Block Validation &rarr; Subtree Validation `CheckBlockSubtrees`: validation cannot continue
+      until it learns whether the referenced subtrees are known/valid.
+- **Use Kafka** when the path is asynchronous, fire-and-forget, one-to-many, or the
+  producer does not need to know whether or when a consumer processes the message.
+  Examples already in the codebase:
+    - Propagation &rarr; Validator (`kafka_validatortxsConfig`): the Propagation service hands off
+      a new transaction and moves on; it does not wait for validation to complete.
+    - Validator &rarr; Subtree Validation (`kafka_txmetaConfig`) and Validator &rarr; P2P
+      (`kafka_rejectedTxConfig`): notifications the Validator emits without caring who
+      consumes them or when.
+    - P2P &rarr; Block Validation / Subtree Validation (`kafka_blocksConfig`, `kafka_subtreesConfig`):
+      network events fanned out for eventual processing, decoupling ingestion rate from
+      validation rate.
+    - Blockchain &rarr; Block Persister (`kafka_blocksFinalConfig`): a finalized block is queued
+      for eventual, non-blocking long-term storage.
+
+**Rule of thumb:** if the calling code needs the result before it can proceed (or needs
+to know the call failed), use gRPC. If the producer only needs to announce that
+something happened, and doesn't care who's listening, whether they're currently up, or
+when they get to it, use Kafka. When a message must reach every consumer independently
+(broadcast/fan-out) or must survive a consumer being temporarily down, Kafka's
+persistence and multiple-consumer-group model make it the better fit even if a given
+consumer happens to process messages quickly.
 
 ## 7. Related Resources
 
