@@ -2,9 +2,12 @@ package util
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"os"
+	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -82,6 +85,14 @@ type ConnectionOptions struct {
 	MaxConnectionAge time.Duration       // The maximum amount of time a connection may exist before it will be closed by sending a GoAway
 	APIKey           string              // API key for authentication
 	CallerName       string              // Name of the calling service for retry metrics (e.g. "validator", "propagation")
+
+	// APIKeyMethods, when non-empty, restricts the x-api-key header to these
+	// full gRPC method paths. The transport is plaintext unless
+	// SecurityLevelGRPC is enabled, so stamping the credential on every call -
+	// thousands per second on a connection like the blockchain client's - puts
+	// it on the wire far more often than the protected RPCs require. Leave it
+	// nil to attach the key to every call (the previous behaviour).
+	APIKeyMethods map[string]bool
 }
 
 // grpcClientRetriesTotal tracks gRPC client retry attempts by caller service and status code.
@@ -165,17 +176,28 @@ func GetGRPCClient(_ context.Context, address string, connectionOptions *Connect
 	streamClientInterceptors := make([]grpc.StreamClientInterceptor, 0, 3)
 
 	if connectionOptions.APIKey != "" {
+		apiKeyMethods := connectionOptions.APIKeyMethods
+		needsAPIKey := func(method string) bool {
+			return len(apiKeyMethods) == 0 || apiKeyMethods[method]
+		}
+
 		unaryClientInterceptors = append(unaryClientInterceptors,
 			func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn,
 				invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-				ctx = metadata.AppendToOutgoingContext(ctx, apiKeyHeader, connectionOptions.APIKey)
+				if needsAPIKey(method) {
+					ctx = metadata.AppendToOutgoingContext(ctx, apiKeyHeader, connectionOptions.APIKey)
+				}
+
 				return invoker(ctx, method, req, reply, cc, opts...)
 			})
 
 		streamClientInterceptors = append(streamClientInterceptors,
 			func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn,
 				method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-				ctx = metadata.AppendToOutgoingContext(ctx, apiKeyHeader, connectionOptions.APIKey)
+				if needsAPIKey(method) {
+					ctx = metadata.AppendToOutgoingContext(ctx, apiKeyHeader, connectionOptions.APIKey)
+				}
+
 				return streamer(ctx, desc, cc, method, opts...)
 			})
 	}
@@ -558,8 +580,10 @@ func CreateAuthInterceptor(apiKey string, protectedMethods map[string]bool) grpc
 			return nil, status.Error(codes.Unauthenticated, "missing API key")
 		}
 
-		// Validate API key
-		if keys[0] != apiKey {
+		// Validate API key. Constant-time so the comparison does not leak the
+		// key through response timing - this is the only credential check in
+		// the path.
+		if subtle.ConstantTimeCompare([]byte(keys[0]), []byte(apiKey)) != 1 {
 			return nil, status.Error(codes.Unauthenticated, "invalid API key")
 		}
 
@@ -569,4 +593,50 @@ func CreateAuthInterceptor(apiKey string, protectedMethods map[string]bool) grpc
 		// Proceed with the handler
 		return handler(newCtx, req)
 	}
+}
+
+// CreatePanicRecoveryUnaryInterceptor returns a unary server interceptor that
+// turns a panicking handler into an Internal gRPC error instead of letting the
+// panic unwind through grpc-go, which does not recover handler panics and would
+// take the whole process down. A malformed request that trips a bug in a single
+// handler must not be able to kill a service that owns chain state.
+func CreatePanicRecoveryUnaryInterceptor(logger ulogger.Logger, serviceName string) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				if logger != nil {
+					logger.Errorf("[%s] panic recovered in %s: %v - %s", serviceName, info.FullMethod, r, singleLineStack())
+				}
+
+				resp = nil
+				err = status.Error(codes.Internal, "internal error")
+			}
+		}()
+
+		return handler(ctx, req)
+	}
+}
+
+// CreatePanicRecoveryStreamInterceptor is the streaming counterpart of
+// CreatePanicRecoveryUnaryInterceptor.
+func CreatePanicRecoveryStreamInterceptor(logger ulogger.Logger, serviceName string) grpc.StreamServerInterceptor {
+	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				if logger != nil {
+					logger.Errorf("[%s] panic recovered in %s: %v - %s", serviceName, info.FullMethod, r, singleLineStack())
+				}
+
+				err = status.Error(codes.Internal, "internal error")
+			}
+		}()
+
+		return handler(srv, ss)
+	}
+}
+
+// singleLineStack renders the current stack trace on one line, so a recovered
+// panic still produces a single-line log message per the logging convention.
+func singleLineStack() string {
+	return strings.ReplaceAll(string(debug.Stack()), "\n", " | ")
 }

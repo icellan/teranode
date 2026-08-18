@@ -30,6 +30,31 @@ type AuthOptions struct {
 	ExtraUnaryInterceptors []grpc.UnaryServerInterceptor
 }
 
+// placeholderAdminAPIKeys are values that have shipped in committed or example
+// configuration at some point, or that are otherwise trivially guessable. They
+// are worse than an empty key: a non-empty key installs the auth interceptor,
+// so logs and behaviour both claim the surface is authenticated while anyone
+// who reads the repository holds the credential.
+var placeholderAdminAPIKeys = map[string]bool{
+	"testkey":  true,
+	"test":     true,
+	"changeme": true,
+	"secret":   true,
+	"password": true,
+	"admin":    true,
+}
+
+// ValidateAdminAPIKey rejects known-placeholder admin API keys. An empty key is
+// allowed and means "admin auth disabled" - that is a visible, warned-about
+// posture. A placeholder key is not, so it is a hard configuration error.
+func ValidateAdminAPIKey(apiKey string) error {
+	if placeholderAdminAPIKeys[strings.ToLower(strings.TrimSpace(apiKey))] {
+		return errors.NewConfigurationError("grpc_admin_api_key is set to the known placeholder value %q - set a real secret, or leave it empty to run with admin auth explicitly disabled", apiKey)
+	}
+
+	return nil
+}
+
 // StartGRPCServer starts a gRPC server with the specified configuration and registration function.
 // It handles TLS setup, authentication, metrics, tracing, and graceful shutdown.
 // The server will listen on the provided address and register services via the callback function.
@@ -58,10 +83,11 @@ func StartGRPCServer(ctx context.Context, l ulogger.Logger, tSettings *settings.
 	}
 
 	// Create server options
-	var serverOptions []grpc.ServerOption
+	serverOptions := make([]grpc.ServerOption, 0, 2)
 
-	// Collect unary interceptors: auth + extras
-	var unaryInterceptors []grpc.UnaryServerInterceptor
+	// Collect unary interceptors: panic recovery first, then auth + extras.
+	// Recovery has to sit outermost so it also covers the interceptors after it.
+	unaryInterceptors := []grpc.UnaryServerInterceptor{CreatePanicRecoveryUnaryInterceptor(l, serviceName)}
 
 	if authOptions != nil {
 		if authOptions.APIKey != "" {
@@ -70,9 +96,10 @@ func StartGRPCServer(ctx context.Context, l ulogger.Logger, tSettings *settings.
 		unaryInterceptors = append(unaryInterceptors, authOptions.ExtraUnaryInterceptors...)
 	}
 
-	if len(unaryInterceptors) > 0 {
-		serverOptions = append(serverOptions, grpc.ChainUnaryInterceptor(unaryInterceptors...))
-	}
+	serverOptions = append(serverOptions,
+		grpc.ChainUnaryInterceptor(unaryInterceptors...),
+		grpc.ChainStreamInterceptor(CreatePanicRecoveryStreamInterceptor(l, serviceName)),
+	)
 
 	connectionOptions := &ConnectionOptions{
 		SecurityLevel: securityLevel,
