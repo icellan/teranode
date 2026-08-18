@@ -13,6 +13,7 @@
     - [Consumer Resilience](#consumer-resilience)
 4. [Configuration](#4-configuration)
     - [TLS and Authentication](#tls-and-authentication)
+    - [Trust Model and Network Isolation](#trust-model-and-network-isolation)
 5. [Operational Guidelines](#5-operational-guidelines)
     - [Performance Tuning](#performance-tuning)
     - [Reliability Considerations](#reliability-considerations)
@@ -204,6 +205,57 @@ KAFKA_ENABLE_TLS = true
 KAFKA_TLS_SKIP_VERIFY = true  # Only for testing!
 kafka_enable_debug_logging = true  # For troubleshooting
 ```
+
+### Trust Model and Network Isolation
+
+The manifests and compose files shipped in this repository (`deploy/kubernetes/kafka/`,
+`deploy/docker/base/`) run Kafka/Redpanda with **no broker ACLs, no SASL, and a plaintext
+listener by default**. `KAFKA_ENABLE_TLS` is `false` out of the box, so client-side mTLS
+(described above) is available but not active until an operator turns it on. Nothing in the
+default deployment restricts *who* can connect to the broker or *which* topics a connected
+client may write to.
+
+This means the security boundary for Kafka, as shipped, is **network isolation, not
+authentication**: any workload with network reach to the Kafka Service can publish or
+consume on any topic, including forging messages onto topics other services trust.
+
+- `deploy/kubernetes/kafka/kafka-shared-networkpolicy.yaml` restricts ingress to the Kafka
+  pods to same-namespace traffic only, as a default-deny boundary against workloads outside
+  the namespace. It is intentionally a coarse, same-namespace allowlist rather than a
+  per-service one: there is no consistent pod-label scheme shared across every
+  producer/consumer service and deployment style (docker-compose-derived manifests vs. the
+  operator-managed CRs in `deploy/kubernetes/teranode/`) to key a tighter selector off. Treat
+  it as a floor, not a substitute for proper multi-tenant segmentation.
+- For non-Kubernetes deployments (plain `docker compose`, bare-metal), the equivalent control
+  is a firewall rule or Docker network membership limiting reachability of ports `9092`
+  (broker), `9093` (pandaproxy), and `8081` (schema registry) to the hosts running Teranode
+  services. No such rule is provided by default in `deploy/docker/base/`.
+- Not every topic carries the same trust weight if that boundary is breached. Most topics
+  (`blocks`, `subtrees`, `invalid-blocks`, `invalid-subtrees`, `rejectedtx`,
+  `tx-policy-rejected`) carry pointers or advisory data that downstream services re-validate
+  or treat as unblessed input — forged messages on those topics are dropped or, at worst,
+  waste a fetch. `txmeta` is the exception: message contents are written directly into the
+  in-memory tx-metadata cache, and a cache hit skips per-transaction re-validation during
+  subtree processing. Forged `txmeta` entries cannot be used to forge transactions or
+  double-spend — every transaction is still created/spent against the authoritative UTXO
+  store under proof-of-work when a block is accepted — but they can let a signature-verification
+  step be skipped for a transaction that later spends a genuinely unspent output. Treat write
+  access to `txmeta` as the most sensitive of the topics above.
+
+**Operators running Kafka in a shared or multi-tenant cluster, or subject to compliance
+requirements, should not rely on network isolation alone.** On top of the NetworkPolicy:
+
+- Enable `KAFKA_ENABLE_TLS` (and provide `KAFKA_TLS_CA_FILE`/`KAFKA_TLS_CERT_FILE`/
+  `KAFKA_TLS_KEY_FILE` for mutual TLS) as documented above — this is wired into every
+  producer and consumer path already, it is simply off by default.
+- Configure broker-side ACLs restricting write access to `txmeta` to the identity used by the
+  Validator service (and, more generally, restricting produce/consume per topic to the
+  services that need it). Teranode does not implement or configure broker ACLs itself —
+  this is a Kafka/Redpanda broker-side configuration and certificate-distribution decision
+  that has to be made per deployment, and is out of scope for the client library to enforce.
+- There is currently no SASL/SCRAM support in the Kafka client (`util/kafka/`). Where broker
+  ACLs require SASL rather than mTLS-based identity, that is a gap requiring further client
+  work, not something enabled by an existing setting.
 
 ## 5. Operational Guidelines
 
