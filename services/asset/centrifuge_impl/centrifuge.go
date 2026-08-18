@@ -248,9 +248,10 @@ func (c *Centrifuge) Init(_ context.Context) (err error) {
 
 // wsAllowedOrigins returns the operator-configured extra allowed origins for
 // the /connection/websocket endpoint, plus the dashboard's Vite dev-server
-// origins (settings.Dashboard.DevServerPorts) so `make dev` keeps working
-// under the default-deny origin check below. Returns nil if settings are
-// unavailable.
+// origins (settings.Dashboard.DevServerPorts) when - and only when - the
+// Asset HTTP server binds loopback, so `make dev` keeps working without
+// leaving http(s)://localhost:5173/:4173 permanently allowlisted on a
+// network-reachable node. Returns nil if settings are unavailable.
 func (c *Centrifuge) wsAllowedOrigins() []string {
 	if c.settings == nil {
 		return nil
@@ -258,43 +259,12 @@ func (c *Centrifuge) wsAllowedOrigins() []string {
 
 	origins := make([]string, 0, len(c.settings.Asset.WSAllowedOrigins))
 	origins = append(origins, c.settings.Asset.WSAllowedOrigins...)
-	origins = append(origins, util.DevServerOrigins(c.settings.Dashboard.DevServerPorts)...)
+
+	if util.LoopbackListenAddress(c.settings.Asset.HTTPListenAddress) {
+		origins = append(origins, util.DevServerOrigins(c.settings.Dashboard.DevServerPorts)...)
+	}
 
 	return origins
-}
-
-// checkWebsocketOrigin returns a CheckOrigin function for the Centrifuge
-// WebSocket upgrader. It replaces a previous "always allow any origin"
-// check, which made the endpoint trivially embeddable by any third-party
-// page for cross-site WebSocket hijacking.
-//
-// Rules mirror services/p2p/HandleWebsocket.go's websocketCheckOrigin:
-//   - No Origin header (non-browser clients) - always allowed.
-//   - Origin host matches the request Host (same-host) - always allowed.
-//   - Anything else - allowed only if present in allowedOrigins.
-func checkWebsocketOrigin(allowedOrigins []string) func(r *http.Request) bool {
-	allowed := make(map[string]struct{}, len(allowedOrigins))
-	for _, o := range allowedOrigins {
-		o = strings.ToLower(strings.TrimSpace(o))
-		if o != "" {
-			allowed[o] = struct{}{}
-		}
-	}
-
-	return func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			return true
-		}
-
-		if u, err := url.Parse(origin); err == nil && u.Host != "" && strings.EqualFold(u.Host, r.Host) {
-			return true
-		}
-
-		_, ok := allowed[strings.ToLower(strings.TrimSpace(origin))]
-
-		return ok
-	}
 }
 
 // Start begins the Centrifuge server operation, setting up WebSocket handlers
@@ -317,7 +287,7 @@ func (c *Centrifuge) Start(ctx context.Context, addr string) error {
 	websocketHandler := NewWebsocketHandler(c.centrifugeNode, WebsocketConfig{
 		ReadBufferSize:     1024,
 		UseWriteBufferPool: true,
-		CheckOrigin:        checkWebsocketOrigin(c.wsAllowedOrigins()),
+		CheckOrigin:        util.WebsocketOriginChecker(c.wsAllowedOrigins()),
 	})
 	_ = c.httpServer.AddHTTPHandler("/connection/websocket", c.authMiddleware(websocketHandler))
 	_ = c.httpServer.AddHTTPHandler("/client/", http.FileServer(http.Dir("./client")))

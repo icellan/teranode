@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
@@ -21,6 +22,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -149,13 +151,11 @@ func TestHandleClientMessages(t *testing.T) {
 
 		ch := make(chan []byte, 1)
 		deadClientCh := make(chan chan []byte, 1)
-		ws := &testWebSocketConn{
-			t: t,
-		}
+		ws := newTestWebSocketConn(t, nil)
 
 		done := make(chan struct{})
 		go func() {
-			s.handleClientMessages(ws, ch, deadClientCh)
+			s.handleClientMessages(t.Context(), ws, ch, deadClientCh)
 			close(done)
 		}()
 
@@ -179,11 +179,11 @@ func TestHandleClientMessages(t *testing.T) {
 
 		ch := make(chan []byte, 1)
 		deadClientCh := make(chan chan []byte, 1)
-		ws := &testWebSocketConn{t: t, writeError: assert.AnError}
+		ws := newTestWebSocketConn(t, assert.AnError)
 
 		done := make(chan struct{})
 		go func() {
-			s.handleClientMessages(ws, ch, deadClientCh)
+			s.handleClientMessages(t.Context(), ws, ch, deadClientCh)
 			close(done)
 		}()
 
@@ -212,6 +212,14 @@ type testWebSocketConn struct {
 	t          *testing.T
 	writeCount int
 	writeError error
+	closeOnce  sync.Once
+	readBlock  chan struct{}
+}
+
+var errTestConnClosed = errors.NewProcessingError("test websocket connection closed")
+
+func newTestWebSocketConn(t *testing.T, writeError error) *testWebSocketConn {
+	return &testWebSocketConn{t: t, writeError: writeError, readBlock: make(chan struct{})}
 }
 
 func (c *testWebSocketConn) WriteMessage(messageType int, data []byte) error {
@@ -222,13 +230,28 @@ func (c *testWebSocketConn) WriteMessage(messageType int, data []byte) error {
 }
 
 func (c *testWebSocketConn) Close() error {
+	c.closeOnce.Do(func() {
+		if c.readBlock != nil {
+			close(c.readBlock)
+		}
+	})
+
 	return nil
 }
 
 func (c *testWebSocketConn) ReadMessage() (messageType int, p []byte, err error) {
-	// Not used in the test but needed to satisfy the interface
-	return websocket.TextMessage, []byte{}, nil
+	// /p2p-ws is push-only; the read side exists only as a liveness probe.
+	// Block until the connection is closed rather than spinning.
+	<-c.readBlock
+
+	return websocket.TextMessage, nil, errTestConnClosed
 }
+
+func (c *testWebSocketConn) SetWriteDeadline(time.Time) error { return nil }
+
+func (c *testWebSocketConn) SetReadDeadline(time.Time) error { return nil }
+
+func (c *testWebSocketConn) SetPongHandler(func(string) error) {}
 
 func TestStartNotificationProcessor(t *testing.T) {
 	s := &Server{
@@ -242,7 +265,7 @@ func TestStartNotificationProcessor(t *testing.T) {
 	}
 
 	clientChannels := newClientChannelMap()
-	newClientCh := make(chan chan []byte, 1)
+	newClientCh := make(chan *wsClient, 1)
 	deadClientCh := make(chan chan []byte, 1)
 	notificationCh := make(chan *notificationMsg, 1)
 
@@ -270,7 +293,7 @@ func TestStartNotificationProcessor(t *testing.T) {
 
 	t.Run("Add new client", func(t *testing.T) {
 		clientCh := make(chan []byte, 10)
-		newClientCh <- clientCh
+		newClientCh <- &wsClient{ch: clientCh}
 
 		// Wait for client to be added
 		time.Sleep(50 * time.Millisecond)
@@ -280,7 +303,7 @@ func TestStartNotificationProcessor(t *testing.T) {
 
 	t.Run("Send notification", func(t *testing.T) {
 		clientCh := make(chan []byte, 10)
-		newClientCh <- clientCh
+		newClientCh <- &wsClient{ch: clientCh}
 
 		// Wait for client to be added
 		time.Sleep(50 * time.Millisecond)
@@ -319,7 +342,7 @@ func TestStartNotificationProcessor(t *testing.T) {
 
 	t.Run("Remove client", func(t *testing.T) {
 		clientCh := make(chan []byte, 10)
-		newClientCh <- clientCh
+		newClientCh <- &wsClient{ch: clientCh}
 
 		// Wait for client to be added
 		time.Sleep(50 * time.Millisecond)
@@ -336,7 +359,7 @@ func TestStartNotificationProcessor(t *testing.T) {
 
 	t.Run("Broadcast timeout handling", func(t *testing.T) {
 		slowCh := make(chan []byte) // Unbuffered channel that will block
-		newClientCh <- slowCh
+		newClientCh <- &wsClient{ch: slowCh}
 
 		// Wait for client to be added
 		time.Sleep(50 * time.Millisecond)
@@ -504,7 +527,7 @@ func TestBroadcast_SequentialTimeoutDoS(t *testing.T) {
 	}
 
 	clientChannels := newClientChannelMap()
-	newClientCh := make(chan chan []byte, 100)
+	newClientCh := make(chan *wsClient, 100)
 	deadClientCh := make(chan chan []byte, 100)
 	notificationCh := make(chan *notificationMsg, 100)
 
@@ -530,7 +553,7 @@ func TestBroadcast_SequentialTimeoutDoS(t *testing.T) {
 	for i := 0; i < numMaliciousClients; i++ {
 		// Create unbuffered channel that will block when trying to send
 		maliciousChannels[i] = make(chan []byte)
-		newClientCh <- maliciousChannels[i]
+		newClientCh <- &wsClient{ch: maliciousChannels[i]}
 	}
 
 	// Wait for all clients to be added
@@ -540,7 +563,7 @@ func TestBroadcast_SequentialTimeoutDoS(t *testing.T) {
 	// Add one legitimate client that will read messages
 	// Add it AFTER malicious clients to ensure it's processed last in the broadcast loop
 	legitimateCh := make(chan []byte, 100)
-	newClientCh <- legitimateCh
+	newClientCh <- &wsClient{ch: legitimateCh}
 	time.Sleep(50 * time.Millisecond)
 
 	// Start reading from legitimate client in background
@@ -877,7 +900,7 @@ func TestStartNotificationProcessor_SlowBlockchainDoesNotStallProcessor(t *testi
 	}
 
 	clientChannels := newClientChannelMap()
-	newClientCh := make(chan chan []byte, 10)
+	newClientCh := make(chan *wsClient, 10)
 	deadClientCh := make(chan chan []byte, 10)
 	notificationCh := make(chan *notificationMsg, 10)
 
@@ -885,7 +908,7 @@ func TestStartNotificationProcessor_SlowBlockchainDoesNotStallProcessor(t *testi
 
 	// Connect a client while the blockchain call cannot complete.
 	clientCh := make(chan []byte, 10)
-	newClientCh <- clientCh
+	newClientCh <- &wsClient{ch: clientCh}
 
 	require.Eventually(t, func() bool { return clientChannels.contains(clientCh) },
 		time.Second, 5*time.Millisecond, errClientNotAdded)
@@ -939,7 +962,7 @@ func TestStartNotificationProcessor_InitialStatusPrecedesBroadcasts(t *testing.T
 	defer cancel()
 
 	clientChannels := newClientChannelMap()
-	newClientCh := make(chan chan []byte, 10)
+	newClientCh := make(chan *wsClient, 10)
 	deadClientCh := make(chan chan []byte, 10)
 	notificationCh := make(chan *notificationMsg, 10)
 
@@ -949,7 +972,7 @@ func TestStartNotificationProcessor_InitialStatusPrecedesBroadcasts(t *testing.T
 	// time. The client must either see our own status first or miss the remote
 	// broadcast entirely (if it was processed before registration).
 	clientCh := make(chan []byte, 10)
-	newClientCh <- clientCh
+	newClientCh <- &wsClient{ch: clientCh}
 	notificationCh <- &notificationMsg{Type: "node_status", PeerID: "remote-node"}
 
 	select {
@@ -1261,78 +1284,62 @@ func TestHandleNodeStatusNotification_PublishBudgetSurvivesSlowCompute(t *testin
 	}
 }
 
-// TestWebsocketCheckOrigin covers the /p2p-ws origin check: same-host and
-// no-Origin requests are always allowed, everything else must be explicitly
-// allowlisted. This replaces the previous CheckOrigin that unconditionally
-// returned true for any origin.
-func TestWebsocketCheckOrigin(t *testing.T) {
-	tests := []struct {
-		name           string
-		allowedOrigins []string
-		origin         string
-		host           string
-		want           bool
-	}{
-		{
-			name: "no origin header is allowed",
-			host: "node.example.com",
-			want: true,
-		},
-		{
-			name:   "same-host origin is allowed",
-			origin: "https://node.example.com",
-			host:   "node.example.com",
-			want:   true,
-		},
-		{
-			name:   "same-host origin with different scheme is allowed",
-			origin: "http://node.example.com",
-			host:   "node.example.com",
-			want:   true,
-		},
-		{
-			name:   "cross-origin request is denied by default",
-			origin: "https://evil.example.com",
-			host:   "node.example.com",
-			want:   false,
-		},
-		{
-			name:           "cross-origin request in the allowlist is allowed",
-			allowedOrigins: []string{"https://dashboard.example.com"},
-			origin:         "https://dashboard.example.com",
-			host:           "node.example.com",
-			want:           true,
-		},
-		{
-			name:           "cross-origin request not in the allowlist is denied",
-			allowedOrigins: []string{"https://dashboard.example.com"},
-			origin:         "https://evil.example.com",
-			host:           "node.example.com",
-			want:           false,
-		},
-		{
-			name:           "allowlist match is case-insensitive",
-			allowedOrigins: []string{"https://Dashboard.Example.Com"},
-			origin:         "https://dashboard.example.com",
-			host:           "node.example.com",
-			want:           true,
+// The origin predicate itself is covered once, in
+// util.TestWebsocketOriginChecker. This test covers only what is specific to
+// the P2P service: which origins it feeds that predicate.
+//
+// The dev-server escape hatch is gated on the listen address rather than on
+// dashboard_devServerPorts, whose default is non-empty in every settings
+// context. Appending it unconditionally would leave
+// http(s)://localhost:5173/:4173 permanently allowlisted on every production
+// node, so any page an operator loads from one of those local ports could
+// open websockets to any node their browser can reach.
+func TestServer_wsAllowedOrigins_DevOriginsOnlyOnLoopback(t *testing.T) {
+	newServer := func(listenAddress string) *Server {
+		return &Server{
+			logger: &ulogger.TestLogger{},
+			settings: &settings.Settings{
+				P2P: settings.P2PSettings{HTTPListenAddress: listenAddress},
+				Dashboard: settings.DashboardSettings{
+					DevServerPorts: []int{5173, 4173},
+				},
+			},
+		}
+	}
+
+	allowsDevOrigin := func(s *Server) bool {
+		req := httptest.NewRequest(http.MethodGet, "http://localhost:9906/p2p-ws", nil)
+		req.Host = "localhost:9906"
+		req.Header.Set("Origin", "http://localhost:5173")
+
+		return util.WebsocketOriginChecker(s.wsAllowedOrigins())(req)
+	}
+
+	require.True(t, allowsDevOrigin(newServer("127.0.0.1:9906")),
+		"a loopback-bound p2p server must still allow the dev server so `make dev` keeps working")
+
+	require.False(t, allowsDevOrigin(newServer(":9906")),
+		"a wildcard-bound p2p server is network-reachable, so dev origins must not be allowlisted")
+
+	require.False(t, allowsDevOrigin(newServer("10.0.0.5:9906")),
+		"a network-bound p2p server must not allowlist dev origins")
+}
+
+// TestServer_wsAllowedOrigins_IncludesConfiguredOrigins verifies the
+// operator-configured p2p_wsAllowedOrigins reach the checker regardless of
+// the listen address.
+func TestServer_wsAllowedOrigins_IncludesConfiguredOrigins(t *testing.T) {
+	s := &Server{
+		logger: &ulogger.TestLogger{},
+		settings: &settings.Settings{
+			P2P: settings.P2PSettings{
+				HTTPListenAddress: ":9906",
+				WSAllowedOrigins:  []string{"https://dashboard.example.com"},
+			},
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			checkOrigin := websocketCheckOrigin(tt.allowedOrigins)
-
-			req := httptest.NewRequest(http.MethodGet, "http://"+tt.host+"/p2p-ws", nil)
-			req.Host = tt.host
-
-			if tt.origin != "" {
-				req.Header.Set("Origin", tt.origin)
-			}
-
-			require.Equal(t, tt.want, checkOrigin(req))
-		})
-	}
+	require.Equal(t, []string{"https://dashboard.example.com"}, s.wsAllowedOrigins())
 }
 
 // TestWSConnLimiter_GlobalCap verifies that acquire rejects connections once
@@ -1521,19 +1528,20 @@ func TestHandleWebSocket_ConnectionCap(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 }
 
-// TestHandleWebSocket_DevServerOriginAllowedByDefault verifies that the
-// dashboard's Vite dev-server origin is accepted even when
-// p2p_wsAllowedOrigins is unset, so `make dev` keeps working under the
-// default-deny origin check, while an unrelated foreign origin is still
-// rejected.
-func TestHandleWebSocket_DevServerOriginAllowedByDefault(t *testing.T) {
+// TestHandleWebSocket_DevServerOriginAllowedOnLoopback verifies end-to-end
+// that on a loopback-bound node the dashboard's Vite dev-server origin is
+// accepted even when p2p_wsAllowedOrigins is unset, so `make dev` keeps
+// working under the default-deny origin check, while an unrelated foreign
+// origin is still rejected.
+func TestHandleWebSocket_DevServerOriginAllowedOnLoopback(t *testing.T) {
 	s := &Server{
 		gCtx:   t.Context(),
 		logger: &ulogger.TestLogger{},
 		settings: &settings.Settings{
 			P2P: settings.P2PSettings{
-				ListenMode: settings.ListenModeFull,
-				EnableNAT:  false,
+				ListenMode:        settings.ListenModeFull,
+				EnableNAT:         false,
+				HTTPListenAddress: "127.0.0.1:9906",
 			},
 			Dashboard: settings.DashboardSettings{
 				DevServerPorts: []int{5173, 4173},

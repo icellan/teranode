@@ -11,8 +11,17 @@ import (
 
 // TrustedProxyIPExtractor builds an echo.IPExtractor that trusts
 // X-Forwarded-For only from the given pipe-separated CIDR ranges. When
-// trustedProxyCIDRs is empty, it returns echo's default extractor (trusts
-// loopback and RFC1918 ranges).
+// trustedProxyCIDRs is empty, it returns echo's default extractor, which
+// trusts loopback, link-local and RFC1918 direct peers.
+//
+// echo's newIPChecker starts from {trustLoopback, trustLinkLocal,
+// trustPrivateNet} all true and only *appends* TrustIPRange entries, so
+// supplying CIDRs alone would widen rather than narrow the boundary: any
+// direct peer in a private range could still forge X-Forwarded-For. That is
+// the common Kubernetes shape (externalTrafficPolicy: Cluster SNATs external
+// clients to a node IP; L7 ingress and sidecars live in the pod network), so
+// when explicit CIDRs are supplied we turn the implicit defaults off first
+// and trust only what the operator named.
 //
 // When trustedProxyCIDRs is non-empty but no valid CIDRs are parsed, this
 // fails loudly rather than silently falling back to "trust all private
@@ -25,7 +34,17 @@ func TrustedProxyIPExtractor(trustedProxyCIDRs, settingLabel string) (echo.IPExt
 		return echo.ExtractIPFromXFFHeader(), nil
 	}
 
-	var trustOpts []echo.TrustOption
+	// Turn echo's implicit "trust every private/loopback/link-local direct
+	// peer" defaults off before adding the operator's ranges, so the
+	// configured list is the whole trust boundary rather than an addition to
+	// a much wider one.
+	trustOpts := []echo.TrustOption{
+		echo.TrustLoopback(false),
+		echo.TrustLinkLocal(false),
+		echo.TrustPrivateNet(false),
+	}
+
+	var rangeOpts int
 
 	var parseErrors []string
 
@@ -42,9 +61,10 @@ func TrustedProxyIPExtractor(trustedProxyCIDRs, settingLabel string) (echo.IPExt
 		}
 
 		trustOpts = append(trustOpts, echo.TrustIPRange(ipNet))
+		rangeOpts++
 	}
 
-	if len(trustOpts) == 0 {
+	if rangeOpts == 0 {
 		return nil, errors.NewConfigurationError(
 			"%s is set but no valid CIDRs were parsed: %s",
 			settingLabel, strings.Join(parseErrors, ", "),

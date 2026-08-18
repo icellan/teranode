@@ -6,95 +6,70 @@ import (
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/require"
 )
 
-// TestCheckWebsocketOrigin covers the /connection/websocket origin check:
-// same-host and no-Origin requests are always allowed, everything else must
-// be explicitly allowlisted. Mirrors
-// services/p2p/HandleWebsocket_test.go's TestWebsocketCheckOrigin.
-func TestCheckWebsocketOrigin(t *testing.T) {
-	tests := []struct {
-		name           string
-		allowedOrigins []string
-		origin         string
-		host           string
-		want           bool
-	}{
-		{
-			name: "no origin header is allowed",
-			host: "node.example.com",
-			want: true,
-		},
-		{
-			name:   "same-host origin is allowed",
-			origin: "https://node.example.com",
-			host:   "node.example.com",
-			want:   true,
-		},
-		{
-			name:   "cross-origin request is denied by default",
-			origin: "https://evil.example.com",
-			host:   "node.example.com",
-			want:   false,
-		},
-		{
-			name:           "cross-origin request in the allowlist is allowed",
-			allowedOrigins: []string{"https://dashboard.example.com"},
-			origin:         "https://dashboard.example.com",
-			host:           "node.example.com",
-			want:           true,
-		},
-		{
-			name:           "cross-origin request not in the allowlist is denied",
-			allowedOrigins: []string{"https://dashboard.example.com"},
-			origin:         "https://evil.example.com",
-			host:           "node.example.com",
-			want:           false,
-		},
-		{
-			name:           "dev-server origin is allowed once allowlisted",
-			allowedOrigins: []string{"http://localhost:5173"},
-			origin:         "http://localhost:5173",
-			host:           "localhost:8090",
-			want:           true,
-		},
+// The origin predicate itself is covered once, in
+// util.TestWebsocketOriginChecker. These tests cover only what is specific to
+// the Asset service: which origins it feeds that predicate.
+
+// TestCentrifuge_wsAllowedOrigins_DevOriginsOnlyOnLoopback verifies the
+// dev-server escape hatch is gated on the listen address rather than on
+// dashboard_devServerPorts, whose default is non-empty in every settings
+// context. Appending it unconditionally would leave
+// http(s)://localhost:5173/:4173 permanently allowlisted on every production
+// node, so any page an operator loads from one of those local ports could
+// open websockets to any node their browser can reach.
+func TestCentrifuge_wsAllowedOrigins_DevOriginsOnlyOnLoopback(t *testing.T) {
+	newCentrifuge := func(listenAddress string) *Centrifuge {
+		return &Centrifuge{
+			settings: &settings.Settings{
+				Asset: settings.AssetSettings{HTTPListenAddress: listenAddress},
+				Dashboard: settings.DashboardSettings{
+					DevServerPorts: []int{5173, 4173},
+				},
+			},
+		}
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			checkOrigin := checkWebsocketOrigin(tt.allowedOrigins)
+	allowsDevOrigin := func(c *Centrifuge) bool {
+		req := httptest.NewRequest(http.MethodGet, "http://localhost:8090/connection/websocket", nil)
+		req.Host = "localhost:8090"
+		req.Header.Set("Origin", "http://localhost:5173")
 
-			req := httptest.NewRequest(http.MethodGet, "http://"+tt.host+"/connection/websocket", nil)
-			req.Host = tt.host
-
-			if tt.origin != "" {
-				req.Header.Set("Origin", tt.origin)
-			}
-
-			require.Equal(t, tt.want, checkOrigin(req))
-		})
+		return util.WebsocketOriginChecker(c.wsAllowedOrigins())(req)
 	}
+
+	require.True(t, allowsDevOrigin(newCentrifuge("127.0.0.1:8090")),
+		"a loopback-bound asset server must still allow the dev server so `make dev` keeps working")
+
+	require.False(t, allowsDevOrigin(newCentrifuge(":8090")),
+		"a wildcard-bound asset server is network-reachable, so dev origins must not be allowlisted")
+
+	require.False(t, allowsDevOrigin(newCentrifuge("10.0.0.5:8090")),
+		"a network-bound asset server must not allowlist dev origins")
 }
 
-// TestCentrifuge_wsAllowedOrigins_IncludesDevServerOrigins verifies that the
-// dashboard's Vite dev-server origins (settings.Dashboard.DevServerPorts) are
-// always permitted, even when asset_wsAllowedOrigins is unset, so `make dev`
-// keeps working now that the websocket origin check is default-deny.
-func TestCentrifuge_wsAllowedOrigins_IncludesDevServerOrigins(t *testing.T) {
+// TestCentrifuge_wsAllowedOrigins_IncludesConfiguredOrigins verifies the
+// operator-configured asset_wsAllowedOrigins reach the checker regardless of
+// the listen address.
+func TestCentrifuge_wsAllowedOrigins_IncludesConfiguredOrigins(t *testing.T) {
 	c := &Centrifuge{
 		settings: &settings.Settings{
-			Dashboard: settings.DashboardSettings{
-				DevServerPorts: []int{5173, 4173},
+			Asset: settings.AssetSettings{
+				HTTPListenAddress: ":8090",
+				WSAllowedOrigins:  []string{"https://dashboard.example.com"},
 			},
 		},
 	}
 
-	origins := c.wsAllowedOrigins()
+	require.Equal(t, []string{"https://dashboard.example.com"}, c.wsAllowedOrigins())
+}
 
-	req := httptest.NewRequest(http.MethodGet, "http://localhost:8090/connection/websocket", nil)
-	req.Host = "localhost:8090"
-	req.Header.Set("Origin", "http://localhost:5173")
-
-	require.True(t, checkWebsocketOrigin(origins)(req), "dev-server origin must be allowed so `make dev` keeps working")
+// TestCentrifuge_wsAllowedOrigins_NilSettings verifies the nil-settings path
+// is safe and yields no extra origins (same-host only).
+func TestCentrifuge_wsAllowedOrigins_NilSettings(t *testing.T) {
+	c := &Centrifuge{}
+	require.Nil(t, c.wsAllowedOrigins())
 }

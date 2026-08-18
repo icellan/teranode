@@ -59,8 +59,13 @@ func (rl *ipRateLimiter) Middleware() echo.MiddlewareFunc {
 }
 
 // allow consumes one token from rawIP's bucket, creating it if necessary.
-// Uses load-then-store so a race-losing goroutine's allocation isn't
-// stranded.
+//
+// PeekOrAdd checks-and-inserts under the cache lock, so concurrent
+// first-touch callers for the same key converge on one bucket. An
+// unconditional Add would let a race-losing goroutine replace a bucket
+// another goroutine had already installed and consumed from, resetting it to
+// a full burst - which is exploitable every time a key is recreated after
+// LRU eviction, and eviction is attacker-driven via key churn.
 func (rl *ipRateLimiter) allow(rawIP string) bool {
 	key := wsConnKey(rawIP)
 
@@ -69,9 +74,8 @@ func (rl *ipRateLimiter) allow(rawIP string) bool {
 	}
 
 	lim := rate.NewLimiter(rate.Limit(rl.ratePerSec), rl.ratePerSec)
-	rl.limiters.Add(key, lim)
 
-	if existing, ok := rl.limiters.Get(key); ok {
+	if existing, ok, _ := rl.limiters.PeekOrAdd(key, lim); ok {
 		return existing.Allow()
 	}
 

@@ -4,6 +4,8 @@ package p2p
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/labstack/echo/v4"
@@ -39,6 +41,63 @@ func TestIPRateLimiter_KeysPerIP(t *testing.T) {
 	require.False(t, rl.allow("10.0.0.1"), "10.0.0.1's burst should already be exhausted")
 
 	require.True(t, rl.allow("10.0.0.2"), "a different IP must not share 10.0.0.1's bucket")
+}
+
+// TestIPRateLimiter_ConcurrentFirstTouchDoesNotResetBucket verifies the
+// per-key bucket survives a concurrent first-touch burst. An unconditional
+// Add lets a race-losing goroutine overwrite a bucket another goroutine
+// already installed and consumed from, handing the key a fresh full burst;
+// with N goroutines racing on one previously-unseen key and a burst of B,
+// the number of grants must still be exactly B.
+func TestIPRateLimiter_ConcurrentFirstTouchDoesNotResetBucket(t *testing.T) {
+	const (
+		ratePerSec = 2
+		goroutines = 16
+		trials     = 500
+	)
+
+	var peakGranted int64
+
+	for trial := 0; trial < trials; trial++ {
+		rl := newIPRateLimiter(ratePerSec)
+
+		var (
+			ready   sync.WaitGroup
+			start   sync.WaitGroup
+			done    sync.WaitGroup
+			granted int64
+		)
+
+		start.Add(1)
+
+		for g := 0; g < goroutines; g++ {
+			ready.Add(1)
+			done.Add(1)
+
+			go func() {
+				defer done.Done()
+
+				ready.Done()
+				start.Wait()
+
+				if rl.allow("10.0.0.1") {
+					atomic.AddInt64(&granted, 1)
+				}
+			}()
+		}
+
+		ready.Wait()
+		start.Done()
+		done.Wait()
+
+		if granted > peakGranted {
+			peakGranted = granted
+		}
+	}
+
+	require.LessOrEqual(t, peakGranted, int64(ratePerSec),
+		"a concurrent first-touch burst granted %d requests for a bucket of %d: "+
+			"a race-losing goroutine replaced a live bucket", peakGranted, ratePerSec)
 }
 
 // TestIPRateLimiter_MiddlewarePassThroughWhenDisabled verifies that a
