@@ -1027,7 +1027,10 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	// Start node status publisher
 	go s.publishNodeStatus(ctx)
 
-	apiKey := s.resolveAdminAPIKey()
+	apiKey, err := s.resolveAdminAPIKey()
+	if err != nil {
+		return errors.WrapGRPC(err)
+	}
 
 	// Create auth options
 	authOptions := &util.AuthOptions{
@@ -1223,14 +1226,20 @@ func adminProtectedMethods() map[string]bool {
 // generated one: util.StartGRPCServer only installs the auth interceptor
 // when the key is non-empty, so a generated key no client could ever learn
 // would just mask the fact that the admin RPCs are unauthenticated. A single
-// warning is logged in that case so the exposure is visible.
-func (s *Server) resolveAdminAPIKey() string {
+// warning is logged in that case so the exposure is visible. A known
+// placeholder key is refused outright: it would install the interceptor and
+// claim the surface is protected while the credential is public knowledge.
+func (s *Server) resolveAdminAPIKey() (string, error) {
 	apiKey := s.settings.GRPCAdminAPIKey
+	if err := util.ValidateAdminAPIKey(apiKey); err != nil {
+		return "", err
+	}
+
 	if apiKey == "" {
 		s.logger.Warnf("[P2P] grpc_admin_api_key is not set; admin RPCs (ban, unban, clear bans, ban score, reputation reset, connect/disconnect peer) are unauthenticated - set grpc_admin_api_key to secure them")
 	}
 
-	return apiKey
+	return apiKey, nil
 }
 
 // updatePeerLastMessageTime updates the last message time for both the sender and originator.

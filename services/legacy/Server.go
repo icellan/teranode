@@ -629,14 +629,20 @@ func (s *Server) logPeerStats(ctx context.Context) {
 // generated one: util.StartGRPCServer only installs the auth interceptor
 // when the key is non-empty, so a generated key no client could ever learn
 // would just mask the fact that BanPeer/UnbanPeer are unauthenticated. A
-// single warning is logged in that case so the exposure is visible.
-func (s *Server) resolveAdminAPIKey() string {
+// single warning is logged in that case so the exposure is visible. A known
+// placeholder key is refused outright: it would install the interceptor and
+// claim the surface is protected while the credential is public knowledge.
+func (s *Server) resolveAdminAPIKey() (string, error) {
 	apiKey := s.settings.GRPCAdminAPIKey
+	if err := util.ValidateAdminAPIKey(apiKey); err != nil {
+		return "", err
+	}
+
 	if apiKey == "" {
 		s.logger.Warnf("[Legacy] grpc_admin_api_key is not set; admin-protected RPCs (BanPeer, UnbanPeer) are unauthenticated - set grpc_admin_api_key to secure them")
 	}
 
-	return apiKey
+	return apiKey, nil
 }
 
 func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
@@ -662,7 +668,10 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	go s.logPeerStats(ctx)
 	s.logger.Infof("[Legacy Server] Started peer statistics logging")
 
-	apiKey := s.resolveAdminAPIKey()
+	apiKey, err := s.resolveAdminAPIKey()
+	if err != nil {
+		return errors.WrapGRPC(err)
+	}
 
 	// Define protected methods - use the full gRPC method path
 	protectedMethods := map[string]bool{

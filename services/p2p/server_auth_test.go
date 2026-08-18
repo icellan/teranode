@@ -139,8 +139,9 @@ func TestResolveAdminAPIKey_Configured(t *testing.T) {
 		settings: &settings.Settings{GRPCAdminAPIKey: "configured-key"},
 	}
 
-	apiKey := s.resolveAdminAPIKey()
+	apiKey, err := s.resolveAdminAPIKey()
 
+	require.NoError(t, err)
 	require.Equal(t, "configured-key", apiKey)
 	logger.AssertNumberOfCalls(t, "Warnf", 0)
 }
@@ -156,8 +157,9 @@ func TestResolveAdminAPIKey_Empty(t *testing.T) {
 		settings: &settings.Settings{GRPCAdminAPIKey: ""},
 	}
 
-	apiKey := s.resolveAdminAPIKey()
+	apiKey, err := s.resolveAdminAPIKey()
 
+	require.NoError(t, err)
 	require.Empty(t, apiKey)
 	logger.AssertNumberOfCalls(t, "Warnf", 1)
 }

@@ -71,8 +71,12 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, address st
 	baConn, err := util.GetGRPCClient(ctx, address, &util.ConnectionOptions{
 		MaxRetries:   tSettings.GRPCMaxRetries,
 		RetryBackoff: tSettings.GRPCRetryBackoff,
-		APIKey:       apiKey, // Add the API key to the connection options
-		CallerName:   "p2p",
+		// Attach the key only to the admin RPCs that actually require it, so
+		// the credential is not stamped onto every ordinary call over what is
+		// a plaintext transport by default.
+		APIKey:        apiKey,
+		APIKeyMethods: adminProtectedMethods(),
+		CallerName:    "p2p",
 	}, tSettings)
 	if err != nil {
 		return nil, errors.NewServiceError("failed to init p2p service connection ", err)
