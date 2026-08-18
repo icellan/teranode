@@ -24,7 +24,7 @@
 
 ## 1. Overview
 
-The Lock Record Pattern is a distributed consistency mechanism used by Teranode's UTXO store to safely handle transactions with more outputs than `utxostore_utxoBatchSize` (default 128). Such a transaction does not fit in a single record and must be split across multiple records. The lock record pattern ensures these multi-record operations complete atomically, preventing data corruption from partial writes or concurrent access.
+The Lock Record Pattern is a distributed consistency mechanism used by Teranode's UTXO store to safely handle transactions with more outputs than `utxostore_utxoBatchSize` (default 128). Such a transaction is split into records of `utxoBatchSize` UTXOs each, so a record never grows unbounded with the output count; this is a batching choice, not a record-size limit (record-size overflow is handled separately, see [Storage Implementation](../datamodel/utxo_data_model.md#storage-implementation)). The lock record pattern ensures these multi-record operations complete atomically, preventing data corruption from partial writes or concurrent access.
 
 The pattern uses two key mechanisms:
 
@@ -333,7 +333,8 @@ The lock record pattern uses these configuration settings:
 |---------|---------|-------------|
 | `utxostore_utxoBatchSize` | 128 | UTXOs per record (more outputs than this triggers multi-record) |
 | `utxostore_externalizeAllTransactions` | false | Force external storage for all transactions |
-| `MaxTxSizeInStoreInBytes` (compile-time constant, not a setting) | 32KB | Size threshold for external storage |
+
+Note: the external-storage size threshold is not configurable — it's a compile-time constant, `MaxTxSizeInStoreInBytes = 32 * 1024` in `stores/utxo/aerospike/aerospike.go`.
 
 **Batch Size Impact:**
 

@@ -329,9 +329,9 @@ To know more about the Transaction Validator, please check its specific service 
 
 ### 4.7. UTXO Batch Processing and External Storage mode
 
-Aerospike is the primary datastore for the UTXO store. However, to overcome Aerospike's record size limitation of 1MB, the system implements an external storage mechanism for large transactions.
+Aerospike is the primary datastore for the UTXO store. However, to overcome Aerospike's record size limitation, the system implements an external storage mechanism for large transactions.
 
-If a transaction is too large to fit in a single Aerospike record (indicated by a `RECORD_TOO_BIG` error), or if the system is configured to externalize all transactions, the UTXO store will store the full transaction data in an external storage (typically AWS S3, but any external storage can be used).
+A transaction is stored externally when its extended size exceeds `MaxTxSizeInStoreInBytes` (32KB), when it needs more than one record (more outputs than `utxostore_utxoBatchSize`), or if the system is configured to externalize all transactions (`utxostore_externalizeAllTransactions`). A `RECORD_TOO_BIG` error from Aerospike is handled as a fallback retry via the same external-storage path. In all these cases, the UTXO store will store the full transaction data in an external storage (typically AWS S3, but any external storage can be used).
 
 In such cases, the full transaction data is stored externally, while metadata and UTXOs are still stored in Aerospike, potentially across multiple records. The Aerospike record will have an `external` flag set to true, indicating that the full transaction data is stored externally.
 

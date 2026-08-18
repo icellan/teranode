@@ -434,7 +434,7 @@ Transaction Size Check
          ├──> Medium (≤32KB, > utxoBatchSize outputs)
          │    └──> Multiple Aerospike Records (Pagination)
          │         ├─ Master Record (index 0)
-         │         │  ├─ Full transaction data
+         │         │  ├─ external=true flag (no inline tx data)
          │         │  ├─ First utxoBatchSize UTXOs
          │         │  └─ Metadata + totalExtraRecs
          │         └─ Child Records (index 1, 2, 3...)
@@ -454,7 +454,7 @@ Transaction Size Check
 
 ### Record Pagination (More Outputs Than `utxoBatchSize`)
 
-Transactions with more outputs than `utxostore_utxoBatchSize` (default 128) are automatically split across multiple Aerospike records to stay within database size constraints.
+Transactions with more outputs than `utxostore_utxoBatchSize` (default 128) are automatically split into records of `utxoBatchSize` UTXOs each, so a record never grows unbounded with the output count. Actual record-size overflow is handled separately by the 32KB externalisation threshold (see [External Blob Storage](#external-blob-storage)) and by the `RECORD_TOO_BIG` retry.
 
 #### Pagination Strategy
 
@@ -553,7 +553,7 @@ Large transactions exceeding Aerospike size limits are stored in external blob s
 
 External storage used when:
 
-- Transaction size > `MaxTxSizeInStoreInBytes` (32KB)
+- Transaction extended size > `MaxTxSizeInStoreInBytes` (32KB)
 - Transaction has more outputs than `utxostore_utxoBatchSize` (default 128), so it paginates across multiple records
 - Configuration forces externalization: `ExternalizeAllTransactions=true`
 
@@ -597,6 +597,12 @@ type UTXO struct {
 
     - Write transaction to blob storage as `.tx` file
     - Store only metadata and UTXOs in Aerospike
+    - Set `external=true` flag
+4. If outputs > `utxoBatchSize` (regardless of size):
+
+    - Write transaction to blob storage (the multi-record write goes through the
+      same two-phase-commit path as external storage)
+    - Split UTXOs across a master record plus child records
     - Set `external=true` flag
 
 **Partial Transactions** (outputs only):
