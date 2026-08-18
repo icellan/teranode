@@ -28,7 +28,8 @@
 8. [Running the Store Locally](#8-running-the-store-locally)
     - [How to run](#8-running-the-store-locally)
 9. [Configuration and Settings](#9-configuration-and-settings)
-10. [Other Resources](#10-other-resources)
+10. [UTXO Store Write-Access Surface](#10-utxo-store-write-access-surface)
+11. [Other Resources](#11-other-resources)
 
 ## 1. Description
 
@@ -606,7 +607,7 @@ UTXO Store Package Structure (stores/utxo)
 The UTXO Store is a data store component that is used by various services. It is not run independently. To use the UTXO Store locally, run services that depend on it, such as the Validator or UTXO Persister:
 
 ```shell
-SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] go run . -validator=1 
+SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] go run . -validator=1
 ```
 
 Please refer to the [Locally Running Services Documentation](../../howto/locallyRunningServices.md) document for more information on running services locally.
@@ -615,6 +616,36 @@ Please refer to the [Locally Running Services Documentation](../../howto/locally
 
 For comprehensive configuration documentation including all settings, defaults, and interactions, see the [UTXO Store Settings Reference](../../references/settings/stores/utxo_settings.md).
 
-## 10. Other Resources
+## 10. UTXO Store Write-Access Surface
+
+The UTXO Store's `Interface` (`stores/utxo/Interface.go`) is shared by every service and CLI tool that links against `stores/utxo`, but only some of them ever call a mutating method (`SpendAndCreate`, `Unspend`, `Delete`, `SetMinedMulti`/`SetMinedMultiChunked`, `FreezeUTXOs`, `UnFreezeUTXOs`, `ReAssignUTXO`, `SetLocked`, `SetConflicting`/`ProcessConflicting`/`ReverseProcessConflicting`, `BeginConflictIntent`/`CompleteConflictIntent`, `MarkTransactionsOnLongestChain`, `RemoveBlockIDs`, `RemoveFromConflictingChildren`, `PreserveTransactions`/`ProcessExpiredPreservations`, `SetBlockHeight`/`SetBlockState`). Everything else (Asset Server, Block Persister, Subtree Validation, the Blockchain service's health check) only reads (`Get`, `GetMeta`, `BatchDecorate`, `GetBlockHeight`, `Health`, …) and is not a writer.
+
+The current writers, re-derived directly from the code (not from the settings/deployment topology), are:
+
+### Services
+
+| Service | File(s) | Writes | Why |
+|---|---|---|---|
+| **Validator** | `services/validator/Validator.go` | `SpendAndCreate` (creates the tx's outputs, spends its inputs), `SetLocked` | Core transaction validation: on accepting a new transaction it atomically creates its UTXOs and spends the ones it consumes; `SetLocked` releases the temporary lock placed on parent outputs while a child is mid-validation. |
+| **Block Validation** | `services/blockvalidation/quick_validate.go`, `services/blockvalidation/Server.go` | `SpendAndCreate` (`WithCreateOnly`/`WithSpendOnly` during quick-validate replay), `utxo.SetMinedMultiChunked` (→ `SetMinedMulti`), `SetLocked` | Validates incoming blocks: creates/spends UTXOs for transactions not already known, then marks the block's transactions as mined (records `BlockID`/`SubtreeIdx`) and unlocks parents once children are confirmed. |
+| **Block Assembly** | `services/blockassembly/BlockAssembler.go`, `services/blockassembly/subtreeprocessor/SubtreeProcessor.go` | `MarkTransactionsOnLongestChain`, `SetLocked`, `utxo.ProcessConflicting` / `utxo.ReverseProcessConflicting` (→ `SetConflicting`, `BeginConflictIntent`/`CompleteConflictIntent`, `RemoveFromConflictingChildren`) | Owns chain-tip bookkeeping during block building and reorgs: flags which transactions sit on the currently-longest chain, unlocks matured parents, and drives the conflicting-transaction state machine (marking/unmarking double-spends and reversing that on reorg). |
+| **Legacy (p2p sync)** | `services/legacy/netsync/handle_block.go` | `SpendAndCreate`, `utxo.SetMinedMultiChunked` (→ `SetMinedMulti`) | The legacy Bitcoin-protocol block-sync path validates and applies blocks received from legacy peers the same way Block Validation does for the native protocol — same create/spend/set-mined writes, different ingestion path. |
+| **Alert System** | `services/alert/node.go` | `FreezeUTXOs`, `UnFreezeUTXOs`, `ReAssignUTXO` | Executes alert-network directives (court orders / network alerts) to freeze, unfreeze, or reassign specific UTXOs. |
+| **RPC** | `services/rpc/handlers.go` | `FreezeUTXOs`, `UnFreezeUTXOs`, `ReAssignUTXO` | Exposes the same freeze/unfreeze/reassign operations as operator-facing RPC calls (e.g. for manual intervention), independent of the Alert System's automated path. |
+| **Pruner** | `services/pruner/worker.go`, `services/pruner/server.go` | `ProcessExpiredPreservations`, plus record deletion via the store-provided `pruner.Service.Prune` (obtained through `PrunerServiceProvider.GetPrunerService()`) | Background cleanup: deletes UTXO records once their `DeleteAtHeight` has passed and expires now-unneeded preservation holds on parent transactions of old unmined transactions. |
+
+### CLI tools
+
+| Tool | File(s) | Writes | Why |
+|---|---|---|---|
+| **`seeder`** | `cmd/seeder/seeder.go` | `SpendAndCreate` | Bulk-loads a UTXO set from an external source (e.g. a snapshot) directly into the store to bootstrap a node. |
+| **`seedimport`** | `cmd/seedimport/seedimport/seedimport.go` | `SpendAndCreate`, `Delete` | Imports a UTXO set dump, creating/spending records and deleting ones that don't belong (e.g. rollback of a partial import). |
+| **`rewindblockchain`** | `cmd/rewindblockchain/rewindblockchain/rewind.go`, `phase2_blocks.go`, `tx_delete.go`, `phase1_unmined.go` | `SetBlockHeight`, `Delete`, `Unspend`, `RemoveBlockIDs`, `RemoveFromConflictingChildren` | Rewinds a node's chain state to an earlier block height for recovery/operational purposes: unwinds block-height/state, deletes transactions that no longer exist at the target height, un-spends UTXOs consumed by rewound transactions, and trims block-ID/conflicting-children bookkeeping that referenced rewound blocks. |
+
+**Note on `teranodecli loadunminedbench`:** `cmd/teranodecli/teranodecli/loadunminedbench.go` also calls `SpendAndCreate`, but it is a benchmarking subcommand that by default spins up its own ephemeral Aerospike TestContainer; it only writes to a real, shared UTXO store if explicitly pointed at one via its `-aerospikeURL` flag. It is listed here for completeness but is not part of the normal production write path.
+
+This list reflects the write-access surface as implemented today. It is descriptive, not prescriptive — it does not assign ownership of the store to any single team or service.
+
+## 11. Other Resources
 
 [UTXO Store Reference](../../references/stores/utxo_reference.md)
