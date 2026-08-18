@@ -1,5 +1,8 @@
 syntax = "proto3";
 
+// Version: v1 (implicit). This package has no version suffix because it has
+// never had a breaking change. When a breaking change is introduced, bump to
+// package pruner.v1 (or the next version) at that time -- not before.
 package pruner;
 
 option go_package = "github.com/bsv-blockchain/teranode/services/pruner/pruner_api";

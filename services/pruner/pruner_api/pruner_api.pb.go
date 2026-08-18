@@ -4,6 +4,10 @@
 // 	protoc        v7.34.1
 // source: services/pruner/pruner_api/pruner_api.proto
 
+// Version: v1 (implicit). This package has no version suffix because it has
+// never had a breaking change. When a breaking change is introduced, bump to
+// package pruner.v1 (or the next version) at that time -- not before.
+
 package pruner_api
 
 import (

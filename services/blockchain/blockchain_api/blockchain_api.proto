@@ -3,6 +3,10 @@ syntax = "proto3";
 option go_package = "./;blockchain_api";
 
 // Package blockchain_api defines the gRPC service interface for blockchain operations.
+//
+// Version: v1 (implicit). This package has no version suffix because it has
+// never had a breaking change. When a breaking change is introduced, bump to
+// package blockchain_api.v1 (or the next version) at that time -- not before.
 package blockchain_api;
 
 import "google/protobuf/timestamp.proto";
