@@ -25,11 +25,11 @@ func TestExcessiveBlockSizeUserAgentComment(t *testing.T) {
 		t.Fatal("Expected EB UserAgentComment")
 	}
 
-	// uac := cfg.UserAgentComments[0]
-	// uacExpected := "EB32.0"
-	// if uac != uacExpected {
-	//	t.Fatalf("Expected UserAgentComments to contain %s but got %s", uacExpected, uac)
-	// }
+	uac := cfg.UserAgentComments[0]
+	uacExpected := "EB4000.0"
+	if uac != uacExpected {
+		t.Fatalf("Expected UserAgentComments to contain %s but got %s", uacExpected, uac)
+	}
 
 	// Custom excessive block size.
 	os.Args = []string{"bsvd", "--excessiveblocksize=64000000"}
@@ -42,13 +42,15 @@ func TestExcessiveBlockSizeUserAgentComment(t *testing.T) {
 	if len(cfg.UserAgentComments) != 1 {
 		t.Fatal("Expected EB UserAgentComment")
 	}
-	// uac = cfg.UserAgentComments[0]
-	// uacExpected = "EB64.0"
-	// we do not support the command line options an
-	//
-	//	if uac != uacExpected {
-	//		t.Fatalf("Expected UserAgentComments to contain %s but got %s", uacExpected, uac)
-	//	}
+
+	// loadConfig's advertised EB now tracks the enforced policy limit passed
+	// in (4294967296, capped at maxWireBlockPayload), not the CLI flag: the
+	// CLI parsing path is dead code (see TestLoadConfigAdvertisesEnforcedExcessiveBlockSize).
+	uac = cfg.UserAgentComments[0]
+	uacExpected = "EB4000.0"
+	if uac != uacExpected {
+		t.Fatalf("Expected UserAgentComments to contain %s but got %s", uacExpected, uac)
+	}
 }
 
 // TestAdvertisedExcessiveBlockSizeTracksEnforcedPolicy confirms the advertised
@@ -64,8 +66,8 @@ func TestAdvertisedExcessiveBlockSizeTracksEnforcedPolicy(t *testing.T) {
 	}{
 		{"policy below the wire block payload cap is advertised verbatim", 64000000, 64000000},
 		{"policy equal to the wire block payload cap", maxWireBlockPayload, maxWireBlockPayload},
-		{"policy above the wire block payload cap is capped", 10737418240, maxWireBlockPayload},
-		{"the 4GiB settings default is capped", 4294967296, maxWireBlockPayload},
+		{"the 10GiB shipped settings.conf default is capped", 10737418240, maxWireBlockPayload},
+		{"the 4GiB Go struct fallback default is capped", 4294967296, maxWireBlockPayload},
 		{"a disabled policy limit falls back to the wire block payload cap", 0, maxWireBlockPayload},
 		{"a negative policy limit falls back to the wire block payload cap", -1, maxWireBlockPayload},
 	}
@@ -98,12 +100,50 @@ func TestLoadConfigAdvertisesEnforcedExcessiveBlockSize(t *testing.T) {
 	// Blocks we mine must stay inside the size we accept.
 	require.LessOrEqual(t, cfg.BlockMaxSize, cfg.ExcessiveBlockSize-1000)
 
-	// The 4GiB settings default exceeds the largest block message the legacy
-	// wire path accepts, so the advertisement is capped there.
+	// The 4GiB Go struct fallback default exceeds the largest block message
+	// the legacy wire path accepts, so the advertisement is capped there.
 	cfg, _, err = loadConfig(ulogger.TestLogger{}, 4294967296)
 	require.NoError(t, err)
 	require.Equal(t, uint64(maxWireBlockPayload), cfg.ExcessiveBlockSize)
 	require.Equal(t, []string{"EB4000.0"}, cfg.UserAgentComments)
+
+	// The 10GiB shipped settings.conf default likewise exceeds the wire cap.
+	cfg, _, err = loadConfig(ulogger.TestLogger{}, 10737418240)
+	require.NoError(t, err)
+	require.Equal(t, uint64(maxWireBlockPayload), cfg.ExcessiveBlockSize)
+	require.Equal(t, []string{"EB4000.0"}, cfg.UserAgentComments)
+}
+
+// TestBlockMaxSizeNeverExceedsExcessiveBlockSize confirms the invariant stated
+// in loadConfig's comment above the clamp -- "never mine a block bigger than
+// the excessive blocksize we accept" -- holds even for a policy
+// excessiveblocksize at or below blockMaxSizeMin (1000), where the floor
+// applied to blockMaxSizeMax must not itself push BlockMaxSize above
+// ExcessiveBlockSize.
+func TestBlockMaxSizeNeverExceedsExcessiveBlockSize(t *testing.T) {
+	os.Args = []string{"bsvd"}
+
+	tests := []struct {
+		name            string
+		policy          int
+		expectedEB      uint64
+		expectedMaxSize uint64
+	}{
+		{"policy below blockMaxSizeMin", 999, 999, 999},
+		{"policy equal to blockMaxSizeMin", 1000, 1000, 1000},
+		{"policy at the 1000-byte margin boundary", 2000, 2000, 1000},
+		{"policy just above the margin boundary", 2001, 2001, 1001},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, _, err := loadConfig(ulogger.TestLogger{}, tt.policy)
+			require.NoError(t, err)
+			require.Equal(t, tt.expectedEB, cfg.ExcessiveBlockSize)
+			require.Equal(t, tt.expectedMaxSize, cfg.BlockMaxSize)
+			require.LessOrEqual(t, cfg.BlockMaxSize, cfg.ExcessiveBlockSize)
+		})
+	}
 }
 
 func TestCreateDefaultConfigFile(t *testing.T) {

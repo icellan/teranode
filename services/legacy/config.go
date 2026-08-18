@@ -150,16 +150,6 @@ func advertisedExcessiveBlockSize(policyExcessiveBlockSize int) uint64 {
 	return minUint64(uint64(policyExcessiveBlockSize), maxWireBlockPayload)
 }
 
-// maxUint32 is a helper function to return the maximum of two uint32s.
-// This avoids a math import and the need to cast to floats.
-func maxUint32(a, b uint32) uint32 {
-	if a > b {
-		return a
-	}
-
-	return b
-}
-
 // config defines the configuration options for the legacy BSV Blockchain protocol server.
 // Configuration values can be set via command-line flags, configuration files, or environment variables.
 type config struct {
@@ -659,6 +649,11 @@ func loadConfig(logger ulogger.Logger, policyExcessiveBlockSize int) (*config, [
 	if cfg.ExcessiveBlockSize > blockMaxSizeMin+1000 {
 		blockMaxSizeMax = cfg.ExcessiveBlockSize - 1000
 	}
+
+	// The floor above must never push the cap above the excessive blocksize
+	// itself -- a policy excessiveblocksize at or below blockMaxSizeMin would
+	// otherwise let BlockMaxSize exceed ExcessiveBlockSize.
+	blockMaxSizeMax = minUint64(cfg.ExcessiveBlockSize, blockMaxSizeMax)
 
 	cfg.BlockMaxSize = minUint64(cfg.BlockMaxSize, blockMaxSizeMax)
 
