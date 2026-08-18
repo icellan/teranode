@@ -46,6 +46,15 @@ Before submitting a bug report, gather the following information:
 
     - Include any relevant visual information
 
+## Severity
+
+New bug reports must select a severity (`severity:critical`, `severity:major`, or
+`severity:minor`) using the "Severity" section of the bug report template, and the
+maintainer triaging the issue applies the matching `severity:*` label. This replaces
+the old convention of encoding severity in the issue title (e.g. `[P2P-003][medium]`)
+for new issues going forward — existing issue titles are not being changed
+retroactively.
+
 ## Submitting the Bug Report
 
 1. Go to the Teranode GitHub repository.
@@ -59,6 +68,12 @@ Before submitting a bug report, gather the following information:
 When creating a new issue, GitHub will automatically load a template. The template includes the following sections:
 
 ```markdown
+## Severity (required)
+Select one and delete the others:
+- severity:critical
+- severity:major
+- severity:minor
+
 ## Describe the bug
 A clear and concise description of what the bug is.
 
