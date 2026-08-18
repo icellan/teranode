@@ -85,10 +85,11 @@
 
 ### Optimistic Mining
 
-- `OptimisticMining = true`: Enables background validation for performance
-- Block validation proceeds while subtree validation runs in background
-- Can be overridden per-validation via DisableOptimisticMining option
-- Disabled during catchup mode for better performance
+- `OptimisticMining` defaults to `true` (enabled): the block is added to the chain and mining can start on it immediately, before full script validation completes
+- Full script validation continues in parallel; if it fails, the block's UTXOs are reverted
+- Trade-off: competitive mining latency (seconds down to milliseconds) versus the risk of wasted hashpower if the block later proves invalid
+- Can be overridden per-validation via the `DisableOptimisticMining` option
+- Disabled during catchup mode for better reliability
 
 ### Quick Validation Pipeline
 
@@ -102,14 +103,17 @@ For checkpoint-verified blocks, a fan-in pipeline overlaps I/O with processing:
   3. **Processor**: Creates/spends UTXOs and writes files in parallel per batch
 
 ### Transaction Metadata Processing
+
 - Cache and store processing work together with threshold-based fallback
 - Batch sizes and concurrency settings control performance
 
 ### Secret Mining Detection
+
 - `SecretMiningThreshold` uses `PreviousBlockHeaderCount` for analysis
 - Detection triggers when block difference exceeds threshold
 
 ### Two-Phase Double-Spend Detection
+
 - `RecentBlockIDsLimit` controls the size of the fast-path in-memory block ID window
 - Transactions mined in blocks within this window are detected immediately (fast path)
 - Transactions mined in older blocks trigger a blockchain service query (slow path)
@@ -117,6 +121,7 @@ For checkpoint-verified blocks, a fan-in pipeline overlaps I/O with processing:
 - Default of 50,000 covers approximately 347 days of blocks at 10-minute intervals
 
 ### Channel Buffer Management
+
 - `BlockFoundChBufferSize` and `CatchupChBufferSize` must accommodate processing loads
 
 ## Service Dependencies
