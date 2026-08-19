@@ -4,11 +4,14 @@ groups:
       # teranode_blockassembly_current_state is a numeric gauge, so compare it
       # against the state number (`running` is `1`) — a string comparison such
       # as `!= "running"` is not valid PromQL.
+      #
+      # The `for` clause supplies the "sustained" semantics. Do not add a
+      # `time() - timestamp(...)` clause: timestamp() returns the sample's own
+      # timestamp, so that only measures scrape staleness (never > 30s with a
+      # 30s scrape interval) and silently prevents the alert from ever firing.
+      # See blockassembly.rules_test.yml.
       - alert: BlockAssemblerStuckInState
-        expr: |
-          teranode_blockassembly_current_state != 1
-          and
-          (time() - timestamp(teranode_blockassembly_current_state) > 30)
+        expr: teranode_blockassembly_current_state != 1
         for: 1m
         annotations:
           summary: "BlockAssembler stuck in non-running state"
