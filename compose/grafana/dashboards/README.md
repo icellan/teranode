@@ -145,6 +145,13 @@ Note: `teranode_blockassembly_current_state` is a numeric gauge, so the
 (`running` is `1`) — a string comparison such as `!= "running"` is not valid
 PromQL.
 
+Changes to the rules are covered by
+[`deploy/docker/base/blockassembly.rules_test.yml`](../../../deploy/docker/base/blockassembly.rules_test.yml):
+
+```bash
+promtool test rules deploy/docker/base/blockassembly.rules_test.yml
+```
+
 ### Import Instructions
 
 1. Open Grafana
