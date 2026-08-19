@@ -31,3 +31,23 @@ groups:
         for: 5m
         annotations:
           summary: "Reorgs happening more than once per 10 seconds"
+
+      # Block assembly normally tracks the chain tip, so any sustained lag means
+      # the mining candidate is being built on a stale tip. This is the primary
+      # stall signal; the state-machine alerts above only catch the cases where
+      # the assembler is also parked in a non-running state.
+      - alert: BlockAssemblyBehindTip
+        expr: teranode_blockassembly_tip_lag_blocks > 0
+        for: 10m
+        annotations:
+          summary: "Block assembly is {{ $value }} block(s) behind the chain tip"
+
+      # Catch-up/reorg/move-forward failures that left the assembler behind the
+      # tip. Rate rather than absolute count, so a single transient failure that
+      # then recovers does not page anyone.
+      - alert: BlockAssemblyProcessingStuck
+        expr: |
+          sum(rate(teranode_blockassembly_processing_stuck_total[15m])) by (reason) > 0
+        for: 15m
+        annotations:
+          summary: "Block assembly repeatedly failing to advance (reason: {{ $labels.reason }})"

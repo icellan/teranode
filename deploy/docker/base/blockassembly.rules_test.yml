@@ -93,3 +93,55 @@ tests:
       - eval_time: 20m
         alertname: FrequentReorgs
         exp_alerts: []
+
+  # BlockAssemblyBehindTip: a persistent 3-block lag fires after 10m, and not
+  # before.
+  - interval: 30s
+    input_series:
+      - series: 'teranode_blockassembly_tip_lag_blocks'
+        values: '3+0x60'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: BlockAssemblyBehindTip
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: BlockAssemblyBehindTip
+        exp_alerts:
+          - exp_annotations:
+              summary: "Block assembly is 3 block(s) behind the chain tip"
+
+  # BlockAssemblyBehindTip: a short lag spike that recovers must not alert.
+  - interval: 30s
+    input_series:
+      - series: 'teranode_blockassembly_tip_lag_blocks'
+        values: '0+0x10 2 2 2 0+0x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: BlockAssemblyBehindTip
+        exp_alerts: []
+
+  # BlockAssemblyProcessingStuck: repeated catch-up failures fire, labelled by
+  # reason.
+  - interval: 30s
+    input_series:
+      - series: 'teranode_blockassembly_processing_stuck_total{reason="catchup"}'
+        values: '0+1x80'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: BlockAssemblyProcessingStuck
+        exp_alerts:
+          - exp_labels:
+              reason: catchup
+            exp_annotations:
+              summary: "Block assembly repeatedly failing to advance (reason: catchup)"
+
+  # BlockAssemblyProcessingStuck: one transient failure followed by recovery
+  # must not alert.
+  - interval: 30s
+    input_series:
+      - series: 'teranode_blockassembly_processing_stuck_total{reason="reorg"}'
+        values: '0 1+0x80'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: BlockAssemblyProcessingStuck
+        exp_alerts: []
