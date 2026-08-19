@@ -55,7 +55,6 @@ All metrics are CounterVec type with labels: `function` (handler function name),
 | `teranode_blockassembly_get_mining_candidate_duration`        | Histogram | Histogram of GetMiningCandidate in the blockassembly service                     |
 | `teranode_blockassembly_submit_mining_solution_ch`            | Gauge     | Number of items in the SubmitMiningSolution channel in the blockassembly service |
 | `teranode_blockassembly_submit_mining_solution`               | Histogram | Histogram of SubmitMiningSolution in the blockassembly service                   |
-| `teranode_blockassembly_update_subtrees_dah`                  | Histogram | Histogram of updating subtrees DAH in the blockassembly service                  |
 | `teranode_blockassembly_block_assembler_get_mining_candidate` | Counter   | Number of calls to GetMiningCandidate in the block assembler                     |
 | `teranode_blockassembly_block_assembler_candidate_time_clock_skew` | Counter | Mining-candidate polls refused because the parent's median-time-past floor is above the two-hour future bound, so no valid block timestamp exists; a non-zero rate means the local clock is far behind the network and block production has stopped |
 | `teranode_blockassembly_subtree_stored`                       | Histogram | Histogram of subtree stored duration in block assembler                          |
@@ -89,7 +88,11 @@ All metrics are CounterVec type with labels: `function` (handler function name),
 | `teranode_blockassembly_add_directly_total`                               | Counter      | Total number of transactions added directly to subtree processor                |
 | `teranode_blockassembly_add_directly_batch_seconds`                       | Histogram    | Time taken to add all unmined transactions to subtree processor                 |
 | `teranode_blockassembly_tip_lag_blocks`                                   | Gauge        | Number of blocks block assembly is behind the blockchain tip (0 when caught up); sustained non-zero values indicate the mining-candidate refresh has fallen behind and block assembly is stuck |
-| `teranode_blockassembly_processing_stuck_total`                          | CounterVec   | Count of block assembly catch-up/reorg/move-forward failures that left the assembler behind the tip, labelled by reason (`reason`); a useful signal for stall alerting |
+| `teranode_blockassembly_processing_stuck_total`                            | CounterVec   | Count of block assembly catch-up/reorg/move-forward failures that left the assembler behind the tip, labelled by reason (`reason`); a useful signal for stall alerting |
+| `teranode_blockassembly_catchup`                                          | Counter      | Number of forward-only catch-ups (moveBack=0) handled in block assembler        |
+| `teranode_blockassembly_coinbase_divergence_total`                        | CounterVec   | Coinbase-divergence events by outcome (label: `outcome`); every detection records exactly one follow-up outcome, so `detected == repaired + no_gap + escalated + aborted` |
+| `teranode_blockassembly_conflict_intents_pending`                         | Gauge        | Number of pending conflict-resolution WAL intents found at startup (interrupted ProcessConflicting/ReverseProcessConflicting operations awaiting replay) |
+| `teranode_blockassembly_conflict_intent_replay_total`                     | CounterVec   | Total conflict-resolution WAL intent replays at startup, by result (label: `result`) |
 
 ## Blockchain Service Metrics
 

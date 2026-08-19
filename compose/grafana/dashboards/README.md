@@ -134,22 +134,42 @@ Transition Matrix: running → reorging: 0.05/sec
 ### Alerting Rules
 
 The block-assembler alert rules (stuck-state, slow tip advance, frequent
-reorgs) are loaded by Prometheus from
-[`deploy/docker/base/blockassembly.rules.yml`](../../../deploy/docker/base/blockassembly.rules.yml),
-referenced via `rule_files` in
-[`deploy/docker/base/prometheus.yml`](../../../deploy/docker/base/prometheus.yml).
+reorgs, tip lag, repeated processing failures) live in a single canonical file,
+[`deploy/docker/base/blockassembly.rules.yml`](../../../deploy/docker/base/blockassembly.rules.yml).
 Edit that file to change the rules — this README no longer carries a copy.
+
+Every Prometheus config in the repo references it via `rule_files` and mounts it
+at `/etc/prometheus/blockassembly.rules.yml`:
+
+| Stack | Config |
+| --- | --- |
+| Local / mainnet / testnet docker | [`deploy/docker/base/prometheus.yml`](../../../deploy/docker/base/prometheus.yml) |
+| Monitoring-only docker | [`deploy/docker/monitoring/prometheus.yml`](../../../deploy/docker/monitoring/prometheus.yml) |
+| 3-node compose (`docker-compose-ss.yml`, `docker-compose-3blasters.yml`) | [`prometheus-1.yml`](../../prometheus/prometheus-1.yml), `-2`, `-3` |
+| Host-network tests (`test/docker-compose-host.yml`) | [`prometheus-host-1.yml`](../../prometheus/prometheus-host-1.yml), `-2`, `-3` |
+
+Alert *delivery* is only wired in the `deploy/docker/base` stack, which runs an
+Alertmanager (UI on <http://localhost:9094>) configured in
+[`deploy/docker/base/alertmanager.yml`](../../../deploy/docker/base/alertmanager.yml).
+That Alertmanager has **no notifier attached** — firing alerts are visible in
+its UI and in Prometheus (`/alerts`), but nothing is sent anywhere until a
+receiver is added. In the other stacks the rules are evaluated and visible in
+the Prometheus UI, but there is no Alertmanager at all.
 
 Note: `teranode_blockassembly_current_state` is a numeric gauge, so the
 `BlockAssemblerStuckInState` rule compares it against the state number
 (`running` is `1`) — a string comparison such as `!= "running"` is not valid
 PromQL.
 
-Changes to the rules are covered by
-[`deploy/docker/base/blockassembly.rules_test.yml`](../../../deploy/docker/base/blockassembly.rules_test.yml):
+Changes to the rules are covered by unit tests in
+[`deploy/docker/base/blockassembly.rules_test.yml`](../../../deploy/docker/base/blockassembly.rules_test.yml),
+run in CI by
+[`.github/workflows/prometheus_rules.yaml`](../../../.github/workflows/prometheus_rules.yaml)
+and locally with:
 
 ```bash
-promtool test rules deploy/docker/base/blockassembly.rules_test.yml
+promtool check rules deploy/docker/base/blockassembly.rules.yml
+cd deploy/docker/base && promtool test rules blockassembly.rules_test.yml
 ```
 
 ### Import Instructions
