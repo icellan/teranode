@@ -1669,11 +1669,22 @@ func SetConflictingAfterCreate(t *testing.T, db utxostore.Store) {
 	// newTestTx's input references the shared Tx fixture, and marking a tx
 	// conflicting walks its inputs to update the parent's bookkeeping, so the
 	// parent has to exist.
+	createdFixture := true
+
 	if _, _, err := db.SpendAndCreate(ctx, Tx, 1000, utxostore.WithCreateOnly()); err != nil {
 		require.ErrorIs(t, err, errors.ErrTxExists, "parent fixture must either be created here or already present")
+
+		createdFixture = false
 	}
 
-	defer func() { _ = db.Delete(ctx, Tx.TxIDChainHash()) }()
+	// Only clean up the shared fixture if this call is what created it. Deleting it
+	// unconditionally would remove a fixture an earlier subtest owns — the aerospike
+	// suite shares one store across subtests — and break whatever runs next.
+	defer func() {
+		if createdFixture {
+			_ = db.Delete(ctx, Tx.TxIDChainHash())
+		}
+	}()
 
 	child := newTestTx(t, 8_400_000)
 
@@ -1682,10 +1693,23 @@ func SetConflictingAfterCreate(t *testing.T, db utxostore.Store) {
 
 	defer func() { _ = db.Delete(ctx, child.TxIDChainHash()) }()
 
+	// Bound the call's own context, not just the wait, so the goroutine cannot
+	// outlive this test indefinitely.
+	//
+	// Measured caveat, so nobody reads more into this than it delivers: it does NOT
+	// make a regression local. Re-running this test against the pre-fix store with
+	// this deadline in place still ends in "panic: test timed out" — SQLite's
+	// writer-lock wait is not interruptible by context cancellation, and this
+	// test's own cleanup blocks on the same lock. What does survive is the stderr
+	// line below (verified present in that run) plus the panic's goroutine dump
+	// naming SetConflicting. The deadline is hygiene, not the diagnostic.
+	setCtx, cancelSet := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelSet()
+
 	done := make(chan error, 1)
 
 	go func() {
-		_, _, setErr := db.SetConflicting(ctx, []chainhash.Hash{*child.TxIDChainHash()}, true)
+		_, _, setErr := db.SetConflicting(setCtx, []chainhash.Hash{*child.TxIDChainHash()}, true)
 		done <- setErr
 	}()
 
