@@ -219,6 +219,7 @@ type WebSocketConn interface {
 	ReadMessage() (messageType int, p []byte, err error)
 	SetWriteDeadline(t time.Time) error
 	SetReadDeadline(t time.Time) error
+	SetReadLimit(limit int64)
 	SetPongHandler(h func(appData string) error)
 	Close() error
 }
@@ -244,6 +245,16 @@ var (
 	// wsPingPeriod is how often we ping an otherwise idle peer.
 	wsPingPeriod = 25 * time.Second
 )
+
+// wsMaxClientMessageBytes bounds the size of a single frame read from a
+// /p2p-ws client. The endpoint is push-only - the read side exists purely as
+// a liveness probe (pong frames plus whatever a peer sends unprompted) - so
+// there is no legitimate client payload to accommodate. Without a limit,
+// gorilla's default of "unlimited" lets a client declare an arbitrarily large
+// frame and have the server grow a single buffer to match, which is a
+// trivial remote OOM. 4KB is generously larger than an RFC 6455 control
+// frame (125 bytes) and anything a conforming client would ever send here.
+const wsMaxClientMessageBytes = 4 * 1024
 
 // wsAllowedOrigins returns the operator-configured extra allowed origins for
 // /p2p-ws, plus the dashboard's Vite dev-server origins when - and only when -
@@ -460,6 +471,8 @@ func (s *Server) handleClientMessages(ctx context.Context, ws WebSocketConn, ch 
 func (s *Server) startReadPump(ws WebSocketConn, cancel context.CancelFunc) {
 	defer cancel()
 
+	ws.SetReadLimit(wsMaxClientMessageBytes)
+
 	if err := ws.SetReadDeadline(time.Now().Add(wsPongWait)); err != nil {
 		s.logger.Debugf("Failed to set websocket read deadline: %v", err)
 		return
@@ -481,10 +494,23 @@ func (s *Server) startReadPump(ws WebSocketConn, cancel context.CancelFunc) {
 	}
 }
 
-// startNotificationProcessor starts the goroutine that processes notifications and manages clients
+// startNotificationProcessor starts the goroutine that processes notifications and manages clients.
+//
+// Registering a new client (and sending its initial node_status) happens
+// synchronously on the connecting goroutine, in handleWebSocket, rather than
+// here. That serves two invariants at once:
+//   - insertion must strictly precede any possible removal, otherwise a
+//     connection that ends before this goroutine got around to registering
+//     it would leave an orphan entry (buffered channel plus broadcast slot)
+//     that nothing would ever clean up;
+//   - the initial node_status must reach the client before any broadcast
+//     does (see sendInitialNodeStatuses), which is only guaranteed if the
+//     client isn't made visible to broadcast (added to clientChannels) until
+//     after the initial send - routing both through this single-goroutine
+//     select loop would race the new-client case against the notification
+//     case whenever both become ready at once.
 func (s *Server) startNotificationProcessor(
 	clientChannels *clientChannelMap,
-	newClientCh <-chan *wsClient,
 	deadClientCh <-chan chan []byte,
 	notificationCh <-chan *notificationMsg,
 	ctx context.Context,
@@ -493,11 +519,6 @@ func (s *Server) startNotificationProcessor(
 		select {
 		case <-ctx.Done():
 			return
-
-		case newClient := <-newClientCh:
-			clientChannels.addClient(newClient)
-			// Send initial node_status messages to the new client
-			s.sendInitialNodeStatuses(ctx, newClient.ch)
 
 		case deadClient := <-deadClientCh:
 			clientChannels.remove(deadClient)
@@ -570,12 +591,11 @@ func (s *Server) HandleWebSocket(notificationCh chan *notificationMsg) func(c ec
 // when a connection ends.
 func (s *Server) handleWebSocket(notificationCh chan *notificationMsg) (func(c echo.Context) error, *wsConnLimiter) {
 	clientChannels := newClientChannelMap()
-	newClientCh := make(chan *wsClient, 1_000)
 	deadClientCh := make(chan chan []byte, 1_000)
 
 	serverCtx := s.gCtx
 
-	go s.startNotificationProcessor(clientChannels, newClientCh, deadClientCh, notificationCh, serverCtx)
+	go s.startNotificationProcessor(clientChannels, deadClientCh, notificationCh, serverCtx)
 
 	maxConns, maxConnsPerIP := 0, 0
 
@@ -619,10 +639,26 @@ func (s *Server) handleWebSocket(notificationCh chan *notificationMsg) (func(c e
 			s.handleClientMessages(connCtx, ws, ch, deadClientCh)
 		}()
 
-		// Registered with its cancel func so dropping the client anywhere
+		// Send the initial node_status before the client becomes visible to
+		// broadcast (i.e. before addClient), so it is guaranteed to be the
+		// first message the client ever receives on this connection - a
+		// contract consumers (the asset service's centrifuge listener and
+		// the dashboard) rely on. See sendInitialNodeStatuses.
+		s.sendInitialNodeStatuses(serverCtx, ch)
+
+		// Registered synchronously - before the connection can possibly be
+		// torn down - with its cancel func so dropping the client anywhere
 		// (broadcast send timeout, dead-client path, shutdown) tears the
-		// connection down and releases its slot.
-		newClientCh <- &wsClient{ch: ch, cancel: connCancel}
+		// connection down and releases its slot. Registering here, on the
+		// connecting goroutine, rather than asynchronously on the
+		// notification-processor goroutine, guarantees insertion strictly
+		// precedes any removal; previously the insert only happened when the
+		// processor dequeued a registration message, which could run after
+		// teardown had already removed the client, leaving an orphan entry
+		// (buffered channel plus broadcast slot) that nothing would ever
+		// clean up.
+		client := &wsClient{ch: ch, cancel: connCancel}
+		clientChannels.addClient(client)
 
 		select {
 		case <-connCtx.Done():

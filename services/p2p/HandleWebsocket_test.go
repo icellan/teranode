@@ -214,6 +214,7 @@ type testWebSocketConn struct {
 	writeError error
 	closeOnce  sync.Once
 	readBlock  chan struct{}
+	readLimit  atomic.Int64
 }
 
 var errTestConnClosed = errors.NewProcessingError("test websocket connection closed")
@@ -251,7 +252,44 @@ func (c *testWebSocketConn) SetWriteDeadline(time.Time) error { return nil }
 
 func (c *testWebSocketConn) SetReadDeadline(time.Time) error { return nil }
 
+func (c *testWebSocketConn) SetReadLimit(limit int64) { c.readLimit.Store(limit) }
+
 func (c *testWebSocketConn) SetPongHandler(func(string) error) {}
+
+// TestStartReadPump_SetsReadLimit is the regression test for ChiR8: before
+// the fix, startReadPump never called SetReadLimit, so gorilla's default of
+// "unlimited" let a client declare an arbitrarily large frame and grow a
+// single heap buffer to match - a trivial remote OOM. The limit must be
+// applied before the connection ever reads a frame.
+func TestStartReadPump_SetsReadLimit(t *testing.T) {
+	s := &Server{
+		gCtx:   t.Context(),
+		logger: &ulogger.TestLogger{},
+	}
+
+	ws := newTestWebSocketConn(t, nil)
+	_, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		s.startReadPump(ws, cancel)
+	}()
+
+	require.Eventually(t, func() bool { return ws.readLimit.Load() == wsMaxClientMessageBytes },
+		time.Second, 5*time.Millisecond,
+		"startReadPump must call SetReadLimit(%d) before entering the read loop", wsMaxClientMessageBytes)
+
+	require.NoError(t, ws.Close())
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("startReadPump did not exit after the connection closed")
+	}
+}
 
 func TestStartNotificationProcessor(t *testing.T) {
 	s := &Server{
@@ -265,7 +303,6 @@ func TestStartNotificationProcessor(t *testing.T) {
 	}
 
 	clientChannels := newClientChannelMap()
-	newClientCh := make(chan *wsClient, 1)
 	deadClientCh := make(chan chan []byte, 1)
 	notificationCh := make(chan *notificationMsg, 1)
 
@@ -279,7 +316,7 @@ func TestStartNotificationProcessor(t *testing.T) {
 
 	go func() {
 		close(processorStarted)
-		s.startNotificationProcessor(clientChannels, newClientCh, deadClientCh, notificationCh, ctx)
+		s.startNotificationProcessor(clientChannels, deadClientCh, notificationCh, ctx)
 		close(processorDone)
 	}()
 
@@ -293,23 +330,23 @@ func TestStartNotificationProcessor(t *testing.T) {
 
 	t.Run("Add new client", func(t *testing.T) {
 		clientCh := make(chan []byte, 10)
-		newClientCh <- &wsClient{ch: clientCh}
+		// Registration is the caller's responsibility (see handleWebSocket);
+		// the processor no longer touches the client map on connect.
+		clientChannels.addClient(&wsClient{ch: clientCh})
 
-		// Wait for client to be added
-		time.Sleep(50 * time.Millisecond)
 		assert.True(t, clientChannels.contains(clientCh), errClientNotAdded)
 		assert.Equal(t, 1, clientChannels.count(), "Expected exactly one client")
 	})
 
 	t.Run("Send notification", func(t *testing.T) {
 		clientCh := make(chan []byte, 10)
-		newClientCh <- &wsClient{ch: clientCh}
-
-		// Wait for client to be added
-		time.Sleep(50 * time.Millisecond)
+		clientChannels.addClient(&wsClient{ch: clientCh})
 		require.True(t, clientChannels.contains(clientCh), errClientNotAdded)
 
-		// First, drain the initial node_status message
+		// The caller sends the initial node_status directly (see
+		// handleWebSocket), before addClient; simulate that here.
+		s.sendInitialNodeStatuses(ctx, clientCh)
+
 		select {
 		case msg := <-clientCh:
 			var initialMsg notificationMsg
@@ -342,10 +379,7 @@ func TestStartNotificationProcessor(t *testing.T) {
 
 	t.Run("Remove client", func(t *testing.T) {
 		clientCh := make(chan []byte, 10)
-		newClientCh <- &wsClient{ch: clientCh}
-
-		// Wait for client to be added
-		time.Sleep(50 * time.Millisecond)
+		clientChannels.addClient(&wsClient{ch: clientCh})
 		require.True(t, clientChannels.contains(clientCh), errClientNotAdded)
 		initialCount := clientChannels.count()
 
@@ -359,10 +393,7 @@ func TestStartNotificationProcessor(t *testing.T) {
 
 	t.Run("Broadcast timeout handling", func(t *testing.T) {
 		slowCh := make(chan []byte) // Unbuffered channel that will block
-		newClientCh <- &wsClient{ch: slowCh}
-
-		// Wait for client to be added
-		time.Sleep(50 * time.Millisecond)
+		clientChannels.addClient(&wsClient{ch: slowCh})
 		require.True(t, clientChannels.contains(slowCh), errClientNotAdded)
 		initialCount := clientChannels.count()
 
@@ -527,7 +558,6 @@ func TestBroadcast_SequentialTimeoutDoS(t *testing.T) {
 	}
 
 	clientChannels := newClientChannelMap()
-	newClientCh := make(chan *wsClient, 100)
 	deadClientCh := make(chan chan []byte, 100)
 	notificationCh := make(chan *notificationMsg, 100)
 
@@ -536,7 +566,7 @@ func TestBroadcast_SequentialTimeoutDoS(t *testing.T) {
 
 	processorDone := make(chan struct{})
 	go func() {
-		s.startNotificationProcessor(clientChannels, newClientCh, deadClientCh, notificationCh, ctx)
+		s.startNotificationProcessor(clientChannels, deadClientCh, notificationCh, ctx)
 		close(processorDone)
 	}()
 
@@ -553,18 +583,15 @@ func TestBroadcast_SequentialTimeoutDoS(t *testing.T) {
 	for i := 0; i < numMaliciousClients; i++ {
 		// Create unbuffered channel that will block when trying to send
 		maliciousChannels[i] = make(chan []byte)
-		newClientCh <- &wsClient{ch: maliciousChannels[i]}
+		clientChannels.addClient(&wsClient{ch: maliciousChannels[i]})
 	}
 
-	// Wait for all clients to be added
-	time.Sleep(100 * time.Millisecond)
 	require.Equal(t, numMaliciousClients, clientChannels.count(), "All malicious clients should be added")
 
 	// Add one legitimate client that will read messages
 	// Add it AFTER malicious clients to ensure it's processed last in the broadcast loop
 	legitimateCh := make(chan []byte, 100)
-	newClientCh <- &wsClient{ch: legitimateCh}
-	time.Sleep(50 * time.Millisecond)
+	clientChannels.addClient(&wsClient{ch: legitimateCh})
 
 	// Start reading from legitimate client in background
 	legitimateReceived := make(chan []byte, 1)
@@ -900,18 +927,20 @@ func TestStartNotificationProcessor_SlowBlockchainDoesNotStallProcessor(t *testi
 	}
 
 	clientChannels := newClientChannelMap()
-	newClientCh := make(chan *wsClient, 10)
 	deadClientCh := make(chan chan []byte, 10)
 	notificationCh := make(chan *notificationMsg, 10)
 
-	go s.startNotificationProcessor(clientChannels, newClientCh, deadClientCh, notificationCh, ctx)
+	go s.startNotificationProcessor(clientChannels, deadClientCh, notificationCh, ctx)
 
-	// Connect a client while the blockchain call cannot complete.
+	// Connect a client (as handleWebSocket now does: send the initial status
+	// directly, then register) while the blockchain call cannot complete.
+	// sendInitialNodeStatuses' own cache-miss fallback runs on a separate
+	// goroutine, so this must not block here either.
 	clientCh := make(chan []byte, 10)
-	newClientCh <- &wsClient{ch: clientCh}
+	s.sendInitialNodeStatuses(ctx, clientCh)
+	clientChannels.addClient(&wsClient{ch: clientCh})
 
-	require.Eventually(t, func() bool { return clientChannels.contains(clientCh) },
-		time.Second, 5*time.Millisecond, errClientNotAdded)
+	require.True(t, clientChannels.contains(clientCh), errClientNotAdded)
 
 	// The processor must keep broadcasting while the initial node-status fetch
 	// is still blocked on the blockchain service.
@@ -962,17 +991,18 @@ func TestStartNotificationProcessor_InitialStatusPrecedesBroadcasts(t *testing.T
 	defer cancel()
 
 	clientChannels := newClientChannelMap()
-	newClientCh := make(chan *wsClient, 10)
 	deadClientCh := make(chan chan []byte, 10)
 	notificationCh := make(chan *notificationMsg, 10)
 
-	go s.startNotificationProcessor(clientChannels, newClientCh, deadClientCh, notificationCh, ctx)
+	go s.startNotificationProcessor(clientChannels, deadClientCh, notificationCh, ctx)
 
-	// Register a client and broadcast a remote peer's node_status at the same
-	// time. The client must either see our own status first or miss the remote
-	// broadcast entirely (if it was processed before registration).
+	// Register a client exactly as handleWebSocket now does: send the
+	// initial status first, then addClient, so the client cannot become
+	// visible to a concurrently broadcast remote node_status until its own
+	// status has already been queued.
 	clientCh := make(chan []byte, 10)
-	newClientCh <- &wsClient{ch: clientCh}
+	s.sendInitialNodeStatuses(ctx, clientCh)
+	clientChannels.addClient(&wsClient{ch: clientCh})
 	notificationCh <- &notificationMsg{Type: "node_status", PeerID: "remote-node"}
 
 	select {

@@ -137,6 +137,121 @@ func TestHandleWebSocket_StalledClientFreesCapSlot(t *testing.T) {
 	_ = ws2.Close()
 }
 
+// TestHandleWebSocket_OversizedClientFrameFreesCapSlot is the regression test
+// for ChiR8: before the fix, startReadPump never called SetReadLimit, so a
+// client could declare an arbitrarily large frame and have the server grow a
+// single unbounded heap buffer to match it. /p2p-ws is push-only, so any
+// data frame from a client is already anomalous; a client that sends one
+// larger than wsMaxClientMessageBytes must be torn down (not have its
+// payload buffered) and its cap slot released.
+func TestHandleWebSocket_OversizedClientFrameFreesCapSlot(t *testing.T) {
+	httpServer, _, limiter := newTestWebSocketServer(t, 1, 1)
+
+	wsURL := "ws" + strings.TrimPrefix(httpServer.URL, "http")
+
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+
+	defer ws.Close()
+
+	waitForSlots(t, limiter, 1, 5*time.Second, "after connecting")
+
+	// Send a frame well over the server's read limit. gorilla checks the
+	// declared frame length against SetReadLimit before allocating the
+	// payload buffer, so the server must reject and close the connection
+	// rather than buffering this.
+	oversized := make([]byte, wsMaxClientMessageBytes*2)
+	require.NoError(t, ws.WriteMessage(websocket.BinaryMessage, oversized))
+
+	waitForSlots(t, limiter, 0, 5*time.Second,
+		"a client sending an over-limit frame must be torn down and release its slot")
+
+	ws2, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err, "the endpoint must still accept connections after the oversized-frame client is reaped")
+
+	_ = ws2.Close()
+}
+
+// TestNotificationProcessor_ConnectThenImmediateDisconnectLeavesNoOrphan is
+// the regression test for ChiR9: registration used to happen asynchronously
+// - only when the notification processor dequeued a separate "new client"
+// channel - while deregistration was synchronous, called directly from
+// connection teardown. If a connection ended (and its teardown path called
+// clientChannels.remove) before the processor got around to dequeuing the
+// registration, the later dequeue would re-insert a channel whose reader
+// goroutine had already returned: an orphan entry holding a buffered channel
+// and a broadcast goroutine slot forever.
+//
+// The fix (see handleWebSocket) registers the client synchronously via
+// clientChannels.addClient on the connecting goroutine itself, with no
+// hand-off to the notification processor at all, so insertion strictly
+// precedes any possible removal regardless of how busy the processor is.
+// This test reproduces the worst-case timing directly: it stalls the
+// processor inside a slow broadcast, then registers and immediately removes
+// a client - mirroring handleWebSocket's exact call sequence - while the
+// processor cannot do anything else, and asserts no orphan remains.
+func TestNotificationProcessor_ConnectThenImmediateDisconnectLeavesNoOrphan(t *testing.T) {
+	s := &Server{
+		logger:   &ulogger.TestLogger{},
+		settings: &settings.Settings{},
+	}
+
+	clientChannels := newClientChannelMap()
+	deadClientCh := make(chan chan []byte, 10)
+	notificationCh := make(chan *notificationMsg, 10)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	processorDone := make(chan struct{})
+	go func() {
+		defer close(processorDone)
+		s.startNotificationProcessor(clientChannels, deadClientCh, notificationCh, ctx)
+	}()
+
+	// A stalling client with no reader forces any broadcast to block for the
+	// full 1s send timeout, giving a deterministic window during which the
+	// processor is busy and could not have processed anything else.
+	stallCh := make(chan []byte)
+	clientChannels.addClient(&wsClient{ch: stallCh})
+
+	notificationCh <- &notificationMsg{Type: "stall_trigger"}
+
+	// Give the processor a moment to pick up the notification and enter the
+	// blocking broadcast before we register/remove our test client.
+	time.Sleep(50 * time.Millisecond)
+
+	// Mirror handleWebSocket's exact sequence: register synchronously, then
+	// (as if the connection ended immediately) remove directly - both calls
+	// made independently of the processor, which is still blocked inside the
+	// broadcast at this point.
+	clientCh := make(chan []byte, 100)
+	client := &wsClient{ch: clientCh}
+	clientChannels.addClient(client)
+	clientChannels.remove(client.ch)
+
+	require.False(t, clientChannels.contains(client.ch),
+		"client must already be gone immediately after remove")
+
+	// Let the processor finish the stalled broadcast (~1s).
+	require.Eventually(t, func() bool { return !clientChannels.contains(stallCh) },
+		3*time.Second, 20*time.Millisecond, "stalling client should eventually be reaped by its own broadcast timeout")
+
+	// The removed client must never be resurrected once the processor
+	// catches up - there is no path left by which it could be.
+	require.Never(t, func() bool { return clientChannels.contains(client.ch) },
+		500*time.Millisecond, 20*time.Millisecond,
+		"a client removed while the processor was busy must not be resurrected (orphan entry)")
+
+	cancel()
+
+	select {
+	case <-processorDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("processor did not stop")
+	}
+}
+
 // TestClientChannelMap_RemoveCancelsConnection pins the contract that makes
 // the stalled-client teardown possible: dropping a client from the broadcast
 // set must cancel its connection context. Without it nothing will ever send
