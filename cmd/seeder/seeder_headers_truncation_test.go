@@ -94,7 +94,70 @@ func TestProcessHeaders_TruncatedFile_ReturnsError(t *testing.T) {
 	store := newTestBlockchainStore(t)
 
 	err := processHeaders(context.Background(), ulogger.TestLogger{}, store, path)
-	require.Error(t, err, "a truncated utxo-headers file must not be reported as a successful import")
+	require.ErrorContains(t, err, "truncated",
+		"the record-count validation must be what rejects the file")
+}
+
+// TestProcessHeaders_BoundaryAlignedCut_ReturnsError covers the case a
+// mid-record cut cannot: a file cut exactly on a record boundary produces a
+// genuinely clean io.EOF, indistinguishable from a complete file by any
+// error-inspection fix. Only the record-count check catches it.
+func TestProcessHeaders_BoundaryAlignedCut_ReturnsError(t *testing.T) {
+	genesisRecord := dummyBlockIndexBytes(t, 0)
+
+	// The header claims a tip height of 1 (2 records: heights 0 and 1), but
+	// only the genesis record is present - cut cleanly on a record boundary
+	// rather than mid-record.
+	path := writeUtxoHeadersFile(t, 1, genesisRecord)
+
+	store := newTestBlockchainStore(t)
+
+	err := processHeaders(context.Background(), ulogger.TestLogger{}, store, path)
+	require.ErrorContains(t, err, "truncated",
+		"a boundary-aligned cut yields a clean io.EOF and must be caught by the record-count check")
+}
+
+// TestProcessHeaders_V1File_FinishesCleanly guards the V1 (no-coinbase) path
+// against the new record-count validation: processHeaders still supports V1
+// utxo-headers files, and the invariant applies identically to both formats.
+func TestProcessHeaders_V1File_FinishesCleanly(t *testing.T) {
+	ctx := context.Background()
+	store := newTestBlockchainStore(t)
+
+	genesis, err := store.GetBlockByID(ctx, 0)
+	require.NoError(t, err)
+
+	genesisRecord, err := blockToIndexBytesV1(t, genesis, genesis.Header.Hash())
+	require.NoError(t, err)
+
+	coinbase := makeCoinbaseTx(t, 1, 1)
+	root := coinbase.TxIDChainHash()
+
+	block1 := &model.Block{
+		Header: &model.BlockHeader{
+			Version:        1,
+			Timestamp:      1700000001,
+			Nonce:          1,
+			HashPrevBlock:  genesis.Header.Hash(),
+			HashMerkleRoot: root,
+			Bits:           genesis.Header.Bits,
+		},
+		CoinbaseTx:       coinbase,
+		TransactionCount: 1,
+		Height:           1,
+	}
+	block1Hash := block1.Header.Hash()
+
+	block1Record, err := blockToIndexBytesV1(t, block1, block1Hash)
+	require.NoError(t, err)
+
+	path := writeV1UtxoHeadersFile(t, 1, genesisRecord, block1Record)
+
+	require.NoError(t, processHeaders(ctx, ulogger.TestLogger{}, store, path))
+
+	stored, err := store.GetBlockByID(ctx, 1)
+	require.NoError(t, err)
+	require.Equal(t, block1Hash.String(), stored.Header.Hash().String())
 }
 
 // TestLoadCoinbaseTxs_TruncatedFile_ReturnsError is the same regression, for
@@ -106,7 +169,8 @@ func TestLoadCoinbaseTxs_TruncatedFile_ReturnsError(t *testing.T) {
 	path := writeUtxoHeadersFile(t, 1, firstRecord, secondRecord[:10])
 
 	_, err := loadCoinbaseTxs(ulogger.TestLogger{}, path)
-	require.Error(t, err, "a truncated utxo-headers file must not be reported as a successful import")
+	require.ErrorContains(t, err, "truncated",
+		"the record-count validation must be what rejects the file")
 }
 
 // TestLoadCoinbaseTxs_TruncatedFile_ReturnsPartialMap is the regression test
@@ -180,6 +244,59 @@ func TestLoadCoinbaseTxs_TruncatedFile_ReturnsPartialMap(t *testing.T) {
 	require.False(t, ok, "block2's coinbase was never fully read and must not appear")
 }
 
+// TestLoadCoinbaseTxs_UndecodableRecord_ReturnsPartialMap is the ChiR2
+// regression test for the decode/IO-error exit distinct from truncation: a
+// final record that is read in full (unlike the mid-record cuts above, which
+// hit io.ErrUnexpectedEOF and are caught by the record-count check) but whose
+// coinbase bytes fail to decode as a transaction. Before the fix this path
+// discarded every coinbase read so far; it must now hand back the partial map,
+// just like the count-mismatch path does.
+func TestLoadCoinbaseTxs_UndecodableRecord_ReturnsPartialMap(t *testing.T) {
+	store := newTestBlockchainStore(t)
+	ctx := context.Background()
+
+	genesis, err := store.GetBlockByID(ctx, 0)
+	require.NoError(t, err)
+
+	genesisRecord, err := blockToIndexBytes(t, genesis, genesis.Header.Hash())
+	require.NoError(t, err)
+
+	coinbase1 := makeCoinbaseTx(t, 1, 1)
+	block1 := &model.Block{
+		Header: &model.BlockHeader{
+			Version:        1,
+			Timestamp:      1700000001,
+			Nonce:          1,
+			HashPrevBlock:  genesis.Header.Hash(),
+			HashMerkleRoot: coinbase1.TxIDChainHash(),
+			Bits:           genesis.Header.Bits,
+		},
+		CoinbaseTx:       coinbase1,
+		TransactionCount: 1,
+		Height:           1,
+	}
+	block1Record, err := blockToIndexBytes(t, block1, block1.Header.Hash())
+	require.NoError(t, err)
+
+	// A fully-present final record: 32 (hash) + 4 (height) + 8 (txCount) + 80
+	// (block header) bytes, followed by a coinbase length of 4 and four bytes
+	// that are not a decodable transaction. This reaches the non-EOF error
+	// exit in the read loop, unlike the mid-record cuts used by the truncation
+	// tests above.
+	badRecord := append([]byte{}, block1Record[:124]...)
+	badRecord = append(badRecord, 0x04, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef)
+
+	path := writeUtxoHeadersFile(t, 2, genesisRecord, block1Record, badRecord)
+
+	coinbaseTxs, err := loadCoinbaseTxs(ulogger.TestLogger{}, path)
+	require.Error(t, err, "an undecodable record must still be reported as an error")
+	require.NotNil(t, coinbaseTxs, "the partial map read before the undecodable record must not be discarded")
+
+	got, ok := coinbaseTxs[*coinbase1.TxIDChainHash()]
+	require.True(t, ok, "block1's coinbase was fully read before the undecodable record and must survive in the partial map")
+	require.Equal(t, coinbase1.TxIDChainHash().String(), got.TxIDChainHash().String())
+}
+
 // TestProcessHeaders_CompleteFile_FinishesCleanly is the positive-path
 // counterpart to the truncation regression test above: a well-formed,
 // complete utxo-headers file (tip height matches the number of records
@@ -246,6 +363,68 @@ func blockToIndexBytes(t *testing.T, block *model.Block, hash *chainhash.Hash) (
 	}
 
 	return buf.Bytes(), nil
+}
+
+// blockToIndexBytesV1 serialises a model.Block into the legacy V1 BlockIndex
+// wire format: hash, height, tx count and block header only - no coinbase
+// length/data fields at all. NewUTXOHeaderFromReader(reader, isV1=true) never
+// reads a coinbase field, so a V1 record carries none, unlike
+// BlockIndex.Serialise (which always writes a V2-shaped record).
+func blockToIndexBytesV1(t *testing.T, block *model.Block, hash *chainhash.Hash) ([]byte, error) {
+	t.Helper()
+
+	var buf bytes.Buffer
+
+	if _, err := buf.Write(hash[:]); err != nil {
+		return nil, err
+	}
+
+	var heightBytes [4]byte
+	binary.LittleEndian.PutUint32(heightBytes[:], block.Height)
+
+	if _, err := buf.Write(heightBytes[:]); err != nil {
+		return nil, err
+	}
+
+	var txCountBytes [8]byte
+	binary.LittleEndian.PutUint64(txCountBytes[:], block.TransactionCount)
+
+	if _, err := buf.Write(txCountBytes[:]); err != nil {
+		return nil, err
+	}
+
+	if err := block.Header.ToWireBlockHeader().Serialize(&buf); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+// writeV1UtxoHeadersFile is writeUtxoHeadersFile's V1 counterpart: it emits
+// the legacy "U-H-1.0 " magic instead of the V2 default NewHeader produces, so
+// the read loop takes the isV1 branch.
+func writeV1UtxoHeadersFile(t *testing.T, tipHeight uint32, records ...[]byte) string {
+	t.Helper()
+
+	data := make([]byte, 0)
+	data = append(data, []byte("U-H-1.0 ")...)
+
+	var tipHash chainhash.Hash
+	tipHash[0] = 0xee
+	data = append(data, tipHash[:]...)
+
+	heightBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(heightBytes, tipHeight)
+	data = append(data, heightBytes...)
+
+	for _, r := range records {
+		data = append(data, r...)
+	}
+
+	path := filepath.Join(t.TempDir(), "v1.utxo-headers")
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+
+	return path
 }
 
 // TestLoadCoinbaseTxs_CompleteFile_FinishesCleanly is the positive-path
