@@ -135,7 +135,7 @@ Map lag to the responsible consumer:
 | `txmeta` | Subtree Validation behind |
 | `blocks` | Block Validation behind / catching up |
 | `subtrees` | Subtree Validation behind |
-| `blocksFinal` | Block Persister behind |
+| `blocksFinal` | Legacy P2P behind (Block Persister has no Kafka consumer — it polls Blockchain over gRPC; check `blockpersister_persistSleep` / DB query latency instead) |
 | `rejectedTx` | P2P behind (low impact) |
 
 Lag on `blocks` while the node is in **CATCHINGBLOCKS** is expected during sync — correlate
