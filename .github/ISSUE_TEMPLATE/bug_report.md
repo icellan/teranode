@@ -9,11 +9,11 @@ assignees: ''
 
 ## Severity (required)
 
-Select one and delete the others:
+Tick exactly one (see the [severity criteria](../../docs/howto/bugReporting.md#severity)):
 
-- severity:critical
-- severity:major
-- severity:minor
+- [ ] severity:critical — consensus failure, data loss or corruption, funds at risk, or a node that cannot sync or stay up, with no workaround
+- [ ] severity:major — a core function is broken or badly degraded (sustained throughput loss, a service needing manual restarts), but a workaround exists
+- [ ] severity:minor — cosmetic, documentation, or low-impact issues with an easy workaround
 
 ## Describe the bug
 
