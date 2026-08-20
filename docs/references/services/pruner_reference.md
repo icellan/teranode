@@ -170,14 +170,14 @@ teranode_pruner_active 1
 **Labels:**
 
 - `operation`: Operation where error occurred
-    - `parent_preservation` - Error during Phase 1 parent preservation
+    - `preserve_parents` - Error during Phase 1 parent preservation
     - `expire_preservations` - Error during Phase 1b preservation expiry
     - `dah_pruner` - Error during Phase 2 DAH pruning
 
 **Example:**
 
 ```prometheus
-teranode_pruner_errors_total{operation="parent_preservation"} 0
+teranode_pruner_errors_total{operation="preserve_parents"} 0
 teranode_pruner_errors_total{operation="expire_preservations"} 0
 teranode_pruner_errors_total{operation="dah_pruner"} 2
 ```
@@ -449,7 +449,7 @@ ERROR [PreserveParents] Failed to preserve parent transaction: CRITICAL - aborti
 1. Check `teranode_pruner_errors_total` by operation:
 
     ```prometheus
-    teranode_pruner_errors_total{operation="parent_preservation"}
+    teranode_pruner_errors_total{operation="preserve_parents"}
     teranode_pruner_errors_total{operation="expire_preservations"}
     teranode_pruner_errors_total{operation="dah_pruner"}
     ```
