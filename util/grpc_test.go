@@ -990,6 +990,19 @@ func TestValidateAdminAPIKey(t *testing.T) {
 	}
 }
 
+// TestValidateAdminAPIKey_WhitespaceOnly pins that a whitespace-only key is
+// rejected rather than silently treated as equivalent to empty. Before this
+// fix, TrimSpace(" ") == "" was only used for the placeholder-blocklist
+// comparison, and the untrimmed " " was installed as the real credential -
+// so auth was enabled with a key no client could realistically present intact
+// over a header.
+func TestValidateAdminAPIKey_WhitespaceOnly(t *testing.T) {
+	require.Error(t, ValidateAdminAPIKey(" "))
+	require.Error(t, ValidateAdminAPIKey("   "))
+	require.Error(t, ValidateAdminAPIKey("\t"))
+	require.Error(t, ValidateAdminAPIKey(" a-real-secret "), "a key with surrounding whitespace must be refused, not silently trimmed")
+}
+
 // TestPanicRecoveryInterceptors covers the structural fix for the
 // slice-to-array panic class: grpc-go does not recover handler panics, so
 // without these interceptors a single malformed request kills the process.
