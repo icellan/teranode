@@ -759,14 +759,18 @@ func (s *Store) rollbackPartialSpends(tx *bt.Tx, result *spendCompletionResult, 
 	// identity, or creating the spending tx's record before spending its
 	// parents — tracked in #1291; the outcome metrics here make the residual
 	// window measurable in the meantime.
-	unspendErr := s.Unspend(rbCtx, result.spentSpends)
+	// Call the counting form, not Unspend: the counter must be a ref count so it
+	// means the same thing as the sql store's counter of the same name. Aggregating
+	// calls on one backend and dangling refs on the other would be exactly the
+	// per-backend drift the shared outcome labels exist to prevent.
+	unspendFailed, unspendErr := s.unspend(rbCtx, result.spentSpends)
 	if unspendErr != nil {
 		if prometheusUtxoSpendRollbackFailed != nil {
-			prometheusUtxoSpendRollbackFailed.Inc()
+			prometheusUtxoSpendRollbackFailed.Add(float64(unspendFailed))
 		}
 
-		s.logger.Errorf("[SPEND][%s] failed to fully roll back %d partial spend(s) (%s): %v",
-			tx.TxID(), len(result.spentSpends), phase, unspendErr)
+		s.logger.Errorf("[SPEND][%s] rolled back %d of %d partial spend(s), %d left dangling (%s): %v",
+			tx.TxID(), len(result.spentSpends)-unspendFailed, len(result.spentSpends), unspendFailed, phase, unspendErr)
 
 		return
 	}

@@ -287,7 +287,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "aerospike",
 			Name:      "utxo_spend_rollback_failed",
-			Help:      "Partial-spend rollbacks that failed, each leaving potential dangling spender refs",
+			Help:      "Spends that could not be reverted by a partial-spend rollback, i.e. potential dangling spender refs left behind (a count of spends, not of calls)",
 		},
 	)
 

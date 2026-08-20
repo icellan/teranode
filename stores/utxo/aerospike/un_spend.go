@@ -96,7 +96,9 @@ import (
 //   - Handles concurrent unspend operations
 //   - Coordinates with external storage
 func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked ...bool) (err error) {
-	return s.unspend(ctx, spends, flagAsLocked...)
+	_, err = s.unspend(ctx, spends, flagAsLocked...)
+
+	return err
 }
 
 // unspend implements the core unspend logic.
@@ -123,7 +125,11 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 // exactly the case that left the most uncompensated state. It now treats a failed
 // step 2 as partially committed for that reason. Any future caller deciding
 // "did this happen?" from the error alone needs the same treatment.
-func (s *Store) unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked ...bool) (err error) {
+// unspend returns how many spends could NOT be reverted alongside the aggregated
+// error, so the partial-spend rollback can count dangling refs rather than failed
+// calls — the sql store's counter of the same name is a ref count, and a fleet
+// dashboard summing the two must not mix units.
+func (s *Store) unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked ...bool) (failed int, err error) {
 	var errs []error
 
 loop:
@@ -161,7 +167,7 @@ loop:
 	}
 
 	if len(errs) == 0 {
-		return nil
+		return 0, nil
 	}
 
 	// Best-effort-over-all: every spend in the batch is attempted (unless the
@@ -169,7 +175,7 @@ loop:
 	// failed index is exactly the dangling "ghost spender" reference this
 	// rollback exists to unwind. Aggregate with a hard cap so a mass failure
 	// on a wide transaction doesn't build an O(N^2) error chain.
-	return errors.NewStorageError("error un-spending %d of %d utxos", len(errs), len(spends), errors.JoinCapped(maxAggregatedSpendErrs, errs...))
+	return len(errs), errors.NewStorageError("error un-spending %d of %d utxos", len(errs), len(spends), errors.JoinCapped(maxAggregatedSpendErrs, errs...))
 }
 
 // unspendLua executes the Lua script for a single UTXO unspend.
