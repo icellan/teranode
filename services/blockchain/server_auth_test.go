@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/model"
@@ -28,6 +29,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -38,7 +40,7 @@ import (
 // omission. Mirrors services/p2p/server_auth_test.go's
 // TestAdminProtectedMethodsCoverAllRPCs.
 func TestProtectedMethodsCoverAllRPCs(t *testing.T) {
-	protected := protectedMethods()
+	protected := protectedMethods
 
 	checkCoverage := func(t *testing.T, serviceName string, methods []grpc.MethodDesc, public map[string]bool) {
 		t.Helper()
@@ -54,7 +56,7 @@ func TestProtectedMethodsCoverAllRPCs(t *testing.T) {
 
 			require.False(t, isProtected && isPublic, "%s is both protected and public", fullMethod)
 			require.True(t, isProtected || isPublic,
-				"%s is not classified: add it to protectedMethods() (state-mutating RPC) or the public list in this test (read-only)", fullMethod)
+				"%s is not classified: add it to protectedMethods (state-mutating RPC) or the public list in this test (read-only)", fullMethod)
 		}
 
 		for method := range public {
@@ -84,7 +86,7 @@ func TestProtectedMethodsCoverAllRPCs(t *testing.T) {
 	// BlockchainAPI declares one streaming RPC, Subscribe. The auth
 	// interceptor installed in util.StartGRPCServer is unary-only (see
 	// util/grpc.go), so Subscribe bypasses authentication entirely and
-	// cannot be added to protectedMethods(). It is deliberately left
+	// cannot be added to protectedMethods. It is deliberately left
 	// unauthenticated rather than silently exempted: it only pushes
 	// server-initiated block/subtree/FSM notifications to the caller, so an
 	// unauthenticated subscriber can observe but not mutate chain state.
@@ -110,7 +112,7 @@ func TestProtectedMethodsCoverAllRPCs(t *testing.T) {
 func TestAuthInterceptorProtectsSendNotification(t *testing.T) {
 	const apiKey = "test-admin-key"
 
-	interceptor := util.CreateAuthInterceptor(apiKey, protectedMethods())
+	interceptor := util.CreateAuthInterceptor(apiKey, protectedMethods)
 
 	handlerCalled := false
 	handler := func(ctx context.Context, req any) (any, error) {
@@ -161,7 +163,7 @@ func TestAuthInterceptorProtectsSendNotification(t *testing.T) {
 func TestAuthInterceptorProtectsReportPeerFailureAndSetBlockSubtreesSet(t *testing.T) {
 	const apiKey = "test-admin-key"
 
-	interceptor := util.CreateAuthInterceptor(apiKey, protectedMethods())
+	interceptor := util.CreateAuthInterceptor(apiKey, protectedMethods)
 
 	handlerCalled := false
 	handler := func(ctx context.Context, req any) (any, error) {
@@ -423,6 +425,15 @@ func TestSanitizeSubscriberSource(t *testing.T) {
 	require.Equal(t, "evilINFO fake log line", sanitizeSubscriberSource("evil\nINFO fake log line"))
 	require.Len(t, sanitizeSubscriberSource(strings.Repeat("x", 1024)), 64)
 
+	// A multi-byte rune sitting exactly on the 64-byte truncation boundary
+	// must not be split in half: the result must stay valid UTF-8, or
+	// protobuf refuses to marshal it into GetSubscribersResponse.sources.
+	multiByte := strings.Repeat("a", 63) + "é" // 'é' is 2 bytes, so byte 64 lands mid-rune
+	sanitized := sanitizeSubscriberSource(multiByte)
+	require.True(t, utf8.ValidString(sanitized), "sanitized source must be valid UTF-8, got %q", sanitized)
+	_, err := proto.Marshal(&blockchain_api.GetSubscribersResponse{Sources: []string{sanitized}})
+	require.NoError(t, err, "sanitized source must marshal into the public GetSubscribers response")
+
 	require.Equal(t, SubscriberP2P, metricSourceLabel(SubscriberP2P))
 	require.Equal(t, "other", metricSourceLabel(strings.Repeat("x", 64)))
 	require.Equal(t, "other", metricSourceLabel("unknown"))
@@ -498,7 +509,7 @@ func TestGRPCAuthIsWiredIntoStart(t *testing.T) {
 	defer callCancel()
 
 	_, err = client.SendNotification(callCtx, notification)
-	require.Equal(t, codes.Unauthenticated, status.Code(err), "SendNotification must be rejected without the API key - protectedMethods() is not wired into Start()")
+	require.Equal(t, codes.Unauthenticated, status.Code(err), "SendNotification must be rejected without the API key - protectedMethods is not wired into Start()")
 
 	authedCtx := metadata.AppendToOutgoingContext(callCtx, "x-api-key", apiKey)
 	_, err = client.SendNotification(authedCtx, notification)
@@ -671,7 +682,13 @@ func TestHeightRangeBoundsRejectUnboundedRequests(t *testing.T) {
 	// TestPreallocBounds in stores/blockchain/sql.
 
 	_, err = b.GetMedianTimePastByHeights(ctx, &blockchain_api.GetMedianTimePastByHeightsRequest{
-		Heights: make([]uint32, maxMedianTimePastHeights+1),
+		Heights: make([]uint32, defaultMaxMedianTimePastHeights+1),
 	})
 	require.Error(t, err, "an oversized heights list must be rejected")
+
+	_, err = b.GetBlockHeaders(ctx, &blockchain_api.GetBlockHeadersRequest{
+		StartHash:       make([]byte, chainhash.HashSize),
+		NumberOfHeaders: maxBlockHeadersPerRequest + 1,
+	})
+	require.Error(t, err, "an oversized numberOfHeaders must be rejected before it reaches the store LIMIT")
 }

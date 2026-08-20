@@ -140,11 +140,11 @@ func (c *PeerRegistryClient) log() ulogger.Logger {
 // It reuses the same address as the blockchain service since PeerRegistryService is served on the same port.
 func NewPeerRegistryClient(ctx context.Context, address string, tSettings *settings.Settings) (PeerRegistryClientI, error) {
 	// Include the admin API key so the admin-protected PeerRegistryService
-	// RPCs (see protectedMethods() in Server.go) accept calls made through
+	// RPCs (see protectedMethods in Server.go) accept calls made through
 	// this client.
 	conn, err := util.GetGRPCClient(ctx, address, &util.ConnectionOptions{
 		APIKey:        tSettings.GRPCAdminAPIKey,
-		APIKeyMethods: protectedMethods(),
+		APIKeyMethods: protectedMethods,
 	}, tSettings)
 	if err != nil {
 		return nil, err

@@ -44,11 +44,20 @@ var placeholderAdminAPIKeys = map[string]bool{
 	"admin":    true,
 }
 
-// ValidateAdminAPIKey rejects known-placeholder admin API keys. An empty key is
-// allowed and means "admin auth disabled" - that is a visible, warned-about
-// posture. A placeholder key is not, so it is a hard configuration error.
+// ValidateAdminAPIKey rejects known-placeholder admin API keys, and any key
+// that differs from its own trimmed form. The latter catches a
+// whitespace-only key: TrimSpace collapses it to "", so without this check it
+// would compare equal to no placeholder, install the auth interceptor, and
+// then depend on the transport preserving leading/trailing whitespace in a
+// header - a confusing outage waiting to happen. An empty key is allowed and
+// means "admin auth disabled" - that is a visible, warned-about posture. A
+// placeholder key is not, so it is a hard configuration error.
 func ValidateAdminAPIKey(apiKey string) error {
-	if placeholderAdminAPIKeys[strings.ToLower(strings.TrimSpace(apiKey))] {
+	if trimmed := strings.TrimSpace(apiKey); trimmed != apiKey {
+		return errors.NewConfigurationError("grpc_admin_api_key has leading or trailing whitespace - remove it, or leave the key empty to run with admin auth explicitly disabled")
+	}
+
+	if placeholderAdminAPIKeys[strings.ToLower(apiKey)] {
 		return errors.NewConfigurationError("grpc_admin_api_key is set to the known placeholder value %q - set a real secret, or leave it empty to run with admin auth explicitly disabled", apiKey)
 	}
 

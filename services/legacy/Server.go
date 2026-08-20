@@ -639,10 +639,42 @@ func (s *Server) resolveAdminAPIKey() (string, error) {
 	}
 
 	if apiKey == "" {
-		s.logger.Warnf("[Legacy] grpc_admin_api_key is not set; admin-protected RPCs (BanPeer, UnbanPeer) are unauthenticated - set grpc_admin_api_key to secure them")
+		s.logger.Warnf("[Legacy] grpc_admin_api_key is not set; admin-protected RPCs (BanPeer, UnbanPeer, ClearBanned) are unauthenticated - set grpc_admin_api_key to secure them")
 	}
 
 	return apiKey, nil
+}
+
+// protectedMethods is the full gRPC method paths of every state-mutating RPC
+// on PeerService; the auth interceptor requires the admin API key for these.
+// ClearBanned wipes the entire ban list in one call - a strict superset of
+// UnbanPeer, which sits next to it here - so leaving it out would let an
+// attacker unban everyone at once while still being unable to call UnbanPeer
+// directly. Any new mutating RPC must be added here; the classification is
+// enforced by TestProtectedMethodsCoverAllRPCs.
+var protectedMethods = map[string]bool{
+	"/peer_api.PeerService/BanPeer":     true,
+	"/peer_api.PeerService/UnbanPeer":   true,
+	"/peer_api.PeerService/ClearBanned": true,
+}
+
+// publicPeerServiceMethods are the PeerService RPCs deliberately reachable
+// without the admin API key. This lives here, next to protectedMethods,
+// rather than in a test file: it is a production statement of intent about
+// which RPCs an operator is choosing to leave open, and the classification
+// test asserts against it rather than owning it.
+var publicPeerServiceMethods = map[string]bool{
+	// Read-only: reports whether a single IP/subnet is banned, no different in
+	// sensitivity from ListBanned below.
+	"/peer_api.PeerService/IsBanned": true,
+	// Read-only: the full ban list is already disclosed piecemeal via IsBanned,
+	// and other services query it without admin credentials.
+	"/peer_api.PeerService/ListBanned": true,
+	// Read-only: discloses connected-peer topology, mirrored by p2p's own
+	// public GetPeers/GetPeer equivalents.
+	"/peer_api.PeerService/GetPeers": true,
+	// Read-only: a single count, no different in sensitivity than GetPeers.
+	"/peer_api.PeerService/GetPeerCount": true,
 }
 
 func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
@@ -670,13 +702,7 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	apiKey, err := s.resolveAdminAPIKey()
 	if err != nil {
-		return errors.WrapGRPC(err)
-	}
-
-	// Define protected methods - use the full gRPC method path
-	protectedMethods := map[string]bool{
-		"/peer_api.PeerService/BanPeer":   true,
-		"/peer_api.PeerService/UnbanPeer": true,
+		return err
 	}
 
 	// Create auth options

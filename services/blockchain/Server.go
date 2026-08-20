@@ -474,17 +474,15 @@ func (b *Blockchain) Init(ctx context.Context) error {
 // - Error if any part of the startup sequence fails, nil on successful startup
 
 const (
-	// maxBlocksByHeightRange bounds the height window GetBlocksByHeight will
-	// serve. Full blocks are the most expensive thing this service hands out
-	// and the RPC is unauthenticated, so an unbounded window is a free
-	// out-of-memory primitive. No in-tree caller asks for more than this.
-	maxBlocksByHeightRange = 2000
-
-	// maxMedianTimePastHeights bounds the number of heights a single
-	// GetMedianTimePastByHeights call may ask about. The request is a
-	// caller-supplied slice on an unauthenticated RPC, and its min/max drive a
-	// header range read.
-	maxMedianTimePastHeights = 10000
+	// defaultMaxBlocksByHeightRange and defaultMaxMedianTimePastHeights are the
+	// fallback bounds used when settings is nil (as in some unit tests that
+	// construct a bare Blockchain{}); production code always goes through the
+	// settings-backed BlockChain.MaxBlocksByHeightRange /
+	// BlockChain.MaxMedianTimePastHeights so operators can raise either bound
+	// without a rebuild. See [Blockchain][maxBlocksByHeightRange] and
+	// [Blockchain][maxMedianTimePastHeights].
+	defaultMaxBlocksByHeightRange   = 2000
+	defaultMaxMedianTimePastHeights = 10000
 
 	// Notification payload bounds. The type/hash fields are validated exactly;
 	// these bound the two free-form fields so a single accepted notification
@@ -492,7 +490,43 @@ const (
 	maxNotificationBaseURLLen       = 256
 	maxNotificationMetadataEntries  = 16
 	maxNotificationMetadataFieldLen = 256
+
+	// maxBlockHeadersPerRequest bounds GetBlockHeaders' caller-supplied
+	// numberOfHeaders. The store's preallocFor already bounds the initial
+	// slice capacity, but not the result set: the value flows straight into a
+	// SQL LIMIT, so an oversized request still walks and returns the entire
+	// chain. This RPC is unauthenticated. The bound is generous rather than
+	// tight because legitimate callers (e.g. BlockAssembler's chain-movement
+	// catch-up) can legitimately ask for tens of thousands of headers.
+	maxBlockHeadersPerRequest = 1_000_000
 )
+
+// maxBlocksByHeightRange bounds the height window GetBlocksByHeight will
+// serve. Full blocks are the most expensive thing this service hands out and
+// the RPC is unauthenticated, so an unbounded window is a free out-of-memory
+// primitive. Settings-backed so an operator can raise it without a rebuild;
+// defaultMaxBlocksByHeightRange is used only when settings is nil.
+func (b *Blockchain) maxBlocksByHeightRange() int {
+	if b.settings == nil || b.settings.BlockChain.MaxBlocksByHeightRange <= 0 {
+		return defaultMaxBlocksByHeightRange
+	}
+
+	return b.settings.BlockChain.MaxBlocksByHeightRange
+}
+
+// maxMedianTimePastHeights bounds the number of heights a single
+// GetMedianTimePastByHeights call may ask about. The request is a
+// caller-supplied slice on an unauthenticated RPC, and its min/max drive a
+// header range read. Settings-backed so an operator can raise it without a
+// rebuild; Client.GetMedianTimePastRange chunks into batches of at most this
+// size so raising or lowering it never breaks that first-party caller.
+func (b *Blockchain) maxMedianTimePastHeights() int {
+	if b.settings == nil || b.settings.BlockChain.MaxMedianTimePastHeights <= 0 {
+		return defaultMaxMedianTimePastHeights
+	}
+
+	return b.settings.BlockChain.MaxMedianTimePastHeights
+}
 
 // knownSubscriberSources is the closed set of in-tree Subscribe() sources. It
 // exists so a caller-supplied source string can never become a new Prometheus
@@ -544,7 +578,14 @@ func sanitizeSubscriberSource(source string) string {
 	}
 
 	if len(cleaned) > maxSubscriberSourceLen {
-		cleaned = cleaned[:maxSubscriberSourceLen]
+		// Truncate on a rune boundary, not a byte offset: source arrives via
+		// protobuf unmarshal (which guarantees valid UTF-8), but slicing at an
+		// arbitrary byte offset can split a multi-byte rune in half, and
+		// protobuf refuses to marshal an invalid UTF-8 string field. That would
+		// break the public GetSubscribers RPC for as long as the offending
+		// stream stays open.
+		truncated := cleaned[:maxSubscriberSourceLen]
+		cleaned = strings.ToValidUTF8(truncated, "")
 	}
 
 	return cleaned
@@ -555,7 +596,7 @@ func sanitizeSubscriberSource(source string) string {
 // An empty key is returned as-is rather than replaced with a generated one:
 // util.StartGRPCServer only installs the auth interceptor when the key is
 // non-empty, so a generated key no client could ever learn would just mask
-// the fact that the RPCs in protectedMethods() are unauthenticated. A single
+// the fact that the RPCs in protectedMethods are unauthenticated. A single
 // warning is logged in that case so the exposure is visible. A known
 // placeholder key is refused outright: it would install the interceptor and
 // claim the surface is protected while the credential is public knowledge.
@@ -572,10 +613,12 @@ func (b *Blockchain) resolveAdminAPIKey() (string, error) {
 	return apiKey, nil
 }
 
-// protectedMethods returns the full gRPC method paths of every state-mutating
-// RPC on BlockchainAPI and PeerRegistryService (both served on the same
-// listener, see [Blockchain][Start]); the auth interceptor requires the
-// admin API key for these.
+// protectedMethods is the full gRPC method paths of every state-mutating RPC
+// on BlockchainAPI and PeerRegistryService (both served on the same listener,
+// see [Blockchain][Start]); the auth interceptor requires the admin API key
+// for these. A package-level var rather than a function: the map never
+// changes after init, and constructing a fresh ~60-entry map on every call
+// (including once per NewClientWithAddress) is wasted work.
 //
 // The criterion is what the handler's underlying store call actually does, not
 // what its name suggests: GetNextBlockID reads like a query but allocates from
@@ -583,9 +626,12 @@ func (b *Blockchain) resolveAdminAPIKey() (string, error) {
 // stay unauthenticated because other services call them without admin
 // credentials - note that "unauthenticated" is a statement about access
 // control only, and says nothing about cost: a public method must separately
-// bound any allocation the caller can drive (see the range clamps in
-// GetBlocksByHeight, GetBlockHeadersByHeight, GetBlockHeaders and
-// GetMedianTimePastByHeights).
+// bound any allocation the caller can drive - see the range clamps in
+// GetBlocksByHeight, GetBlockHeaders and GetMedianTimePastByHeights.
+// GetBlockHeadersByHeight is the one exception, and deliberately so: its
+// window is uncapped on purpose because utxopersister legitimately asks for
+// 1..tip in one call (see its own doc comment), so only the store-side
+// preallocation is bounded there, not the window itself.
 //
 // SendNotification,
 // ReportPeerFailure and SetBlockSubtreesSet are protected together: the
@@ -594,60 +640,58 @@ func (b *Blockchain) resolveAdminAPIKey() (string, error) {
 // attacker reach the same b.notifications flood vector without ever calling
 // SendNotification. Any new mutating RPC must be added here; the
 // classification is enforced by TestProtectedMethodsCoverAllRPCs.
-func protectedMethods() map[string]bool {
-	return map[string]bool{
-		// BlockchainAPI - state mutation.
-		"/blockchain_api.BlockchainAPI/AddBlock":                   true,
-		"/blockchain_api.BlockchainAPI/InvalidateBlock":            true,
-		"/blockchain_api.BlockchainAPI/RevalidateBlock":            true,
-		"/blockchain_api.BlockchainAPI/SendNotification":           true,
-		"/blockchain_api.BlockchainAPI/SetState":                   true,
-		"/blockchain_api.BlockchainAPI/AssignBlockID":              true,
-		"/blockchain_api.BlockchainAPI/GetNextBlockID":             true,
-		"/blockchain_api.BlockchainAPI/SetBlockMinedSet":           true,
-		"/blockchain_api.BlockchainAPI/ClearBlockMinedSet":         true,
-		"/blockchain_api.BlockchainAPI/SetBlockSubtreesSet":        true,
-		"/blockchain_api.BlockchainAPI/SetBlockPersistedAt":        true,
-		"/blockchain_api.BlockchainAPI/SetBlockProcessedAt":        true,
-		"/blockchain_api.BlockchainAPI/SendFSMEvent":               true,
-		"/blockchain_api.BlockchainAPI/Run":                        true,
-		"/blockchain_api.BlockchainAPI/CatchUpBlocks":              true,
-		"/blockchain_api.BlockchainAPI/Idle":                       true,
-		"/blockchain_api.BlockchainAPI/ReportPeerFailure":          true,
-		"/blockchain_api.BlockchainAPI/ScheduleBlobDeletion":       true,
-		"/blockchain_api.BlockchainAPI/CancelBlobDeletion":         true,
-		"/blockchain_api.BlockchainAPI/RemoveBlobDeletion":         true,
-		"/blockchain_api.BlockchainAPI/IncrementBlobDeletionRetry": true,
-		"/blockchain_api.BlockchainAPI/CompleteBlobDeletions":      true,
-		"/blockchain_api.BlockchainAPI/AcquireBlobDeletionBatch":   true,
-		"/blockchain_api.BlockchainAPI/CompleteBlobDeletionBatch":  true,
+var protectedMethods = map[string]bool{
+	// BlockchainAPI - state mutation.
+	"/blockchain_api.BlockchainAPI/AddBlock":                   true,
+	"/blockchain_api.BlockchainAPI/InvalidateBlock":            true,
+	"/blockchain_api.BlockchainAPI/RevalidateBlock":            true,
+	"/blockchain_api.BlockchainAPI/SendNotification":           true,
+	"/blockchain_api.BlockchainAPI/SetState":                   true,
+	"/blockchain_api.BlockchainAPI/AssignBlockID":              true,
+	"/blockchain_api.BlockchainAPI/GetNextBlockID":             true,
+	"/blockchain_api.BlockchainAPI/SetBlockMinedSet":           true,
+	"/blockchain_api.BlockchainAPI/ClearBlockMinedSet":         true,
+	"/blockchain_api.BlockchainAPI/SetBlockSubtreesSet":        true,
+	"/blockchain_api.BlockchainAPI/SetBlockPersistedAt":        true,
+	"/blockchain_api.BlockchainAPI/SetBlockProcessedAt":        true,
+	"/blockchain_api.BlockchainAPI/SendFSMEvent":               true,
+	"/blockchain_api.BlockchainAPI/Run":                        true,
+	"/blockchain_api.BlockchainAPI/CatchUpBlocks":              true,
+	"/blockchain_api.BlockchainAPI/Idle":                       true,
+	"/blockchain_api.BlockchainAPI/ReportPeerFailure":          true,
+	"/blockchain_api.BlockchainAPI/ScheduleBlobDeletion":       true,
+	"/blockchain_api.BlockchainAPI/CancelBlobDeletion":         true,
+	"/blockchain_api.BlockchainAPI/RemoveBlobDeletion":         true,
+	"/blockchain_api.BlockchainAPI/IncrementBlobDeletionRetry": true,
+	"/blockchain_api.BlockchainAPI/CompleteBlobDeletions":      true,
+	"/blockchain_api.BlockchainAPI/AcquireBlobDeletionBatch":   true,
+	"/blockchain_api.BlockchainAPI/CompleteBlobDeletionBatch":  true,
 
-		// PeerRegistryService - state mutation.
-		"/blockchain_api.PeerRegistryService/RegisterPeer":                true,
-		"/blockchain_api.PeerRegistryService/UpdatePeerMetrics":           true,
-		"/blockchain_api.PeerRegistryService/RemovePeer":                  true,
-		"/blockchain_api.PeerRegistryService/AddBanScore":                 true,
-		"/blockchain_api.PeerRegistryService/ClearBannedPeers":            true,
-		"/blockchain_api.PeerRegistryService/UpdateConnectionState":       true,
-		"/blockchain_api.PeerRegistryService/UpdateLastMessageTime":       true,
-		"/blockchain_api.PeerRegistryService/UpdateStorage":               true,
-		"/blockchain_api.PeerRegistryService/RecordSyncAttempt":           true,
-		"/blockchain_api.PeerRegistryService/ClearAllSyncAttempts":        true,
-		"/blockchain_api.PeerRegistryService/RecordBlockReceived":         true,
-		"/blockchain_api.PeerRegistryService/RecordSubtreeReceived":       true,
-		"/blockchain_api.PeerRegistryService/RecordTransactionReceived":   true,
-		"/blockchain_api.PeerRegistryService/RecordCatchupError":          true,
-		"/blockchain_api.PeerRegistryService/RecordCatchupAttempt":        true,
-		"/blockchain_api.PeerRegistryService/RecordCatchupSuccess":        true,
-		"/blockchain_api.PeerRegistryService/RecordCatchupFailure":        true,
-		"/blockchain_api.PeerRegistryService/ResetReputation":             true,
-		"/blockchain_api.PeerRegistryService/ReconsiderBadPeers":          true,
-		"/blockchain_api.PeerRegistryService/RecordValidatedPeerProgress": true,
-	}
+	// PeerRegistryService - state mutation.
+	"/blockchain_api.PeerRegistryService/RegisterPeer":                true,
+	"/blockchain_api.PeerRegistryService/UpdatePeerMetrics":           true,
+	"/blockchain_api.PeerRegistryService/RemovePeer":                  true,
+	"/blockchain_api.PeerRegistryService/AddBanScore":                 true,
+	"/blockchain_api.PeerRegistryService/ClearBannedPeers":            true,
+	"/blockchain_api.PeerRegistryService/UpdateConnectionState":       true,
+	"/blockchain_api.PeerRegistryService/UpdateLastMessageTime":       true,
+	"/blockchain_api.PeerRegistryService/UpdateStorage":               true,
+	"/blockchain_api.PeerRegistryService/RecordSyncAttempt":           true,
+	"/blockchain_api.PeerRegistryService/ClearAllSyncAttempts":        true,
+	"/blockchain_api.PeerRegistryService/RecordBlockReceived":         true,
+	"/blockchain_api.PeerRegistryService/RecordSubtreeReceived":       true,
+	"/blockchain_api.PeerRegistryService/RecordTransactionReceived":   true,
+	"/blockchain_api.PeerRegistryService/RecordCatchupError":          true,
+	"/blockchain_api.PeerRegistryService/RecordCatchupAttempt":        true,
+	"/blockchain_api.PeerRegistryService/RecordCatchupSuccess":        true,
+	"/blockchain_api.PeerRegistryService/RecordCatchupFailure":        true,
+	"/blockchain_api.PeerRegistryService/ResetReputation":             true,
+	"/blockchain_api.PeerRegistryService/ReconsiderBadPeers":          true,
+	"/blockchain_api.PeerRegistryService/RecordValidatedPeerProgress": true,
 }
 
 // publicBlockchainAPIMethods are the BlockchainAPI RPCs deliberately reachable
-// without the admin API key. This lives here, next to protectedMethods(),
+// without the admin API key. This lives here, next to protectedMethods,
 // rather than in a test file: it is a production statement of intent about
 // which RPCs an operator is choosing to leave open, and the classification
 // test asserts against it rather than owning it.
@@ -768,18 +812,24 @@ func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	// Start batch token cleanup
 	go b.cleanupExpiredBatchTokens()
 
-	if err := b.startHTTP(ctx); err != nil {
-		return errors.WrapGRPC(err)
-	}
-
+	// Resolve (and validate) the admin key before starting the HTTP admin
+	// routes: requireAdminAPIKey reads b.settings.GRPCAdminAPIKey directly, but
+	// resolveAdminAPIKey is also where a placeholder key is rejected outright.
+	// Starting HTTP first meant a rejected/placeholder key still had a window
+	// where the HTTP listener accepted admin requests before Start returned
+	// the config error.
 	apiKey, err := b.resolveAdminAPIKey()
 	if err != nil {
-		return errors.WrapGRPC(err)
+		return err
+	}
+
+	if err := b.startHTTP(ctx); err != nil {
+		return err
 	}
 
 	authOptions := &util.AuthOptions{
 		APIKey:           apiKey,
-		ProtectedMethods: protectedMethods(),
+		ProtectedMethods: protectedMethods,
 	}
 
 	// this will block
@@ -2028,6 +2078,10 @@ func (b *Blockchain) GetBlockHeaders(ctx context.Context, req *blockchain_api.Ge
 		return nil, errors.WrapGRPC(errors.NewBlockNotFoundError("[Blockchain][GetBlockHeaders] request's hash is not valid", err))
 	}
 
+	if req.NumberOfHeaders > maxBlockHeadersPerRequest {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlockHeaders] %d headers requested, maximum is %d", req.NumberOfHeaders, maxBlockHeadersPerRequest))
+	}
+
 	blockHeaders, blockHeaderMetas, err := b.store.GetBlockHeaders(ctx, startHash, req.NumberOfHeaders)
 	if err != nil {
 		return nil, errors.WrapGRPC(err)
@@ -2220,8 +2274,8 @@ func (b *Blockchain) GetMedianTimePastByHeights(ctx context.Context, req *blockc
 	)
 	defer deferFn()
 
-	if len(req.Heights) > maxMedianTimePastHeights {
-		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetMedianTimePastByHeights] %d heights requested, maximum is %d", len(req.Heights), maxMedianTimePastHeights))
+	if maxHeights := b.maxMedianTimePastHeights(); len(req.Heights) > maxHeights {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetMedianTimePastByHeights] %d heights requested, maximum is %d", len(req.Heights), maxHeights))
 	}
 
 	mtps, err := b.GetMedianTimePastForHeights(ctx, req.Heights)
@@ -2262,8 +2316,8 @@ func (b *Blockchain) GetBlocksByHeight(ctx context.Context, req *blockchain_api.
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlocksByHeight] endHeight %d is below startHeight %d", req.EndHeight, req.StartHeight))
 	}
 
-	if req.EndHeight-req.StartHeight >= maxBlocksByHeightRange {
-		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlocksByHeight] height range %d..%d exceeds the maximum of %d blocks", req.StartHeight, req.EndHeight, maxBlocksByHeightRange))
+	if maxRange := b.maxBlocksByHeightRange(); req.EndHeight-req.StartHeight >= uint32(maxRange) {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlocksByHeight] height range %d..%d exceeds the maximum of %d blocks", req.StartHeight, req.EndHeight, maxRange))
 	}
 
 	blocks, err := b.store.GetBlocksByHeight(ctx, req.StartHeight, req.EndHeight)

@@ -1029,7 +1029,7 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 	apiKey, err := s.resolveAdminAPIKey()
 	if err != nil {
-		return errors.WrapGRPC(err)
+		return err
 	}
 
 	// Create auth options
