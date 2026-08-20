@@ -77,12 +77,14 @@ Located in `/services/pruner/metrics.go`:
 
 - `operation`: Operation type
     - `preserve_parents` - Phase 1: Parent preservation
+    - `expire_preservations` - Phase 1b: Expiring old parent preservations
     - `dah_pruner` - Phase 2: DAH pruning
 
 **Example:**
 
 ```prometheus
 teranode_pruner_duration_seconds{operation="preserve_parents"} 1.234
+teranode_pruner_duration_seconds{operation="expire_preservations"} 0.456
 teranode_pruner_duration_seconds{operation="dah_pruner"} 5.678
 ```
 
@@ -95,16 +97,18 @@ teranode_pruner_duration_seconds{operation="dah_pruner"} 5.678
 **Labels:**
 
 - `reason`: Reason for skipping
-    - `not_running` - Block Assembly not in RUNNING state
-    - `no_new_height` - No new block height to process
-    - `already_in_progress` - Pruning already running
+    - `block_assembly_timeout` - Timed out or errored waiting for Block Assembly to be ready
+    - `below_min_height` - Block height at or below `pruner_minBlockHeight`
+    - `fsm_error` - Failed to read the blockchain FSM state
+    - `catchup_mode` - Node is in the CATCHINGBLOCKS FSM state and `pruner_skipDuringCatchup` is set
 
 **Example:**
 
 ```prometheus
-teranode_pruner_skipped_total{reason="not_running"} 42
-teranode_pruner_skipped_total{reason="already_in_progress"} 10
-teranode_pruner_skipped_total{reason="preserve_failed"} 0
+teranode_pruner_skipped_total{reason="block_assembly_timeout"} 42
+teranode_pruner_skipped_total{reason="below_min_height"} 10
+teranode_pruner_skipped_total{reason="fsm_error"} 0
+teranode_pruner_skipped_total{reason="catchup_mode"} 7
 ```
 
 **Note**: When defensive mode is enabled, skipped records are logged but not tracked as a separate metric label. Monitor logs for "Defensive skip" messages.
@@ -166,16 +170,16 @@ teranode_pruner_active 1
 **Labels:**
 
 - `operation`: Operation where error occurred
-    - `preserve_parents` - Error during parent preservation
-    - `dah_pruner` - Error during DAH pruning
-    - `state_check` - Error checking Block Assembly state
+    - `parent_preservation` - Error during Phase 1 parent preservation
+    - `expire_preservations` - Error during Phase 1b preservation expiry
+    - `dah_pruner` - Error during Phase 2 DAH pruning
 
 **Example:**
 
 ```prometheus
-teranode_pruner_errors_total{operation="preserve_parents"} 0
+teranode_pruner_errors_total{operation="parent_preservation"} 0
+teranode_pruner_errors_total{operation="expire_preservations"} 0
 teranode_pruner_errors_total{operation="dah_pruner"} 2
-teranode_pruner_errors_total{operation="state_check"} 0
 ```
 
 ### Store-Level Metrics
@@ -445,7 +449,8 @@ ERROR [PreserveParents] Failed to preserve parent transaction: CRITICAL - aborti
 1. Check `teranode_pruner_errors_total` by operation:
 
     ```prometheus
-    teranode_pruner_errors_total{operation="preserve_parents"}
+    teranode_pruner_errors_total{operation="parent_preservation"}
+    teranode_pruner_errors_total{operation="expire_preservations"}
     teranode_pruner_errors_total{operation="dah_pruner"}
     ```
 
