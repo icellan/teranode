@@ -72,7 +72,7 @@ func _initPrometheusMetrics() {
 			Name:      "errors_total",
 			Help:      "Total number of pruner errors",
 		},
-		[]string{"operation"}, // "parent_preservation", "expire_preservations", "dah_pruner"
+		[]string{"operation"}, // "preserve_parents", "expire_preservations", "dah_pruner"
 	)
 
 	prunerUpdatingParents = promauto.NewCounter(
