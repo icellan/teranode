@@ -128,9 +128,9 @@ Examples:
 - `subtreevalidation.mynode`
 - `p2p.node1`
 
-**Special Case - Block Persister TxMeta:** `{serviceName}.{clientName}.{random16chars}`
+**Special Case - TxMeta / Policy-Rejected:** `{serviceName}.{clientName}.{random16chars}`
 
-The Block Persister appends a random 16-character suffix to its TxMeta consumer group ID, allowing multiple instances to independently process all messages.
+The `txmeta` and `tx-policy-rejected` consumer groups (Subtree Validation) append a random 16-character suffix per process, allowing every Subtree Validation pod to independently process the full stream rather than sharing partitions. Block Persister has no Kafka consumer at all — it polls the Blockchain service over gRPC instead.
 
 **Auto-Commit Behavior:**
 
@@ -242,7 +242,7 @@ This constraint is validated during consumer creation for both URL-based and dir
 
 ### Block Persister Service
 
-- **Consumer**: `TxMetaConfig` - consumes transaction metadata (with random consumer group suffix)
+Block Persister has no Kafka producer or consumer. It polls the Blockchain service over gRPC (`GetBlocksNotPersisted`) on a `blockpersister_persistSleep` interval (default 10s).
 
 ### Legacy Service
 
