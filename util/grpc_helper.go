@@ -109,6 +109,34 @@ var grpcClientRetriesTotal = prometheusgolang.NewCounterVec(
 	[]string{"grpc_caller", "grpc_code"},
 )
 
+// grpcPanicsRecoveredTotal counts handler panics recovered by
+// CreatePanicRecoveryUnaryInterceptor / CreatePanicRecoveryStreamInterceptor.
+// The caller already gets an Internal error for these, so the counter is not
+// about the caller - it is what makes a recovered panic observable by an
+// operator instead of only appearing as a log line among many.
+var grpcPanicsRecoveredTotal = prometheusgolang.NewCounterVec(
+	prometheusgolang.CounterOpts{
+		Namespace: "teranode",
+		Name:      "grpc_panics_recovered_total",
+		Help:      "Total number of gRPC handler panics recovered by the panic recovery interceptor, by service and method",
+	},
+	[]string{"grpc_service", "grpc_method"},
+)
+
+// grpcAuthRejectionsTotal counts requests rejected by CreateAuthInterceptor
+// (missing metadata, missing API key, or an API key that does not match).
+// A misconfigured/mismatched admin API key across services makes every
+// protected RPC fail while HealthGRPC and Health stay green, so this counter
+// is the signal an operator watches during a rollout to notice that case.
+var grpcAuthRejectionsTotal = prometheusgolang.NewCounterVec(
+	prometheusgolang.CounterOpts{
+		Namespace: "teranode",
+		Name:      "grpc_auth_rejections_total",
+		Help:      "Total number of gRPC requests rejected by the admin API key auth interceptor, by method",
+	},
+	[]string{"grpc_method"},
+)
+
 // ---------------------------------------------------------------------
 
 func init() {
@@ -356,6 +384,8 @@ func RegisterPrometheusMetrics() {
 	prometheusRegisterServerOnce.Do(func() {
 		prometheusgolang.MustRegister(prometheusMetrics)
 		prometheusgolang.MustRegister(grpcClientRetriesTotal)
+		prometheusgolang.MustRegister(grpcPanicsRecoveredTotal)
+		prometheusgolang.MustRegister(grpcAuthRejectionsTotal)
 	})
 }
 
@@ -571,12 +601,14 @@ func CreateAuthInterceptor(apiKey string, protectedMethods map[string]bool) grpc
 		// Extract metadata from context
 		md, ok := metadata.FromIncomingContext(ctx)
 		if !ok {
+			grpcAuthRejectionsTotal.WithLabelValues(info.FullMethod).Inc()
 			return nil, status.Error(codes.Unauthenticated, "missing metadata")
 		}
 
 		// Get API key from metadata
 		keys := md.Get(apiKeyHeader)
 		if len(keys) == 0 {
+			grpcAuthRejectionsTotal.WithLabelValues(info.FullMethod).Inc()
 			return nil, status.Error(codes.Unauthenticated, "missing API key")
 		}
 
@@ -584,6 +616,7 @@ func CreateAuthInterceptor(apiKey string, protectedMethods map[string]bool) grpc
 		// key through response timing - this is the only credential check in
 		// the path.
 		if subtle.ConstantTimeCompare([]byte(keys[0]), []byte(apiKey)) != 1 {
+			grpcAuthRejectionsTotal.WithLabelValues(info.FullMethod).Inc()
 			return nil, status.Error(codes.Unauthenticated, "invalid API key")
 		}
 
@@ -604,6 +637,8 @@ func CreatePanicRecoveryUnaryInterceptor(logger ulogger.Logger, serviceName stri
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
 		defer func() {
 			if r := recover(); r != nil {
+				grpcPanicsRecoveredTotal.WithLabelValues(serviceName, info.FullMethod).Inc()
+
 				if logger != nil {
 					logger.Errorf("[%s] panic recovered in %s: %v - %s", serviceName, info.FullMethod, r, singleLineStack())
 				}
@@ -623,6 +658,8 @@ func CreatePanicRecoveryStreamInterceptor(logger ulogger.Logger, serviceName str
 	return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) (err error) {
 		defer func() {
 			if r := recover(); r != nil {
+				grpcPanicsRecoveredTotal.WithLabelValues(serviceName, info.FullMethod).Inc()
+
 				if logger != nil {
 					logger.Errorf("[%s] panic recovered in %s: %v - %s", serviceName, info.FullMethod, r, singleLineStack())
 				}
