@@ -588,12 +588,14 @@ func (us *UTXOSet) CreateUTXOSet(ctx context.Context, c *consolidator) (err erro
 	}
 
 	var (
-		readStat   = createStat.NewStat("readTX")
-		filterStat = createStat.NewStat("filterUTXOs")
-		writeStat  = createStat.NewStat("writeUTXOs")
-		ts         = gocore.CurrentTime()
-		txCount    uint64
-		utxoCount  uint64
+		readStat    = createStat.NewStat("readTX")
+		filterStat  = createStat.NewStat("filterUTXOs")
+		writeStat   = createStat.NewStat("writeUTXOs")
+		ts          = gocore.CurrentTime()
+		txCount     uint64
+		utxoCount   uint64
+		recordsRead uint64
+		utxosRead   uint64
 	)
 
 	if c.firstPreviousBlockHash.String() != c.settings.ChainCfgParams.GenesisHash.String() {
@@ -672,9 +674,9 @@ func (us *UTXOSet) CreateUTXOSet(ctx context.Context, c *consolidator) (err erro
 					// genuine truncation and must fail loudly rather than
 					// silently produce a new snapshot that omits the
 					// unread tail.
-					boundary, ok := err.(*ErrRecordBoundary)
-					if !ok {
-						return errors.NewStorageError("error reading previous utxo-set (%s.%s) at iteration %d", c.firstPreviousBlockHash.String(), fileformat.FileTypeUtxoSet, txCount, err)
+					var boundary *ErrRecordBoundary
+					if !errors.As(err, &boundary) {
+						return errors.NewStorageError("error reading previous utxo-set (%s.%s) at iteration %d", c.firstPreviousBlockHash.String(), fileformat.FileTypeUtxoSet, recordsRead, err)
 					}
 
 					expectedTxCount, expectedUTXOCount, decErr := DecodeFooter(boundary.FooterBytes[:])
@@ -682,15 +684,24 @@ func (us *UTXOSet) CreateUTXOSet(ctx context.Context, c *consolidator) (err erro
 						return errors.NewStorageError("error decoding previous utxo-set (%s.%s) footer", c.firstPreviousBlockHash.String(), fileformat.FileTypeUtxoSet, decErr)
 					}
 
-					if expectedTxCount != txCount || expectedUTXOCount != utxoCount {
+					if expectedTxCount != recordsRead || expectedUTXOCount != utxosRead {
 						return errors.NewProcessingError("previous utxo-set (%s.%s) is truncated: footer expects %d transactions/%d utxos, only %d/%d were read",
-							c.firstPreviousBlockHash.String(), fileformat.FileTypeUtxoSet, expectedTxCount, expectedUTXOCount, txCount, utxoCount)
+							c.firstPreviousBlockHash.String(), fileformat.FileTypeUtxoSet, expectedTxCount, expectedUTXOCount, recordsRead, utxosRead)
 					}
 
 					break OUTER
 				}
 
 				ts = readStat.AddTime(ts)
+
+				// Count every wrapper read from the previous file,
+				// unconditionally and before deletion filtering, so the
+				// truncation check above compares against what was actually
+				// read - not against txCount/utxoCount, which only track
+				// survivors after filtering and exist to write the *new*
+				// file's own footer below.
+				recordsRead++
+				utxosRead += uint64(len(utxoWrapper.UTXOs))
 
 				// Filter UTXOs based on the deletions map
 				utxoWrapper.UTXOs = filterUTXOs(utxoWrapper.UTXOs, c.deletions, &utxoWrapper.TxID)

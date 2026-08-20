@@ -356,6 +356,73 @@ func TestCreateUTXOSet_PreviousSetFooterMismatch_ReturnsError(t *testing.T) {
 	require.Error(t, err, "a footer whose counts disagree with what was actually read must be rejected")
 }
 
+// TestCreateUTXOSet_PreviousSetWithDeletions_NotReportedAsTruncated is the
+// regression test for the survivor/read miscount bug: txCount/utxoCount only
+// increment for wrappers that survive deletion filtering (they exist to
+// write the *new* file's own footer), but the previous-set footer check
+// compared them directly against the previous file's footer, which records
+// records actually written there. Any real consolidation that spends a
+// pre-existing UTXO makes survivors < previous total, and the pre-fix check
+// fired a spurious "previous utxo-set ... is truncated" on an intact file.
+// The previous set here has two wrappers/two UTXOs; one output is spent
+// (present in c.deletions), so only one wrapper survives filtering, but the
+// file is not truncated and CreateUTXOSet must succeed.
+func TestCreateUTXOSet_PreviousSetWithDeletions_NotReportedAsTruncated(t *testing.T) {
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	tSettings := test.CreateBaseTestSettings(t)
+	blockStore := memory.New()
+
+	previousBlockHash := chainhash.HashH([]byte("previous-block-hash-for-deletions-test"))
+	currentBlockHash := chainhash.HashH([]byte("current-block-hash-for-deletions-test"))
+	grandparentHash := chainhash.HashH([]byte("grandparent-block-hash-for-deletions-test"))
+
+	spentTxID := chainhash.HashH([]byte("wrapper-spent-for-deletions-test"))
+	keptTxID := chainhash.HashH([]byte("wrapper-kept-for-deletions-test"))
+
+	spentWrapper := &UTXOWrapper{
+		TxID:   spentTxID,
+		Height: 42,
+		UTXOs:  []*UTXO{{Index: 0, Value: 1000, Script: []byte{0x76, 0xa9, 0x88, 0xac}}},
+	}
+	keptWrapper := &UTXOWrapper{
+		TxID:   keptTxID,
+		Height: 42,
+		UTXOs:  []*UTXO{{Index: 0, Value: 2000, Script: []byte{0x76, 0xa9, 0x88, 0xac}}},
+	}
+
+	// Footer records the previous file's total: 2 transactions/2 utxos.
+	var footer [16]byte
+	binary.LittleEndian.PutUint64(footer[0:8], 2)
+	binary.LittleEndian.PutUint64(footer[8:16], 2)
+
+	var heightBuf [4]byte
+	binary.LittleEndian.PutUint32(heightBuf[:], 42)
+
+	body := make([]byte, 0, len(previousBlockHash)+len(heightBuf)+len(grandparentHash)+
+		len(spentWrapper.Bytes())+len(keptWrapper.Bytes())+len(footer))
+	body = append(body, previousBlockHash[:]...)
+	body = append(body, heightBuf[:]...)
+	body = append(body, grandparentHash[:]...)
+	body = append(body, spentWrapper.Bytes()...)
+	body = append(body, keptWrapper.Bytes()...)
+	body = append(body, footer[:]...)
+	require.NoError(t, blockStore.Set(ctx, previousBlockHash[:], fileformat.FileTypeUtxoSet, body))
+
+	c := NewConsolidator(logger, tSettings, nil, nil, blockStore, &previousBlockHash)
+	c.lastBlockHash = &currentBlockHash
+	c.lastBlockHeight = 43
+	c.previousBlockHash = &previousBlockHash
+	// spentWrapper's single output was spent within the consolidated range.
+	c.deletions[UTXODeletion{TxID: spentTxID, Index: 0}] = struct{}{}
+
+	us, err := GetUTXOSet(ctx, logger, tSettings, blockStore, &currentBlockHash)
+	require.NoError(t, err)
+
+	err = us.CreateUTXOSet(ctx, c)
+	require.NoError(t, err, "a previous set with spent outputs must not be reported as truncated: survivor counts are expected to be lower than the footer's total record counts")
+}
+
 var (
 	hash1 = chainhash.HashH([]byte{0x00, 0x01, 0x02, 0x03, 0x04})
 	// hash2 = chainhash.HashH([]byte{0x05, 0x06, 0x07, 0x08, 0x09})

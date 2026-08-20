@@ -130,8 +130,8 @@ func validateUTXOSet(ctx context.Context, r io.Reader, verbose bool) (*UTXOValid
 			// ErrRecordBoundary whose footer bytes don't match - is a
 			// genuine truncation and must fail loudly rather than being
 			// reported as a successful, complete validation.
-			boundary, ok := err.(*utxopersister.ErrRecordBoundary)
-			if !ok {
+			var boundary *utxopersister.ErrRecordBoundary
+			if !errors.As(err, &boundary) {
 				return nil, errors.NewProcessingError("error reading UTXO wrapper", err)
 			}
 
