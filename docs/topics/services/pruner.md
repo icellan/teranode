@@ -242,7 +242,7 @@ When a transaction remains unmined for a long time, its parent transactions (UTX
 
 6. Pruner updates metrics
     - `teranode_pruner_duration_seconds{operation="dah_pruner"}`
-    - `pruner_processed_total`
+    - `teranode_pruner_deleting_children_total`
     - `utxo_cleanup_batch_duration_seconds`
 
 **Chunk Processing Configuration:**
