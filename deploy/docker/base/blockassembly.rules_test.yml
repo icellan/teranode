@@ -15,11 +15,12 @@ evaluation_interval: 30s
 
 tests:
   # BlockAssemblerStuckInState: fires when the assembler sits in a non-running
-  # state (2 == reorging) across a normal 30s scrape interval.
+  # state (5 == reorging, per StateStrings in BlockAssembler.go) across a normal
+  # 30s scrape interval.
   - interval: 30s
     input_series:
       - series: 'teranode_blockassembly_current_state'
-        values: '2+0x40'
+        values: '5+0x40'
     alert_rule_test:
       - eval_time: 30s
         alertname: BlockAssemblerStuckInState
@@ -50,6 +51,26 @@ tests:
         values: '0+10x40'
       - series: 'teranode_blockassembly_state_duration_seconds_bucket{state="movingUp",le="+Inf"}'
         values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SlowTipAdvance
+        exp_alerts:
+          - exp_annotations:
+              summary: "Block assembly tip advance is slow (P95 > 1s)"
+
+  # SlowTipAdvance: a SINGLE slow advance must still fire. This is the
+  # regression test for `for` >= the rate window: with `[5m]`/`for: 5m` the lone
+  # observation at t=5m aged out of the window before the pending timer expired
+  # and the alert reset instead of firing. At mainnet block times a single slow
+  # advance per window is the normal case, so that made the rule unfireable.
+  - interval: 30s
+    input_series:
+      - series: 'teranode_blockassembly_state_duration_seconds_bucket{state="movingUp",le="1.0"}'
+        values: '0+0x80'
+      - series: 'teranode_blockassembly_state_duration_seconds_bucket{state="movingUp",le="2.0"}'
+        values: '0+0x9 1+0x70'
+      - series: 'teranode_blockassembly_state_duration_seconds_bucket{state="movingUp",le="+Inf"}'
+        values: '0+0x9 1+0x70'
     alert_rule_test:
       - eval_time: 20m
         alertname: SlowTipAdvance

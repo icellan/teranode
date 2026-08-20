@@ -138,8 +138,10 @@ reorgs, tip lag, repeated processing failures) live in a single canonical file,
 [`deploy/docker/base/blockassembly.rules.yml`](../../../deploy/docker/base/blockassembly.rules.yml).
 Edit that file to change the rules — this README no longer carries a copy.
 
-Every Prometheus config in the repo references it via `rule_files` and mounts it
-at `/etc/prometheus/blockassembly.rules.yml`:
+Every Prometheus config that a stack in this repo actually mounts references it
+via `rule_files` and bind-mounts it at `/etc/prometheus/blockassembly.rules.yml`
+(`compose/prometheus/prometheus.yml` and `prometheus-microservices.yml` are not
+wired into any compose file and are left alone):
 
 | Stack | Config |
 | --- | --- |
