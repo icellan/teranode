@@ -691,4 +691,37 @@ func TestHeightRangeBoundsRejectUnboundedRequests(t *testing.T) {
 		NumberOfHeaders: maxBlockHeadersPerRequest + 1,
 	})
 	require.Error(t, err, "an oversized numberOfHeaders must be rejected before it reaches the store LIMIT")
+
+	_, err = b.GetBlockHeadersFromOldestRequest(ctx, &blockchain_api.GetBlockHeadersFromOldestRequest{
+		ChainTipHash:    make([]byte, chainhash.HashSize),
+		TargetHash:      make([]byte, chainhash.HashSize),
+		NumberOfHeaders: maxBlockHeadersPerRequest + 1,
+	})
+	require.Error(t, err, "an oversized numberOfHeaders must be rejected before GetBlockHeadersFromOldest reaches the store")
+
+	_, err = b.GetBlockHeaderIDs(ctx, &blockchain_api.GetBlockHeadersRequest{
+		StartHash:       make([]byte, chainhash.HashSize),
+		NumberOfHeaders: maxBlockHeadersPerRequest + 1,
+	})
+	require.Error(t, err, "an oversized numberOfHeaders must be rejected before GetBlockHeaderIDs reaches the store")
+
+	_, err = b.LocateBlockHeaders(ctx, &blockchain_api.LocateBlockHeadersRequest{
+		HashStop:  make([]byte, chainhash.HashSize),
+		MaxHashes: maxBlockHeadersPerRequest + 1,
+	})
+	require.Error(t, err, "an oversized maxHashes must be rejected before LocateBlockHeaders reaches the store")
+}
+
+// TestGetMedianTimePastByHeightsRejectsOversizedSpan covers the span this PR's
+// count cap does not: len(req.Heights) can be tiny while minHeight/maxHeight
+// still drive a whole-chain header read and dense cache write.
+func TestGetMedianTimePastByHeightsRejectsOversizedSpan(t *testing.T) {
+	ctx := context.Background()
+
+	b := &Blockchain{logger: ulogger.TestLogger{}, stats: gocore.NewStat("test")}
+
+	_, err := b.GetMedianTimePastByHeights(ctx, &blockchain_api.GetMedianTimePastByHeightsRequest{
+		Heights: []uint32{0, 920000},
+	})
+	require.Error(t, err, "a two-element request spanning the whole chain must be rejected, not just a request with many heights")
 }
