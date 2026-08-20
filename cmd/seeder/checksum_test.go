@@ -89,3 +89,43 @@ func TestVerifyChecksum_EmptySidecarFails(t *testing.T) {
 	err := verifyChecksum(ulogger.TestLogger{}, filePath)
 	require.Error(t, err)
 }
+
+// TestVerifyChecksum_MalformedSidecarFails guards against a sidecar whose
+// first field isn't a hex-encoded SHA-256 digest (a truncated write, or a
+// BSD/`--tag`-style sidecar such as "SHA256 (f) = ...") falling through to
+// the generic "checksum mismatch" branch, which would misdirect the operator
+// at the snapshot file rather than at the malformed sidecar itself.
+func TestVerifyChecksum_MalformedSidecarFails(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "abc123.utxo-set")
+	content := []byte("this is the utxo-set snapshot content")
+
+	require.NoError(t, os.WriteFile(filePath, content, 0o644))
+	require.NoError(t, os.WriteFile(filePath+checksumSidecarExtension, []byte("SHA256 (abc123.utxo-set) = deadbeef\n"), 0o644))
+
+	err := verifyChecksum(ulogger.TestLogger{}, filePath)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "checksum sidecar", "the error must name the malformed sidecar, not report a mismatch on the file")
+	require.NotContains(t, err.Error(), "checksum mismatch")
+}
+
+// TestVerifyChecksum_MismatchedFilenameFails guards against a sidecar
+// mistakenly paired with a different snapshot: its checksum field may still
+// happen to match some other file's content, but the filename field
+// identifies it as belonging elsewhere, and that must be reported rather than
+// treated as a plain checksum mismatch (or worse, silently accepted).
+func TestVerifyChecksum_MismatchedFilenameFails(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "abc123.utxo-set")
+	content := []byte("this is the utxo-set snapshot content")
+
+	require.NoError(t, os.WriteFile(filePath, content, 0o644))
+
+	sum := sha256.Sum256(content)
+	sidecar := hex.EncodeToString(sum[:]) + "  " + "someother.utxo-set" + "\n"
+	require.NoError(t, os.WriteFile(filePath+checksumSidecarExtension, []byte(sidecar), 0o644))
+
+	err := verifyChecksum(ulogger.TestLogger{}, filePath)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "belongs to")
+}

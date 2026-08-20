@@ -147,6 +147,17 @@ func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir stri
 		if err := verifyChecksum(logger, headerFile); err != nil {
 			return errors.NewProcessingError("checksum verification failed for headers file %s", headerFile, err)
 		}
+	} else if !skipUTXOs {
+		// The header pass itself is skipped, but processUTXOs still reads
+		// headerFile back (via loadCoinbaseTxs) to recover coinbase inputs, so a
+		// corrupted headers file must not be silently consumed just because
+		// -skipHeaders was passed. Unlike the pass above, absence is fine here —
+		// loadCoinbaseTxs already tolerates a missing headers file.
+		if _, err := os.Stat(headerFile); err == nil {
+			if err := verifyChecksum(logger, headerFile); err != nil {
+				return errors.NewProcessingError("checksum verification failed for headers file %s", headerFile, err)
+			}
+		}
 	}
 
 	if !skipUTXOs {
@@ -849,13 +860,26 @@ func writeBlockAssemblerState(ctx context.Context, logger ulogger.Logger, store 
 func verifyChecksum(logger ulogger.Logger, filePath string) error {
 	sidecarPath := filePath + checksumSidecarExtension
 
-	sidecar, err := os.ReadFile(sidecarPath)
+	// maxSidecarSize bounds the sidecar read: a genuine sidecar is a hex digest
+	// plus an optional filename, well under 1KB. Anything larger is not a
+	// sidecar (e.g. the snapshot file itself, copied to the wrong name), and
+	// reading it in full would pull an arbitrarily large file into memory.
+	const maxSidecarSize = 4096
+
+	f, err := os.Open(sidecarPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			logger.Warnf("[verifyChecksum] no checksum sidecar %s found for %s; proceeding without checksum verification", sidecarPath, filePath)
 			return nil
 		}
 
+		return errors.NewStorageError("failed to read checksum sidecar %s", sidecarPath, err)
+	}
+
+	sidecar, err := io.ReadAll(io.LimitReader(f, maxSidecarSize))
+	_ = f.Close()
+
+	if err != nil {
 		return errors.NewStorageError("failed to read checksum sidecar %s", sidecarPath, err)
 	}
 
@@ -866,18 +890,38 @@ func verifyChecksum(logger ulogger.Logger, filePath string) error {
 
 	expected := strings.ToLower(fields[0])
 
-	f, err := os.Open(filePath)
+	if len(expected) != sha256.Size*2 {
+		return errors.NewProcessingError("checksum sidecar %s is malformed: %q is not a hex-encoded SHA-256 digest", sidecarPath, fields[0])
+	}
+
+	if _, err := hex.DecodeString(expected); err != nil {
+		return errors.NewProcessingError("checksum sidecar %s is malformed: %q is not a hex-encoded SHA-256 digest", sidecarPath, fields[0])
+	}
+
+	// The standard sha256sum layout names the file the checksum belongs to as
+	// the second field. When present, it must match filePath's own basename —
+	// otherwise the sidecar was paired with the wrong snapshot, and reporting
+	// that as a checksum mismatch would misdirect the operator.
+	if len(fields) > 1 && fields[1] != filepath.Base(filePath) {
+		return errors.NewProcessingError("checksum sidecar %s belongs to %q, not to %s", sidecarPath, fields[1], filepath.Base(filePath))
+	}
+
+	if st, statErr := os.Stat(filePath); statErr == nil {
+		logger.Infof("[verifyChecksum] verifying %s (%s bytes) against %s; this reads the whole file", filePath, formatNumber(uint64(st.Size())), sidecarPath)
+	}
+
+	sf, err := os.Open(filePath)
 	if err != nil {
 		return errors.NewStorageError("failed to open %s for checksum verification", filePath, err)
 	}
 
 	defer func() {
-		_ = f.Close()
+		_ = sf.Close()
 	}()
 
 	h := sha256.New()
 
-	if _, err = io.Copy(h, f); err != nil {
+	if _, err = io.Copy(h, sf); err != nil {
 		return errors.NewStorageError("failed to read %s for checksum verification", filePath, err)
 	}
 

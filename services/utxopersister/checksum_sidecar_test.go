@@ -83,6 +83,7 @@ func TestCreateUTXOSet_WritesChecksumSidecar(t *testing.T) {
 	expectedHex := hex.EncodeToString(sum[:])
 
 	fields := strings.Fields(string(sidecar))
-	require.NotEmpty(t, fields, "sidecar must not be empty")
+	require.Len(t, fields, 2, "sidecar must be '<hex-sha256>  <filename>'")
 	require.Equal(t, expectedHex, strings.ToLower(fields[0]), "sidecar checksum must match the actual file content")
+	require.Equal(t, filepath.Base(snapshotPath), fields[1], "sidecar must name the snapshot it belongs to")
 }
