@@ -627,11 +627,19 @@ func (b *Blockchain) resolveAdminAPIKey() (string, error) {
 // credentials - note that "unauthenticated" is a statement about access
 // control only, and says nothing about cost: a public method must separately
 // bound any allocation the caller can drive - see the range clamps in
-// GetBlocksByHeight, GetBlockHeaders and GetMedianTimePastByHeights.
+// GetBlocksByHeight, GetMedianTimePastByHeights, and the caller-supplied
+// count clamps (maxBlockHeadersPerRequest) in GetBlockHeaders,
+// GetBlockHeadersFromOldest, GetBlockHeaderIDs and LocateBlockHeaders.
 // GetBlockHeadersByHeight is the one exception, and deliberately so: its
 // window is uncapped on purpose because utxopersister legitimately asks for
 // 1..tip in one call (see its own doc comment), so only the store-side
-// preallocation is bounded there, not the window itself.
+// preallocation is bounded there, not the window itself. That exemption does
+// not extend to GenerationalCache: both this handler's and
+// GetBlockHeaders'/GetBlockHeadersFromOldest's results are cached under a
+// caller-chosen key (hash+count or height range) in an unbounded ttlcache -
+// see stores/blockchain/sql/generational_cache.go - so bounding the count or
+// window at the handler does not bound the number of distinct cache entries
+// an unauthenticated caller can pin for the cache's TTL.
 //
 // SendNotification,
 // ReportPeerFailure and SetBlockSubtreesSet are protected together: the
@@ -1892,6 +1900,10 @@ func (b *Blockchain) GetBlockHeadersFromOldestRequest(ctx context.Context, reque
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlockHeadersFromOldestRequest] request's target hash is not valid", err))
 	}
 
+	if request.NumberOfHeaders > maxBlockHeadersPerRequest {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlockHeadersFromOldest] %d headers requested, maximum is %d", request.NumberOfHeaders, maxBlockHeadersPerRequest))
+	}
+
 	blockHeaders, blockHeaderMetas, err := b.store.GetBlockHeadersFromOldest(ctx, chainTipHash, targetHash, request.GetNumberOfHeaders())
 	if err != nil {
 		return nil, errors.WrapGRPC(err)
@@ -2274,8 +2286,32 @@ func (b *Blockchain) GetMedianTimePastByHeights(ctx context.Context, req *blockc
 	)
 	defer deferFn()
 
-	if maxHeights := b.maxMedianTimePastHeights(); len(req.Heights) > maxHeights {
+	maxHeights := b.maxMedianTimePastHeights()
+	if len(req.Heights) > maxHeights {
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetMedianTimePastByHeights] %d heights requested, maximum is %d", len(req.Heights), maxHeights))
+	}
+
+	// The count cap above bounds len(req.Heights), not the span the sparse
+	// heights cover, and it is the span - min/max drive the store's header
+	// range read and the dense mtpCache write - that costs. Heights =
+	// {0, 920000} passes the count cap with two entries while still forcing
+	// a whole-chain read, so bound the span with the same limit: it is the
+	// batch size Client.GetMedianTimePastRange chunks into, so a legitimate
+	// contiguous request from that caller never spans more than maxHeights-1.
+	if len(req.Heights) > 0 {
+		minHeight, maxHeight := req.Heights[0], req.Heights[0]
+		for _, h := range req.Heights[1:] {
+			if h < minHeight {
+				minHeight = h
+			}
+			if h > maxHeight {
+				maxHeight = h
+			}
+		}
+
+		if span := maxHeight - minHeight; span >= uint32(maxHeights) {
+			return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetMedianTimePastByHeights] heights span %d..%d exceeds the maximum of %d", minHeight, maxHeight, maxHeights))
+		}
 	}
 
 	mtps, err := b.GetMedianTimePastForHeights(ctx, req.Heights)
@@ -2624,6 +2660,10 @@ func (b *Blockchain) GetBlockHeaderIDs(ctx context.Context, request *blockchain_
 	startHash, err := chainhash.NewHash(request.StartHash)
 	if err != nil {
 		return nil, err
+	}
+
+	if request.NumberOfHeaders > maxBlockHeadersPerRequest {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlockHeaderIDs] %d headers requested, maximum is %d", request.NumberOfHeaders, maxBlockHeadersPerRequest))
 	}
 
 	ids, err := b.store.GetBlockHeaderIDs(ctx, startHash, request.NumberOfHeaders)
@@ -3525,6 +3565,10 @@ func (b *Blockchain) LocateBlockHeaders(ctx context.Context, request *blockchain
 	}
 
 	hashStop, _ := chainhash.NewHash(request.HashStop)
+
+	if request.MaxHashes > maxBlockHeadersPerRequest {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][LocateBlockHeaders] %d hashes requested, maximum is %d", request.MaxHashes, maxBlockHeadersPerRequest))
+	}
 
 	// Get the blocks
 	blockHeaders, err := b.store.LocateBlockHeaders(ctx, locator, hashStop, request.MaxHashes)

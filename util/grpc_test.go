@@ -19,6 +19,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test/mocklogger"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -1012,6 +1013,8 @@ func TestPanicRecoveryInterceptors(t *testing.T) {
 	t.Run("unary panic becomes Internal", func(t *testing.T) {
 		interceptor := CreatePanicRecoveryUnaryInterceptor(logger, "test")
 
+		before := testutil.ToFloat64(grpcPanicsRecoveredTotal.WithLabelValues("test", "/svc/Method"))
+
 		resp, err := interceptor(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: "/svc/Method"},
 			func(ctx context.Context, req any) (any, error) {
 				panic("boom")
@@ -1019,6 +1022,8 @@ func TestPanicRecoveryInterceptors(t *testing.T) {
 
 		require.Nil(t, resp)
 		require.Equal(t, codes.Internal, status.Code(err))
+		require.Equal(t, before+1, testutil.ToFloat64(grpcPanicsRecoveredTotal.WithLabelValues("test", "/svc/Method")),
+			"a recovered unary panic must be counted so it is alertable, not just logged")
 	})
 
 	t.Run("unary success passes through", func(t *testing.T) {
@@ -1036,11 +1041,15 @@ func TestPanicRecoveryInterceptors(t *testing.T) {
 	t.Run("stream panic becomes Internal", func(t *testing.T) {
 		interceptor := CreatePanicRecoveryStreamInterceptor(logger, "test")
 
+		before := testutil.ToFloat64(grpcPanicsRecoveredTotal.WithLabelValues("test", "/svc/Stream"))
+
 		err := interceptor(nil, nil, &grpc.StreamServerInfo{FullMethod: "/svc/Stream"},
 			func(srv any, stream grpc.ServerStream) error {
 				panic("boom")
 			})
 
 		require.Equal(t, codes.Internal, status.Code(err))
+		require.Equal(t, before+1, testutil.ToFloat64(grpcPanicsRecoveredTotal.WithLabelValues("test", "/svc/Stream")),
+			"a recovered stream panic must be counted so it is alertable, not just logged")
 	})
 }
