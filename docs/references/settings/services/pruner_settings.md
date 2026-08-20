@@ -844,7 +844,7 @@ export UTXOSTORE_PARENTPRESERVATIONBLOCKS=20000
 While not configuration settings, these Prometheus metrics should be monitored:
 
 - `teranode_pruner_duration_seconds`: Adjust `jobTimeout` if consistently near timeout
-- `teranode_pruner_skipped_total{reason="not_running"}`: Indicates Block Assembly issues
+- `teranode_pruner_skipped_total{reason="block_assembly_timeout"}`: Indicates Block Assembly issues
 - `teranode_pruner_errors_total`: Indicates database or connectivity issues
 - `utxo_cleanup_batch_duration_seconds`: Indicates Aerospike performance
 

@@ -39,7 +39,7 @@ func initPrometheusMetrics() {
 
 // _initPrometheusMetrics is the internal implementation that registers all Prometheus metrics
 // used by the pruner service. Metrics track:
-// - Duration of pruner operations (preserve_parents, dah_pruner)
+// - Duration of pruner operations (preserve_parents, expire_preservations, dah_pruner)
 // - Operations skipped due to various conditions
 // - Successfully processed operations
 // - Errors during pruner operations
@@ -52,7 +52,7 @@ func _initPrometheusMetrics() {
 			Help:      "Duration of pruner operations in seconds",
 			Buckets:   prometheus.ExponentialBuckets(1, 2, 10), // 1s to ~17 minutes
 		},
-		[]string{"operation"}, // "preserve_parents" or "dah_pruner"
+		[]string{"operation"}, // "preserve_parents", "expire_preservations", "dah_pruner"
 	)
 
 	prunerSkipped = promauto.NewCounterVec(
@@ -62,7 +62,7 @@ func _initPrometheusMetrics() {
 			Name:      "skipped_total",
 			Help:      "Number of pruner operations skipped",
 		},
-		[]string{"reason"}, // "not_running", "no_new_height", "already_in_progress"
+		[]string{"reason"}, // "block_assembly_timeout", "below_min_height", "fsm_error", "catchup_mode"
 	)
 
 	prunerErrors = promauto.NewCounterVec(
@@ -72,7 +72,7 @@ func _initPrometheusMetrics() {
 			Name:      "errors_total",
 			Help:      "Total number of pruner errors",
 		},
-		[]string{"operation"}, // "preserve_parents", "dah_pruner", "poll"
+		[]string{"operation"}, // "parent_preservation", "expire_preservations", "dah_pruner"
 	)
 
 	prunerUpdatingParents = promauto.NewCounter(
