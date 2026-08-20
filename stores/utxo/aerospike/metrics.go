@@ -275,10 +275,10 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "aerospike",
 			Name:      "utxo_partial_spend_rollbacks",
-			Help:      "Outcome of rolling back the successful spends of a failed spend batch (fired|spender_exists|indeterminate|transient_lock)",
+			Help:      "Outcome of rolling back the successful spends of a failed spend batch (fired|spender_exists|indeterminate|transient_lock|transient_creating)",
 		},
 		[]string{
-			"outcome", // utxo.RollbackOutcomes: fired | spender_exists | indeterminate | transient_lock
+			"outcome", // utxo.RollbackOutcomes: fired | spender_exists | indeterminate | transient_lock | transient_creating
 		},
 	)
 

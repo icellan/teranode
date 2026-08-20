@@ -56,6 +56,7 @@ var (
 
 	prometheusUtxoPartialSpendRollbacks *prometheus.CounterVec
 	prometheusUtxoSpendRollbackFailed   prometheus.Counter
+	prometheusUtxoSpendAbortInFlight    prometheus.Counter
 
 	prometheusSQLUtxoGetCounterConflicting prometheus.Histogram
 	prometheusSQLUtxoGetConflicting        prometheus.Histogram
@@ -111,10 +112,10 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "sql",
 			Name:      "utxo_partial_spend_rollbacks",
-			Help:      "Outcome of rolling back the successful spends of a failed spend batch (fired|spender_exists|indeterminate|transient_lock)",
+			Help:      "Outcome of rolling back the successful spends of a failed spend batch (fired|spender_exists|indeterminate|transient_lock|transient_creating)",
 		},
 		[]string{
-			"outcome", // utxo.RollbackOutcomes: fired | spender_exists | indeterminate | transient_lock
+			"outcome", // utxo.RollbackOutcomes: fired | spender_exists | indeterminate | transient_lock | transient_creating
 		},
 	)
 
@@ -124,6 +125,20 @@ func _initPrometheusMetrics() {
 			Subsystem: "sql",
 			Name:      "utxo_spend_rollback_failed",
 			Help:      "Partial-spend rollbacks that failed, each leaving potential dangling spender refs",
+		},
+	)
+
+	// Mirrors the aerospike counter of the same name: a give-up on a per-item
+	// wait (ctx.Done() or the per-item timer) inside the batched Spend leaves
+	// that item still enqueued in the batcher, so a straggler UPDATE can land
+	// after the rollback above has already run — the same #1214 dangling
+	// reference this rollback exists to prevent, just uncounted until now.
+	prometheusUtxoSpendAbortInFlight = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "sql",
+			Name:      "utxo_spend_abort_in_flight",
+			Help:      "Spend items still in flight when the batch aborted, excluded from the rollback set and applied by the batcher afterwards (residual dangling-ref window, see #1291)",
 		},
 	)
 

@@ -22,8 +22,19 @@ const (
 	// RollbackOutcomeTransientLock: at least one spend failed with ErrTxLocked
 	// while nothing in the batch made the tx unwinnable, so a concurrent attempt
 	// at the same txid may legitimately own the slots and the rollback was
-	// suppressed. This is the deliberately-uncovered flavour of #1214.
+	// suppressed. This is the deliberately-uncovered flavour of #1214, and it is
+	// create-first (#1355) that covers it.
 	RollbackOutcomeTransientLock = "transient_lock"
+	// RollbackOutcomeTransientCreating: same suppression, but triggered by
+	// ErrTxCreating — the multi-record create's own two-phase commit window on a
+	// parent (teranode.lua rejects a spend while the parent record carries
+	// creating=true). Kept as a distinct value rather than folded into
+	// transient_lock because the two windows have different owners: the locked
+	// flavour is covered by create-first (#1355), while the ownership check that
+	// would let a rollback tell two attempts apart is #1291. An operator needs to
+	// tell them apart, and once create-first is enabled a parent's 2PC window
+	// becomes a creating window rather than a locked one.
+	RollbackOutcomeTransientCreating = "transient_creating"
 )
 
 // RollbackOutcomes is every value the outcome label can take, so each store's
@@ -33,4 +44,5 @@ var RollbackOutcomes = []string{
 	RollbackOutcomeSpenderExists,
 	RollbackOutcomeIndeterminate,
 	RollbackOutcomeTransientLock,
+	RollbackOutcomeTransientCreating,
 }

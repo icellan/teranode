@@ -106,6 +106,7 @@ func TestRollbackDecisionLabels(t *testing.T) {
 	require.Equal(t, utxo.RollbackOutcomeSpenderExists, rollbackSkipSpenderExists.String())
 	require.Equal(t, utxo.RollbackOutcomeIndeterminate, rollbackSkipIndeterminate.String())
 	require.Equal(t, utxo.RollbackOutcomeTransientLock, rollbackSkipTransientLock.String())
+	require.Equal(t, utxo.RollbackOutcomeTransientCreating, rollbackSkipTransientCreating.String())
 
 	// Every decision must map to a value in the shared set, and the shared set
 	// must have no value no decision produces — otherwise a dashboard either
@@ -117,6 +118,7 @@ func TestRollbackDecisionLabels(t *testing.T) {
 		rollbackSkipSpenderExists.String(),
 		rollbackSkipIndeterminate.String(),
 		rollbackSkipTransientLock.String(),
+		rollbackSkipTransientCreating.String(),
 	}
 	require.ElementsMatch(t, utxo.RollbackOutcomes, emitted,
 		"aerospike outcome labels must be exactly utxo.RollbackOutcomes")
@@ -124,6 +126,6 @@ func TestRollbackDecisionLabels(t *testing.T) {
 	// The literal strings are the dashboard contract; pin them so a rename of a
 	// constant cannot silently change what is exported.
 	require.ElementsMatch(t,
-		[]string{"fired", "spender_exists", "indeterminate", "transient_lock"},
+		[]string{"fired", "spender_exists", "indeterminate", "transient_lock", "transient_creating"},
 		utxo.RollbackOutcomes)
 }

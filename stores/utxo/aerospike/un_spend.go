@@ -114,6 +114,15 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 // prevent. Failures are collected and returned together at the end; only a
 // cancelled/expired context stops the loop early, since further Lua calls
 // would just fail too.
+//
+// Note for the OTHER callers, whose contract this changed without their asking:
+// a returned error now means "some, possibly nearly all, spends were reverted",
+// where it used to mean "the first k were". ProcessConflicting's step 2 relied on
+// the old reading — it set step2Committed only on full success and gated its
+// compensating re-spend on that flag, so a partial failure skipped the undo in
+// exactly the case that left the most uncompensated state. It now treats a failed
+// step 2 as partially committed for that reason. Any future caller deciding
+// "did this happen?" from the error alone needs the same treatment.
 func (s *Store) unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked ...bool) (err error) {
 	var errs []error
 

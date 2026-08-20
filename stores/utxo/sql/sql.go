@@ -1946,7 +1946,9 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 				// will be committed by the callback under the store's own context,
 				// not this caller ctx. A straggler UPDATE can land after we give up
 				// here and after the rollback below has already run, leaving exactly
-				// the #1214 dangling ref. Not fixed here.
+				// the #1214 dangling ref. Not fixed here — counted below so it is
+				// at least observable.
+				prometheusUtxoSpendAbortInFlight.Inc()
 				spends[idx].Err = errors.NewContextCanceledError("[SPEND][%s:%d] context canceled while waiting for batch response", spend.TxID.String(), spend.Vout)
 				return nil
 			case <-timer.C:
@@ -1954,8 +1956,10 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 				// reverse-on-abort): same straggler risk as the ctx.Done() arm
 				// above — the item remains enqueued and can still commit under the
 				// store's own context after this per-item wait gives up and after
-				// the rollback below has run. Not fixed here.
+				// the rollback below has run. Not fixed here — counted below so it
+				// is at least observable.
 				prometheusUtxoErrors.WithLabelValues("Spend", "BatchTimeout").Inc()
+				prometheusUtxoSpendAbortInFlight.Inc()
 				spends[idx].Err = errors.NewServiceUnavailableError("[SPEND][%s:%d] batch operation timed out after %s", spend.TxID.String(), spend.Vout, spendTimeout)
 				return nil
 			}
@@ -2028,13 +2032,15 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// is not dangling and the rollback would instead clear a slot a live tx
 		// legitimately owns. An indeterminate lookup skips the rollback.
 		//
-		// Also skipped when any spend failed with ErrTxLocked AND nothing else in
-		// the batch proves the tx unwinnable: ErrTxLocked alone is transient, so a
-		// concurrent attempt at the SAME txid may be spending these very inputs
-		// successfully right now, and spending_data ({TxID, Vin}) carries no
-		// attempt identity for the rollback to tell the two apart. See
-		// hasTransientLockFailure for that reasoning and what covers the
-		// ErrTxLocked flavour of #1214 instead.
+		// Also skipped when any spend failed with ErrTxLocked or ErrTxCreating AND
+		// nothing else in the batch proves the tx unwinnable: both are transient
+		// two-phase-commit windows (see hasTransientLockFailure and
+		// hasTransientCreatingFailure — the latter is inert on this backend today,
+		// kept only so the two stores' guards stay in step), so a concurrent
+		// attempt at the SAME txid may be spending these very inputs successfully
+		// right now, and spending_data ({TxID, Vin}) carries no attempt identity
+		// for the rollback to tell the two apart. See hasTransientLockFailure for
+		// that reasoning and what covers this flavour of #1214 instead.
 		//
 		// That exclusion does not hold once the batch ALSO contains ErrSpent,
 		// ErrTxConflicting, ErrFrozen, or ErrUtxoHashMismatch: a concurrent attempt
@@ -2042,7 +2048,10 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		// failure, so it can never reach Create either — nobody can be a
 		// legitimate owner of the partial spends, and the rollback is both safe
 		// and required. See hasUnwinnableFailure.
-		if len(spentSpends) > 0 && (!hasTransientLockFailure(spends) || hasUnwinnableFailure(spends)) {
+		sawTransientLock := hasTransientLockFailure(spends)
+		sawTransientCreating := hasTransientCreatingFailure(spends)
+
+		if len(spentSpends) > 0 && (!(sawTransientLock || sawTransientCreating) || hasUnwinnableFailure(spends)) {
 			// Wrapped in a closure so rbCancel can be deferred: Spend has a parent
 			// recover() (see the top of this function), and a panic between
 			// context.WithTimeout and a bare inline rbCancel() call would unwind
@@ -2067,9 +2076,17 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 				// the price of the freshest possible answer at the one point where
 				// getting it wrong is the failure mode we're rolling back to fix
 				// (#1214). Do not "optimise" this back to the memo.
-				rbTimeout := s.settings.UtxoStore.SpendWaitTimeout
+				//
+				// Uses SpendRollbackTimeout, not SpendWaitTimeout: SpendWaitTimeout
+				// is the end-to-end budget for ONE batched spend, while this budget
+				// covers the existence probe plus rollbackSpendChunks' sequence of
+				// chunked Unspend calls over spentSpends — a multiple of that
+				// single-spend cost on a wide transaction. On overrun the loop
+				// aborts and the remaining spends stay applied, counted via
+				// prometheusUtxoSpendRollbackFailed below.
+				rbTimeout := s.settings.UtxoStore.SpendRollbackTimeout
 				if rbTimeout <= 0 {
-					rbTimeout = 30 * time.Second
+					rbTimeout = 120 * time.Second
 				}
 
 				rbCtx, rbCancel := context.WithTimeout(context.Background(), rbTimeout)
@@ -2090,18 +2107,34 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 				}
 
 				if rollback {
-					if unspendErr := s.Unspend(rbCtx, spentSpends); unspendErr != nil {
-						s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
-						prometheusUtxoSpendRollbackFailed.Inc()
+					reverted, unspendErr := s.rollbackSpendChunks(rbCtx, spentSpends)
+					if unspendErr != nil {
+						left := len(spentSpends) - reverted
+						s.logger.Errorf("[SPEND][%s] error in sql unspend (batched mode): reverted %d of %d partial spend(s), %d left dangling: %v",
+							tx.TxID(), reverted, len(spentSpends), left, unspendErr)
+						// Counted per dangling spend left behind, not per call: with
+						// chunking, one failing chunk no longer means the whole
+						// rollback failed, so this is read as a ref count.
+						prometheusUtxoSpendRollbackFailed.Add(float64(left))
+					} else {
+						s.logger.Warnf("[SPEND][%s] rolled back %d partial spend(s) (batched mode)", tx.TxID(), reverted)
 					}
 				}
 			}()
 		} else if len(spentSpends) > 0 {
-			// Transient-lock suppression: record the outcome so this store's
-			// dashboard signal has the same value set as aerospike's — a
-			// suppressed rollback here would otherwise be invisible next to
-			// aerospike's "transient_lock" counter for the identical situation.
-			prometheusUtxoPartialSpendRollbacks.WithLabelValues(utxo.RollbackOutcomeTransientLock).Inc()
+			// Transient suppression: record the outcome so this store's dashboard
+			// signal has the same value set as aerospike's — a suppressed
+			// rollback here would otherwise be invisible next to aerospike's
+			// counters for the identical situation. When both signals fire in
+			// the same batch, report transient_lock, mirroring aerospike's rule
+			// (transient_lock has the existing dashboard history; creating is
+			// inert on this backend today — see hasTransientCreatingFailure).
+			outcome := utxo.RollbackOutcomeTransientLock
+			if sawTransientCreating && !sawTransientLock {
+				outcome = utxo.RollbackOutcomeTransientCreating
+			}
+
+			prometheusUtxoPartialSpendRollbacks.WithLabelValues(outcome).Inc()
 		}
 
 		var spendErrors error

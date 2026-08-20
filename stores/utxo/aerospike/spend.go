@@ -538,6 +538,16 @@ type spendCompletionResult struct {
 	// UNLESS sawUnwinnable is also set.
 	sawTransientLock bool
 
+	// sawTransientCreating records that at least one completed spend failed
+	// with ErrTxCreating — the OTHER two-phase-commit window the store exposes
+	// on a parent record (set in create phase 1, cleared in phase 2 by
+	// ensureCreatingBin; see create.go). Tracked as a separate signal from
+	// sawTransientLock, not folded into it, because the two windows have
+	// different owners/fixes (see rollbackPartialSpends and
+	// RollbackOutcomeTransientCreating). Suppresses the rollback under the same
+	// rule as sawTransientLock — UNLESS sawUnwinnable is also set.
+	sawTransientCreating bool
+
 	// sawUnwinnable records that at least one completed spend failed with an
 	// error class meaning this txid can never win (ErrSpent, ErrTxConflicting,
 	// ErrFrozen, ErrUtxoHashMismatch). When set, it overrides sawTransientLock's
@@ -569,6 +579,13 @@ const (
 	// legitimately own the slots we would clear. See rollbackPartialSpends'
 	// gate (spendCompletionResult.sawTransientLock / sawUnwinnable).
 	rollbackSkipTransientLock
+	// rollbackSkipTransientCreating: same suppression as
+	// rollbackSkipTransientLock, but caused by ErrTxCreating — the store's other
+	// two-phase-commit window on a parent record — rather than ErrTxLocked. Kept
+	// as a separate decision (and a separate outcome label) so an operator can
+	// tell the two windows apart; when a batch shows both, rollbackPartialSpends
+	// reports rollbackSkipTransientLock (see its gate).
+	rollbackSkipTransientCreating
 )
 
 // String doubles as the "outcome" label value on
@@ -582,6 +599,8 @@ func (d rollbackDecision) String() string {
 		return utxo.RollbackOutcomeIndeterminate
 	case rollbackSkipTransientLock:
 		return utxo.RollbackOutcomeTransientLock
+	case rollbackSkipTransientCreating:
+		return utxo.RollbackOutcomeTransientCreating
 	default:
 		return utxo.RollbackOutcomeFired
 	}
@@ -635,9 +654,17 @@ func (s *Store) rollbackPartialSpends(tx *bt.Tx, result *spendCompletionResult, 
 		return
 	}
 
-	// A transient lock means a concurrent attempt at this same txid may be the
-	// legitimate owner of these slots, and nothing in the stored spending data
-	// lets a rollback tell the two apart — so do not touch them.
+	// A transient window means a concurrent attempt at this same txid may be
+	// the legitimate owner of these slots, and nothing in the stored spending
+	// data lets a rollback tell the two apart — so do not touch them. "Transient
+	// window" is the store's set of two-phase-commit windows on a parent
+	// record, not a single error: ErrTxLocked (set/cleared around the record's
+	// own locked bin) and ErrTxCreating (set in create phase 1, cleared in
+	// phase 2 by ensureCreatingBin; see create.go, teranode.lua:297) are both
+	// windows a legitimate concurrent creator passes through, and once
+	// create-first (#1355) is enabled a parent's window becomes a creating
+	// window rather than a locked one — so both must gate the rollback the same
+	// way.
 	//
 	// That exclusion only holds while nothing else in the batch proves the tx
 	// unwinnable. If the batch ALSO contains ErrSpent, ErrTxConflicting,
@@ -648,15 +675,25 @@ func (s *Store) rollbackPartialSpends(tx *bt.Tx, result *spendCompletionResult, 
 	// required — leaving them in place here would be the exact #1214 shape
 	// (a parent naming a record-less spender).
 	//
-	// So the transient-lock-only case is a deliberately uncovered flavour of
-	// #1214: create-first ordering (#1355) covers it by making the record exist
+	// So the transient-only case is a deliberately uncovered flavour of #1214:
+	// create-first ordering (#1355) covers it by making the record exist
 	// before any spend, and attempt identity in the stored spending data (#1291)
 	// would cover it by letting the ownership check tell two attempts apart.
 	// Neither belongs in an error-path rollback. Mirrors the sql store's
 	// hasTransientLockFailure/hasUnwinnableFailure doc comments — keep in step.
-	if result.sawTransientLock && !result.sawUnwinnable {
+	if (result.sawTransientLock || result.sawTransientCreating) && !result.sawUnwinnable {
+		// When both transient signals fire in the same batch, report
+		// transient_lock: it is the flavour with an existing dashboard history
+		// and the more commonly hit window today (creating only shows up on
+		// wide parents beyond utxoBatchSize); both boil down to the same
+		// suppression rule above.
+		decision := rollbackSkipTransientLock
+		if result.sawTransientCreating && !result.sawTransientLock {
+			decision = rollbackSkipTransientCreating
+		}
+
 		if prometheusUtxoPartialSpendRollbacks != nil {
-			prometheusUtxoPartialSpendRollbacks.WithLabelValues(rollbackSkipTransientLock.String()).Inc()
+			prometheusUtxoPartialSpendRollbacks.WithLabelValues(decision.String()).Inc()
 		}
 
 		return
@@ -677,9 +714,17 @@ func (s *Store) rollbackPartialSpends(tx *bt.Tx, result *spendCompletionResult, 
 	// leaving the dangling refs this function exists to prevent, exactly when a
 	// shutdown races in-flight spends. Cleanup of writes we already made has to
 	// outlive the store's own context; the timeout is what keeps that bounded.
-	rbTimeout := s.settings.UtxoStore.SpendWaitTimeout
+	//
+	// Deliberately SpendRollbackTimeout, not SpendWaitTimeout: SpendWaitTimeout
+	// is the end-to-end budget for ONE batched spend, but this rollback is
+	// len(spentSpends) sequential single-record Unspend calls plus the probe
+	// above — on a wide transaction it needs a multiple of that budget, not the
+	// same one. On overrun the loop aborts and every spend past that point
+	// stays applied (a bounded truncation, not a full revert), counted by
+	// utxo_spend_rollback_failed.
+	rbTimeout := s.settings.UtxoStore.SpendRollbackTimeout
 	if rbTimeout <= 0 {
-		rbTimeout = 30 * time.Second
+		rbTimeout = 120 * time.Second
 	}
 
 	rbCtx, cancel := context.WithTimeout(context.Background(), rbTimeout)
@@ -744,11 +789,36 @@ func (s *Store) rollbackPartialSpends(tx *bt.Tx, result *spendCompletionResult, 
 // false (the normal, non-abort path), group.Wait having returned nil already
 // guarantees every item completed, so the flag is a no-op safety check here,
 // not the source of truth.
+//
+// An unpublished item is skipped in its entirety on the abort path: it is
+// invisible not just to spentSpends but also to sawTransientLock,
+// sawTransientCreating and sawUnwinnable, for the same race reason (reading
+// spend.Err before observing published would race). That means a transient
+// window (locked or creating) sitting on an unpublished item does NOT
+// suppress rollbackPartialSpends here — the rollback can fire and clear a
+// slot a concurrent attempt at this same txid legitimately owns. This is an
+// accepted residual of the abort path specifically (prometheusUtxoSpendAbortInFlight
+// counts it below); closing it needs attempt identity (#1291) or
+// create-before-spend ordering (#1355), same as the transient-window gate
+// itself.
 func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []*batchSpend, onlyCompleted bool) *spendCompletionResult {
 	result := &spendCompletionResult{spentSpends: make([]*utxo.Spend, 0, len(items))}
 
 	for _, item := range items {
 		if onlyCompleted && !item.published.Load() {
+			// This item is invisible to sawTransientLock, sawTransientCreating and
+			// sawUnwinnable as well as to spentSpends, because reading spend.Err
+			// before observing published would race with the dispatcher. Two
+			// consequences on the abort path, both accepted rather than fixed:
+			// a transient 2PC window among unpublished items does NOT suppress the
+			// rollback, so the rollback can clear a slot a concurrent attempt at
+			// this same txid legitimately owns; and an unwinnable failure among
+			// them cannot re-enable a rollback that a published transient window
+			// suppressed. The sql store's guard scans the whole spends slice, so
+			// the two backends genuinely take different inputs here. Closing this
+			// needs attempt identity (#1291) or create-before-spend ordering
+			// (#1355); prometheusUtxoSpendAbortInFlight counts how often the
+			// window is entered at all.
 			if prometheusUtxoSpendAbortInFlight != nil {
 				prometheusUtxoSpendAbortInFlight.Inc()
 			}
@@ -788,6 +858,14 @@ func (s *Store) resolveSpendCompletions(ctx context.Context, tx *bt.Tx, items []
 		if spend.Err != nil {
 			if errors.Is(spend.Err, errors.ErrTxLocked) {
 				result.sawTransientLock = true
+			}
+
+			// ErrTxCreating is the store's OTHER two-phase-commit window on a
+			// parent: creating is set in create phase 1 and cleared in phase 2
+			// (ensureCreatingBin, create.go), so this is transient for the same
+			// reason ErrTxLocked is — see rollbackPartialSpends' gate.
+			if errors.Is(spend.Err, errors.ErrTxCreating) {
+				result.sawTransientCreating = true
 			}
 
 			// This txid can never win: every concurrent attempt at it sees the
