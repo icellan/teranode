@@ -27,14 +27,14 @@ func (s *Server) startConnectedPeersMonitor(ctx context.Context, interval time.D
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		s.updateConnectedPeersGauge()
+		s.updateConnectedPeersGauge(ctx)
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.updateConnectedPeersGauge()
+				s.updateConnectedPeersGauge(ctx)
 			}
 		}
 	}()
@@ -42,12 +42,31 @@ func (s *Server) startConnectedPeersMonitor(ctx context.Context, interval time.D
 	return done
 }
 
-// updateConnectedPeersGauge sets prometheusP2PConnectedPeers to the current
-// number of peers reported by the P2P client. A nil client (e.g. before
-// NewServer has finished wiring the service) is a no-op.
-func (s *Server) updateConnectedPeersGauge() {
-	if s.P2PClient == nil {
+// updateConnectedPeersGauge sets prometheusP2PConnectedPeers to the number of
+// DIRECTLY connected peers, using the same definition as the
+// connected_peers_count field in node_status (see getNodeStatusMessage in
+// Server.go): the registry also holds gossiped/disconnected peers, so only
+// entries with IsConnected set are counted. A nil registry (e.g. before
+// NewServer has finished wiring the service) is a no-op, and a failed lookup
+// leaves the gauge at its previous value rather than publishing a wrong one.
+func (s *Server) updateConnectedPeersGauge(ctx context.Context) {
+	if s.peerRegistry == nil {
 		return
 	}
-	prometheusP2PConnectedPeers.Set(float64(len(s.P2PClient.GetPeers())))
+
+	peers, err := s.peerRegistry.ListPeers(ctx, nil, 0, 0, false, false)
+	if err != nil {
+		s.logger.Warnf("[updateConnectedPeersGauge] ListPeers failed: %v", err)
+		return
+	}
+
+	connected := 0
+
+	for _, p := range peers {
+		if p.IsConnected {
+			connected++
+		}
+	}
+
+	prometheusP2PConnectedPeers.Set(float64(connected))
 }

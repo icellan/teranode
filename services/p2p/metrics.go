@@ -49,16 +49,6 @@ func initPrometheusMetrics() {
 	prometheusMetricsInitOnce.Do(_initPrometheusMetrics)
 }
 
-// init eagerly registers the metrics at package load. Unlike most other
-// services, many p2p unit tests construct *Server directly (bypassing
-// NewServer) and exercise ban/catchup/websocket code paths that record
-// metrics, so initialization cannot rely solely on being called from
-// NewServer. sync.Once still guarantees a single registration even though
-// NewServer also calls initPrometheusMetrics().
-func init() {
-	initPrometheusMetrics()
-}
-
 // _initPrometheusMetrics is the internal implementation that registers all
 // Prometheus metrics used by the p2p service. Each metric is namespaced under
 // 'teranode' and the 'p2p' subsystem.

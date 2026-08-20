@@ -2493,6 +2493,11 @@ func (s *Server) BanPeer(ctx context.Context, peer *p2p_api.BanPeerRequest) (*p2
 		return nil, errors.WrapGRPCPublic(err)
 	}
 
+	// This RPC bypasses AddBanScore/onPeerBanned entirely, so it must
+	// increment prometheusP2PBanEvents itself or operator-issued bans would
+	// be invisible to the metric despite its name implying all ban events.
+	prometheusP2PBanEvents.WithLabelValues(ReasonOperatorBan).Inc()
+
 	return &p2p_api.BanPeerResponse{Ok: true}, nil
 }
 
@@ -2624,7 +2629,10 @@ func (s *Server) onPeerBanned(peerID, reason string) {
 	}
 	until := time.Now().Add(banDuration)
 	s.logger.Infof("[onPeerBanned] Peer %s banned until %s for reason: %s", peerID, until.Format(time.RFC3339), reason)
-	prometheusP2PBanEvents.WithLabelValues(reason).Inc()
+	// The label is bounded to the known reason set; the unbounded value
+	// handed to peerRegistry.AddBanScore above is untouched so per-reason
+	// ban-score weights aren't affected.
+	prometheusP2PBanEvents.WithLabelValues(normalizeBanReasonLabel(reason)).Inc()
 
 	// Make the ban effective for gossip filtering immediately, without waiting
 	// for the cached IsPeerBanned=false entry to expire.

@@ -914,7 +914,7 @@ pruner_jobTimeout = 20m  # or higher
 1. Verify pruner running:
 
     ```bash
-    curl http://localhost:8096/metrics | grep pruner_processed_total
+    curl http://localhost:8096/metrics | grep teranode_pruner_active
     ```
 
 2. Check `teranode_pruner_skipped_total` reasons:
