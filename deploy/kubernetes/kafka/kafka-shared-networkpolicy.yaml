@@ -1,3 +1,10 @@
+# PREREQUISITE: this policy is enforced only on clusters whose CNI plugin
+# implements NetworkPolicy. A cluster whose CNI does not will accept this
+# object and ignore it - no error is raised. Confirm enforcement before
+# relying on it, e.g. from a pod in another namespace:
+#   kubectl run np-probe --rm -it --image=busybox -n default -- \
+#     nc -vz -w3 kafka-shared.teranode-operator.svc.cluster.local 9092
+# The connection must fail. If it succeeds, your CNI is not enforcing policy.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
