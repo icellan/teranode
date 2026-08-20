@@ -519,7 +519,7 @@ Master Record (key = hash(txID), index 0):
   - recordUtxos = 128     // Non-nil in this record
   - spentUtxos = 0
   - spentExtraRecs = 0
-  - Full tx data or external=true
+  - external=true (tx data in blob storage)
   - All metadata fields
 
 Child Record 1 (key = hash(txID+1), index 1):
