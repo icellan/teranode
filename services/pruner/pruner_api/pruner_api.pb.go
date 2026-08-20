@@ -4,9 +4,9 @@
 // 	protoc        v7.34.1
 // source: services/pruner/pruner_api/pruner_api.proto
 
-// Version: v1 (implicit). This package has no version suffix because it has
-// never had a breaking change. When a breaking change is introduced, bump to
-// package pruner.v1 (or the next version) at that time -- not before.
+// Version: v1 (implicit). No version suffix; the unsuffixed name IS v1. A
+// breaking change adds the next suffixed version (v2) alongside it -- see
+// docs/references/protoVersioning.md.
 
 package pruner_api
 

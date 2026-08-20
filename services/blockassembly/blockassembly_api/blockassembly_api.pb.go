@@ -4,9 +4,12 @@
 // 	protoc        v7.34.1
 // source: services/blockassembly/blockassembly_api/blockassembly_api.proto
 
-// Version: v1 (implicit). This package has no version suffix because it has
-// never had a breaking change. When a breaking change is introduced, bump to
-// package blockassembly_api.v1 (or the next version) at that time -- not before.
+// Version: v1 (implicit). No version suffix; the unsuffixed name IS v1. This
+// package has already had a breaking change handled via `reserved` fields
+// without a version bump (see AddTxBatchColumnarRequest below) -- reserving
+// prevents wire corruption but is not the same as version coexistence. A
+// version bump (v2) is for changes reserved fields can't express -- see
+// docs/references/protoVersioning.md.
 
 package blockassembly_api
 
