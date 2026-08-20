@@ -107,6 +107,7 @@ func (b *Blockchain) NewFiniteStateMachine(opts ...func(*fsm.FSM)) *fsm.FSM {
 //     healthy but not yet processing, not unavailable.
 //   - StatusServiceUnavailable (503): For any unknown/unlisted state, or if the
 //     FSM state query itself fails.
+//
 // checkLiveness is accepted only to satisfy the shared health.Check signature; this
 // check ignores it because it is registered as a readiness check and callers never
 // invoke it on the liveness path (liveness handlers return before building the check
