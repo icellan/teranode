@@ -50,14 +50,15 @@ func TestOptimisticMiningDocMatchesCodeDefault(t *testing.T) {
 		}
 	}
 	require.True(t, found, "setting %s not found in ExportMetadata()", settingKey)
-	require.Equal(t, "true", structTagDefault, "struct tag default for %s changed - update the doc alongside it", settingKey)
+	require.Contains(t, []string{"true", "false"}, structTagDefault,
+		"struct tag default for %s is not a bool literal: %q", settingKey, structTagDefault)
 
 	// 3. Runtime default literal passed to getBool() in settings.go.
 	settingsGoPath := filepath.Join(settingsDir, "settings.go")
 	settingsGoBytes, err := os.ReadFile(settingsGoPath)
 	require.NoError(t, err, "reading settings.go")
 
-	runtimeDefaultRe := regexp.MustCompile(`getBool\(\s*"` + regexp.QuoteMeta(settingKey) + `"\s*,\s*(true|false)\s*,`)
+	runtimeDefaultRe := regexp.MustCompile(`getBool\(\s*"` + regexp.QuoteMeta(settingKey) + `"\s*,\s*(true|false)\s*[,)]`)
 	runtimeMatches := runtimeDefaultRe.FindStringSubmatch(string(settingsGoBytes))
 	require.Len(t, runtimeMatches, 2, "could not find getBool default for %s in settings.go", settingKey)
 	runtimeDefault := runtimeMatches[1] == "true"
@@ -68,4 +69,25 @@ func TestOptimisticMiningDocMatchesCodeDefault(t *testing.T) {
 	require.Equal(t, runtimeDefault, structTagDefault == "true",
 		"struct tag default (%s) for %s disagrees with the settings.go runtime default (%v)",
 		structTagDefault, settingKey, runtimeDefault)
+
+	// 4. Stale-prose guard: these phrases described optimistic mining incorrectly (they named
+	// script validation, rather than the block-level checks, as the deferred work) and were
+	// corrected once already. If either the doc or the struct tag longdesc regresses back to one
+	// of these phrases, fail even though the boolean default above still matches everywhere.
+	stalePhrases := []string{
+		"before full script validation completes",
+		"Full script validation continues in parallel",
+		"subtree validation runs in background",
+	}
+
+	blockvalidationSettingsGoPath := filepath.Join(settingsDir, "blockvalidation_settings.go")
+	blockvalidationSettingsGoBytes, err := os.ReadFile(blockvalidationSettingsGoPath)
+	require.NoError(t, err, "reading blockvalidation_settings.go")
+
+	for _, phrase := range stalePhrases {
+		require.NotContains(t, string(docBytes), phrase,
+			"stale optimistic-mining prose is back in the settings doc: %q", phrase)
+		require.NotContains(t, string(blockvalidationSettingsGoBytes), phrase,
+			"stale optimistic-mining prose is back in the longdesc struct tag: %q", phrase)
+	}
 }

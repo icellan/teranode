@@ -85,11 +85,22 @@
 
 ### Optimistic Mining
 
-- `OptimisticMining` defaults to `true` (enabled): the block is added to the chain and mining can start on it immediately, before full script validation completes
-- Full script validation continues in parallel; if it fails, the block's UTXOs are reverted
-- Trade-off: competitive mining latency (seconds down to milliseconds) versus the risk of wasted hashpower if the block later proves invalid
+- `OptimisticMining` defaults to `true` (enabled): once the block's subtrees have been validated
+  (transaction and script checks), the block is added to the chain and mining can start on it,
+  before the remaining block-level checks have run
+- Block-level validation continues in the background - merkle root, coinbase and BIP34 checks,
+  duplicate transactions, transaction ordering and parent-spend checks, and the old-block-ID
+  double-spend scan
+- If a background check proves the block invalid it is invalidated and its UTXO effects are
+  rolled back; a transient storage or processing failure instead schedules a re-validation and
+  leaves the block on the chain in the meantime
+- Trade-off: competitive mining latency (seconds down to milliseconds) versus the risk of wasted
+  hashpower if the block later proves invalid
 - Can be overridden per-validation via the `DisableOptimisticMining` option
-- Disabled during catchup mode for better reliability
+- Disabled during catchup mode for better reliability, and also for legacy-sourced blocks and
+  operator-triggered block revalidation
+- Checkpoint-verified blocks take the quick-validation pipeline instead, which does not consult
+  this setting
 
 ### Quick Validation Pipeline
 
