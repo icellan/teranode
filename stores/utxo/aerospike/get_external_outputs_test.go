@@ -279,6 +279,32 @@ func TestGetExternalTransactionOrOutputs_FallsBackOnlyOnNotFound(t *testing.T) {
 			"the original failure must be preserved, got %v", err)
 	})
 
+	t.Run("missing .tx and missing .outputs is both not-found and our fault", func(t *testing.T) {
+		// An external record with neither blob is this node's storage contradicting
+		// itself, not a transaction it legitimately lacks, so the error carries both
+		// classifications. ErrTxNotFound is what netsync's DAH'd-parent recovery and
+		// subtreevalidation's continue-the-level branch key on; ErrStorageError is
+		// what errors.IsTransientLocalError keys on, and legacy/peer_server.go's
+		// shouldDisconnectOnBlockErr is its negation — so losing it would disconnect
+		// a peer for our missing blob.
+		s, _, tx := newOutputsOnlyStore(t)
+
+		// newOutputsOnlyStore with no live indexes still writes an .outputs blob, so
+		// remove both representations to reach the neither-stored state.
+		require.NoError(t, s.externalStore.Del(context.Background(), tx.TxIDChainHash()[:], fileformat.FileTypeOutputs))
+
+		got, err := s.getExternalTransactionOrOutputs(context.Background(), *tx.TxIDChainHash())
+		require.Error(t, err)
+		require.Nil(t, got)
+
+		require.True(t, errors.Is(err, errors.ErrTxNotFound),
+			"what is missing must stay visible to callers that branch on it, got %v", err)
+		require.True(t, errors.Is(err, errors.ErrStorageError),
+			"whose fault it is must stay visible: this classifies as a local storage fault, got %v", err)
+		require.True(t, errors.IsTransientLocalError(err),
+			"a missing blob of ours must not be attributed to the peer that sent the block, got %v", err)
+	})
+
 	t.Run("missing .tx and missing .outputs reports not found", func(t *testing.T) {
 		chainParams := chaincfg.RegressionNetParams
 		tSettings := &settings.Settings{}

@@ -1778,8 +1778,30 @@ func (s *Store) getExternalOutpoints(ctx context.Context, previousTxHash chainha
 //   - Callers that serialize, hash, or re-serve the transaction must reject it
 //     first with meta.Data.TxIsSerializable — a reconstruction has no inputs and
 //     nil holes, so serializing it panics in go-bt and it never hashes back to its
-//     own txid. services/asset, services/blockpersister and services/legacy all
-//     gate on that predicate.
+//     own txid.
+//
+// Three serving paths do gate, and they are the ones reached in a shipped
+// configuration: services/asset/repository/repository.go isRequestedTransaction,
+// services/blockpersister/streaming_process_subtree.go, and
+// services/legacy/peer_server.go pushTxMsg. That list is the audited set, not a
+// service-wide invariant — three other sites serialize without the predicate:
+//
+//   - services/asset/repository/GetLegacyBlock.go writeChunkToWriter, and
+//     GetSubtreeData.go, which reach the same writer. Both run in a detached
+//     errgroup goroutine feeding an io.Pipe, outside the reach of Echo's
+//     request-goroutine middleware.Recover — but #1383 gave those goroutines their
+//     own util.RecoverToError, so a nil-hole fault there now fails the stream and
+//     closes the pipe rather than ending the process.
+//   - services/legacy/peer_server.go getTxFromStore and
+//     services/blockpersister/processTxMetaUsingStore.go, both of which have no
+//     callers today.
+//
+// None of those is reachable as shipped: the reconstruction exists only for an
+// input-less external transaction, which is cmd/seeder output, and a
+// snapshot-seeded transaction predates every block whose subtrees this node serves.
+// The exposure is also unchanged by this function's fallback — main reached the same
+// shape through the same paths. Recorded rather than left implied, because the
+// sentence above is the one a reader will trust.
 //
 // Errors keep the distinction the fallback depends on: neither representation
 // stored is ErrTxNotFound, a failure to read one that is stored is a storage
@@ -1954,11 +1976,33 @@ func (s *Store) getExternalTransactionOrOutputs(ctx context.Context, previousTxH
 
 	tx, outputsErr := s.getExternalOutputs(ctx, previousTxHash)
 	if outputsErr != nil {
-		// Neither representation is stored. Distinguish that from a failure to read
-		// the one that is, so the caller can tell "this node does not have it" from
-		// "this node could not look".
+		// Neither representation is stored, for a record that says it is external.
+		// That is not a transaction this node legitimately does not have: it is this
+		// node's own storage contradicting itself. create.go writes the blob before
+		// the Aerospike record, and the pruner deletes the record before the blob, so
+		// no step in the normal lifecycle leaves an external record without one — it
+		// takes lost data, a wrong or unmounted externalStore path, or
+		// pruner_skipDeletions, which drops blobs while keeping records.
+		//
+		// So the error is classified BOTH ways on purpose, and the nesting is the
+		// point rather than belt-and-braces:
+		//
+		//   - StorageError outermost, because whose fault it is matters. It is ours.
+		//     errors.IsTransientLocalError keys on ErrStorageError, and
+		//     legacy/peer_server.go shouldDisconnectOnBlockErr is exactly its
+		//     negation — so without this a block from a peer that happens to spend
+		//     such a parent gets the peer disconnected for our missing blob, then the
+		//     next peer, and the next.
+		//   - ErrTxNotFound in the chain, because what is missing matters too, and
+		//     callers already branch on it usefully: netsync's extendPerTxFallback
+		//     tries a DAH'd-parent recovery, and subtreevalidation continues the
+		//     level rather than aborting it.
+		//
+		// Both survive errors.Is, which walks the chain comparing codes.
 		if errors.Is(outputsErr, errors.ErrTxNotFound) {
-			return nil, errors.NewTxNotFoundError("[getExternalTransactionOrOutputs][%s] neither tx nor outputs are stored externally", previousTxHash.String(), outputsErr)
+			return nil, errors.NewStorageError("[getExternalTransactionOrOutputs][%s] external record has neither tx nor outputs stored",
+				previousTxHash.String(),
+				errors.NewTxNotFoundError("[getExternalTransactionOrOutputs][%s] neither tx nor outputs are stored externally", previousTxHash.String(), outputsErr))
 		}
 
 		return nil, outputsErr
