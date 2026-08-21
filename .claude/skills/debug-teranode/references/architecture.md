@@ -248,7 +248,7 @@ seeding from an exported UTXO set.
 | `kafka_invalid_blocks` | Block Validation → subscribers | `{block_hash, reason}` | varies |
 | `kafka_legacy_inv` | Legacy P2P | legacy inv messages | auto |
 
-- Consumer concurrency = `partitions / consumer_ratio` (NOT the `kafkaWorkers` setting directly).
+- Consumer concurrency = partition count. One consumer group member per service instance; Kafka gives each partition to exactly one member, and each member fans out a goroutine per assigned partition. Neither `consumer_ratio` (does not exist in the code) nor the `*_kafkaWorkers` settings (loaded but never read) affect it.
 - Teranode **pauses** processing when Kafka is unhealthy and auto-resumes (safe-state design).
 
 ---

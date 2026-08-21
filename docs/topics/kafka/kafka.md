@@ -306,15 +306,15 @@ When configuring Kafka consumers via URL, the following query parameters are sup
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `partitions` | int | 1 | Number of topic partitions to consume from |
-| `consumer_ratio` | int | 1 | Ratio for scaling consumer count (partitions/consumer_ratio) |
+| `partitions` | int | 1 | Number of topic partitions (used when the topic is auto-created by the producer) |
 | `replay` | int | 1 | Whether to replay messages from beginning (1=true, 0=false) |
-| `group_id` | string | - | Consumer group identifier for coordination |
+
+The consumer group ID is **not** a URL parameter — it is passed as an argument when the consumer group is constructed in `daemon/daemon_kafka.go`. A `group_id=` query parameter in a Kafka URL is ignored.
 
 **Example Consumer URL:**
 
 ```text
-kafka://localhost:9092/transactions?partitions=4&consumer_ratio=2&replay=0&group_id=validator-group
+kafka://localhost:9092/transactions?partitions=4&replay=0
 ```
 
 ### Producer Configuration Parameters
@@ -359,7 +359,7 @@ Advanced URL parameters for fine-tuning consumer behavior and timeout configurat
 Services that process messages slowly (e.g., subtree validation with large datasets) need increased timeouts to prevent partition abandonment:
 
 ```text
-kafka://localhost:9092/subtrees?partitions=4&consumer_ratio=1&sessionTimeout=90000&heartbeatInterval=20000
+kafka://localhost:9092/subtrees?partitions=4&sessionTimeout=90000&heartbeatInterval=20000
 ```
 
 This configuration:
@@ -420,16 +420,15 @@ Note: the Block Persister has no Kafka consumer at all — it polls the Blockcha
 
 ### Kafka Consumer Concurrency
 
-**Important**: Unlike what the service-specific `kafkaWorkers` settings might suggest, Kafka consumer concurrency in Teranode is actually controlled through the `consumer_ratio` URL parameter for each topic. The actual number of consumers is calculated as:
+**Partition count is the unit of consumer parallelism.** Each service instance creates exactly one consumer group member per topic (`NewKafkaConsumerGroupFromURL` in `util/kafka/kafka_consumer.go`). Kafka assigns each partition to exactly one member of a group, so:
 
-```text
-consumerCount = partitions / consumer_ratio
-```
+- The number of partitions is the hard ceiling on how many instances of a service can consume a topic in parallel. Adding instances beyond the partition count leaves the extra instances idle.
+- Within one instance, the consume loop spawns a goroutine per assigned partition per fetch, so a single instance holding N partitions processes up to N partitions concurrently. Handlers run sequentially within a partition's goroutine.
+- Raising `partitions` is therefore the lever for consumer throughput; there is no separate consumer-count parameter.
 
-Common consumer ratios in use:
+**There is no `consumer_ratio` parameter.** It appears in older documentation and example URLs but is not read anywhere in the code — no `consumer_ratio`, `ConsumerRatio` or `consumerRatio` identifier exists, and it is not picked up by the generic URL-parameter helpers (`util.GetQueryParam*`) that parse every recognised Kafka URL parameter. Unknown query parameters are silently ignored, so leaving it in a URL is inert rather than harmful — but it does not scale consumers.
 
-- `consumer_ratio=1`: One consumer per partition (maximum parallelism)
-- `consumer_ratio=4`: One consumer per 4 partitions (balanced approach)
+Likewise, the service-specific `*_kafkaWorkers` settings (`validator_kafkaWorkers`, `blockvalidation_kafkaWorkers`, `block_kafkaWorkers`) are loaded into the settings structs but are not read by any consumer code path. They do not currently affect consumer concurrency either.
 
 ### Service-Specific Performance Settings
 
@@ -442,25 +441,23 @@ Common consumer ratios in use:
 
 #### Validator Service Settings
 
-- **`validator_kafkaWorkers`**: Number of concurrent Kafka processing workers
-    - **Purpose**: Controls parallel transaction processing capacity
-    - **Tuning**: Should match CPU cores and expected transaction volume
-    - **Integration**: Works with Block Assembly via direct gRPC (not Kafka)
+- **`validator_kafkaWorkers`**: declared but inert
+    - **Status**: The setting is defined and loaded (`settings/validator_settings.go`, `settings/settings.go`) but no code reads it, so changing it has no effect. The same applies to `blockvalidation_kafkaWorkers` and `block_kafkaWorkers`.
+    - **Use instead**: raise the topic's `partitions` and/or run more service instances in the same consumer group — see [Kafka Consumer Concurrency](#kafka-consumer-concurrency)
 
 ### Configuration Examples by Service
 
 #### High-Throughput Service (Propagation)
 
 ```text
-kafka_validatortxsConfig=kafka://localhost:9092/validator-txs?partitions=8&consumer_ratio=2&flush_frequency=1s
+kafka_validatortxsConfig=kafka://localhost:9092/validator-txs?partitions=8&flush_frequency=1s
 validator_kafka_maxMessageBytes=1048576  # 1MB threshold
 ```
 
 #### Critical Processing Service (Block Validation)
 
 ```text
-kafka_blocksConfig=kafka://localhost:9092/blocks?partitions=4&consumer_ratio=1&replay=0
-blockvalidation_kafkaWorkers=4
+kafka_blocksConfig=kafka://localhost:9092/blocks?partitions=4&replay=0
 ```
 
 `autoCommit` is not a URL parameter and cannot be set via `kafka_blocksConfig` — Block Validation's consumer group is always constructed with `autoCommit=false` in code (`daemon/daemon_kafka.go`).
@@ -468,7 +465,7 @@ blockvalidation_kafkaWorkers=4
 #### Metadata Service (Subtree Validation)
 
 ```text
-kafka_txmetaConfig=kafka://localhost:9092/txmeta?partitions=2&consumer_ratio=1&replay=1
+kafka_txmetaConfig=kafka://localhost:9092/txmeta?partitions=2&replay=1
 ```
 
 `autoCommit` is not a URL parameter here either — the txmeta consumer group is always constructed with `autoCommit=true` in code (`daemon/daemon_kafka.go`).
