@@ -327,43 +327,6 @@ When disabled (default), each pruner cycle clears expired PreserveUntil markers 
 
 **Description**: Skip deletion operations during pruning
 
-## Operation Timeout Settings
-
-### pruner_jobTimeout
-
-**Type**: Duration
-
-**Default**: `10m` (10 minutes)
-
-**Description**: Timeout for overall pruning operation completion
-
-**Format**: Duration string (e.g., `5m`, `30s`, `1h`)
-
-**Example:**
-
-```conf
-pruner_jobTimeout = 10m
-```
-
-**Behavior:**
-
-- Pruning operation runs synchronously up to this timeout
-- On timeout: Operation is logged as timed out but continues in background
-
-**Tuning Guidelines:**
-
-- **Small databases**: `5m` may be sufficient
-- **Large databases**: Increase to `15m` or `20m`
-- **Slow storage**: Increase timeout accordingly
-- **High latency networks**: Add buffer for network delays
-
-**Impact:**
-
-- Too short: Frequent timeouts logged
-- Too long: Blocks other operations unnecessarily
-
-**Metrics**: Monitor `pruner_duration_seconds` to determine appropriate timeout
-
 ## UTXO Store Settings
 
 These settings control the pruning behavior at the UTXO store level.
@@ -381,7 +344,7 @@ These settings control the pruning behavior at the UTXO store level.
 **Calculation:**
 
 ```conf
-globalBlockHeightRetention = 14400  # ~100 days
+global_blockHeightRetention = 14400  # ~100 days
 utxostore_unminedTxRetention = 7200  # 50 days
 ```
 
@@ -406,10 +369,10 @@ Unmined transactions older than this are considered "old" and their parent trans
 
 **Description**: Number of blocks to preserve parent transactions of old unmined transactions
 
-**Calculation:**
+**Calculation:** `blocksInADayOnAverage` (144, ~1 day at a 10-minute block target) is a fixed constant in
+settings.go, not a configurable key. The default is derived from it, not read from settings.conf:
 
 ```conf
-blocksInADayOnAverage = 144  # Typical Bitcoin block time
 utxostore_parentPreservationBlocks = 1440  # 10 days
 ```
 
@@ -429,47 +392,6 @@ This prevents parent UTXOs from being deleted for the specified number of blocks
 - **Decrease**: Prune parents sooner, faster pruning, higher risk for resubmissions
 
 **Recommendation**: Keep default value unless specific use case requires change.
-
-### utxostore_prunerMaxConcurrentOperations
-
-**Type**: Integer
-
-**Default**: UTXO store connection pool size
-
-**Description**: Maximum number of concurrent pruning operations for Aerospike
-
-**Applies To**: Aerospike store only (SQL uses fixed worker count)
-
-**Example:**
-
-```conf
-utxostore_prunerMaxConcurrentOperations = 8
-```
-
-**Impact:**
-
-- **Higher values**: Faster pruning, higher load on database
-- **Lower values**: Slower pruning, lower load on database
-
-**Tuning Guidelines:**
-
-- **Small databases**: 4-8 workers sufficient
-- **Large databases**: 8-16 workers for faster pruning
-- **Limited resources**: Reduce to 2-4 workers
-- **High throughput nodes**: Increase to 16-32 workers
-
-**Constraint**: Limited by Aerospike connection pool size. Exceeding pool size causes contention.
-
-**Aerospike Worker Count:**
-
-Default: 4 workers (hardcoded in `/stores/utxo/aerospike/pruner/pruner_service.go`)
-
-To change, modify code:
-
-```go
-// In pruner_service.go
-workerCount := 4  // Change this value
-```
 
 ### utxostore_disableDAHCleaner
 
@@ -709,7 +631,6 @@ pruner_utxoDefensiveBatchReadSize = 10000
 startPruner = true
 pruner_grpcAddress = localhost:8096
 pruner_grpcListenAddress = localhost:8096
-pruner_jobTimeout = 10m
 ```
 
 ### Docker Context (Single Machine, Multi-Node)
@@ -719,7 +640,6 @@ pruner_jobTimeout = 10m
 startPruner = true
 pruner_grpcAddress = pruner:8096
 pruner_grpcListenAddress = :8096
-pruner_jobTimeout = 10m
 ```
 
 ### Docker Context (Per-Service Containers)
@@ -729,7 +649,6 @@ pruner_jobTimeout = 10m
 startPruner = true
 pruner_grpcAddress = ${clientName}:8096
 pruner_grpcListenAddress = :8096
-pruner_jobTimeout = 10m
 ```
 
 ### Docker Host Context (Access from Host)
@@ -739,7 +658,6 @@ pruner_jobTimeout = 10m
 startPruner = true
 pruner_grpcAddress = localhost:${PORT_PREFIX}8096
 pruner_grpcListenAddress = localhost:${PORT_PREFIX}8096
-pruner_jobTimeout = 10m
 
 # Disable pruner for specific nodes
 startPruner.teranode1.coinbase = false
@@ -753,7 +671,6 @@ startPruner.teranode2.coinbase = false
 startPruner = true
 pruner_grpcAddress = k8s:///pruner.${clientName}.svc.cluster.local:8096
 pruner_grpcListenAddress = :8096
-pruner_jobTimeout = 15m  # Increase for distributed environments
 ```
 
 ## Configuration Examples
@@ -772,7 +689,6 @@ All other settings use defaults.
 ```conf
 # settings.conf
 startPruner = true
-pruner_jobTimeout = 5m  # Shorter timeout
 pruner_utxoChunkSize = 2000  # Larger chunks
 pruner_utxoChunkGroupLimit = 20  # More parallel chunks
 utxostore_unminedTxRetention = 5000  # Prune sooner
@@ -786,7 +702,6 @@ utxostore_parentPreservationBlocks = 10000  # Shorter preservation
 ```conf
 # settings.conf
 startPruner = true
-pruner_jobTimeout = 20m  # Longer timeout
 pruner_utxoChunkGroupLimit = 5  # Fewer parallel chunks
 pruner_utxoDefensiveEnabled = true  # Enable safety checks
 utxostore_unminedTxRetention = 10000  # Retain longer
@@ -822,28 +737,26 @@ startPruner.docker.host.teranode3 = true
 
 ## Environment Variable Overrides
 
-Settings can be overridden via environment variables using uppercase names with underscores:
+Settings can be overridden via environment variables using the exact key name (case-sensitive, no
+automatic uppercasing):
 
 ```bash
 # Override pruner enable/disable
-export STARTPRUNER=false
+export startPruner=false
 
-# Override gRPC port
-export PRUNER_GRPCPORT=8097
-
-# Override job timeout
-export PRUNER_JOBTIMEOUT=15m
+# Override gRPC port (via the settings.conf ${PRUNER_GRPC_PORT} template variable used above)
+export PRUNER_GRPC_PORT=8097
 
 # Override UTXO settings
-export UTXOSTORE_UNMINEDTXRETENTION=10000
-export UTXOSTORE_PARENTPRESERVATIONBLOCKS=20000
+export utxostore_unminedTxRetention=10000
+export utxostore_parentPreservationBlocks=20000
 ```
 
 ## Monitoring Settings
 
 While not configuration settings, these Prometheus metrics should be monitored:
 
-- `pruner_duration_seconds`: Adjust `jobTimeout` if consistently near timeout
+- `pruner_duration_seconds`: Watch for a rising trend, which may indicate the chunk/concurrency settings below need tuning
 - `pruner_skipped_total{reason="not_running"}`: Indicates Block Assembly issues
 - `pruner_errors_total`: Indicates database or connectivity issues
 - `utxo_cleanup_batch_duration_seconds`: Indicates Aerospike performance
@@ -866,16 +779,6 @@ While not configuration settings, these Prometheus metrics should be monitored:
 PRUNER_GRPC_PORT = 8097
 pruner_grpcAddress = localhost:8097
 pruner_grpcListenAddress = :8097
-```
-
-### Frequent Timeouts
-
-**Symptoms**: `WARN [Pruner] Job timeout reached`
-
-**Solution**: Increase `pruner_jobTimeout`:
-
-```conf
-pruner_jobTimeout = 20m  # or higher
 ```
 
 ### Slow Pruning
