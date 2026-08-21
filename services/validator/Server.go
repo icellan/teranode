@@ -361,7 +361,17 @@ func (v *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 
 		// should not pass in a height when validating from Kafka, should just be current utxo store height
 		if _, err = v.validator.ValidateWithOptions(ctx, tx, height, options); err != nil {
-			prometheusInvalidTransactions.Inc()
+			// ErrTxMissingParent here means the tx merely arrived before its
+			// parent on this Kafka topic's 32 concurrent partitions - it is not
+			// evidence of an attack or a malformed tx, so count it separately
+			// from prometheusInvalidTransactions to keep that counter usable as
+			// a signal for genuinely invalid/attack traffic.
+			if errors.Is(err, errors.ErrTxMissingParent) {
+				prometheusMissingParentTransactions.Inc()
+			} else {
+				prometheusInvalidTransactions.Inc()
+			}
+
 			v.logger.Errorf("[Validator] Invalid tx: %s", err)
 
 			return err
