@@ -31,6 +31,14 @@ type GenerationalCache struct {
 
 // NewGenerationalCache creates a new generational cache instance.
 // The cache is automatically started and begins cleanup of expired items.
+//
+// The underlying ttlcache is created without a capacity limit, so the number of
+// live entries is unbounded and only the per-entry TTL evicts them. The accessors
+// in this package build their cache keys by hashing a format string that includes
+// caller-supplied values (see GetBlockHeaders and the sibling header accessors,
+// which all follow the same pattern), so a caller varying those values produces a
+// distinct entry per value and therefore controls how many entries exist until
+// the TTL expires them.
 func NewGenerationalCache() *GenerationalCache {
 	gc := &GenerationalCache{
 		ttlCache: ttlcache.New[chainhash.Hash, any](
