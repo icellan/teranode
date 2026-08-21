@@ -163,20 +163,32 @@ func getPostgresPoolSettings(servicePrefix string, alternativeContext ...string)
 	retryMaxAttempts := getInt(servicePrefix+"_postgres_retryMaxAttempts", 0, alternativeContext...)
 	retryBaseDelay := getDuration(servicePrefix+"_postgres_retryBaseDelay", 0, alternativeContext...)
 	retryEnabled := getBool(servicePrefix+"_postgres_retryEnabled", false, alternativeContext...)
+	circuitBreakerEnabled := getBool(servicePrefix+"_postgres_circuitBreakerEnabled", false, alternativeContext...)
+	circuitBreakerFailureThreshold := getInt(servicePrefix+"_postgres_circuitBreakerFailureThreshold", 0, alternativeContext...)
+	circuitBreakerHalfOpenMax := getInt(servicePrefix+"_postgres_circuitBreakerHalfOpenMax", 0, alternativeContext...)
+	circuitBreakerCooldown := getDuration(servicePrefix+"_postgres_circuitBreakerCooldown", 0, alternativeContext...)
+	circuitBreakerFailureWindow := getDuration(servicePrefix+"_postgres_circuitBreakerFailureWindow", 0, alternativeContext...)
 
 	// Only return settings if at least one is configured (non-zero)
 	if maxOpenConns == 0 && maxIdleConns == 0 && connMaxLifetime == 0 && connMaxIdleTime == 0 &&
-		retryMaxAttempts == 0 && retryBaseDelay == 0 {
+		retryMaxAttempts == 0 && retryBaseDelay == 0 && !circuitBreakerEnabled &&
+		circuitBreakerFailureThreshold == 0 && circuitBreakerHalfOpenMax == 0 &&
+		circuitBreakerCooldown == 0 && circuitBreakerFailureWindow == 0 {
 		return nil
 	}
 
 	return &PostgresSettings{
-		MaxOpenConns:     maxOpenConns,
-		MaxIdleConns:     maxIdleConns,
-		ConnMaxLifetime:  connMaxLifetime,
-		ConnMaxIdleTime:  connMaxIdleTime,
-		RetryMaxAttempts: retryMaxAttempts,
-		RetryBaseDelay:   retryBaseDelay,
-		RetryEnabled:     retryEnabled,
+		MaxOpenConns:                   maxOpenConns,
+		MaxIdleConns:                   maxIdleConns,
+		ConnMaxLifetime:                connMaxLifetime,
+		ConnMaxIdleTime:                connMaxIdleTime,
+		RetryMaxAttempts:               retryMaxAttempts,
+		RetryBaseDelay:                 retryBaseDelay,
+		RetryEnabled:                   retryEnabled,
+		CircuitBreakerEnabled:          circuitBreakerEnabled,
+		CircuitBreakerFailureThreshold: circuitBreakerFailureThreshold,
+		CircuitBreakerHalfOpenMax:      circuitBreakerHalfOpenMax,
+		CircuitBreakerCooldown:         circuitBreakerCooldown,
+		CircuitBreakerFailureWindow:    circuitBreakerFailureWindow,
 	}
 }

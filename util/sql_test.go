@@ -737,3 +737,88 @@ func TestSQLiteConnectionString(t *testing.T) {
 		assert.Equal(t, 5000, busyTimeout, "Busy timeout should be 5000ms")
 	})
 }
+
+// postgresCircuitBreakerTestSettings returns global settings with a
+// non-zero pool config so InitPostgresDB doesn't fall over on the unrelated
+// zero-value pool fields; only the circuit breaker fields vary per test.
+func postgresCircuitBreakerTestSettings(cb settings.PostgresSettings) *settings.Settings {
+	cb.MaxOpenConns = 50
+	cb.MaxIdleConns = 10
+	cb.ConnMaxLifetime = 5 * time.Minute
+	cb.ConnMaxIdleTime = time.Minute
+
+	return &settings.Settings{Postgres: cb}
+}
+
+// TestInitPostgresDB_CircuitBreakerInstalled is the load-bearing test for this
+// change: postgres_circuitBreakerEnabled=true plus non-zero thresholds must
+// actually reach db.SetCircuitBreaker inside InitPostgresDB. Before the
+// settings wiring, CircuitBreakerEnabled was permanently the Go zero value
+// (false), so this breaker was never installed on any Postgres store.
+//
+// stdlib.OpenDB() does not dial the server, so this exercises the full
+// InitPostgresDB configuration path (pool, retry, circuit breaker) without
+// needing a live Postgres connection.
+func TestInitPostgresDB_CircuitBreakerInstalled(t *testing.T) {
+	logger := &mockLogger{}
+	storeURL, err := url.Parse("postgres://user:pass@localhost:5432/testdb")
+	require.NoError(t, err)
+
+	tSettings := postgresCircuitBreakerTestSettings(settings.PostgresSettings{
+		CircuitBreakerEnabled:          true,
+		CircuitBreakerFailureThreshold: 5,
+		CircuitBreakerHalfOpenMax:      3,
+		CircuitBreakerCooldown:         30 * time.Second,
+		CircuitBreakerFailureWindow:    10 * time.Second,
+	})
+
+	db, err := util.InitPostgresDB(logger, storeURL, tSettings, nil)
+	require.NoError(t, err)
+	require.NotNil(t, db)
+	defer func() { _ = db.Close() }()
+
+	cb := db.GetCircuitBreaker()
+	require.NotNil(t, cb, "circuit breaker must be installed when enabled with valid thresholds")
+}
+
+// TestInitPostgresDB_CircuitBreakerNotInstalledByDefault pins that the
+// breaker stays uninstalled with no circuit breaker configuration at all -
+// the struct-tag defaults (Enabled=false) must not change until an operator
+// opts in.
+func TestInitPostgresDB_CircuitBreakerNotInstalledByDefault(t *testing.T) {
+	logger := &mockLogger{}
+	storeURL, err := url.Parse("postgres://user:pass@localhost:5432/testdb")
+	require.NoError(t, err)
+
+	tSettings := postgresCircuitBreakerTestSettings(settings.PostgresSettings{})
+
+	db, err := util.InitPostgresDB(logger, storeURL, tSettings, nil)
+	require.NoError(t, err)
+	require.NotNil(t, db)
+	defer func() { _ = db.Close() }()
+
+	require.Nil(t, db.GetCircuitBreaker(), "circuit breaker must stay uninstalled when not explicitly enabled")
+}
+
+// TestInitPostgresDB_CircuitBreakerEnabledWithZeroThresholds pins the
+// documented failure mode this change must avoid: Enabled=true with
+// zero-value thresholds is a silent no-op (warn logged, no breaker
+// installed) rather than a working breaker with sane defaults. Wiring all
+// five keys together (not just Enabled) is what prevents operators from
+// landing here.
+func TestInitPostgresDB_CircuitBreakerEnabledWithZeroThresholds(t *testing.T) {
+	logger := &mockLogger{}
+	storeURL, err := url.Parse("postgres://user:pass@localhost:5432/testdb")
+	require.NoError(t, err)
+
+	tSettings := postgresCircuitBreakerTestSettings(settings.PostgresSettings{
+		CircuitBreakerEnabled: true,
+	})
+
+	db, err := util.InitPostgresDB(logger, storeURL, tSettings, nil)
+	require.NoError(t, err)
+	require.NotNil(t, db)
+	defer func() { _ = db.Close() }()
+
+	require.Nil(t, db.GetCircuitBreaker(), "zero thresholds must not silently produce a working breaker")
+}
