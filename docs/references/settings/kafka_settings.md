@@ -22,7 +22,7 @@ Components of the URL:
 Example:
 
 ```text
-kafka://localhost:9092/blocks?partitions=4&consumer_ratio=2&replication=3
+kafka://localhost:9092/blocks?partitions=4&replication=3
 ```
 
 ### In-Memory Kafka URL Format (Testing)
@@ -40,7 +40,7 @@ Components of the URL:
 Example:
 
 ```text
-memory://test_blocks?partitions=2&consumer_ratio=1
+memory://test_blocks?partitions=2
 ```
 
 **Usage**: Automatically enabled for dev/test contexts (`KAFKA_SCHEMA.dev = memory` in settings.conf). Eliminates need for running Kafka cluster during development. For Docker-based Kafka, override with `KAFKA_SCHEMA.dev = kafka` in `settings_local.conf`.
