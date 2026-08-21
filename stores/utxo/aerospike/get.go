@@ -1796,6 +1796,18 @@ func (s *Store) getExternalOutpoints(ctx context.Context, previousTxHash chainha
 //     services/blockpersister/processTxMetaUsingStore.go, both of which have no
 //     callers today.
 //
+// One consumer sits outside both classes rather than below the gate. BatchDecorate
+// assigns the reconstruction to Data.Tx for a fields.Inputs request and hands it to
+// subtree.NewTxInpointsFromTx, which yields an EMPTY inpoint set, because the
+// reconstruction has no inputs. It never serializes, so the panic reasoning does not
+// apply, and it never checks the predicate, so the gate does not protect it — it
+// answers "this transaction has no parents". For a snapshot-seeded parent that is
+// the honest answer: the node bootstrapped from a UTXO set and genuinely does not
+// know what the transaction spent, and fabricating inpoints would be worse than
+// reporting none. Written down because it is a real consumer of this shape and the
+// list above is otherwise read as exhaustive; unchanged by this function's fallback,
+// since main reached it identically.
+//
 // None of those is reachable as shipped: the reconstruction exists only for an
 // input-less external transaction, which is cmd/seeder output, and a
 // snapshot-seeded transaction predates every block whose subtrees this node serves.
@@ -1918,6 +1930,18 @@ func (s *Store) getExternalOutputs(ctx context.Context, previousTxHash chainhash
 	// position; the gaps left behind are the nil entries described above. Computed
 	// directly rather than via utxopersister.PadUTXOsWithNil, which allocated a
 	// whole padded slice only for its length and then had its contents discarded.
+	//
+	// Two deliberate differences from that helper, neither of which any caller can
+	// distinguish but both of which are changes:
+	//
+	//   - A blob with no live UTXOs yields no outputs. PadUTXOsWithNil returned
+	//     maxIndex+1 == 1 for an empty input, so the transaction came back with a
+	//     single nil output. Both shapes fail every consumer identically — the
+	//     outpoint reader finds no active outputs either way, and the validator's
+	//     bound check rejects index 0 whether the slice is empty or holds a nil —
+	//     so this reports "nothing live" instead of "one thing, absent".
+	//   - A nil entry in uw.UTXOs is skipped rather than dereferenced. The helper
+	//     read u.Index on every element and would have faulted on a nil one.
 	var highestIndex uint32
 
 	for _, u := range uw.UTXOs {
@@ -2022,14 +2046,23 @@ func (s *Store) GetTxInpointsFromExternalStore(ctx context.Context, txHash chain
 	// Stream from external store - don't load entire file into memory
 	reader, err := s.externalStore.GetIoReader(ctx, txHash[:], fileformat.FileTypeTx)
 	if err != nil {
-		// Same distinction the other two external reads make. There is no fallback
-		// to offer here — inpoints are inputs, and the .outputs representation
-		// retains none — but a miss is still not a store failure, and on a
-		// snapshot-seeded node an .outputs-only parent makes the miss routine
-		// rather than exceptional. Reporting it as a storage error hands callers
-		// that branch on ErrTxNotFound the wrong answer.
+		// Classified exactly as getExternalTransactionOrOutputs classifies the same
+		// physical condition — an absent .tx blob for a record that claims to be
+		// external — so the two cannot disagree about blame. There is no fallback to
+		// offer here (inpoints are inputs, and the .outputs representation retains
+		// none), but the classification still has to match, because the next caller
+		// to branch on it should not get a different answer depending on which
+		// reader it happened to reach.
+		//
+		// This read cannot tell the two causes apart: a snapshot-seeded parent whose
+		// .tx never existed, or an external record whose blob was lost. Neither is
+		// the fault of a peer that merely sent a block spending it, so ErrStorageError
+		// is the outer class here too — see the longer note in
+		// getExternalTransactionOrOutputs for why that marker matters.
 		if isBlobMiss(err) {
-			return subtree.TxInpoints{}, errors.NewTxNotFoundError("[GetTxInpointsFromExternalStore][%s] tx is not stored externally", txHash.String(), err)
+			return subtree.TxInpoints{}, errors.NewStorageError("[GetTxInpointsFromExternalStore][%s] external record has no tx stored",
+				txHash.String(),
+				errors.NewTxNotFoundError("[GetTxInpointsFromExternalStore][%s] tx is not stored externally", txHash.String(), err))
 		}
 
 		return subtree.TxInpoints{}, errors.NewStorageError("[GetTxInpointsFromExternalStore][%s] could not get tx from external store", txHash.String(), err)

@@ -3,6 +3,7 @@ package aerospike
 import (
 	"context"
 	"io"
+	"sync"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -36,6 +37,43 @@ func (f *failingReadStore) GetIoReader(ctx context.Context, key []byte, fileType
 	}
 
 	return f.Store.GetIoReader(ctx, key, fileType, opts...)
+}
+
+// recordingReadStore counts GetIoReader calls per file type, and can fail one of
+// them, so a test can assert which representations were consulted rather than only
+// what came back. Proving a blob was never read is the point: "it hard-fails" and
+// "it hard-fails without quietly reaching for the other representation" are
+// different guarantees, and only the second is the one being made here.
+type recordingReadStore struct {
+	blob.Store
+
+	mu     sync.Mutex
+	counts map[fileformat.FileType]int
+
+	failFileType fileformat.FileType
+	failWith     error
+}
+
+func (r *recordingReadStore) GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (io.ReadCloser, error) {
+	r.mu.Lock()
+	if r.counts == nil {
+		r.counts = map[fileformat.FileType]int{}
+	}
+	r.counts[fileType]++
+	r.mu.Unlock()
+
+	if r.failWith != nil && fileType == r.failFileType {
+		return nil, r.failWith
+	}
+
+	return r.Store.GetIoReader(ctx, key, fileType, opts...)
+}
+
+func (r *recordingReadStore) reads(fileType fileformat.FileType) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.counts[fileType]
 }
 
 // newOutputsOnlyStore builds a store whose external blob store holds only the
@@ -172,6 +210,86 @@ func TestGetExternalTransaction_ReadsOnlyTheTxBlob(t *testing.T) {
 	})
 }
 
+// TestGetExternalTransaction_CorruptTxDoesNotDegradeToOutputs covers the one
+// behaviour change this branch set out to make deliberately: a damaged .tx blob
+// hard-fails where it used to degrade to a snapshot reconstruction.
+//
+// On main the fallback triggered on any error from the .tx read, so a node holding
+// a corrupt blob silently served the UTXO-set shape in place of the transaction —
+// a wrong answer dressed as a right one. Gating on isBlobMiss is what stops that,
+// and the guarantee has two halves: the read fails, AND it fails without consulting
+// the other representation. The second half is why these assert read counts rather
+// than only the returned error.
+func TestGetExternalTransaction_CorruptTxDoesNotDegradeToOutputs(t *testing.T) {
+	t.Run("an unparseable .tx body is invalid, not a miss", func(t *testing.T) {
+		s, mem, tx := newOutputsOnlyStore(t, 1, 2)
+		txHash := *tx.TxIDChainHash()
+
+		// A .tx blob that exists and carries a valid store header, but whose contents
+		// are not a transaction — a truncated or garbled write.
+		require.NoError(t, mem.Set(context.Background(), txHash[:], fileformat.FileTypeTx,
+			[]byte{0xff, 0xff, 0xff, 0xff}))
+
+		rec := &recordingReadStore{Store: mem}
+		s.externalStore = rec
+
+		got, err := s.getExternalTransactionOrOutputs(context.Background(), txHash)
+
+		require.Error(t, err)
+		require.Nil(t, got)
+		require.True(t, errors.Is(err, errors.ErrTxInvalid),
+			"a .tx blob that will not parse is invalid data, got %v", err)
+		require.False(t, errors.Is(err, errors.ErrTxNotFound),
+			"a corrupt blob is present, not absent — calling it not-found would invite the fallback")
+		require.Equal(t, 1, rec.reads(fileformat.FileTypeTx))
+		require.Zero(t, rec.reads(fileformat.FileTypeOutputs),
+			"the reconstruction must not be substituted for a transaction the node does hold")
+	})
+
+	t.Run("a header-level failure is a storage error, not a miss", func(t *testing.T) {
+		s, mem, tx := newOutputsOnlyStore(t, 1, 2)
+
+		// What a blob store reports for a missing or mismatched fileformat header:
+		// a StorageError carrying no not-found anywhere in the chain.
+		rec := &recordingReadStore{
+			Store:        mem,
+			failFileType: fileformat.FileTypeTx,
+			failWith:     errors.NewStorageError("[File][GetIoReader] [x] missing or invalid header"),
+		}
+		s.externalStore = rec
+
+		got, err := s.getExternalTransactionOrOutputs(context.Background(), *tx.TxIDChainHash())
+
+		require.Error(t, err)
+		require.Nil(t, got)
+		require.True(t, errors.Is(err, errors.ErrStorageError))
+		require.False(t, errors.Is(err, errors.ErrTxNotFound),
+			"a damaged header is not the blob being absent")
+		require.Zero(t, rec.reads(fileformat.FileTypeOutputs),
+			"the fallback must not fire for a blob the store failed to read")
+	})
+}
+
+// TestGetExternalOutputs_EmptyBlobYieldsNoOutputs pins the shape for a .outputs
+// blob with nothing live in it — every output already spent at snapshot time.
+//
+// The previous sizing (via utxopersister.PadUTXOsWithNil) returned maxIndex+1 == 1
+// for an empty set, so the reconstruction came back holding a single nil output.
+// Reporting nothing live is the more honest shape, and no consumer can tell the two
+// apart: the outpoint reader finds no active outputs either way, and the validator's
+// bound check rejects index 0 whether the slice is empty or holds a nil.
+func TestGetExternalOutputs_EmptyBlobYieldsNoOutputs(t *testing.T) {
+	s, _, tx := newOutputsOnlyStore(t)
+
+	got, err := s.getExternalOutputs(context.Background(), *tx.TxIDChainHash())
+	require.NoError(t, err)
+	require.Empty(t, got.Outputs, "no live UTXOs means no outputs, not one absent output")
+
+	// Still recognisable as a reconstruction, so the serializing consumers keep
+	// refusing it rather than treating an empty tx as fine to serialize.
+	require.False(t, (&meta.Data{Tx: got}).TxIsSerializable())
+}
+
 // TestGetTxInpointsFromExternalStore_MissIsNotAStoreFailure covers the third
 // external read. There is no fallback to offer — inpoints are inputs and the
 // .outputs blob retains none — but the miss/failure distinction still has to hold,
@@ -185,6 +303,15 @@ func TestGetTxInpointsFromExternalStore_MissIsNotAStoreFailure(t *testing.T) {
 		require.Error(t, err)
 		require.True(t, errors.Is(err, errors.ErrTxNotFound),
 			"an absent .tx blob is not-found, not a store failure, got %v", err)
+
+		// Classified the same way getExternalTransactionOrOutputs classifies the same
+		// physical condition, so the two readers cannot disagree about blame. This
+		// read cannot tell a seeded parent (whose .tx never existed) from a lost
+		// blob, and neither is the fault of a peer that sent a block spending it.
+		require.True(t, errors.Is(err, errors.ErrStorageError),
+			"an absent external blob is our condition, not the sending peer's, got %v", err)
+		require.True(t, errors.IsTransientLocalError(err),
+			"must not be attributable to a peer, got %v", err)
 	})
 
 	t.Run("a transient failure stays a store failure", func(t *testing.T) {
