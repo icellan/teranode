@@ -5,7 +5,9 @@ repos:
       - id: check-yaml
         # mkdocs.yml uses !!python/name: tags that yaml.safe_load cannot
         # construct; the docs-deploy workflow validates it via mkdocs build.
-        exclude: deploy/k8s/ingresses|^mkdocs\.yml$
+        # Newer hook revs (checked up to v6.0.0) still safe-load by default and
+        # fail identically, so the exclusion is not a version-skew artefact.
+        exclude: ^mkdocs\.yml$
       - id: end-of-file-fixer
       - id: trailing-whitespace
   - repo: local
