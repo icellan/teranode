@@ -267,6 +267,13 @@ consume on any topic, including forging messages onto topics other services trus
       message as-is, with no check that the producer was entitled to request them, so produce
       access to this topic means choosing the validation mode a transaction is processed
       under (`skipPolicyChecks` maps to consensus-mode validation, bypassing local policy).
+      The `options` field itself is optional-presence on the wire; a message that omits it
+      falls back to the validator's own defaults (`services/validator/Server.go`,
+      `optionsFromKafkaMessage`) — the same defaults the in-tree Propagation producer already
+      sends — rather than crashing or silently becoming more permissive. More generally, the
+      Kafka consumer now recovers a panic in any topic's handler instead of letting it take
+      down the process (`util/kafka/kafka_consumer.go`), so a malformed message on this or any
+      other topic is a logged, counted event, not an outage.
     - `blocks-final` is the one topic whose contents leave the node. The legacy sync manager
       relays each message's hash and 80-byte header to every connected legacy P2P peer without
       checking proof-of-work, without consulting the blockchain store, and without verifying
