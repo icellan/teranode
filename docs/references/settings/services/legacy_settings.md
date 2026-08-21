@@ -13,7 +13,7 @@
 | StoreBatcherSize | int | 1024 | legacy_storeBatcherSize | **CRITICAL** - Store operation batch size |
 | StoreBatcherConcurrency | int | 32 | legacy_storeBatcherConcurrency | **CRITICAL** - Store operation parallelism |
 | SpendBatcherSize | int | 1024 | legacy_spendBatcherSize | **CRITICAL** - Spend operation batch size |
-| SpendBatcherConcurrency | int | 32 | legacy_spendBatcherConcurrency | **CRITICAL** - Spend operation parallelism |
+| SpendBatcherConcurrency | int | 4 | legacy_spendBatcherConcurrency | **CRITICAL** - Spend operation parallelism |
 | OutpointBatcherSize | int | 1024 | legacy_outpointBatcherSize | **CRITICAL** - Outpoint operation batch size |
 | OutpointBatcherConcurrency | int | 32 | legacy_outpointBatcherConcurrency | Outpoint operation parallelism |
 | PrintInvMessages | bool | false | legacy_printInvMessages | Debug logging for inventory messages |

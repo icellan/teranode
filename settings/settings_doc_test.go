@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-chaincfg"
+	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/require"
 )
 
@@ -236,7 +238,7 @@ func canonicalDefault(raw string) string {
 		v = strings.TrimSpace(stripped)
 	}
 
-	if v == "[]" || v == "{}" {
+	if v == "[]" || v == "{}" || v == "map[]" {
 		return ""
 	}
 
@@ -249,6 +251,14 @@ func canonicalDefault(raw string) string {
 	}
 
 	if d, err := time.ParseDuration(v); err == nil {
+		// A duration field's zero value formats as "0s" (time.Duration.String()),
+		// but a doc or struct tag documenting that same field's default often
+		// just writes the bare "0" - both mean the same zero duration, so fold
+		// them onto the same token rather than reporting a false mismatch.
+		if d == 0 {
+			return "0"
+		}
+
 		return d.String()
 	}
 
@@ -259,37 +269,62 @@ func canonicalDefault(raw string) string {
 	return v
 }
 
-// docDefaultsExemptions lists doc/key pairs that a straightforward text
-// comparison cannot verify, together with why. Each entry is checked to still
-// exist in the doc so a fixed or removed row does not leave a stale
+// docDefaultsExemptions lists doc/key pairs that the three-way doc/tag/runtime
+// comparison cannot fully verify, together with why. Each entry is checked to
+// still exist in the doc so a fixed or removed row does not leave a stale
 // exemption. Loosening canonicalDefault instead of listing these explicitly
 // would let the guard silently stop checking rows it can't parse - worse than
 // no guard, per the project rule this test is enforcing.
+//
+// unreliable names which anchor(s) this exemption says cannot be trusted for
+// comparison against the other(s):
+//   - "tag" - the struct tag is a static snapshot of a value actually computed
+//     at runtime from another setting; doc/runtime is still checked and must
+//     match, only the pairs involving the tag are skipped.
+//   - "runtime" - the reverse: the value is only knowable at runtime (e.g. it
+//     depends on the number of CPUs on the machine running the test), so the
+//     doc and tag agree with each other on a formula/sentinel but neither can
+//     be compared against the concrete number the runtime produces; doc/tag
+//     is still checked and must match, only the pairs involving runtime are
+//     skipped.
+//   - "both" - neither anchor is trustworthy for this key (e.g. a key
+//     resolution collision in ExportMetadata's flat map means both the tag
+//     and the runtime value it reads back may reflect the wrong field); every
+//     comparison for this row is skipped.
 type docDefaultExemption struct {
-	file   string // basename of the doc file
-	key    string // environment variable key
-	reason string
+	file       string // basename of the doc file
+	key        string // environment variable key
+	reason     string
+	unreliable string // "tag", "runtime", or "both"
 }
 
 var docDefaultsExemptions = []docDefaultExemption{
 	{
 		file: "utxo_settings.md",
 		key:  "utxostore_unminedTxRetention",
-		reason: "the real runtime default (settings.go) is globalBlockHeightRetention/2, matching the doc; the " +
-			"struct tag's default:\"144\" is a static snapshot because tags cannot reference the runtime-computed " +
-			"globalBlockHeightRetention variable - the doc is right, the tag is a documentation-only approximation",
+		reason: "the doc intentionally documents the runtime formula (globalBlockHeightRetention/2) rather than its " +
+			"resolved number, so it cannot be text-compared against either anchor: the struct tag's default:\"144\" " +
+			"is a static snapshot because tags cannot reference the runtime-computed globalBlockHeightRetention " +
+			"variable, and the isolated-construction runtime value (144, matching the tag here) is only the " +
+			"formula's result under globalBlockHeightRetention's own default - none of the three can be reduced to " +
+			"the same comparable literal without a formula evaluator this test does not have",
+		unreliable: "both",
 	},
 	{
 		file: "utxo_settings.md",
 		key:  "utxostore_parentPreservationBlocks",
-		reason: "the real runtime default (settings.go) is blocksInADayOnAverage*10, matching the doc; the struct " +
-			"tag's default:\"1440\" is a static snapshot for the same reason as utxostore_unminedTxRetention above",
+		reason: "same as utxostore_unminedTxRetention above - the doc documents blocksInADayOnAverage*10 " +
+			"symbolically, not its resolved number, so it cannot be text-compared against the tag's static " +
+			"default:\"1440\" or the runtime's resolved 1440",
+		unreliable: "both",
 	},
 	{
 		file: "utxo_settings.md",
 		key:  "utxostore_blockHeightRetention",
-		reason: "the real runtime default (settings.go) is globalBlockHeightRetention, matching the doc; the " +
-			"struct tag's default:\"288\" is a static snapshot for the same reason as utxostore_unminedTxRetention above",
+		reason: "same as utxostore_unminedTxRetention above - the doc documents globalBlockHeightRetention " +
+			"symbolically, not its resolved number, so it cannot be text-compared against the tag's static " +
+			"default:\"288\" or the runtime's resolved 288",
+		unreliable: "both",
 	},
 	{
 		file: "policy_settings.md",
@@ -297,36 +332,183 @@ var docDefaultsExemptions = []docDefaultExemption{
 		reason: "the key \"blockmaxsize\" is used by two different struct fields - PolicySettings.BlockMaxSize " +
 			"(default 0, documented here, controls what this node mines) and BlockSettings.MaxSize (default " +
 			"4294967296, controls what it accepts) - so ExportMetadata()'s flat key->default map holds whichever " +
-			"one the reflection walk visits last, currently BlockSettings.MaxSize. This is a genuine settings.go " +
-			"ambiguity worth fixing separately (surfaced here, not fixed, because resolving it changes runtime " +
-			"key-resolution behaviour rather than a doc)",
+			"one the reflection walk visits last, currently BlockSettings.MaxSize, for BOTH the tag default and the " +
+			"runtime CurrentValue read back through the same map. This is a genuine settings.go ambiguity worth " +
+			"fixing separately (surfaced here, not fixed, because resolving it changes runtime key-resolution " +
+			"behaviour rather than a doc)",
+		unreliable: "both",
+	},
+	{
+		file: "blockvalidation_settings.md",
+		key:  "blockvalidation_processTxMetaUsingStore_Concurrency",
+		reason: "the doc (\"max(4, CPU/2)\") and the struct tag (default:\"auto\") agree with each other on the " +
+			"formula, canonicalDefault folds both to \"auto\" - but the concrete runtime value is " +
+			"max(4, runtime.NumCPU()/2) on whatever machine runs this test, which is not a fixed literal the doc " +
+			"or tag can state and will vary by CI runner/laptop core count",
+		unreliable: "runtime",
+	},
+	{
+		file:       "blockvalidation_settings.md",
+		key:        "blockvalidation_validateBlockSubtreesConcurrency",
+		reason:     "same runtime.NumCPU()-derived default as blockvalidation_processTxMetaUsingStore_Concurrency above",
+		unreliable: "runtime",
+	},
+	{
+		file:       "blockvalidation_settings.md",
+		key:        "blockvalidation_catchupConcurrency",
+		reason:     "same runtime.NumCPU()-derived default as blockvalidation_processTxMetaUsingStore_Concurrency above",
+		unreliable: "runtime",
+	},
+	{
+		file:       "subtreevalidation_settings.md",
+		key:        "subtreevalidation_getMissingTransactions",
+		reason:     "same runtime.NumCPU()-derived default as blockvalidation_processTxMetaUsingStore_Concurrency above",
+		unreliable: "runtime",
 	},
 }
 
-// isExemptDefault reports whether file/key is a documented exemption.
-func isExemptDefault(file, key string) bool {
+// lookupExemption returns the exemption registered for file/key, if any.
+func lookupExemption(file, key string) (docDefaultExemption, bool) {
 	for _, e := range docDefaultsExemptions {
 		if e.file == file && e.key == key {
-			return true
+			return e, true
 		}
 	}
 
-	return false
+	return docDefaultExemption{}, false
+}
+
+// isolatedSettingsContext is a gocore context name distinct from the ambient
+// one (whatever SETTINGS_CONTEXT is set to, or gocore's own "dev" default -
+// see gocore's Config()). Passing it to NewSettings makes
+// gocore.Config(isolatedSettingsContext) create and cache its own copy of
+// the confs map (see gocore's Config()) instead of returning the shared
+// singleton every other test in this package reads through - so
+// buildIsolatedRuntimeSettings below can empty that copy out without
+// affecting anything else running in this test binary.
+const isolatedSettingsContext = "settingsdoctest-isolated-context-3a1c9f"
+
+// settingsKeys returns every settings-package key known to ExportMetadata().
+// It only needs a throwaway Settings value: the key/tag list comes from
+// reflection over the Settings type, not from any field's current value.
+func settingsKeys(t *testing.T) []string {
+	t.Helper()
+
+	probe := &Settings{ChainCfgParams: &chaincfg.MainNetParams}
+
+	keys := make([]string, 0, len(probe.ExportMetadata().Settings))
+	for _, entry := range probe.ExportMetadata().Settings {
+		keys = append(keys, entry.Key)
+	}
+
+	return keys
+}
+
+// buildIsolatedRuntimeSettings constructs a Settings the same way production
+// code does - via NewSettings - but isolated from every source of config
+// that could make the result depend on anything but the getX(...) literal
+// fallback baked into settings.go:
+//
+//  1. settings.conf and settings_local.conf. The doc tables this test checks
+//     document the getX(...) Go-literal fallback as "Default" and call out a
+//     settings.conf override as a separate parenthetical when one exists
+//     (see e.g. docs/references/settings/services/p2p_settings.md's
+//     GRPCListenAddress row: "\":9906\" (Go default; overridden to `:9904`
+//     by `settings.conf` ...)") - so "the value the settings package
+//     actually produces" that this test must anchor to is the fallback, not
+//     whatever settings.conf happens to ship, and settings.conf being
+//     committed (unlike settings_local.conf) does not change that: it is a
+//     deployment configuration file, not the thing the "Default" column
+//     documents. Confirmed by running this uninstrumented: with settings.conf
+//     applied, roughly 90 rows across every doc "mismatched" - overwhelmingly
+//     tuned settings.conf values (batch sizes, ports, timeouts) that were
+//     never doc/tag drift, which is what sent this investigation down the
+//     right path.
+//
+//     gocore.Config(isolatedSettingsContext) (see gocore's Config()) starts
+//     as a copy of the ambient singleton's confs map, which already has both
+//     files merged in by the time any test in this package can observe it
+//     (gocore.Config() loads them once, on the first call from anywhere in
+//     the test binary - see gocore's Config()). Every key in that copy -
+//     enumerated via GetAll() before any mutation - is Unset() one by one, so
+//     the copy ends up with an empty confs map. This only touches the
+//     isolatedSettingsContext copy; the shared "dev" (or whatever ambient
+//     SETTINGS_CONTEXT) config every other test in this package relies on is
+//     untouched.
+//
+//  2. OS environment variables. gocore's getInternal checks
+//     os.LookupEnv(key) before consulting confs at all (see
+//     (*gocore.Configuration).getInternal), so an ambient environment
+//     variable named after a settings key would otherwise silently outrank
+//     the code fallback regardless of step 1. Every variable whose name
+//     matches a known settings key is unset for the duration of the call and
+//     restored via t.Cleanup.
+//
+// A key that was never set is unaffected by either step: Unset on an absent
+// confs key and Setenv/Unsetenv restore on a variable that was never set are
+// both no-ops.
+func buildIsolatedRuntimeSettings(t *testing.T, keys []string) *Settings {
+	t.Helper()
+
+	type envBackup struct {
+		key    string
+		value  string
+		hadEnv bool
+	}
+
+	backups := make([]envBackup, 0, len(keys))
+
+	for _, key := range keys {
+		value, hadEnv := os.LookupEnv(key)
+		backups = append(backups, envBackup{key: key, value: value, hadEnv: hadEnv})
+
+		if hadEnv {
+			require.NoError(t, os.Unsetenv(key), "unsetting ambient env var %s for isolation", key)
+		}
+	}
+
+	t.Cleanup(func() {
+		for _, b := range backups {
+			if b.hadEnv {
+				require.NoError(t, os.Setenv(b.key, b.value), "restoring ambient env var %s", b.key)
+			}
+		}
+	})
+
+	isolatedConfig := gocore.Config(isolatedSettingsContext)
+	for key := range isolatedConfig.GetAll() {
+		isolatedConfig.Unset(key)
+	}
+
+	return NewSettings(isolatedSettingsContext)
 }
 
 // TestSettingsDocDefaultsMatchCode walks every markdown file under
 // docs/references/settings/ and cross-checks every settings-table row's
-// documented default against the real default from the settings package (the
-// struct tag default surfaced by ExportMetadata()). Two rows in the
-// blockvalidation table were documented with each other's values for a long
-// time while a guard existed for one hand-picked setting in one file - this
-// covers every settings-table row in every doc file instead.
+// documented default three ways: against the struct tag default surfaced by
+// ExportMetadata(), and against the real value the settings package produces
+// at runtime (NewSettings(), built in isolation - see
+// buildIsolatedRuntimeSettings). A doc/tag-only check cannot catch the case
+// where a doc and its struct tag drifted together: this PR found nine struct
+// tags in settings/interface.go whose default:"..." no longer matched the
+// literal passed to the corresponding getBool/getInt/getDuration(...) call in
+// settings.go, in every case with the doc holding the correct value and the
+// tag being the stale one - a doc-vs-tag comparison alone is blind to that
+// class of bug because both sides being wrong the same way still compares
+// equal.
 func TestSettingsDocDefaultsMatchCode(t *testing.T) {
-	s := &Settings{ChainCfgParams: &chaincfg.MainNetParams}
+	tagProbe := &Settings{ChainCfgParams: &chaincfg.MainNetParams}
 
 	codeDefaults := make(map[string]string)
-	for _, entry := range s.ExportMetadata().Settings {
+	for _, entry := range tagProbe.ExportMetadata().Settings {
 		codeDefaults[entry.Key] = entry.DefaultValue
+	}
+
+	runtimeSettings := buildIsolatedRuntimeSettings(t, settingsKeys(t))
+
+	runtimeDefaults := make(map[string]string)
+	for _, entry := range runtimeSettings.ExportMetadata().Settings {
+		runtimeDefaults[entry.Key] = entry.CurrentValue
 	}
 
 	seenExemptions := make(map[docDefaultExemption]bool)
@@ -342,6 +524,7 @@ func TestSettingsDocDefaultsMatchCode(t *testing.T) {
 			rows := parseDocSettingsTables(string(docBytes))
 
 			checked := 0
+			var rowFailures []string
 
 			for _, row := range rows {
 				codeDefault, ok := codeDefaults[row.key]
@@ -349,22 +532,51 @@ func TestSettingsDocDefaultsMatchCode(t *testing.T) {
 					continue
 				}
 
-				checked++
-
-				for _, e := range docDefaultsExemptions {
-					if e.file == base && e.key == row.key {
-						seenExemptions[e] = true
-					}
-				}
-
-				if isExemptDefault(base, row.key) {
+				runtimeDefault, ok := runtimeDefaults[row.key]
+				if !ok {
 					continue
 				}
 
-				require.Equal(t, canonicalDefault(codeDefault), canonicalDefault(row.docDefault),
-					"%s documents %s (%s) with default %q, but the settings package defaults it to %q",
-					base, row.setting, row.key, row.docDefault, codeDefault)
+				checked++
+
+				exemption, exempt := lookupExemption(base, row.key)
+				if exempt {
+					seenExemptions[exemption] = true
+				}
+
+				skipTag := exempt && (exemption.unreliable == "tag" || exemption.unreliable == "both")
+				skipRuntime := exempt && (exemption.unreliable == "runtime" || exemption.unreliable == "both")
+
+				docC := canonicalDefault(row.docDefault)
+				tagC := canonicalDefault(codeDefault)
+				runtimeC := canonicalDefault(runtimeDefault)
+
+				var mismatches []string
+
+				if !skipTag && docC != tagC {
+					mismatches = append(mismatches, "doc/tag")
+				}
+
+				if !skipRuntime && docC != runtimeC {
+					mismatches = append(mismatches, "doc/runtime")
+				}
+
+				if !skipTag && !skipRuntime && tagC != runtimeC {
+					mismatches = append(mismatches, "tag/runtime")
+				}
+
+				if len(mismatches) > 0 {
+					rowFailures = append(rowFailures, fmt.Sprintf(
+						"%s (%s): %v disagree - doc default %q, struct tag default %q, runtime default %q",
+						row.setting, row.key, mismatches, row.docDefault, codeDefault, runtimeDefault))
+				}
 			}
+
+			// Every row is checked before failing (rather than failing on the first
+			// mismatch) so one test run reports every drifted row in this doc, not
+			// just the first one found.
+			require.Empty(t, rowFailures, "%s has %d mismatched row(s):\n%s",
+				base, len(rowFailures), strings.Join(rowFailures, "\n"))
 
 			minChecked, ok := minCheckedRowsPerDoc[base]
 			require.True(t, ok, "no minimum-row expectation registered for %s - add one to minCheckedRowsPerDoc "+
