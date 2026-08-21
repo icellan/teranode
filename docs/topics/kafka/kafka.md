@@ -106,7 +106,7 @@ The P2P (Peer-to-Peer) service is responsible for peer-to-peer communication, re
 
 ### Blockchain
 
-![kafka_blockchain_to_others2.svg](img/plantuml/kafka_blockchain_to_others2.svg)
+![kafka_blockchain_to_others.svg](img/plantuml/kafka_blockchain_to_others.svg)
 
 This diagram shows the final stage of block processing:
 
