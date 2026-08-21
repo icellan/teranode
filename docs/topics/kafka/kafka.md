@@ -67,7 +67,7 @@ Notes on the table:
 
 ### Propagation Service
 
-After initial sanity check tests, the propagation service endorses transactions to the validator. This is done by sending transaction notifications to the validator via the `kafka_validatortxsConfig` topic.
+After initial sanity check tests, the propagation service endorses transactions to the validator. When `kafka_validatortxsConfig` is set — empty by default, non-empty in the `.operator` context — this is done by sending transaction notifications to the validator via that topic; otherwise Propagation invokes the Validator directly, either in-process or over gRPC.
 
 ![kafka_propagation_validator.svg](img/plantuml/kafka_propagation_validator.svg)
 
@@ -101,7 +101,7 @@ The P2P (Peer-to-Peer) service is responsible for peer-to-peer communication, re
 
 ### Blockchain
 
-![kafka_blockchain_to_others2.svg](img/plantuml/kafka_blockchain_to_others2.svg)
+![kafka_blockchain_to_others.svg](img/plantuml/kafka_blockchain_to_others.svg)
 
 This diagram shows the final stage of block processing:
 
