@@ -48,9 +48,9 @@
 | PrunerParentUpdateBatcherSize | int | 2000 | utxostore_prunerParentUpdateBatcherSize | Pruner parent update batch size |
 | PrunerParentUpdateBatcherDurationMillis | int | 100 | utxostore_prunerParentUpdateBatcherDurationMillis | Pruner parent update batch duration |
 | PrunerDeleteBatcherSize | int | 5000 | utxostore_prunerDeleteBatcherSize | Pruner delete batch size |
-**Note**: PostgreSQL connection pool settings (MaxOpenConns, MaxIdleConns, ConnMaxLifetime, ConnMaxIdleTime) are now configured globally via `PostgresSettings`. See [Global Settings](../global_settings.md) for details.
 | PrunerDeleteBatcherDurationMillis | int | 100 | utxostore_prunerDeleteBatcherDurationMillis | Pruner delete batch duration |
-| PrunerMaxConcurrentOperations | int | 0 | utxostore_prunerMaxConcurrentOperations | Pruner max concurrent operations (0=use queue size) |
+
+**Note**: PostgreSQL connection pool settings (MaxOpenConns, MaxIdleConns, ConnMaxLifetime, ConnMaxIdleTime) are now configured globally via `PostgresSettings`. See [Global Settings](../global_settings.md) for details.
 
 ## URL Query Parameters
 
@@ -129,7 +129,7 @@ Anything else — including unknown / non-aerospike errors — is treated as non
 
 ```text
 utxostore = "postgres://user:pass@host:5432/db?logging=true"
-utxostore_dbTimeout = "60s"
+utxostore_dbTimeoutDuration = "60s"
 ```
 
 ### Aerospike Store

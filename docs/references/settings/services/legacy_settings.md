@@ -18,7 +18,7 @@
 | OutpointBatcherConcurrency | int | 32 | legacy_outpointBatcherConcurrency | Outpoint operation parallelism |
 | PrintInvMessages | bool | false | legacy_printInvMessages | Debug logging for inventory messages |
 | GRPCAddress | string | "" | legacy_grpcAddress | **CRITICAL** - gRPC client connections (required for client, returns error if empty) |
-| AllowBlockPriority | bool | false | legacy_allowBlockPriority | Block priority handling |
+| AllowBlockPriority | bool | true | legacy_allowBlockPriority | Block priority handling |
 | GRPCListenAddress | string | "" | legacy_grpcListenAddress | gRPC server binding |
 | SavePeers | bool | false | legacy_savePeers | Peer information persistence |
 | AllowSyncCandidateFromLocalPeers | bool | false | legacy_allowSyncCandidateFromLocalPeers | **CRITICAL** - Local peer sync candidate selection |
