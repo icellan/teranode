@@ -392,18 +392,12 @@ func TestSettingsDocDefaultsMatchCode(t *testing.T) {
 // large accidental drop in matched rows still fails even though a couple of
 // rows moving around does not.
 //
-// Two files are registered at 0 because they do not use the tabular
+// One file is registered at 0 because it does not use the tabular
 // "| Setting | Type | Default | Environment Variable | Usage |" format at
 // all, so there is nothing for the table-row parser to check:
-//   - blob_settings.md documents blob store URL query parameters (batch,
-//     sizeInBytes, ...), not settings-package keys - there is no
-//     ExportMetadata() entry to cross-check them against.
-//   - pruner_settings.md documents settings via "### key" headings plus
-//     "**Default**:"/"**Environment Variable**:" prose pairs instead of the
-//     tabular format every other doc uses, so the table-row parser never
-//     matches. This is a real coverage gap, not a false-positive dodge:
-//     converting this doc to the standard table format would let it benefit
-//     from this guard too.
+// blob_settings.md documents blob store URL query parameters (batch,
+// sizeInBytes, ...), not settings-package keys - there is no ExportMetadata()
+// entry to cross-check them against.
 var minCheckedRowsPerDoc = map[string]int{
 	"global_settings.md":            22,
 	"kafka_settings.md":             17,
@@ -419,7 +413,7 @@ var minCheckedRowsPerDoc = map[string]int{
 	"legacy_settings.md":            21,
 	"p2p_settings.md":               32,
 	"propagation_settings.md":       12,
-	"pruner_settings.md":            0,
+	"pruner_settings.md":            24,
 	"rpc_settings.md":               10,
 	"subtreevalidation_settings.md": 16,
 	"utxopersister_settings.md":     2,
