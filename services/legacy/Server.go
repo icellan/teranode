@@ -647,16 +647,12 @@ func (s *Server) resolveAdminAPIKey() (string, error) {
 
 // protectedMethods is the full gRPC method paths of every state-mutating RPC
 // on PeerService; the auth interceptor requires the admin API key for these.
-// ClearBanned wipes the entire ban list in one call - a strict superset of
-// UnbanPeer, which sits next to it here - so leaving it out would let an
-// attacker unban everyone at once while still being unable to call UnbanPeer
-// directly. Any new mutating RPC must be added here; the classification is
-// enforced by TestProtectedMethodsCoverAllRPCs.
-var protectedMethods = map[string]bool{
-	"/peer_api.PeerService/BanPeer":     true,
-	"/peer_api.PeerService/UnbanPeer":   true,
-	"/peer_api.PeerService/ClearBanned": true,
-}
+// Defined in the peer package (legacypeer.ProtectedMethods) so that
+// legacypeer.Client can scope its own APIKeyMethods to the same set without
+// an import cycle; aliased here under its previous name since this file is
+// where it is enforced server-side and TestProtectedMethodsCoverAllRPCs
+// asserts against it.
+var protectedMethods = legacypeer.ProtectedMethods
 
 // publicPeerServiceMethods are the PeerService RPCs deliberately reachable
 // without the admin API key. This lives here, next to protectedMethods,

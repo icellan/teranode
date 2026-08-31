@@ -494,10 +494,12 @@ const (
 	// maxBlockHeadersPerRequest bounds GetBlockHeaders' caller-supplied
 	// numberOfHeaders. The store's preallocFor already bounds the initial
 	// slice capacity, but not the result set: the value flows straight into a
-	// SQL LIMIT, so an oversized request still walks and returns the entire
-	// chain. This RPC is unauthenticated. The bound is generous rather than
-	// tight because legitimate callers (e.g. BlockAssembler's chain-movement
-	// catch-up) can legitimately ask for tens of thousands of headers.
+	// SQL LIMIT. Mainnet is currently well under this bound (~920k blocks), so
+	// it does not stop a request for the whole chain - it caps a single
+	// response at roughly 80MB of headers. This RPC is unauthenticated. The
+	// bound is generous rather than tight because legitimate callers (e.g.
+	// BlockAssembler's chain-movement catch-up) can legitimately ask for tens
+	// of thousands of headers.
 	maxBlockHeadersPerRequest = 1_000_000
 )
 
@@ -3560,11 +3562,20 @@ func (b *Blockchain) LocateBlockHeaders(ctx context.Context, request *blockchain
 	defer deferFn()
 
 	locator := make([]*chainhash.Hash, len(request.Locator))
+
 	for i, hash := range request.Locator {
-		locator[i], _ = chainhash.NewHash(hash)
+		var err error
+
+		locator[i], err = chainhash.NewHash(hash)
+		if err != nil {
+			return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][LocateBlockHeaders] request's locator hash at index %d is not valid", i, err))
+		}
 	}
 
-	hashStop, _ := chainhash.NewHash(request.HashStop)
+	hashStop, err := chainhash.NewHash(request.HashStop)
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][LocateBlockHeaders] request's hash stop is not valid", err))
+	}
 
 	if request.MaxHashes > maxBlockHeadersPerRequest {
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][LocateBlockHeaders] %d hashes requested, maximum is %d", request.MaxHashes, maxBlockHeadersPerRequest))
