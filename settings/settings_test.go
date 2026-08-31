@@ -198,7 +198,8 @@ func TestP2PSyncPeerNoProgressTimeout_EnvOverride(t *testing.T) {
 // NewSettings().
 func TestPostgresCircuitBreakerDefaults(t *testing.T) {
 	tSettings := NewSettings()
-	require.False(t, tSettings.Postgres.CircuitBreakerEnabled)
+	require.NotNil(t, tSettings.Postgres.CircuitBreakerEnabled, "global setting must always be a concrete value, never nil")
+	require.False(t, *tSettings.Postgres.CircuitBreakerEnabled)
 	require.Equal(t, 5, tSettings.Postgres.CircuitBreakerFailureThreshold)
 	require.Equal(t, 3, tSettings.Postgres.CircuitBreakerHalfOpenMax)
 	require.Equal(t, 30*time.Second, tSettings.Postgres.CircuitBreakerCooldown)
@@ -215,7 +216,8 @@ func TestPostgresCircuitBreaker_EnvOverride(t *testing.T) {
 
 	tSettings := NewSettings()
 
-	require.True(t, tSettings.Postgres.CircuitBreakerEnabled)
+	require.NotNil(t, tSettings.Postgres.CircuitBreakerEnabled)
+	require.True(t, *tSettings.Postgres.CircuitBreakerEnabled)
 	require.Equal(t, 7, tSettings.Postgres.CircuitBreakerFailureThreshold)
 	require.Equal(t, 4, tSettings.Postgres.CircuitBreakerHalfOpenMax)
 	require.Equal(t, 45*time.Second, tSettings.Postgres.CircuitBreakerCooldown)

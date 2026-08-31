@@ -76,7 +76,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			RetryMaxAttempts:               getInt("postgres_retryMaxAttempts", 3, alternativeContext...),
 			RetryBaseDelay:                 getDuration("postgres_retryBaseDelay", 100*time.Millisecond, alternativeContext...),
 			RetryEnabled:                   getBool("postgres_retryEnabled", false, alternativeContext...),
-			CircuitBreakerEnabled:          getBool("postgres_circuitBreakerEnabled", false, alternativeContext...),
+			CircuitBreakerEnabled:          boolPtr(getBool("postgres_circuitBreakerEnabled", false, alternativeContext...)),
 			CircuitBreakerFailureThreshold: getInt("postgres_circuitBreakerFailureThreshold", 5, alternativeContext...),
 			CircuitBreakerHalfOpenMax:      getInt("postgres_circuitBreakerHalfOpenMax", 3, alternativeContext...),
 			CircuitBreakerCooldown:         getDuration("postgres_circuitBreakerCooldown", 30*time.Second, alternativeContext...),

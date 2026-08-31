@@ -297,7 +297,8 @@ func TestGetPostgresPoolSettings_CircuitBreaker(t *testing.T) {
 
 		poolSettings := getPostgresPoolSettings("myservice")
 		require.NotNil(t, poolSettings)
-		require.True(t, poolSettings.CircuitBreakerEnabled)
+		require.NotNil(t, poolSettings.CircuitBreakerEnabled)
+		require.True(t, *poolSettings.CircuitBreakerEnabled)
 		require.Equal(t, 9, poolSettings.CircuitBreakerFailureThreshold)
 		require.Equal(t, 6, poolSettings.CircuitBreakerHalfOpenMax)
 		require.Equal(t, 15*time.Second, poolSettings.CircuitBreakerCooldown)
@@ -315,5 +316,15 @@ func TestGetPostgresPoolSettings_CircuitBreaker(t *testing.T) {
 
 	t.Run("nothing configured for the prefix returns nil", func(t *testing.T) {
 		require.Nil(t, getPostgresPoolSettings("unconfiguredservice"))
+	})
+
+	t.Run("explicit false is distinguishable from absent", func(t *testing.T) {
+		gocore.Config().Set("falseservice_postgres_circuitBreakerEnabled", "false")
+		defer gocore.Config().Unset("falseservice_postgres_circuitBreakerEnabled")
+
+		poolSettings := getPostgresPoolSettings("falseservice")
+		require.NotNil(t, poolSettings, "an explicit false key must count as configured, not as absent")
+		require.NotNil(t, poolSettings.CircuitBreakerEnabled)
+		require.False(t, *poolSettings.CircuitBreakerEnabled)
 	})
 }
