@@ -44,7 +44,7 @@ Policy settings control BSV Blockchain consensus rules and transaction validatio
 | MaxStdTxValidationDuration | int | 0 (not wired up; the getInt call is commented out in settings.go) | maxstdtxvalidationduration | Maximum validation time for standard transactions (ms) |
 | MaxNonStdTxValidationDuration | int | 0 (not wired up; the getInt call is commented out in settings.go) | maxnonstdtxvalidationduration | Maximum validation time for non-standard transactions (ms) |
 | MaxTxChainValidationBudget | int | 0 (not wired up; the getInt call is commented out in settings.go) | maxtxchainvalidationbudget | Total time budget for chain validation (ms) |
-| ValidationClockCPU | bool | false | validationclockcpu | Use CPU time instead of wall-clock for validation timeouts |
+| ValidationClockCPU | bool | false (not wired up; the getBool call is commented out in settings.go) | validationclockcpu | Use CPU time instead of wall-clock for validation timeouts |
 
 ### Data Carrier Settings
 
