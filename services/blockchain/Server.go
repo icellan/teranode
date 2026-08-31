@@ -610,6 +610,8 @@ func (b *Blockchain) resolveAdminAPIKey() (string, error) {
 
 	if apiKey == "" {
 		b.logger.Warnf("[Blockchain] grpc_admin_api_key is not set; admin-protected RPCs (SendNotification, ReportPeerFailure, SetBlockSubtreesSet, AddBlock, InvalidateBlock, and other state-mutating RPCs) are unauthenticated - set grpc_admin_api_key to secure them")
+	} else {
+		util.WarnIfAdminAPIKeyExposed(b.logger, "Blockchain", apiKey, b.settings.BlockChain.GRPCListenAddress, b.settings.SecurityLevelGRPC)
 	}
 
 	return apiKey, nil

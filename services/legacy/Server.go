@@ -640,6 +640,8 @@ func (s *Server) resolveAdminAPIKey() (string, error) {
 
 	if apiKey == "" {
 		s.logger.Warnf("[Legacy] grpc_admin_api_key is not set; admin-protected RPCs (BanPeer, UnbanPeer, ClearBanned) are unauthenticated - set grpc_admin_api_key to secure them")
+	} else {
+		util.WarnIfAdminAPIKeyExposed(s.logger, "Legacy", apiKey, s.settings.Legacy.GRPCListenAddress, s.settings.SecurityLevelGRPC)
 	}
 
 	return apiKey, nil

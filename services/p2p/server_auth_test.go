@@ -130,20 +130,45 @@ func TestAuthInterceptorProtectsAdminMethods(t *testing.T) {
 	}
 }
 
-// TestResolveAdminAPIKey_Configured verifies that a configured admin API key
-// is returned verbatim and no warning is logged.
+// TestResolveAdminAPIKey_Configured verifies that a configured, strong admin
+// API key on a loopback listener is returned verbatim and no warning is
+// logged.
 func TestResolveAdminAPIKey_Configured(t *testing.T) {
 	logger := mocklogger.NewTestLogger()
 	s := &Server{
-		logger:   logger,
-		settings: &settings.Settings{GRPCAdminAPIKey: "configured-key"},
+		logger: logger,
+		settings: &settings.Settings{
+			GRPCAdminAPIKey: "a-strong-random-admin-secret-value",
+			P2P:             settings.P2PSettings{GRPCListenAddress: "127.0.0.1:9906"},
+		},
 	}
 
 	apiKey, err := s.resolveAdminAPIKey()
 
 	require.NoError(t, err)
-	require.Equal(t, "configured-key", apiKey)
+	require.Equal(t, "a-strong-random-admin-secret-value", apiKey)
 	logger.AssertNumberOfCalls(t, "Warnf", 0)
+}
+
+// TestResolveAdminAPIKey_ConfiguredWeakOrExposed verifies that a configured
+// key still warns (but is not rejected) when it is short, or when the
+// listener is not loopback-bound without verified TLS - non-posture
+// hardening carried over from the fail-closed design.
+func TestResolveAdminAPIKey_ConfiguredWeakOrExposed(t *testing.T) {
+	logger := mocklogger.NewTestLogger()
+	s := &Server{
+		logger: logger,
+		settings: &settings.Settings{
+			GRPCAdminAPIKey: "short-key",
+			P2P:             settings.P2PSettings{GRPCListenAddress: "0.0.0.0:9906"},
+		},
+	}
+
+	apiKey, err := s.resolveAdminAPIKey()
+
+	require.NoError(t, err)
+	require.Equal(t, "short-key", apiKey)
+	logger.AssertNumberOfCalls(t, "Warnf", 2) // one length warning and one cleartext-exposure warning
 }
 
 // TestResolveAdminAPIKey_Empty verifies that an unset admin API key is

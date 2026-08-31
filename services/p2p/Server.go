@@ -1237,6 +1237,8 @@ func (s *Server) resolveAdminAPIKey() (string, error) {
 
 	if apiKey == "" {
 		s.logger.Warnf("[P2P] grpc_admin_api_key is not set; admin RPCs (ban, unban, clear bans, ban score, reputation reset, connect/disconnect peer) are unauthenticated - set grpc_admin_api_key to secure them")
+	} else {
+		util.WarnIfAdminAPIKeyExposed(s.logger, "P2P", apiKey, s.settings.P2P.GRPCListenAddress, s.settings.SecurityLevelGRPC)
 	}
 
 	return apiKey, nil

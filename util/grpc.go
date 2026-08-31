@@ -30,34 +30,21 @@ type AuthOptions struct {
 	ExtraUnaryInterceptors []grpc.UnaryServerInterceptor
 }
 
-// placeholderAdminAPIKeys are values that have shipped in committed or example
-// configuration at some point, or that are otherwise trivially guessable. They
-// are worse than an empty key: a non-empty key installs the auth interceptor,
-// so logs and behaviour both claim the surface is authenticated while anyone
-// who reads the repository holds the credential.
-var placeholderAdminAPIKeys = map[string]bool{
-	"testkey":  true,
-	"test":     true,
-	"changeme": true,
-	"secret":   true,
-	"password": true,
-	"admin":    true,
-}
-
-// ValidateAdminAPIKey rejects known-placeholder admin API keys, and any key
-// that differs from its own trimmed form. The latter catches a
-// whitespace-only key: TrimSpace collapses it to "", so without this check it
-// would compare equal to no placeholder, install the auth interceptor, and
-// then depend on the transport preserving leading/trailing whitespace in a
-// header - a confusing outage waiting to happen. An empty key is allowed and
-// means "admin auth disabled" - that is a visible, warned-about posture. A
-// placeholder key is not, so it is a hard configuration error.
+// ValidateAdminAPIKey rejects known-placeholder admin API keys (see
+// IsPlaceholderAdminAPIKey in admin_api_key.go), and any key that differs from
+// its own trimmed form. The latter catches a whitespace-only key: TrimSpace
+// collapses it to "", so without this check it would compare equal to no
+// placeholder, install the auth interceptor, and then depend on the transport
+// preserving leading/trailing whitespace in a header - a confusing outage
+// waiting to happen. An empty key is allowed and means "admin auth disabled"
+// - that is a visible, warned-about posture. A placeholder key is not, so it
+// is a hard configuration error.
 func ValidateAdminAPIKey(apiKey string) error {
 	if trimmed := strings.TrimSpace(apiKey); trimmed != apiKey {
 		return errors.NewConfigurationError("grpc_admin_api_key has leading or trailing whitespace - remove it, or leave the key empty to run with admin auth explicitly disabled")
 	}
 
-	if placeholderAdminAPIKeys[strings.ToLower(apiKey)] {
+	if IsPlaceholderAdminAPIKey(apiKey) {
 		return errors.NewConfigurationError("grpc_admin_api_key is set to the known placeholder value %q - set a real secret, or leave it empty to run with admin auth explicitly disabled", apiKey)
 	}
 
