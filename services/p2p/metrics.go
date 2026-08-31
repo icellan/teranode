@@ -144,3 +144,4 @@ func _initPrometheusMetrics() {
 func notificationDropped(notificationType string) {
 	initPrometheusMetrics()
 	prometheusP2PWebsocketNotificationsDropped.WithLabelValues(notificationType).Inc()
+}

@@ -122,10 +122,10 @@ func TestClientChannelMapUpdatesWebsocketConnectionsGauge(t *testing.T) {
 	ch1 := make(chan []byte, 1)
 	ch2 := make(chan []byte, 1)
 
-	cm.add(ch1)
+	cm.add(ch1, nil)
 	require.InDelta(t, before+1, testutil.ToFloat64(prometheusP2PWebsocketConnections), 0.0001)
 
-	cm.add(ch2)
+	cm.add(ch2, nil)
 	require.InDelta(t, before+2, testutil.ToFloat64(prometheusP2PWebsocketConnections), 0.0001)
 
 	cm.remove(ch1)
