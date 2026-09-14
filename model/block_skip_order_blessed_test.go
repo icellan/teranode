@@ -182,6 +182,13 @@ func TestBlock_Valid_SkipRefusedWhenMerkleRootNotChecked(t *testing.T) {
 	coinbase, err := bt.NewTxFromString(CoinbaseHex)
 	require.NoError(t, err)
 
+	// An unbound body now also refuses the sibling fee skip, so the coinbase value has to
+	// fit under the bare subsidy for this test to reach step 12 at all. The value is
+	// irrelevant to what is asserted here (which skip engages).
+	for _, out := range coinbase.Outputs {
+		out.Satoshis = 1
+	}
+
 	txHash, err := chainhash.NewHashFromStr("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206")
 	require.NoError(t, err)
 

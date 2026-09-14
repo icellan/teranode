@@ -1219,7 +1219,7 @@ func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params, storeSupportsOu
 	}
 
 	// Skip the coinbase no-inflation check (coinbaseOutput <= subsidy + fees) only when ALL
-	// THREE conditions hold: the block is at/below the highest HARDCODED checkpoint, the store
+	// FOUR conditions hold: the block is at/below the highest HARDCODED checkpoint, the store
 	// can actually produce the fee=0 subtrees this skip exists to tolerate, and the block is a
 	// confirmed ancestor of the pinned checkpoint. Each condition answers a distinct concern:
 	//
@@ -1248,10 +1248,19 @@ func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params, storeSupportsOu
 	//     SetCheckpointConfirmedAncestor) because it needs blockchain state model cannot see; it
 	//     is fail-safe (any lookup error or ambiguity yields false → the check runs).
 	//
+	//  4. GATED on merkleRootChecked, exactly as the sibling validOrderAndBlessed skip is.
+	//     Conjunct 3's reasoning — "the checkpoint transitively commits the coinbase" — only
+	//     holds once the body has been hashed against the header: the checkpoint commits the
+	//     header, the header commits the merkle root, the merkle root commits the coinbase.
+	//     Without that last step the checkpoint says nothing about the coinbase, and skipping
+	//     the arithmetic would leave its value unchecked. merkleRootChecked is already a
+	//     parameter here (it classifies the verdicts below); this makes it gate the skip too,
+	//     so both below-checkpoint skips engage on exactly the same blocks.
+	//
 	// HighestCheckpointHeight is the single source of truth shared with the fast-path write
 	// side, so the fee-write boundary and this fee-skip boundary cannot diverge (invariant
 	// I3); see model/checkpoint.go.
-	if storeSupportsOutpointOnly && checkpointConfirmedAncestor && b.Height <= HighestCheckpointHeight(params.Checkpoints) {
+	if merkleRootChecked && storeSupportsOutpointOnly && checkpointConfirmedAncestor && b.Height <= HighestCheckpointHeight(params.Checkpoints) {
 		return nil
 	}
 

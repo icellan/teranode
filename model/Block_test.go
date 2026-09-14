@@ -2401,6 +2401,11 @@ func TestCheckBlockRewardAndFees_SkipsBelowHardcodedCheckpoint(t *testing.T) {
 
 	bAbove := buildInflatedBlock(501) // above highest checkpoint (500)
 	require.Error(t, bAbove.checkBlockRewardAndFees(params, true, true, true), "above checkpoint: fee check must still be enforced regardless of store support / ancestry")
+
+	// The skip's premise is that the checkpoint transitively commits the coinbase, which
+	// holds only once the body has been hashed against the header. On an unbound body the
+	// checkpoint says nothing about the coinbase, so the arithmetic must still run.
+	require.Error(t, bBelow.checkBlockRewardAndFees(params, true, true, false), "below checkpoint with every policy conjunct satisfied, but the body was never bound to the header: no-inflation must still be enforced")
 }
 
 // TestCheckBlockRewardAndFees_BoundaryMatchesHighestCheckpointHeight pins the real

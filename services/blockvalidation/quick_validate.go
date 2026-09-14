@@ -268,6 +268,19 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 		return err
 	}
 
+	// The binding says the header commits to this body; it does not say the single
+	// transaction in a no-subtree body is coinbase-shaped. The route's other coinbase
+	// checks are len(Inputs) != 0 and the scriptSig length bound, neither of which
+	// rejects an ordinary spend standing in for the coinbase. Deliberately placed AFTER
+	// the binding: the transaction is then the miner's own committed body, so a
+	// non-coinbase one is genuine invalidity — ahead of the binding the same failure
+	// would be indistinguishable from a corrupted download (bitcoin-sv/teranode#4692).
+	// A no-op when the body carries subtrees; there the coinbase is bound by
+	// validateSubtrees' CheckMerkleRoot and checked as part of the subtree body.
+	if len(block.Subtrees) == 0 && !block.CoinbaseTx.IsCoinbase() {
+		return errors.NewBlockInvalidError("[quickValidateBlock][%s] coinbase-only body whose only transaction is not a coinbase", block.Hash().String())
+	}
+
 	// Compute the below-checkpoint fast-path mode ONCE for this block and thread it through
 	// the pipeline (rather than re-deriving it at each seam) so every phase agrees.
 	outpointOnly := u.quickValidateOutpointOnly(block)
@@ -369,6 +382,19 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 	// further down. Placed ahead of AssignBlockID so a corrupt body never even takes a block ID.
 	if err := block.CheckCoinbaseOnlyBodyBound(); err != nil {
 		return emptyWG, nil, err
+	}
+
+	// The binding says the header commits to this body; it does not say the single
+	// transaction in a no-subtree body is coinbase-shaped. The route's other coinbase
+	// checks are len(Inputs) != 0 and the scriptSig length bound, neither of which
+	// rejects an ordinary spend standing in for the coinbase. Deliberately placed AFTER
+	// the binding: the transaction is then the miner's own committed body, so a
+	// non-coinbase one is genuine invalidity — ahead of the binding the same failure
+	// would be indistinguishable from a corrupted download (bitcoin-sv/teranode#4692).
+	// A no-op when the body carries subtrees; there the coinbase is bound by
+	// validateSubtrees' CheckMerkleRoot and checked as part of the subtree body.
+	if len(block.Subtrees) == 0 && !block.CoinbaseTx.IsCoinbase() {
+		return emptyWG, nil, errors.NewBlockInvalidError("[quickValidateBlockAsync][%s] coinbase-only body whose only transaction is not a coinbase", block.Hash().String())
 	}
 
 	// Compute the below-checkpoint fast-path mode ONCE for this block and thread it through
