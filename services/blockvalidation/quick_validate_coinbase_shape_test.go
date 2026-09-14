@@ -77,6 +77,10 @@ func TestQuickValidateBlock_BoundNonCoinbaseBodyRejected(t *testing.T) {
 
 		suite.MockBlockchain.On("AssignBlockID", mock.Anything, mock.Anything).Return(uint64(1), nil).Maybe()
 		suite.MockBlockchain.On("AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+		// Registered although the guard should stop short of it: without this a regression
+		// that drops the guard reaches commitBlock and panics the whole test binary on an
+		// unexpected mock call, instead of failing this assertion.
+		suite.MockBlockchain.On("SetBlockSubtreesSet", mock.Anything, mock.Anything).Return(nil).Maybe()
 
 		// Buffered so the async path never blocks queuing write jobs; this body queues none.
 		writeJobsChan := make(chan *SubtreeWriteJob, 16)

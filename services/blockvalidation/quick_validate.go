@@ -275,8 +275,13 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 	// the binding: the transaction is then the miner's own committed body, so a
 	// non-coinbase one is genuine invalidity — ahead of the binding the same failure
 	// would be indistinguishable from a corrupted download (bitcoin-sv/teranode#4692).
-	// A no-op when the body carries subtrees; there the coinbase is bound by
-	// validateSubtrees' CheckMerkleRoot and checked as part of the subtree body.
+	// Scoped to the no-subtree shape, which is the shape this binding covers. A body that
+	// carries subtrees gets its coinbase BOUND by validateSubtrees' CheckMerkleRoot (which
+	// substitutes CoinbaseTx's txid for the placeholder before hashing) but never gets
+	// block.CoinbaseTx.IsCoinbase() evaluated anywhere on this route — the shape check in
+	// getBlockTransactions inspects subtreeData.Txs[0], a different object. Binding makes a
+	// substituted coinbase unreachable under a committed header, so this is a defence-in-depth
+	// gap rather than a live hole, but it is a gap: the check is absent, not satisfied elsewhere.
 	if len(block.Subtrees) == 0 && !block.CoinbaseTx.IsCoinbase() {
 		return errors.NewBlockInvalidError("[quickValidateBlock][%s] coinbase-only body whose only transaction is not a coinbase", block.Hash().String())
 	}
@@ -391,8 +396,13 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 	// the binding: the transaction is then the miner's own committed body, so a
 	// non-coinbase one is genuine invalidity — ahead of the binding the same failure
 	// would be indistinguishable from a corrupted download (bitcoin-sv/teranode#4692).
-	// A no-op when the body carries subtrees; there the coinbase is bound by
-	// validateSubtrees' CheckMerkleRoot and checked as part of the subtree body.
+	// Scoped to the no-subtree shape, which is the shape this binding covers. A body that
+	// carries subtrees gets its coinbase BOUND by validateSubtrees' CheckMerkleRoot (which
+	// substitutes CoinbaseTx's txid for the placeholder before hashing) but never gets
+	// block.CoinbaseTx.IsCoinbase() evaluated anywhere on this route — the shape check in
+	// getBlockTransactions inspects subtreeData.Txs[0], a different object. Binding makes a
+	// substituted coinbase unreachable under a committed header, so this is a defence-in-depth
+	// gap rather than a live hole, but it is a gap: the check is absent, not satisfied elsewhere.
 	if len(block.Subtrees) == 0 && !block.CoinbaseTx.IsCoinbase() {
 		return emptyWG, nil, errors.NewBlockInvalidError("[quickValidateBlockAsync][%s] coinbase-only body whose only transaction is not a coinbase", block.Hash().String())
 	}

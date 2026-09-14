@@ -2405,7 +2405,11 @@ func TestCheckBlockRewardAndFees_SkipsBelowHardcodedCheckpoint(t *testing.T) {
 	// The skip's premise is that the checkpoint transitively commits the coinbase, which
 	// holds only once the body has been hashed against the header. On an unbound body the
 	// checkpoint says nothing about the coinbase, so the arithmetic must still run.
-	require.Error(t, bBelow.checkBlockRewardAndFees(params, true, true, false), "below checkpoint with every policy conjunct satisfied, but the body was never bound to the header: no-inflation must still be enforced")
+	unboundErr := bBelow.checkBlockRewardAndFees(params, true, true, false)
+	require.Error(t, unboundErr, "below checkpoint with every policy conjunct satisfied, but the body was never bound to the header: no-inflation must still be enforced")
+	require.True(t, errors.Is(unboundErr, errors.ErrBlockCorrupt),
+		"an unbound body cannot be condemned as invalid — the verdict reads a body nothing has tied to the header: got %v", unboundErr)
+	require.False(t, errors.Is(unboundErr, errors.ErrBlockInvalid), "the honest hash must not be poisoned on an unbound body")
 }
 
 // TestCheckBlockRewardAndFees_BoundaryMatchesHighestCheckpointHeight pins the real

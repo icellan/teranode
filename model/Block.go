@@ -1220,8 +1220,9 @@ func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params, storeSupportsOu
 
 	// Skip the coinbase no-inflation check (coinbaseOutput <= subsidy + fees) only when ALL
 	// FOUR conditions hold: the block is at/below the highest HARDCODED checkpoint, the store
-	// can actually produce the fee=0 subtrees this skip exists to tolerate, and the block is a
-	// confirmed ancestor of the pinned checkpoint. Each condition answers a distinct concern:
+	// can actually produce the fee=0 subtrees this skip exists to tolerate, the block is a
+	// confirmed ancestor of the pinned checkpoint, and its body was bound to the header.
+	// Each condition answers a distinct concern:
 	//
 	//  1. NOT gated on the OutpointOnlyBelowCheckpoint setting. The outpoint-only fast path
 	//     persists subtree fees as 0. A block synced that way must still revalidate on
@@ -1254,8 +1255,11 @@ func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params, storeSupportsOu
 	//     header, the header commits the merkle root, the merkle root commits the coinbase.
 	//     Without that last step the checkpoint says nothing about the coinbase, and skipping
 	//     the arithmetic would leave its value unchecked. merkleRootChecked is already a
-	//     parameter here (it classifies the verdicts below); this makes it gate the skip too,
-	//     so both below-checkpoint skips engage on exactly the same blocks.
+	//     parameter here (it classifies the verdicts below); this makes it gate the skip too.
+	//     The two below-checkpoint skips are still not congruent: skipOrderAndBlessedBelowCheckpoint
+	//     additionally requires the OutpointOnlyBelowCheckpoint opt-in (via OutpointOnlyEligible),
+	//     which this skip deliberately does NOT — see conjunct 1. So it engages on a subset of the
+	//     blocks this one does; the binding is the precondition they share, not the whole predicate.
 	//
 	// HighestCheckpointHeight is the single source of truth shared with the fast-path write
 	// side, so the fee-write boundary and this fee-skip boundary cannot diverge (invariant

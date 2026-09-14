@@ -81,7 +81,10 @@ func newSkipTestSettings(t *testing.T, enabled bool, checkpointHeight int32) *se
 // is a confirmed checkpoint ancestor AND a checkpoint exists AND 0 < height <=
 // checkpoint) must hold; any one missing keeps the skip OFF (fail-safe). The
 // store-support and confirmed-ancestor gates mirror the sibling fee skip in
-// checkBlockRewardAndFees so both skips engage on exactly the same blocks.
+// checkBlockRewardAndFees, and both now require the body to have been bound. They
+// are not congruent, though: this skip additionally requires the
+// OutpointOnlyBelowCheckpoint opt-in, which the fee skip deliberately does not, so
+// it engages on a subset of the fee skip's blocks.
 func TestBlock_SkipOrderAndBlessedBelowCheckpoint_Predicate(t *testing.T) {
 	const checkpointHeight = int32(2000)
 
