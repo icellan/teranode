@@ -775,6 +775,10 @@ func checkEmptyBlockMerkleRoot(ctx context.Context, block *model.Block) error {
 		return errors.NewBlockInvalidError("[checkEmptyBlockMerkleRoot][%s] merkle root mismatch", block.Hash().String(), err)
 	}
 
+	// This path commits straight to the store without going through model.Block.Valid,
+	// so the wire-supplied counts are settled here. See RecomputeCoinbaseOnlyCounts.
+	block.RecomputeCoinbaseOnlyCounts()
+
 	return nil
 }
 

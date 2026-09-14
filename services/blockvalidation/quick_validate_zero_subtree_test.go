@@ -3,7 +3,9 @@ package blockvalidation
 import (
 	"testing"
 
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -60,4 +62,37 @@ func TestQuickValidateBlock_HonestEmptyBlockAccepted(t *testing.T) {
 
 	require.NoError(t, err, "a genuine empty block must still quick-validate")
 	suite.MockBlockchain.AssertCalled(t, "AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestQuickValidateBlock_CoinbaseOnlyCountsRecomputed: quick validation commits the
+// block straight to the store, so whatever TransactionCount / SizeInBytes the sender
+// supplied lands in blocks.tx_count / blocks.size_in_bytes verbatim. Neither is
+// derivable from the header. For a coinbase-only block both are known exactly.
+func TestQuickValidateBlock_CoinbaseOnlyCountsRecomputed(t *testing.T) {
+	suite := NewCatchupTestSuite(t)
+	defer suite.Cleanup()
+
+	suite.MockBlockchain.On("AssignBlockID", mock.Anything, mock.Anything).Return(uint64(1), nil).Maybe()
+	suite.MockBlockchain.On("AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	suite.MockBlockchain.On("SetBlockSubtreesSet", mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	block := testhelpers.CreateTestBlocks(t, 1)[0]
+	block.TransactionCount = 1_000_000_000
+	block.SizeInBytes = 999_999_999
+
+	err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "")
+	require.NoError(t, err)
+
+	var stored *model.Block
+
+	for i := range suite.MockBlockchain.Calls {
+		if suite.MockBlockchain.Calls[i].Method == "AddBlock" {
+			stored = suite.MockBlockchain.Calls[i].Arguments.Get(1).(*model.Block)
+			break
+		}
+	}
+
+	require.NotNil(t, stored, "AddBlock should have been called")
+	require.Equal(t, uint64(1), stored.TransactionCount)
+	require.Equal(t, 80+util.VarintSize(1)+uint64(stored.CoinbaseTx.Size()), stored.SizeInBytes)
 }

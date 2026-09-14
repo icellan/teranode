@@ -876,6 +876,10 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		}
 
 		merkleRootChecked = true
+
+		// 8c. The coinbase-only shape is the one body GetAndValidateSubtrees never
+		// reconciles, so its wire-supplied counts are settled here instead.
+		b.RecomputeCoinbaseOnlyCounts()
 	}
 
 	// 9. Check that the total fees of the block are less than or equal to the block reward.
@@ -2029,6 +2033,27 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 	// TODO something with conflicts
 
 	return nil
+}
+
+// RecomputeCoinbaseOnlyCounts sets TransactionCount and SizeInBytes from the block's
+// own body, for a block that carries no subtrees.
+//
+// Both fields arrive from the wire (readBlockFromReader) and are persisted as given.
+// GetAndValidateSubtrees recomputes them from the real subtree data, but it only runs
+// for blocks that carry subtrees, so this shape would otherwise keep whatever the
+// sender supplied. A coinbase-only block holds exactly one transaction, and its
+// serialized size is the header plus the transaction-count varint plus the coinbase —
+// the same arithmetic GetAndValidateSubtrees applies, with an empty subtree
+// contribution.
+//
+// No-op for a block with subtrees, where the values are not derivable this way.
+func (b *Block) RecomputeCoinbaseOnlyCounts() {
+	if len(b.Subtrees) > 0 || b.CoinbaseTx == nil {
+		return
+	}
+
+	b.TransactionCount = 1
+	b.SizeInBytes = 80 + util.VarintSize(b.TransactionCount) + uint64(b.CoinbaseTx.Size()) // nolint: gosec
 }
 
 // ReleaseSubtreeNodes releases every loaded subtree under the block's subtree

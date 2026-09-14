@@ -10,6 +10,7 @@ import (
 	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/stretchr/testify/require"
 )
 
@@ -144,6 +145,39 @@ func TestBlock_Valid_HonestEmptyBlockAccepted(t *testing.T) {
 
 	require.NoError(t, err)
 	require.True(t, valid)
+}
+
+// TestBlock_Valid_CoinbaseOnlyCountsRecomputed: TransactionCount and SizeInBytes
+// arrive from the wire and are persisted as given (blocks.tx_count /
+// blocks.size_in_bytes). GetAndValidateSubtrees recomputes both from the real body,
+// but it only runs for blocks that carry subtrees, so a coinbase-only block kept
+// whatever the sender put there. For this shape both values are known exactly.
+func TestBlock_Valid_CoinbaseOnlyCountsRecomputed(t *testing.T) {
+	const checkpointHeight = int32(2000)
+	const blockHeight = uint32(1000)
+
+	tSettings := newSkipTestSettings(t, false, checkpointHeight)
+
+	coinbase := coinbaseWithOutputValue(t, 1)
+	hdr := minedHeader(t, coinbase.TxIDChainHash())
+
+	// Counts a sender could claim: neither is derivable from the header, so nothing
+	// upstream contradicts them.
+	block, err := NewBlock(hdr, coinbase, nil, 1_000_000_000, 999_999_999, blockHeight, 0)
+	require.NoError(t, err)
+
+	valid, err := block.Valid(
+		context.Background(), ulogger.TestLogger{}, nil, &nullstore.NullStore{},
+		txmap.NewSyncedMap[chainhash.Hash, []uint32](), []*BlockHeader{}, []uint32{}, tSettings, nil,
+	)
+	require.NoError(t, err)
+	require.True(t, valid)
+
+	// A coinbase-only block holds exactly one transaction, and its serialized size is
+	// the header, the transaction-count varint and the coinbase — the same arithmetic
+	// GetAndValidateSubtrees applies with an empty subtree contribution.
+	require.Equal(t, uint64(1), block.TransactionCount)
+	require.Equal(t, 80+util.VarintSize(1)+uint64(coinbase.Size()), block.SizeInBytes)
 }
 
 // bindBlockMerkleRoot makes a test block self-consistent: it sets the header merkle
