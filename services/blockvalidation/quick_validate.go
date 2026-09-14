@@ -234,6 +234,12 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 			return errors.NewProcessingError("[quickValidateBlock][%s] block ID was not assigned during subtree processing", block.Hash().String())
 		}
 	} else {
+		// Empty (coinbase-only) block: nothing calls validateSubtrees on this path, so the
+		// merkle root is verified here. See checkEmptyBlockMerkleRoot.
+		if err = checkEmptyBlockMerkleRoot(ctx, block); err != nil {
+			return err
+		}
+
 		// No subtrees to process, assign block ID idempotently
 		id, err = u.blockchainClient.AssignBlockID(ctx, block.Hash())
 		if err != nil {
@@ -302,6 +308,12 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 		_, err = u.processBlockSubtreesPipelineAsync(ctx, block, prefetchDepth, writeJobsChan, outpointOnly)
 		if err != nil {
 			return errors.NewProcessingError("[quickValidateBlockAsync][%s] failed to process block subtrees", block.Hash().String(), err)
+		}
+	} else {
+		// Empty (coinbase-only) block: nothing calls validateSubtrees on this path, so the
+		// merkle root is verified here. See checkEmptyBlockMerkleRoot.
+		if err = checkEmptyBlockMerkleRoot(ctx, block); err != nil {
+			return err
 		}
 	}
 
@@ -741,6 +753,29 @@ func (u *BlockValidation) processBlockSubtreesPipelineAsync(ctx context.Context,
 	}
 
 	return u.validateSubtrees(ctx, block, existingBlockID)
+}
+
+// checkEmptyBlockMerkleRoot verifies a zero-subtree block's merkle root.
+//
+// Quick validation runs below a hash-verified checkpoint, which certifies the body
+// transitively: the pinned hash covers the header, the header covers the merkle root,
+// the merkle root covers the body. That last step has to actually be evaluated. For a
+// block with subtrees validateSubtrees does it; a zero-subtree block reaches neither
+// validateSubtrees nor model.Block.Valid, so nothing here read the coinbase at all,
+// even though its outputs become UTXOs once the block commits.
+//
+// For an empty block the check is one hash comparison: the merkle root is the coinbase
+// txid, which model.Block.CheckMerkleRoot computes in its no-subtree branch.
+func checkEmptyBlockMerkleRoot(ctx context.Context, block *model.Block) error {
+	if !block.CoinbaseTx.IsCoinbase() {
+		return errors.NewBlockInvalidError("[checkEmptyBlockMerkleRoot][%s] block coinbase tx is not a valid coinbase tx", block.Hash().String())
+	}
+
+	if err := block.CheckMerkleRoot(ctx); err != nil {
+		return errors.NewBlockInvalidError("[checkEmptyBlockMerkleRoot][%s] merkle root mismatch", block.Hash().String(), err)
+	}
+
+	return nil
 }
 
 // validateSubtrees validates subtree sizes and merkle root after processing.

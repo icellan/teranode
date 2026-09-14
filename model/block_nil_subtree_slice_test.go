@@ -118,7 +118,7 @@ func TestCheckBlockRewardAndFees_NilSubtreeEntryIsTransient(t *testing.T) {
 	b.Height = 100
 
 	require.NotPanics(t, func() {
-		requireTransientError(t, b.checkBlockRewardAndFees(nil, false, false))
+		requireTransientError(t, b.checkBlockRewardAndFees(nil, false, false, true))
 	})
 }
 

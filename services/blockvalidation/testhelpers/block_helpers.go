@@ -31,17 +31,21 @@ func CreateTestBlocksWithPrev(t *testing.T, count int, prevHash *chainhash.Hash)
 	}
 
 	for i := 0; i < count; i++ {
+		coinbaseTx := CreateSimpleCoinbaseTx(uint32(i)) // golint:nolint
+
+		// These are coinbase-only blocks, so the merkle root is the coinbase txid
+		// (model.Block.CheckMerkleRoot's no-subtree branch). Validation paths check it,
+		// so the factory has to produce it; the per-block coinbase script carries i, so
+		// the roots stay distinct across the chain.
 		header := &model.BlockHeader{
 			Version:        1,
 			HashPrevBlock:  prevHash,
-			HashMerkleRoot: GenerateMerkleRoot(i),
+			HashMerkleRoot: coinbaseTx.TxIDChainHash(),
 			Timestamp:      uint32(1600000000 + i*600), // 10 minutes apart
 			Bits:           *nBits,
 			Nonce:          0,
 		}
 		MineHeader(header)
-
-		coinbaseTx := CreateSimpleCoinbaseTx(uint32(i)) // golint:nolint
 
 		blocks[i] = &model.Block{
 			Header:     header,
@@ -305,4 +309,58 @@ func DefaultTestServerConfig() *TestServerConfig {
 			MaxHalfOpenRequests: 1,
 		},
 	}
+}
+
+// CreateSyntheticBlocksFrom builds a chain of coinbase-only blocks extending
+// prevHeader, with heights firstHeight..firstHeight+length-1.
+//
+// Unlike pairing CreateSyntheticChainFrom headers with a coinbase at serve time,
+// each header's merkle root here is its own coinbase txid — which is what a
+// coinbase-only block's merkle root is, and what validation checks. A header paired
+// with an unrelated coinbase does not validate, so fixtures whose blocks have to be
+// accepted need the two to agree.
+func CreateSyntheticBlocksFrom(prevHeader *model.BlockHeader, length int, firstHeight uint32) []*model.Block {
+	blocks := make([]*model.Block, length)
+	prevHash := prevHeader.Hash()
+	nBits, _ := model.NewNBitFromString("207fffff")
+
+	for i := 0; i < length; i++ {
+		height := firstHeight + uint32(i) // nolint:gosec
+		coinbaseTx := CreateSimpleCoinbaseTx(height)
+
+		header := &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  prevHash,
+			HashMerkleRoot: coinbaseTx.TxIDChainHash(),
+			// Walk forward from the parent in 10-minute steps: the chain has to advance
+			// past its parent's median time, and stay inside the 2h future window.
+			Timestamp: prevHeader.Timestamp + uint32((i+1)*600), // nolint:gosec
+			Bits:      *nBits,
+			Nonce:     0,
+		}
+		MineHeader(header)
+
+		blocks[i] = &model.Block{
+			Header:           header,
+			CoinbaseTx:       coinbaseTx,
+			TransactionCount: 1,
+			SizeInBytes:      uint64(80 + len(coinbaseTx.Bytes())),
+			Height:           height,
+			Subtrees:         []*chainhash.Hash{},
+		}
+
+		prevHash = header.Hash()
+	}
+
+	return blocks
+}
+
+// HeadersOf extracts the headers from a block chain built by CreateSyntheticBlocksFrom.
+func HeadersOf(blocks []*model.Block) []*model.BlockHeader {
+	headers := make([]*model.BlockHeader, len(blocks))
+	for i, b := range blocks {
+		headers[i] = b.Header
+	}
+
+	return headers
 }

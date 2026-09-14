@@ -476,6 +476,10 @@ func TestBlock_Valid_CoinbaseScriptSigLength(t *testing.T) {
 		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
 		require.NoError(t, err)
 
+		// The fixture header is paired with a different coinbase; a coinbase-only
+		// block's merkle root is its own coinbase txid, which Valid now enforces.
+		bindEmptyBlockMerkleRoot(t, block)
+
 		return block
 	}
 
@@ -1349,6 +1353,10 @@ func TestBlock_ValidWithOneTransaction(t *testing.T) {
 		123, 0, 0)
 	require.NoError(t, err)
 
+	// The fixture header is paired with a different coinbase; a coinbase-only
+	// block's merkle root is its own coinbase txid, which Valid now enforces.
+	bindEmptyBlockMerkleRoot(t, b)
+
 	subtreeStore, _ := null.New(ulogger.TestLogger{})
 
 	ctx := context.Background()
@@ -2218,7 +2226,7 @@ func TestBlock_CheckBlockRewardAndFees(t *testing.T) {
 		// and the below-checkpoint skip does not fire — this genuinely exercises the reward
 		// arithmetic: the height-1 coinbase claims exactly the 50 BTC subsidy, so it is valid.
 		params := &chaincfg.Params{SubsidyReductionInterval: 210000}
-		err = block.checkBlockRewardAndFees(params, true, true)
+		err = block.checkBlockRewardAndFees(params, true, true, true)
 		require.NoError(t, err)
 	})
 
@@ -2242,7 +2250,7 @@ func TestBlock_CheckBlockRewardAndFees(t *testing.T) {
 		}
 
 		params := &chaincfg.Params{SubsidyReductionInterval: 210000}
-		err = block.checkBlockRewardAndFees(params, true, true)
+		err = block.checkBlockRewardAndFees(params, true, true, true)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "overflow")
 	})
@@ -2344,12 +2352,13 @@ func TestCheckBlockRewardAndFees_SkipsBelowHardcodedCheckpoint(t *testing.T) {
 	}
 
 	bBelow := buildInflatedBlock(300) // below highest checkpoint (500)
-	require.NoError(t, bBelow.checkBlockRewardAndFees(params, true, true), "below checkpoint, fast-path store, confirmed checkpoint ancestor: fee check must be skipped")
-	require.Error(t, bBelow.checkBlockRewardAndFees(params, false, true), "below checkpoint but store lacks fast-path support: no-inflation must still be enforced")
-	require.Error(t, bBelow.checkBlockRewardAndFees(params, true, false), "below checkpoint, fast-path store, but NOT a confirmed checkpoint ancestor (forward-sync / detached fork): no-inflation must still be enforced")
+	require.NoError(t, bBelow.checkBlockRewardAndFees(params, true, true, true), "below checkpoint, fast-path store, confirmed checkpoint ancestor: fee check must be skipped")
+	require.Error(t, bBelow.checkBlockRewardAndFees(params, false, true, true), "below checkpoint but store lacks fast-path support: no-inflation must still be enforced")
+	require.Error(t, bBelow.checkBlockRewardAndFees(params, true, false, true), "below checkpoint, fast-path store, but NOT a confirmed checkpoint ancestor (forward-sync / detached fork): no-inflation must still be enforced")
 
 	bAbove := buildInflatedBlock(501) // above highest checkpoint (500)
-	require.Error(t, bAbove.checkBlockRewardAndFees(params, true, true), "above checkpoint: fee check must still be enforced regardless of store support / ancestry")
+	require.Error(t, bAbove.checkBlockRewardAndFees(params, true, true, true), "above checkpoint: fee check must still be enforced regardless of store support / ancestry")
+	require.Error(t, bBelow.checkBlockRewardAndFees(params, true, true, false), "below checkpoint, every policy conjunct satisfied, but the body was never bound to the header by CheckMerkleRoot: no-inflation must still be enforced")
 }
 
 // TestCheckBlockRewardAndFees_BoundaryMatchesHighestCheckpointHeight pins the real
@@ -2401,11 +2410,11 @@ func TestCheckBlockRewardAndFees_BoundaryMatchesHighestCheckpointHeight(t *testi
 	}
 
 	// Exactly at the boundary (height == hc), fast-path store, confirmed ancestor: skipped.
-	require.NoError(t, buildInflatedBlock(hc).checkBlockRewardAndFees(params, true, true),
+	require.NoError(t, buildInflatedBlock(hc).checkBlockRewardAndFees(params, true, true, true),
 		"at height == HighestCheckpointHeight the check must be skipped (fast-path store, confirmed ancestor)")
 
 	// One above the boundary: enforced (inflated coinbase → error).
-	require.Error(t, buildInflatedBlock(hc+1).checkBlockRewardAndFees(params, true, true),
+	require.Error(t, buildInflatedBlock(hc+1).checkBlockRewardAndFees(params, true, true, true),
 		"at height == HighestCheckpointHeight+1 the check must be enforced")
 }
 
@@ -2858,7 +2867,7 @@ func TestBlock_CheckRewardAndFees_WithHeight(t *testing.T) {
 
 		// Test with a height that triggers the reward calculation logic
 		// This should error because coinbase output is too high
-		err = block.checkBlockRewardAndFees(&chaincfg.MainNetParams, true, true)
+		err = block.checkBlockRewardAndFees(&chaincfg.MainNetParams, true, true, true)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "coinbase output")
 	})
@@ -3206,6 +3215,10 @@ func TestTargetedCoverageIncrease(t *testing.T) {
 		tSettings := test.CreateBaseTestSettings(t)
 		block, err := NewBlock(blockHeader, coinbase, []*chainhash.Hash{}, 1, 123, 0, 0)
 		require.NoError(t, err)
+
+		// The fixture header is paired with a different coinbase; a coinbase-only
+		// block's merkle root is its own coinbase txid, which Valid now enforces.
+		bindEmptyBlockMerkleRoot(t, block)
 
 		ctx := context.Background()
 		logger := ulogger.TestLogger{}

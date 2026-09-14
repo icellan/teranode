@@ -818,9 +818,13 @@ func TestCatchup_CompetingEqualWorkChains(t *testing.T) {
 		testhelpers.MineHeader(genesisHeader)
 
 		// Create two different synthetic chains from the same genesis with equal work
-		// Each chain will have 10 blocks with the same difficulty
-		chain1 := testhelpers.CreateSyntheticChainFrom(genesisHeader, 10)
-		chain2 := testhelpers.CreateSyntheticChainFrom(genesisHeader, 10)
+		// Each chain will have 10 blocks with the same difficulty.
+		// Built as whole blocks so each header's merkle root matches the coinbase served
+		// under it; a header paired with an unrelated coinbase does not validate.
+		chain1Blocks := testhelpers.CreateSyntheticBlocksFrom(genesisHeader, 10, 1)
+		chain2Blocks := testhelpers.CreateSyntheticBlocksFrom(genesisHeader, 10, 1)
+		chain1 := testhelpers.HeadersOf(chain1Blocks)
+		chain2 := testhelpers.HeadersOf(chain2Blocks)
 
 		target1 := &model.Block{
 			Header: chain1[9],
@@ -980,18 +984,8 @@ func TestCatchup_CompetingEqualWorkChains(t *testing.T) {
 				// Return serialized blocks from chain1 in REVERSE order (newest first)
 				// This matches the peer protocol where blocks are returned newest-to-oldest
 				var blockData []byte
-				for i := len(chain1) - 1; i >= 0; i-- {
-					height := uint32(i + 1) // Heights start at 1 (genesis is height 0)
-					coinbaseTx := testhelpers.CreateSimpleCoinbaseTx(height)
-					block := &model.Block{
-						Header:           chain1[i],
-						CoinbaseTx:       coinbaseTx,
-						TransactionCount: 1,
-						SizeInBytes:      uint64(80 + len(coinbaseTx.Bytes())), // header + coinbase
-						Subtrees:         []*chainhash.Hash{},                  // empty subtrees for simplicity
-						Height:           height,
-					}
-					blockBytes, err := block.Bytes()
+				for i := len(chain1Blocks) - 1; i >= 0; i-- {
+					blockBytes, err := chain1Blocks[i].Bytes()
 					if err != nil {
 						return nil, err
 					}
@@ -1008,18 +1002,8 @@ func TestCatchup_CompetingEqualWorkChains(t *testing.T) {
 				// Return serialized blocks from chain2 in REVERSE order (newest first)
 				// This matches the peer protocol where blocks are returned newest-to-oldest
 				var blockData []byte
-				for i := len(chain2) - 1; i >= 0; i-- {
-					height := uint32(i + 1) // Heights start at 1 (genesis is height 0)
-					coinbaseTx := testhelpers.CreateSimpleCoinbaseTx(height)
-					block := &model.Block{
-						Header:           chain2[i],
-						CoinbaseTx:       coinbaseTx,
-						TransactionCount: 1,
-						SizeInBytes:      uint64(80 + len(coinbaseTx.Bytes())), // header + coinbase
-						Height:           height,
-						Subtrees:         []*chainhash.Hash{}, // empty subtrees for simplicity
-					}
-					blockBytes, err := block.Bytes()
+				for i := len(chain2Blocks) - 1; i >= 0; i-- {
+					blockBytes, err := chain2Blocks[i].Bytes()
 					if err != nil {
 						return nil, err
 					}

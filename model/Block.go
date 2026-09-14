@@ -852,6 +852,28 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		}
 
 		merkleRootChecked = true
+	} else if len(b.Subtrees) == 0 && len(b.SubtreeSlices) == 0 {
+		// 8b. Empty (coinbase-only) block: its merkle root is the coinbase txid, which
+		// CheckMerkleRoot's no-subtree branch computes. That needs no subtree store, so
+		// it runs even for a nil-store caller.
+		//
+		// The merkle root is the only thing relating a block's body to its header —
+		// GetHash covers the header alone — so it has to be evaluated for every body
+		// shape, not just the ones with subtrees. A coinbase-only block's outputs are
+		// created as UTXOs like any other (SubtreeProcessor.moveForwardBlock ->
+		// processCoinbaseUtxos), and below a checkpoint the fee arithmetic is skipped,
+		// which leaves this as the only check that reads the coinbase at all.
+		//
+		// Both lengths are tested because CheckMerkleRoot requires them to agree.
+		// SubtreeSlices is always derived from Subtrees (GetAndValidateSubtrees,
+		// processBlockSubtrees), so on every deserialized path they are empty together;
+		// the mismatched state only exists in tests that construct it deliberately, and
+		// there merkleRootChecked correctly stays false.
+		if err = b.CheckMerkleRoot(ctx); err != nil {
+			return false, err
+		}
+
+		merkleRootChecked = true
 	}
 
 	// 9. Check that the total fees of the block are less than or equal to the block reward.
@@ -865,7 +887,7 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		// that does not set it gets full enforcement.
 		storeSupportsOutpointOnly := txMetaStore != nil && txMetaStore.SupportsOutpointOnlySpend()
 
-		err = b.checkBlockRewardAndFees(settings.ChainCfgParams, storeSupportsOutpointOnly, b.checkpointConfirmedAncestor)
+		err = b.checkBlockRewardAndFees(settings.ChainCfgParams, storeSupportsOutpointOnly, b.checkpointConfirmedAncestor, merkleRootChecked)
 		if err != nil {
 			return false, err
 		}
@@ -1035,15 +1057,16 @@ func (b *Block) skipOrderAndBlessedBelowCheckpoint(tSettings *settings.Settings,
 // height of the block we are checking for.
 
 // TODO - do this another way, if necessary
-func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params, storeSupportsOutpointOnly, checkpointConfirmedAncestor bool) error {
+func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params, storeSupportsOutpointOnly, checkpointConfirmedAncestor, merkleRootChecked bool) error {
 	if b.Height == 0 {
 		return nil // Skip this check
 	}
 
 	// Skip the coinbase no-inflation check (coinbaseOutput <= subsidy + fees) only when ALL
-	// THREE conditions hold: the block is at/below the highest HARDCODED checkpoint, the store
-	// can actually produce the fee=0 subtrees this skip exists to tolerate, and the block is a
-	// confirmed ancestor of the pinned checkpoint. Each condition answers a distinct concern:
+	// FOUR conditions hold: the block is at/below the highest HARDCODED checkpoint, the store
+	// can actually produce the fee=0 subtrees this skip exists to tolerate, the block is a
+	// confirmed ancestor of the pinned checkpoint, and CheckMerkleRoot has bound the body to
+	// that checkpoint-certified header. Each condition answers a distinct concern:
 	//
 	//  1. NOT gated on the OutpointOnlyBelowCheckpoint setting. The outpoint-only fast path
 	//     persists subtree fees as 0. A block synced that way must still revalidate on
@@ -1070,10 +1093,17 @@ func (b *Block) checkBlockRewardAndFees(params *chaincfg.Params, storeSupportsOu
 	//     SetCheckpointConfirmedAncestor) because it needs blockchain state model cannot see; it
 	//     is fail-safe (any lookup error or ambiguity yields false → the check runs).
 	//
+	//  4. GATED on merkleRootChecked, exactly as the sibling validOrderAndBlessed skip is.
+	//     Conjunct 3's reasoning — "the checkpoint transitively commits the coinbase" — only
+	//     holds once the body has actually been hashed against the header: the checkpoint
+	//     commits the header, the header commits the merkle root, the merkle root commits
+	//     the coinbase. Without that last step the checkpoint says nothing about the
+	//     coinbase, and skipping the arithmetic would leave its value unchecked.
+	//
 	// HighestCheckpointHeight is the single source of truth shared with the fast-path write
 	// side, so the fee-write boundary and this fee-skip boundary cannot diverge (invariant
 	// I3); see model/checkpoint.go.
-	if storeSupportsOutpointOnly && checkpointConfirmedAncestor && b.Height <= HighestCheckpointHeight(params.Checkpoints) {
+	if merkleRootChecked && storeSupportsOutpointOnly && checkpointConfirmedAncestor && b.Height <= HighestCheckpointHeight(params.Checkpoints) {
 		return nil
 	}
 
