@@ -41,6 +41,8 @@ func (u *Server) catchupSubtreeStore(ctx context.Context) blob.Store {
 	return u.subtreeStore
 }
 
+// Set always preserves existing files, regardless of caller overwrite options.
+// Overwriting would prevent cleanup from distinguishing new files from shared data.
 func (s *catchupArtifacts) Set(ctx context.Context, key []byte, kind fileformat.FileType, value []byte, opts ...options.FileOption) error {
 	hash, err := chainhash.NewHash(key)
 	if err != nil {
