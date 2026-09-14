@@ -314,12 +314,21 @@ func DefaultTestServerConfig() *TestServerConfig {
 // CreateSyntheticBlocksFrom builds a chain of coinbase-only blocks extending
 // prevHeader, with heights firstHeight..firstHeight+length-1.
 //
+// variant distinguishes chains that would otherwise be identical: everything here is
+// derived from (prevHeader, firstHeight, length), so two calls with the same arguments
+// produce the same blocks byte for byte. A test building two competing chains from one
+// parent must pass different variants, or it silently ends up with one chain twice.
+//
+// Timestamps step 10 minutes per block from the parent, so a chain whose parent is near
+// now stays inside the 2h future window for roughly 12 blocks; past that, headers are
+// rejected as too far ahead for reasons unrelated to what the test is exercising.
+//
 // Unlike pairing CreateSyntheticChainFrom headers with a coinbase at serve time,
 // each header's merkle root here is its own coinbase txid — which is what a
 // coinbase-only block's merkle root is, and what validation checks. A header paired
 // with an unrelated coinbase does not validate, so fixtures whose blocks have to be
 // accepted need the two to agree.
-func CreateSyntheticBlocksFrom(prevHeader *model.BlockHeader, length int, firstHeight uint32) []*model.Block {
+func CreateSyntheticBlocksFrom(prevHeader *model.BlockHeader, length int, firstHeight, variant uint32) []*model.Block {
 	blocks := make([]*model.Block, length)
 	prevHash := prevHeader.Hash()
 	nBits, _ := model.NewNBitFromString("207fffff")
@@ -334,7 +343,8 @@ func CreateSyntheticBlocksFrom(prevHeader *model.BlockHeader, length int, firstH
 			HashMerkleRoot: coinbaseTx.TxIDChainHash(),
 			// Walk forward from the parent in 10-minute steps: the chain has to advance
 			// past its parent's median time, and stay inside the 2h future window.
-			Timestamp: prevHeader.Timestamp + uint32((i+1)*600), // nolint:gosec
+			// variant offsets by seconds so sibling chains differ without changing work.
+			Timestamp: prevHeader.Timestamp + uint32((i+1)*600) + variant, // nolint:gosec
 			Bits:      *nBits,
 			Nonce:     0,
 		}

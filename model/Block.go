@@ -852,23 +852,25 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 		}
 
 		merkleRootChecked = true
-	} else if len(b.Subtrees) == 0 && len(b.SubtreeSlices) == 0 {
-		// 8b. Empty (coinbase-only) block: its merkle root is the coinbase txid, which
-		// CheckMerkleRoot's no-subtree branch computes. That needs no subtree store, so
-		// it runs even for a nil-store caller.
+	} else if len(b.Subtrees) == len(b.SubtreeSlices) {
+		// 8b. Every other body whose slices are already in hand, without needing the
+		// subtree store:
+		//   - a coinbase-only block (both lengths 0), whose merkle root is simply the
+		//     coinbase txid — CheckMerkleRoot's no-subtree branch;
+		//   - an in-memory block carrying its own slices (NewBlockFromMsgBlock's offline
+		//     shape), where a nil store is not a reason to leave the body unchecked.
 		//
-		// The merkle root is the only thing relating a block's body to its header —
-		// GetHash covers the header alone — so it has to be evaluated for every body
-		// shape, not just the ones with subtrees. A coinbase-only block's outputs are
+		// The merkle root is the only value relating a block's body to its header —
+		// GetHash covers the header alone — so it is evaluated for every body shape the
+		// caller has given us enough to evaluate. A coinbase-only block's outputs are
 		// created as UTXOs like any other (SubtreeProcessor.moveForwardBlock ->
 		// processCoinbaseUtxos), and below a checkpoint the fee arithmetic is skipped,
 		// which leaves this as the only check that reads the coinbase at all.
 		//
-		// Both lengths are tested because CheckMerkleRoot requires them to agree.
-		// SubtreeSlices is always derived from Subtrees (GetAndValidateSubtrees,
-		// processBlockSubtrees), so on every deserialized path they are empty together;
-		// the mismatched state only exists in tests that construct it deliberately, and
-		// there merkleRootChecked correctly stays false.
+		// The equal-length condition is what CheckMerkleRoot itself requires. It is
+		// false only when slices are absent for subtrees we hold (nothing to hash
+		// against) or, in tests that construct it deliberately, when they disagree; in
+		// both cases merkleRootChecked correctly stays false.
 		if err = b.CheckMerkleRoot(ctx); err != nil {
 			return false, err
 		}

@@ -478,7 +478,7 @@ func TestBlock_Valid_CoinbaseScriptSigLength(t *testing.T) {
 
 		// The fixture header is paired with a different coinbase; a coinbase-only
 		// block's merkle root is its own coinbase txid, which Valid now enforces.
-		bindEmptyBlockMerkleRoot(t, block)
+		bindBlockMerkleRoot(t, block)
 
 		return block
 	}
@@ -1355,7 +1355,7 @@ func TestBlock_ValidWithOneTransaction(t *testing.T) {
 
 	// The fixture header is paired with a different coinbase; a coinbase-only
 	// block's merkle root is its own coinbase txid, which Valid now enforces.
-	bindEmptyBlockMerkleRoot(t, b)
+	bindBlockMerkleRoot(t, b)
 
 	subtreeStore, _ := null.New(ulogger.TestLogger{})
 
@@ -1615,6 +1615,11 @@ func TestBlock_Valid_DupTxDetected_NilSubtreeStore(t *testing.T) {
 
 	// Pre-populate SubtreeSlices so Valid can reach checkDuplicateTransactions without a subtree store.
 	b.SubtreeSlices = []*subtreepkg.Subtree{subtree}
+
+	// The merkle root has to match the body: a CVE-2012-2459 mutation produces the SAME
+	// root as the honest block, so a faithful fixture passes CheckMerkleRoot and is
+	// caught by the duplicate check alone.
+	bindBlockMerkleRoot(t, b)
 
 	// Anchored at the fixture block's real parent, the regtest genesis (issue 1467).
 	currentChain := regtestGenesisParentChain(t, blockHeader)
@@ -3218,7 +3223,7 @@ func TestTargetedCoverageIncrease(t *testing.T) {
 
 		// The fixture header is paired with a different coinbase; a coinbase-only
 		// block's merkle root is its own coinbase txid, which Valid now enforces.
-		bindEmptyBlockMerkleRoot(t, block)
+		bindBlockMerkleRoot(t, block)
 
 		ctx := context.Background()
 		logger := ulogger.TestLogger{}
@@ -5658,6 +5663,11 @@ func TestBlock_Valid_DupTxDetected_DiskMapDirs(t *testing.T) {
 			// without needing a subtree store (matches the nil-subtree-store
 			// CVE-2012-2459 test pattern above).
 			b.SubtreeSlices = []*subtreepkg.Subtree{subtree}
+
+			// The merkle root has to match the body: a CVE-2012-2459 mutation produces the
+			// SAME root as the honest block, so a faithful fixture passes CheckMerkleRoot
+			// and is caught by the duplicate check alone.
+			bindBlockMerkleRoot(t, b)
 
 			// Anchored at the fixture block's real parent, the regtest genesis (issue 1467).
 			currentChain := regtestGenesisParentChain(t, blockHeader)

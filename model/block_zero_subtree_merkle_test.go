@@ -146,22 +146,45 @@ func TestBlock_Valid_HonestEmptyBlockAccepted(t *testing.T) {
 	require.True(t, valid)
 }
 
-// bindEmptyBlockMerkleRoot makes a coinbase-only test block self-consistent: for a
-// block with no subtrees the merkle root is the coinbase txid. The header is
-// re-mined because changing the merkle root invalidates the nonce (cheap at the
-// regtest 207fffff target the model fixtures use).
+// bindBlockMerkleRoot makes a test block self-consistent: it sets the header merkle
+// root to the value CheckMerkleRoot computes for the block's own body, then re-mines
+// (cheap at the regtest 207fffff target the model fixtures use — changing the merkle
+// root invalidates the nonce).
 //
-// Several fixtures pair a real header with an unrelated coinbase, which only
-// validated because Valid skipped CheckMerkleRoot for zero-subtree blocks.
-func bindEmptyBlockMerkleRoot(t *testing.T, block *Block) {
+// Handles the two fixture shapes in this package: a coinbase-only block, whose merkle
+// root is the coinbase txid, and a single-subtree block, whose root is the subtree's
+// with the coinbase placeholder replaced. Several fixtures paired a real header with
+// an unrelated body, which only validated while Valid skipped CheckMerkleRoot for
+// them.
+//
+// Must be called before anything reads block.Hash(), which caches.
+func bindBlockMerkleRoot(t *testing.T, block *Block) {
 	t.Helper()
 
-	require.Empty(t, block.Subtrees, "bindEmptyBlockMerkleRoot is only for coinbase-only blocks")
+	var merkleRoot *chainhash.Hash
+
+	switch len(block.SubtreeSlices) {
+	case 0:
+		require.Empty(t, block.Subtrees, "a block with no slices must have no subtrees")
+
+		merkleRoot = block.CoinbaseTx.TxIDChainHash()
+
+	case 1:
+		var err error
+
+		merkleRoot, err = block.SubtreeSlices[0].RootHashWithReplaceRootNode(
+			block.CoinbaseTx.TxIDChainHash(), 0, uint64(block.CoinbaseTx.Size()),
+		)
+		require.NoError(t, err)
+
+	default:
+		t.Fatalf("bindBlockMerkleRoot handles 0 or 1 subtree, got %d", len(block.SubtreeSlices))
+	}
 
 	// Copy the header: the fixtures share one *BlockHeader across subtests, and
 	// re-mining it in place would change what the others see.
 	hdr := *block.Header
-	hdr.HashMerkleRoot = block.CoinbaseTx.TxIDChainHash()
+	hdr.HashMerkleRoot = merkleRoot
 	hdr.Nonce = 0
 
 	// HasMetTargetDifficulty reports a miss as an error, so only the bool is read

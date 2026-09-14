@@ -821,8 +821,11 @@ func TestCatchup_CompetingEqualWorkChains(t *testing.T) {
 		// Each chain will have 10 blocks with the same difficulty.
 		// Built as whole blocks so each header's merkle root matches the coinbase served
 		// under it; a header paired with an unrelated coinbase does not validate.
-		chain1Blocks := testhelpers.CreateSyntheticBlocksFrom(genesisHeader, 10, 1)
-		chain2Blocks := testhelpers.CreateSyntheticBlocksFrom(genesisHeader, 10, 1)
+		// Different variants: same parent, same heights, same work, different blocks —
+		// without that the two "competing" chains are identical and the test proves
+		// nothing about first-seen.
+		chain1Blocks := testhelpers.CreateSyntheticBlocksFrom(genesisHeader, 10, 1, 0)
+		chain2Blocks := testhelpers.CreateSyntheticBlocksFrom(genesisHeader, 10, 1, 1)
 		chain1 := testhelpers.HeadersOf(chain1Blocks)
 		chain2 := testhelpers.HeadersOf(chain2Blocks)
 
