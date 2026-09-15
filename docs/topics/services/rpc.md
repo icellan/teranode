@@ -134,14 +134,20 @@ All RPC commands require a valid username and password for authentication. The s
 
 #### GRPC API Key Authentication
 
-For GRPC services, certain administrative operations require additional API key authentication. The following methods require an API key:
+The `grpc_admin_api_key` setting authenticates state-mutating gRPC calls using the `x-api-key` metadata header. Clients and servers must share the same secret.
 
-- **Ban/Unban Operations**: `BanPeer` and `UnbanPeer` methods in both P2P and Legacy services require API key authentication for security.
-- **Blockchain admin operations**: state-mutating RPCs on the Blockchain service (including `SendNotification`, `ReportPeerFailure`, `SetBlockSubtreesSet`, `AddBlock`, `InvalidateBlock`, and the peer-registry mutation RPCs) require API key authentication.
+- **P2P:** protects the seven admin operations (`BanPeer`, `UnbanPeer`, `ClearBanned`, `AddBanScore`, `ResetReputation`, `ConnectPeer`, `DisconnectPeer`) and ten internal reporting RPCs (`RecordCatchupAttempt`, `RecordCatchupSuccess`, `RecordCatchupFailure`, `RecordCatchupMalicious`, `UpdateCatchupError`, `ReportValidSubtree`, `ReportValidBlock`, `ReportValidBlockHeaders`, `ReportValidatedChainProgress`, `RecordBytesDownloaded`). Client and server use the same protected-method map.
+- **Legacy:** protects `BanPeer`, `UnbanPeer`, and `ClearBanned` when a key is configured.
+- **Blockchain:** protects state-mutating RPCs, including `SendNotification`, `ReportPeerFailure`, `SetBlockSubtreesSet`, `AddBlock`, `InvalidateBlock`, and peer-registry mutations, when a key is configured.
 
-The API key is configured via the `grpc_admin_api_key` setting. If no API key is provided, admin authentication is disabled entirely and the protected RPCs above are reachable without any key; each service logs a single startup warning naming this exposure. The API key must be included in GRPC requests as metadata with the key `x-api-key`. Source it from an environment variable or secret store rather than committing it to configuration. Well-known placeholder values (e.g. `testkey`, `changeme`) are rejected at startup as a configuration error.
+The shipped key is empty. The services deliberately have different empty-key policies:
 
-`grpc_admin_api_key` ships empty in `settings.conf`. A value committed to the repository is public knowledge, and a non-empty key installs the auth interceptor — which would make the node report that its state-mutating RPCs are protected when the credential is readable by anyone. Set a real secret (32+ characters) per environment. Known placeholder values, `testkey` among them, are refused at startup with a configuration error rather than accepted as a credential.
+| Service | Empty key | Known placeholder |
+|---|---|---|
+| P2P | Generates an unavailable random key; protected RPCs reject calls with `Unauthenticated` | Ignores the placeholder and uses the same fail-closed path |
+| Blockchain and Legacy | Disables gRPC admin authentication and logs a startup warning; protected RPCs are reachable without credentials | Refuses startup with a configuration error |
+
+P2P retains the data-plane authentication already merged in PR 1532. Without a shared usable key, validation services cannot report validated chain progress or delivery, which prevents peers from becoming proven sync candidates. P2P also retains startup rejection of weak keys on non-loopback listeners outside regtest. Configure a random secret of at least 32 characters consistently across the deployment, using an environment variable or secret store.
 
 #### Blockchain HTTP admin endpoints
 

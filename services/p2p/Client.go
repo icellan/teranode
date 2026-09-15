@@ -63,7 +63,7 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, address st
 		// A placeholder is ignored by the server (which uses a random key), so a
 		// client that sent it would still be rejected; warn instead of logging a
 		// reassuring "using API key" line that contradicts the server.
-		logger.Warnf("[P2P Client] grpc_admin_api_key is unset or a well-known placeholder; admin RPCs (ban, unban, connect/disconnect peer) will fail with Unauthenticated because the server ignores placeholders and uses a random key")
+		logger.Warnf("[P2P Client] grpc_admin_api_key is unset or a well-known placeholder; protected admin and data-plane reporting RPCs will fail with Unauthenticated because the server ignores placeholders and uses a random key")
 	} else {
 		logger.Infof("[P2P Client] Using API key for authentication")
 	}
