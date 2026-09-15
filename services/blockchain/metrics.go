@@ -528,7 +528,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "blockchain",
 			Name:      "notifications_dropped_total",
-			Help:      "Number of notifications discarded because the notification channel was full. Non-zero means subscribers missed events the RPC reported as delivered.",
+			Help:      "Number of replaceable PING notifications discarded because the notification channel was full. Delivery-critical notifications apply backpressure instead.",
 		},
 		[]string{"type"},
 	)

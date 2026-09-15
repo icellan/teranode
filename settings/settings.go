@@ -332,6 +332,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PostgresPool:              getPostgresPoolSettings("blockchain", alternativeContext...),
 			UseInMemoryChainCheck:     getBool("blockchain_use_in_memory_chain_check", false, alternativeContext...),
 			HeartbeatInterval:         getDuration("blockchain_heartbeat_interval", 10*time.Second, alternativeContext...),
+			MaxBlockHeadersPerRequest: getInt("blockchain_maxBlockHeadersPerRequest", 1000000, alternativeContext...),
 			MaxMedianTimePastHeights:  getInt("blockchain_maxMedianTimePastHeights", 10000, alternativeContext...),
 			MaxBlocksByHeightRange:    getInt("blockchain_maxBlocksByHeightRange", 2000, alternativeContext...),
 			GenerationalCacheCapacity: getInt("blockchain_generationalCacheCapacity", 100000, alternativeContext...),

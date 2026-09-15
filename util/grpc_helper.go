@@ -592,6 +592,7 @@ func InitGRPCResolver(logger ulogger.Logger, grpcResolver string) {
 // It validates API keys in request metadata and only applies authentication to specified methods.
 // Non-protected methods bypass authentication entirely.
 func CreateAuthInterceptor(apiKey string, protectedMethods map[string]bool) grpc.UnaryServerInterceptor {
+	apiKeyBytes := []byte(apiKey)
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		// Skip authentication for non-protected methods
 		if !protectedMethods[info.FullMethod] {
@@ -615,7 +616,7 @@ func CreateAuthInterceptor(apiKey string, protectedMethods map[string]bool) grpc
 		// Validate API key. Constant-time so the comparison does not leak the
 		// key through response timing - this is the only credential check in
 		// the path.
-		if subtle.ConstantTimeCompare([]byte(keys[0]), []byte(apiKey)) != 1 {
+		if subtle.ConstantTimeCompare([]byte(keys[0]), apiKeyBytes) != 1 {
 			grpcAuthRejectionsTotal.WithLabelValues(info.FullMethod).Inc()
 			return nil, status.Error(codes.Unauthenticated, "invalid API key")
 		}

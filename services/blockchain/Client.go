@@ -25,6 +25,7 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -2525,7 +2526,7 @@ func (c *Client) GetMedianTimePastForHeights(ctx context.Context, heights []uint
 // GetMedianTimePastRange returns the MTP values for all blocks in [fromHeight, toHeight].
 // Returns a dense slice where result[i] = MTP for height (fromHeight + i).
 // Internally builds a full heights array to reuse the existing GetMedianTimePastByHeights RPC,
-// avoiding the need for a new proto endpoint.
+// with up to four concurrent requests.
 //
 // The request is chunked client-side into batches of at most
 // maxMedianTimePastHeightsPerRequest: GetMedianTimePastByHeights rejects any
@@ -2539,46 +2540,62 @@ func (c *Client) GetMedianTimePastRange(ctx context.Context, fromHeight, toHeigh
 		return []uint32{}, nil
 	}
 
-	count := toHeight - fromHeight + 1
-	result := make([]uint32, 0, count)
-
-	chunkSize := maxMedianTimePastHeightsPerRequest(c.settings)
-
-	for chunkStart := fromHeight; ; {
-		remaining := toHeight - chunkStart + 1
-		n := remaining
-		if n > chunkSize {
-			n = chunkSize
-		}
-
-		heights := make([]uint32, n)
-		for i := range heights {
-			heights[i] = chunkStart + uint32(i)
-		}
-
-		resp, err := c.client.GetMedianTimePastByHeights(ctx, &blockchain_api.GetMedianTimePastByHeightsRequest{
-			Heights: heights,
-		})
-		if err != nil {
-			return nil, errors.UnwrapGRPC(err)
-		}
-
-		result = append(result, resp.MedianTimePast...)
-
-		if n == remaining {
+	count := uint64(toHeight) - uint64(fromHeight) + 1
+	result := make([]uint32, count)
+	chunkSize := uint64(maxMedianTimePastHeightsPerRequest(c.settings))
+	group, fetchCtx := errgroup.WithContext(ctx)
+	// Keep startup latency bounded without issuing a whole-chain burst of RPCs.
+	group.SetLimit(4)
+	for offset := uint64(0); offset < count; offset += chunkSize {
+		if fetchCtx.Err() != nil {
 			break
 		}
-
-		chunkStart += n
+		end := offset + chunkSize
+		if end > count {
+			end = count
+		}
+		start := uint32(uint64(fromHeight) + offset)
+		output := result[offset:end]
+		group.Go(func() error { return c.fetchMedianTimePastChunk(fetchCtx, start, output) })
 	}
-
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return result, nil
+}
+
+// A smaller server cap must degrade to extra requests instead of stopping
+// validation. Retry only range-size rejections, down to a single height.
+func (c *Client) fetchMedianTimePastChunk(ctx context.Context, start uint32, output []uint32) error {
+	heights := make([]uint32, len(output))
+	for i := range heights {
+		heights[i] = start + uint32(i)
+	}
+	resp, err := c.client.GetMedianTimePastByHeights(ctx, &blockchain_api.GetMedianTimePastByHeightsRequest{Heights: heights})
+	if err != nil {
+		if status.Code(err) == codes.InvalidArgument && len(output) > 1 {
+			half := len(output) / 2
+			if err := c.fetchMedianTimePastChunk(ctx, start, output[:half]); err != nil {
+				return err
+			}
+			return c.fetchMedianTimePastChunk(ctx, start+uint32(half), output[half:])
+		}
+		return errors.UnwrapGRPC(err)
+	}
+	if resp == nil || len(resp.MedianTimePast) != len(output) {
+		return errors.NewProcessingError("GetMedianTimePastByHeights returned an unexpected number of values")
+	}
+	copy(output, resp.MedianTimePast)
+	return nil
 }
 
 // maxMedianTimePastHeightsPerRequest returns the per-request chunk size used
 // by GetMedianTimePastRange, mirroring the server-side
-// BlockChain.MaxMedianTimePastHeights bound so the client never sends a
-// request the server is going to reject. Falls back to the server's default
+// BlockChain.MaxMedianTimePastHeights bound. If settings differ across processes,
+// fetchMedianTimePastChunk retries with smaller batches. Falls back to the default
 // when settings is nil or unset.
 func maxMedianTimePastHeightsPerRequest(tSettings *settings.Settings) uint32 {
 	const defaultMaxMedianTimePastHeights = 10000
@@ -2587,5 +2604,9 @@ func maxMedianTimePastHeightsPerRequest(tSettings *settings.Settings) uint32 {
 		return defaultMaxMedianTimePastHeights
 	}
 
-	return uint32(tSettings.BlockChain.MaxMedianTimePastHeights) //nolint:gosec // config-bounded int, never near uint32 overflow range
+	configured := uint64(tSettings.BlockChain.MaxMedianTimePastHeights)
+	if configured > uint64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(configured) //nolint:gosec // bounded above before conversion
 }
