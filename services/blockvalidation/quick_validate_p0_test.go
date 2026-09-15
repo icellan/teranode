@@ -10,7 +10,11 @@ import (
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
+	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -130,6 +134,70 @@ func TestQuickValidateBlock_LooseCoinbaseRejectedOnRoute(t *testing.T) {
 	suite.MockBlockchain.AssertNotCalled(t, "AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }
 
+// TestValidateSubtrees_LooseCoinbaseRejected pins the subtree-shape site to the
+// consensus predicate. TestValidateSubtrees_NonCoinbaseBodyRejected cannot: its
+// fixture is an ordinary spend, which go-bt's predicate and the strict one both
+// reject, so that site could be swapped back to CoinbaseTx.IsCoinbase() with the
+// suite still green. This fixture separates them.
+func TestValidateSubtrees_LooseCoinbaseRejected(t *testing.T) {
+	suite := NewCatchupTestSuite(t)
+	defer suite.Cleanup()
+
+	loose := bt.NewTx()
+	require.NoError(t, loose.From("0000000000000000000000000000000000000000000000000000000000000000", 0, "", 0))
+	loose.Inputs[0].SequenceNumber = 0xFFFFFFFF
+	loose.Inputs[0].UnlockingScript = bscript.NewFromBytes(make([]byte, 16))
+	require.NoError(t, loose.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1))
+	require.True(t, loose.IsCoinbase(), "precondition: go-bt accepts this shape")
+
+	st, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, st.AddCoinbaseNode())
+	require.NoError(t, st.AddNode(chainhash.HashH([]byte("tx a")), 1, 0))
+
+	block := testhelpers.CreateTestBlocks(t, 1)[0]
+	block.CoinbaseTx = loose
+	block.Subtrees = []*chainhash.Hash{st.RootHash()}
+	block.SubtreeSlices = []*subtreepkg.Subtree{st}
+
+	root, err := st.RootHashWithReplaceRootNode(loose.TxIDChainHash(), 0, uint64(loose.Size()))
+	require.NoError(t, err)
+	block.Header.HashMerkleRoot = root
+
+	_, err = suite.Server.blockValidation.validateSubtrees(context.Background(), block, 1)
+
+	require.Error(t, err, "the subtree-shape site must apply the consensus predicate")
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "the body is bound: got %v", err)
+}
+
+// TestValidateSubtrees_FirstNodeMustBeCoinbasePlaceholder covers the precondition the
+// duplicate scan depends on: it skips slot [0][0] only when that slot holds the
+// placeholder. A first subtree whose node 0 is a real txid otherwise passes the merkle
+// check with the body's true first transaction silently substituted. Valid enforces this
+// as its step 7.
+func TestValidateSubtrees_FirstNodeMustBeCoinbasePlaceholder(t *testing.T) {
+	suite := NewCatchupTestSuite(t)
+	defer suite.Cleanup()
+
+	st, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, st.AddNode(chainhash.HashH([]byte("a real txid, not the placeholder")), 1, 0))
+	require.NoError(t, st.AddNode(chainhash.HashH([]byte("tx b")), 1, 0))
+
+	block := testhelpers.CreateTestBlocks(t, 1)[0]
+	block.Subtrees = []*chainhash.Hash{st.RootHash()}
+	block.SubtreeSlices = []*subtreepkg.Subtree{st}
+
+	root, err := st.RootHashWithReplaceRootNode(block.CoinbaseTx.TxIDChainHash(), 0, uint64(block.CoinbaseTx.Size()))
+	require.NoError(t, err)
+	block.Header.HashMerkleRoot = root
+
+	_, err = suite.Server.blockValidation.validateSubtrees(context.Background(), block, 1)
+
+	require.Error(t, err, "a first subtree whose node 0 is not the coinbase placeholder must be rejected")
+	require.True(t, errors.IsBlockCorrupt(err), "a peer-supplied body defect is corrupt, not invalid: got %v", err)
+}
+
 // TestIsConsensusCoinbase_RejectsNonNullPrevoutIndex — go-bt's IsCoinbase is a
 // disjunction: a null prevout HASH plus EITHER a 0xFFFFFFFF prevout index OR a
 // 0xFFFFFFFF sequence number. Consensus (COutPoint::IsNull) requires the null hash
@@ -153,4 +221,80 @@ func TestIsConsensusCoinbase_RejectsNonNullPrevoutIndex(t *testing.T) {
 	require.NoError(t, real.From("0000000000000000000000000000000000000000000000000000000000000000", 0xFFFFFFFF, "", 0))
 	real.Inputs[0].UnlockingScript = bscript.NewFromBytes(make([]byte, 16))
 	require.True(t, model.IsConsensusCoinbase(real))
+}
+
+// TestQuickValidateBlock_SubtreeInvalidVerdictNotShadowed drives a subtree-carrying
+// body all the way through quickValidateBlock so validateSubtrees' verdict passes
+// through its caller.
+//
+// teranode's errors.Is walks the cause chain, so wrapping an invalid verdict in
+// ErrProcessing does not hide it — it makes the error match BOTH, and routing then
+// depends on which predicate a call site happens to test first. The corrupt verdict is
+// returned unwrapped for exactly that reason; the invalid one must be too. Asserting
+// only Is(err, ErrBlockInvalid) cannot see the difference, so this pins
+// Is(err, ErrProcessing) being false.
+func TestQuickValidateBlock_SubtreeInvalidVerdictNotShadowed(t *testing.T) {
+	suite := NewCatchupTestSuite(t)
+	defer suite.Cleanup()
+
+	suite.MockBlockchain.On("AssignBlockID", mock.Anything, mock.Anything).Return(uint64(1), nil).Maybe()
+	suite.MockBlockchain.On("AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	suite.MockBlockchain.On("SetBlockSubtreesSet", mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	txs := transactions.CreateTestTransactionChainWithCount(t, 4)
+	regularTxs := txs[1:]
+
+	// A coinbase go-bt accepts and consensus does not, so validateSubtrees — reached only
+	// after the UTXO batches have run — is what rejects the block.
+	loose := bt.NewTx()
+	require.NoError(t, loose.From("0000000000000000000000000000000000000000000000000000000000000000", 0, "", 0))
+	loose.Inputs[0].SequenceNumber = 0xFFFFFFFF
+	loose.Inputs[0].UnlockingScript = bscript.NewFromBytes(make([]byte, 16))
+	require.NoError(t, loose.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1))
+	require.True(t, loose.IsCoinbase(), "precondition: go-bt accepts this shape")
+
+	block := testhelpers.CreateTestBlocks(t, 1)[0]
+	block.Height = 100
+	block.CoinbaseTx = loose
+
+	subtree, err := subtreepkg.NewIncompleteTreeByLeafCount(3)
+	require.NoError(t, err)
+	require.NoError(t, subtree.AddCoinbaseNode())
+	require.NoError(t, subtree.AddNode(*regularTxs[0].TxIDChainHash(), 1, 1))
+	require.NoError(t, subtree.AddNode(*regularTxs[1].TxIDChainHash(), 2, 2))
+
+	subtreeBytes, err := subtree.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, suite.Server.subtreeStore.Set(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes))
+
+	subtreeData := subtreepkg.NewSubtreeData(subtree)
+	require.NoError(t, subtreeData.AddTx(loose, 0))
+	require.NoError(t, subtreeData.AddTx(regularTxs[0], 1))
+	require.NoError(t, subtreeData.AddTx(regularTxs[1], 2))
+
+	subtreeDataBytes, err := subtreeData.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, suite.Server.subtreeStore.Set(t.Context(), subtree.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeDataBytes))
+
+	block.Subtrees = []*chainhash.Hash{subtree.RootHash()}
+	block.TransactionCount = 3
+
+	block.Header.HashMerkleRoot, err = subtree.RootHashWithReplaceRootNode(loose.TxIDChainHash(), 0, 0)
+	require.NoError(t, err)
+
+	suite.MockUTXOStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return((*meta.Data)(nil), errors.NewNotFoundError("not found"))
+	suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, uint32(100), matchCreateOnly()).Return(&meta.Data{}, nil, nil)
+	suite.MockUTXOStore.On("SpendAndCreate", mock.Anything, mock.Anything, mock.Anything, matchSpendOnly()).Return(nil, []*utxo.Spend{}, nil)
+	// Optional: the block is rejected before the post-AddBlock unlock, so this must not
+	// be an unmet expectation — the point of the test is that it never gets that far.
+	suite.MockUTXOStore.On("SetLocked", mock.Anything, mock.Anything, false).Return(nil).Maybe()
+	suite.MockValidator.Errors = []error{nil, nil, nil}
+
+	err = suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "")
+
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "got %v", err)
+	require.False(t, errors.Is(err, errors.ErrProcessing),
+		"the invalid verdict must reach the caller unwrapped, as the corrupt verdict does — a wrapped one matches both classes and routes by check order: got %v", err)
+	suite.MockBlockchain.AssertNotCalled(t, "AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }

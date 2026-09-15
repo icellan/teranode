@@ -306,7 +306,7 @@ func (u *BlockValidation) quickValidateBlock(ctx context.Context, block *model.B
 		if err != nil {
 			// Preserve a corrupt-body verdict from validateSubtrees (bitcoin-sv/teranode#4692) instead
 			// of shadowing it with an outer ErrProcessing.
-			if errors.IsBlockCorrupt(err) {
+			if errors.IsBlockCorrupt(err) || errors.Is(err, errors.ErrBlockInvalid) {
 				return err
 			}
 
@@ -434,7 +434,7 @@ func (u *BlockValidation) quickValidateBlockAsync(ctx context.Context, block *mo
 			// Preserve a corrupt-body verdict from validateSubtrees (bitcoin-sv/teranode#4692) instead
 			// of shadowing it with an outer ErrProcessing, so the caller re-downloads a
 			// fresh body rather than treating it as a transient processing error.
-			if errors.IsBlockCorrupt(err) {
+			if errors.IsBlockCorrupt(err) || errors.Is(err, errors.ErrBlockInvalid) {
 				return wg, freshlyWritten, err
 			}
 
@@ -966,6 +966,27 @@ func (u *BlockValidation) validateSubtrees(ctx context.Context, block *model.Blo
 	//
 	// Corrupt, not invalid: a duplicated transaction is a defect in the body a peer served,
 	// and the honest hash it binds to must not be condemned (bitcoin-sv/teranode#4692).
+	// The dedup scan below skips slot [0][0] only when it holds the coinbase placeholder,
+	// so "first node is the placeholder" is its unstated precondition, and Valid enforces it
+	// as its own step 7. Without it a first subtree whose node 0 is a real txid — reachable on
+	// a retry that reuses a locally present .subtree blob — passes the merkle check with the
+	// body's true first transaction silently substituted, and the scan would then treat that
+	// txid as an ordinary node.
+	if len(block.SubtreeSlices) > 0 {
+		first := block.SubtreeSlices[0]
+		if first == nil {
+			return 0, errors.NewProcessingError("[validateSubtrees][%s] first subtree was released during validation", block.Hash().String())
+		}
+
+		if len(first.Nodes) == 0 {
+			return 0, errors.NewBlockCorruptError("[validateSubtrees][%s] first subtree has no nodes", block.Hash().String())
+		}
+
+		if !first.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholder) {
+			return 0, errors.NewBlockCorruptError("[validateSubtrees][%s] first transaction in first subtree is not a coinbase placeholder: %s", block.Hash().String(), first.Nodes[0].Hash.String())
+		}
+	}
+
 	if err := model.CheckSubtreeSlicesForDuplicateTxs(block.SubtreeSlices); err != nil {
 		return 0, err
 	}
