@@ -39,6 +39,8 @@ type AuthOptions struct {
 // waiting to happen. An empty key is allowed and means "admin auth disabled"
 // - that is a visible, warned-about posture. A placeholder key is not, so it
 // is a hard configuration error.
+// Settings loaded from configuration are already trimmed. The whitespace check
+// also protects callers that construct Settings directly.
 func ValidateAdminAPIKey(apiKey string) error {
 	if trimmed := strings.TrimSpace(apiKey); trimmed != apiKey {
 		return errors.NewConfigurationError("grpc_admin_api_key has leading or trailing whitespace - remove it, or leave the key empty to run with admin auth explicitly disabled")

@@ -95,11 +95,9 @@ func (s *SQL) GetBlockHeaders(ctx context.Context, blockHashFrom *chainhash.Hash
 		cacheTTL = chainWalkCacheTTL
 	}
 
-	// The cache key includes the caller-supplied numberOfHeaders, so the same start
-	// hash with different counts occupies a distinct entry per count. The request
-	// count limit enforced by the blockchain service bounds the size of a single
-	// response, not the number of entries that can be held for the cache TTL, and
-	// the cache itself has no capacity limit (see NewGenerationalCache).
+	// Caller-supplied counts produce distinct cache keys. GenerationalCache
+	// bounds both entry count (blockchain_generationalCacheCapacity) and retained
+	// header-query payloads (64 MiB); larger results are returned without caching.
 	cacheID := chainhash.HashH([]byte(fmt.Sprintf("GetBlockHeaders-%s-%d", blockHashFrom.String(), numberOfHeaders)))
 	cacheOp := cache.NewOp(cacheID)
 

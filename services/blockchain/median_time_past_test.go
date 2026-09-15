@@ -411,6 +411,26 @@ func TestGetMedianTimePastForHeights_WidthIndependent(t *testing.T) {
 
 	require.Equal(t, wideMTPAt30, narrowMTPAt30,
 		"MTP for height 30 must not depend on how many other heights were requested alongside it")
+	local := &LocalClient{store: ctx.server.store}
+	for name, query := range map[string]func(context.Context, uint32, uint32) ([]uint32, error){
+		"service range": ctx.server.GetMedianTimePastRange,
+		"local range":   local.GetMedianTimePastRange,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, from := range []uint32{0, 18, 29, 30} {
+				result, err := query(context.Background(), from, 30)
+				require.NoError(t, err)
+				require.Len(t, result, int(31-from))
+				require.Equal(t, wideMTPAt30, result[len(result)-1])
+			}
+		})
+	}
+	for _, heights := range [][]uint32{{30}, {29, 30}, {30, 18, 30}} {
+		result, err := local.GetMedianTimePastForHeights(context.Background(), heights)
+		require.NoError(t, err)
+		require.Equal(t, wideMTPAt30, result[len(result)-1])
+	}
+
 }
 
 // createTestBlockAtHeight creates a test block at a specific height with a specific timestamp.

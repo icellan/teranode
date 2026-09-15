@@ -151,10 +151,9 @@ The blockchain service's own HTTP listener (`blockchain_httpListenAddress`) expo
 
 Attaching the `x-api-key` header on the blockchain client is new. A service binary built before that change sends no header, so if `grpc_admin_api_key` is non-empty and the blockchain service is upgraded ahead of its callers, every mutating RPC from the older binaries fails with `Unauthenticated` — block validation stops committing blocks, notifications stop flowing and FSM state stops updating, while the failures appear only in logs.
 
-Pick one of:
+**Required upgrade order:** upgrade all blockchain-client services (block assembly, block validation, block persister, subtree validation, p2p, legacy, asset) first, and the blockchain service last. An old server ignores the extra metadata.
 
-- **Upgrade order**: upgrade all blockchain-client services (block assembly, block validation, block persister, subtree validation, p2p, legacy, asset) first, and the blockchain service last. The reverse direction is safe: an old server ignores the extra metadata.
-- **Deferred enablement**: leave `grpc_admin_api_key` empty for the duration of the rollout — admin auth is then disabled and every binary works — and set the key once the whole fleet is on the new version.
+Leaving `grpc_admin_api_key` empty does not make this order optional. This release also caps `GetMedianTimePastByHeights`: an older validator sends an unchunked whole-chain request that the new server rejects with `InvalidArgument`, halting validation even while health checks pass. Set `blockchain_maxMedianTimePastHeights` consistently across the fleet; newer clients retry smaller batches if the server has a lower cap.
 
 ## 2. Architecture
 

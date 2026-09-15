@@ -121,6 +121,7 @@ All metrics are CounterVec type with labels: `function` (handler function name),
 | `teranode_blockchain_get_block_header_ids`              | Histogram | Histogram of GetBlockHeaderIDs calls to the blockchain service          |
 | `teranode_blockchain_invalidate_block`                  | Histogram | Histogram of InvalidateBlock calls to the blockchain service            |
 | `teranode_blockchain_revalidate_block`                  | Histogram | Histogram of RevalidateBlock calls to the blockchain service            |
+| `teranode_blockchain_notifications_dropped_total` | Counter | Replaceable PING notifications dropped when the shared queue is full (`type` label); delivery-critical notifications wait for queue space or return a context error |
 | `teranode_blockchain_send_notification`                 | Histogram | Histogram of SendNotification calls to the blockchain service           |
 | `teranode_blockchain_set_block_mined_set`               | Histogram | Histogram of SetBlockMinedSet calls to the blockchain service           |
 | `teranode_blockchain_get_blocks_mined_not_set`          | Histogram | Histogram of GetBlocksMinedNotSet calls to the blockchain service       |

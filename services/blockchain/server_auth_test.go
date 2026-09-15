@@ -349,38 +349,50 @@ func TestSendNotification_Validation(t *testing.T) {
 	})
 }
 
-// TestSendNotification_NonBlockingWhenChannelFull verifies that a flood of
-// calls degrades gracefully (dropping notifications once the channel buffer
-// is full) rather than blocking the RPC handler goroutine.
-func TestSendNotification_NonBlockingWhenChannelFull(t *testing.T) {
-	ctx := context.Background()
-	validHash := make([]byte, chainhash.HashSize)
-
+func TestSendNotification_BackpressureAndCancellation(t *testing.T) {
 	b := newTestBlockchainForNotifications(t, 1)
-
-	notification := &blockchain_api.Notification{
-		Type: model.NotificationType_Block,
-		Hash: validHash,
-	}
-
-	// Fill the buffer.
-	_, err := b.SendNotification(ctx, notification)
+	notification := &blockchain_api.Notification{Type: model.NotificationType_Block, Hash: make([]byte, chainhash.HashSize)}
+	_, err := b.SendNotification(context.Background(), notification)
 	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err = b.SendNotification(ctx, notification)
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	require.Len(t, b.notifications, 1)
 
-	// The channel is now full; without the non-blocking select this call
-	// would hang forever since nothing is draining the channel.
-	done := make(chan struct{})
-	go func() {
-		_, err := b.SendNotification(ctx, notification)
-		require.NoError(t, err)
-		close(done)
-	}()
-
+	done := make(chan error, 1)
+	go func() { _, err := b.SendNotification(context.Background(), notification); done <- err }()
+	<-b.notifications
 	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("SendNotification blocked on a full channel instead of dropping the notification")
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("notification did not resume after the queue drained")
 	}
+	require.Same(t, notification, <-b.notifications)
+}
+
+func TestSendNotification_PINGMayDrop(t *testing.T) {
+	b := newTestBlockchainForNotifications(t, 1)
+	ping := &blockchain_api.Notification{Type: model.NotificationType_PING}
+	for i := 0; i < 2; i++ {
+		_, err := b.SendNotification(context.Background(), ping)
+		require.NoError(t, err)
+	}
+	require.Len(t, b.notifications, 1)
+}
+
+func TestReportPeerFailure_LongReasonStillNotifies(t *testing.T) {
+	b := newTestBlockchainForNotifications(t, 1)
+	_, err := b.ReportPeerFailure(context.Background(), &blockchain_api.ReportPeerFailureRequest{
+		PeerId: "peer", FailureType: "catchup", Hash: make([]byte, chainhash.HashSize), Reason: strings.Repeat("界", 200),
+	})
+	require.NoError(t, err)
+	notification := <-b.notifications
+	require.Equal(t, "catchup", notification.Metadata.Metadata["failure_type"])
+	reason := notification.Metadata.Metadata["reason"]
+	require.LessOrEqual(t, len(reason), maxNotificationMetadataFieldLen)
+	require.True(t, utf8.ValidString(reason))
 }
 
 func TestSendNotification_PayloadBounds(t *testing.T) {
@@ -713,26 +725,26 @@ func TestHeightRangeBoundsRejectUnboundedRequests(t *testing.T) {
 
 	_, err = b.GetBlockHeaders(ctx, &blockchain_api.GetBlockHeadersRequest{
 		StartHash:       make([]byte, chainhash.HashSize),
-		NumberOfHeaders: maxBlockHeadersPerRequest + 1,
+		NumberOfHeaders: defaultMaxBlockHeadersPerRequest + 1,
 	})
 	require.Error(t, err, "an oversized numberOfHeaders must be rejected before it reaches the store LIMIT")
 
 	_, err = b.GetBlockHeadersFromOldestRequest(ctx, &blockchain_api.GetBlockHeadersFromOldestRequest{
 		ChainTipHash:    make([]byte, chainhash.HashSize),
 		TargetHash:      make([]byte, chainhash.HashSize),
-		NumberOfHeaders: maxBlockHeadersPerRequest + 1,
+		NumberOfHeaders: defaultMaxBlockHeadersPerRequest + 1,
 	})
 	require.Error(t, err, "an oversized numberOfHeaders must be rejected before GetBlockHeadersFromOldest reaches the store")
 
 	_, err = b.GetBlockHeaderIDs(ctx, &blockchain_api.GetBlockHeadersRequest{
 		StartHash:       make([]byte, chainhash.HashSize),
-		NumberOfHeaders: maxBlockHeadersPerRequest + 1,
+		NumberOfHeaders: defaultMaxBlockHeadersPerRequest + 1,
 	})
 	require.Error(t, err, "an oversized numberOfHeaders must be rejected before GetBlockHeaderIDs reaches the store")
 
 	_, err = b.LocateBlockHeaders(ctx, &blockchain_api.LocateBlockHeadersRequest{
 		HashStop:  make([]byte, chainhash.HashSize),
-		MaxHashes: maxBlockHeadersPerRequest + 1,
+		MaxHashes: defaultMaxBlockHeadersPerRequest + 1,
 	})
 	require.Error(t, err, "an oversized maxHashes must be rejected before LocateBlockHeaders reaches the store")
 }
