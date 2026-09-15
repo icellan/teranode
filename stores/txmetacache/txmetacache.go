@@ -218,7 +218,7 @@ func NewTxMetaCache(
 
 		cache = pc
 	} else {
-		c, err := New(maxMB*1024*1024, bucketType)
+		c, err := New(maxMB*1024*1024, bucketType, tSettings.SubtreeValidation.TxMetaCacheTrimRatio)
 		if err != nil {
 			return nil, errors.NewProcessingError("error creating cache", err)
 		}
