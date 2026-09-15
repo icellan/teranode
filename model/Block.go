@@ -918,8 +918,16 @@ func (b *Block) Valid(ctx context.Context, logger ulogger.Logger, subtreeStore S
 	// never poisoned.
 	//
 	// Ordering constraint: this must stay ABOVE CoinbaseScriptSigLengthInBounds, which indexes
-	// Inputs[0] unconditionally and documents IsCoinbase() as its "at least one input" guarantee.
-	if !b.CoinbaseTx.IsCoinbase() {
+	// Inputs[0] unconditionally and documents this check as its "at least one input" guarantee —
+	// IsConsensusCoinbase requires exactly one input, so that guarantee still holds.
+	//
+	// IsConsensusCoinbase rather than go-bt's Tx.IsCoinbase: the latter accepts a null prevout
+	// hash with EITHER a 0xFFFFFFFF index OR a 0xFFFFFFFF sequence number, so it admits a shape
+	// svnode rejects. This is where the verdict is actually decided — above the checkpoint it is
+	// the only check that runs, and on catch-up a quick-route rejection that is neither corrupt
+	// nor incomplete comes back through here — so a looser test here overrules the strict one on
+	// the quick route.
+	if !IsConsensusCoinbase(b.CoinbaseTx) {
 		return false, bindErr("[BLOCK][%s] block coinbase tx is not a valid coinbase tx", b.String())
 	}
 

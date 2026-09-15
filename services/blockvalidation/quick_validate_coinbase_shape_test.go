@@ -22,9 +22,9 @@ import (
 // the binding the same failure would be indistinguishable from a corrupted download,
 // which is the classification bitcoin-sv/teranode#4692 settled.
 
-// TestQuickValidateBlock_BoundNonCoinbaseBodyRejected builds a coinbase-only block whose
-// only transaction is a normal spend, with the header merkle root set to that txid so the
-// body is genuinely bound.
+// buildBoundNonCoinbaseBody builds a coinbase-only block whose only transaction is a
+// normal spend, with the header merkle root set to that txid so the body is genuinely
+// bound.
 func buildBoundNonCoinbaseBody(t *testing.T) *model.Block {
 	t.Helper()
 

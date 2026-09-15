@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -93,6 +94,40 @@ func TestValidateSubtrees_NonCoinbaseBodyRejected(t *testing.T) {
 	require.Error(t, err, "a subtree-carrying body whose coinbase is an ordinary spend must be rejected")
 	require.True(t, errors.Is(err, errors.ErrBlockInvalid),
 		"the body is bound, so this is genuine invalidity: got %v", err)
+}
+
+// TestQuickValidateBlock_LooseCoinbaseRejectedOnRoute drives the loose-but-not-strict
+// shape through the route itself, not just the predicate. Both existing route tests use
+// an ordinary spend, which go-bt's test and the strict one both reject — so swapping
+// IsConsensusCoinbase back to CoinbaseTx.IsCoinbase() left the package green. This is the
+// test that fails if the route stops using the consensus predicate.
+func TestQuickValidateBlock_LooseCoinbaseRejectedOnRoute(t *testing.T) {
+	suite := NewCatchupTestSuite(t)
+	defer suite.Cleanup()
+
+	suite.MockBlockchain.On("AssignBlockID", mock.Anything, mock.Anything).Return(uint64(1), nil).Maybe()
+	suite.MockBlockchain.On("AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+	suite.MockBlockchain.On("SetBlockSubtreesSet", mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	// Null prevout hash, index 0, sequence 0xFFFFFFFF: go-bt says coinbase, consensus does not.
+	loose := bt.NewTx()
+	require.NoError(t, loose.From("0000000000000000000000000000000000000000000000000000000000000000", 0, "", 0))
+	loose.Inputs[0].SequenceNumber = 0xFFFFFFFF
+	loose.Inputs[0].UnlockingScript = bscript.NewFromBytes(make([]byte, 16))
+	require.NoError(t, loose.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 1))
+	require.True(t, loose.IsCoinbase(), "precondition: go-bt accepts this shape")
+
+	block := testhelpers.CreateTestBlocks(t, 1)[0]
+	block.CoinbaseTx = loose
+	block.Header.HashMerkleRoot = loose.TxIDChainHash()
+	block.Header.Nonce = 0
+	testhelpers.MineHeader(block.Header)
+
+	err := suite.Server.blockValidation.quickValidateBlock(suite.Ctx, block, "test", "")
+
+	require.Error(t, err, "the route must apply the consensus predicate, not go-bt's looser one")
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "the body is bound: got %v", err)
+	suite.MockBlockchain.AssertNotCalled(t, "AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }
 
 // TestIsConsensusCoinbase_RejectsNonNullPrevoutIndex — go-bt's IsCoinbase is a
