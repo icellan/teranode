@@ -26,7 +26,10 @@
 | ValidateBlockSubtreesConcurrency | int | max(4, CPU/2) | blockvalidation_validateBlockSubtreesConcurrency | Block subtree validation concurrency |
 | ValidationMaxRetries | int | 3 | blockvalidation_validation_max_retries | Validation retry attempts |
 | ValidationRetrySleep | time.Duration | 5s | blockvalidation_validation_retry_sleep | Validation retry delay |
-| OptimisticMining | bool | true | blockvalidation_optimistic_mining | Optimistic mining behavior |
+| OptimisticMining | bool | true | blockvalidation_optimistic_mining | Optimistic mining behavior (global; the peer-served path also requires OptimisticMiningPeerBlocks, and catch-up is never optimistic) |
+| OptimisticMiningPeerBlocks | bool | false | blockvalidation_optimistic_mining_peer_blocks | Opt in to optimistic mining on the peer-served path (accepts the invalidate-route tradeoff) |
+| MaxCorruptAttemptsPerBlock | int | 3 | blockvalidation_max_corrupt_attempts_per_block | Ban-score-independent per-(block hash, serving peerID) cap on corrupt re-downloads; also sizes the separate local-policy decline cap (0 disables, re-opening the DoS) |
+| CorruptAttemptCooldown | time.Duration | 10m | blockvalidation_corrupt_attempt_cooldown | Fixed cooldown window after which a capped (hash, peerID) is admitted again, for both caps |
 | IsParentMinedRetryMaxRetry | int | 45 | blockvalidation_isParentMined_retry_max_retry | Parent mining check retries |
 | IsParentMinedRetryBackoffMultiplier | int | 4 | blockvalidation_isParentMined_retry_backoff_multiplier | Parent mining retry backoff multiplier |
 | IsParentMinedRetryBackoffDuration | time.Duration | 20ms | blockvalidation_isParentMined_retry_backoff_duration | Parent mining retry backoff base duration |
@@ -39,10 +42,11 @@
 | BatchMissingTransactions | bool | false | blockvalidation_batch_missing_transactions | Missing transaction batching |
 | CheckSubtreeFromBlockTimeout | time.Duration | 5m | blockvalidation_check_subtree_from_block_timeout | Subtree validation timeout |
 | SubtreeDataFetchTimeout | time.Duration | 10m | blockvalidation_subtree_data_fetch_timeout | Bound on one detached subtree_data fetch (download + parse + store) |
+| SubtreeMetaPeerFetchTimeout | time.Duration | 10m | blockvalidation_subtree_meta_peer_fetch_timeout | Per-fetch budget for a subtree meta regeneration subtree_data fetch (all 503 retries + body stream); a cache-busting retry gets a fresh budget |
 | CheckSubtreeFromBlockRetries | int | 5 | blockvalidation_check_subtree_from_block_retries | Subtree validation retries |
 | CheckSubtreeFromBlockRetryBackoffDuration | time.Duration | 30s | blockvalidation_check_subtree_from_block_retry_backoff_duration | Subtree retry backoff |
 | SecretMiningThreshold | uint32 | 99 | blockvalidation_secret_mining_threshold | **CRITICAL** - Secret mining detection |
-| PreviousBlockHeaderCount | uint64 | 100 | blockvalidation_previous_block_header_count | **CRITICAL** - Header chain cache size |
+| PreviousBlockHeaderCount | uint64 | 100 | blockvalidation_previous_block_header_count | **CRITICAL** - Header chain cache size. Floored at 11 (`settings.MedianTimeSpan`): the run is what median-time-past is measured over, so a lower value would compute the median over fewer blocks than consensus requires and accept blocks the rest of the network rejects. Anything below 11 is raised to it, with a warning on stderr |
 | CatchupMaxRetries | int | 3 | blockvalidation_catchup_max_retries | Catchup operation retries |
 | CatchupIterationTimeout | int | 30 | blockvalidation_catchup_iteration_timeout | **CRITICAL** - Catchup iteration timeout |
 | CatchupOperationTimeout | int | 300 | blockvalidation_catchup_operation_timeout | **CRITICAL** - Catchup operation timeout |
@@ -85,10 +89,42 @@
 
 ### Optimistic Mining
 
-- `OptimisticMining = true`: Enables background validation for performance
-- Block validation proceeds while subtree validation runs in background
-- Can be overridden per-validation via DisableOptimisticMining option
-- Disabled during catchup mode for better performance
+- `OptimisticMining = true`: enables background validation for performance on paths that opt in
+- Block validation proceeds while subtree validation runs in the background
+- Can be overridden per-validation via the `DisableOptimisticMining` option
+- **On the peer-served validation path optimistic mining is OFF unless BOTH
+  `blockvalidation_optimistic_mining` AND `blockvalidation_optimistic_mining_peer_blocks` are set**
+  (default `(true, false)` = off). The global flag being false always wins, so the peer-blocks flag
+  can never bypass it (bitcoin-sv/teranode#4692). Revalidation of an already-stored block is always
+  non-optimistic regardless of these flags.
+- **The catch-up path is always non-optimistic**, whatever these two flags are set to. It validates
+  against a cached header run holding only the block's in-batch predecessors, which cannot carry the
+  median-time-past window the optimistic branch checks synchronously; lifting this requires the
+  header cache to top up short windows from the store first (issue 1499).
+- **Opt-in tradeoff:** with both flags set, a corrupt body on the optimistic-background path is
+  already added before background validation runs, so it takes the *invalidate route* (it is
+  invalidated/poisoned rather than re-downloaded) until the `block.Valid` integrity-floor split lands
+  and removes that path. With the default (peer-blocks off) a corrupt body is never added and is
+  re-downloaded, not poisoned.
+
+### Corrupt-body re-download cap
+
+- Independently of the per-peer ban score, corrupt-body re-downloads are bounded per
+  (block hash, serving peerID) on the RUNNING and legacy netsync paths by
+  `MaxCorruptAttemptsPerBlock` (default 3) within a fixed `CorruptAttemptCooldown` window
+  (default 10m), then dropped before the expensive download/validate work until the window lapses
+  (bitcoin-sv/teranode#4692). Keying on the pair rather than the hash alone is deliberate: one peer's
+  corruption can never consume the budget for a hash an honest peer can still serve, so a bad peer
+  cannot wedge the honest tip. The residual aggregate per-hash bound is therefore
+  (concurrent distinct serving peers) × this cap per window.
+- The cap never poisons a hash: once the window lapses an honest body is admitted again, and the
+  counter is cleared by a successful validation. Setting `MaxCorruptAttemptsPerBlock` to 0 disables
+  the cap and re-opens the corrupt-body bandwidth DoS, so it is strongly discouraged.
+- A separate per-(hash, peerID) counter, sized by the same two settings, bounds repeat deliveries of
+  a block this node declines on local `excessiveblocksize` policy, so an oversized block is not
+  re-fetched from the same peer indefinitely. A policy decline is not a corrupt body: it never
+  strikes the peer, never marks the hash invalid, and spends a budget of its own rather than the
+  corrupt one.
 
 ### Quick Validation Pipeline
 
@@ -102,14 +138,17 @@ For checkpoint-verified blocks, a fan-in pipeline overlaps I/O with processing:
   3. **Processor**: Creates/spends UTXOs and writes files in parallel per batch
 
 ### Transaction Metadata Processing
+
 - Cache and store processing work together with threshold-based fallback
 - Batch sizes and concurrency settings control performance
 
 ### Secret Mining Detection
+
 - `SecretMiningThreshold` uses `PreviousBlockHeaderCount` for analysis
 - Detection triggers when block difference exceeds threshold
 
 ### Two-Phase Double-Spend Detection
+
 - `RecentBlockIDsLimit` controls the size of the fast-path in-memory block ID window
 - Transactions mined in blocks within this window are detected immediately (fast path)
 - Transactions mined in older blocks trigger a blockchain service query (slow path)
@@ -117,6 +156,7 @@ For checkpoint-verified blocks, a fan-in pipeline overlaps I/O with processing:
 - Default of 50,000 covers approximately 347 days of blocks at 10-minute intervals
 
 ### Channel Buffer Management
+
 - `BlockFoundChBufferSize` and `CatchupChBufferSize` must accommodate processing loads
 
 ## Service Dependencies
