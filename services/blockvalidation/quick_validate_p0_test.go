@@ -1,0 +1,121 @@
+package blockvalidation
+
+import (
+	"context"
+	"testing"
+
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
+	"github.com/stretchr/testify/require"
+)
+
+// The quick-validation route is a hand-maintained mirror of model.Block.Valid.
+// These cover three rules that exist on the Valid side but had no counterpart
+// here, each reachable with a body a peer supplies.
+
+// TestValidateSubtrees_DuplicateTransactionRejected — CVE-2012-2459.
+//
+// The merkle root CANNOT detect a duplicated trailing transaction: the
+// duplicate-last-node-when-odd rule makes the mutated body produce the SAME root,
+// and therefore the same block hash, as the honest block. So a body that binds to
+// a checkpoint-certified header can still carry a repeated transaction, reusing the
+// honest block's proof of work. model.CheckSubtreeSlicesForDuplicateTxs exists
+// precisely for slice-holding paths that skip Valid's pooled check, and documents
+// itself as mandatory before UTXOs are created — but nothing called it.
+func TestValidateSubtrees_DuplicateTransactionRejected(t *testing.T) {
+	suite := NewCatchupTestSuite(t)
+	defer suite.Cleanup()
+
+	dup := chainhash.HashH([]byte("duplicated tx"))
+
+	st, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+	require.NoError(t, st.AddCoinbaseNode())
+	require.NoError(t, st.AddNode(chainhash.HashH([]byte("tx a")), 1, 0))
+	require.NoError(t, st.AddNode(dup, 1, 0))
+	require.NoError(t, st.AddNode(dup, 1, 0)) // the CVE-2012-2459 mutation
+
+	block := testhelpers.CreateTestBlocks(t, 1)[0]
+	block.Subtrees = []*chainhash.Hash{st.RootHash()}
+	block.SubtreeSlices = []*subtreepkg.Subtree{st}
+
+	// Bind the body: the header commits to exactly these subtree roots, so the
+	// merkle check cannot be what rejects it.
+	root, err := st.RootHashWithReplaceRootNode(block.CoinbaseTx.TxIDChainHash(), 0, uint64(block.CoinbaseTx.Size()))
+	require.NoError(t, err)
+	block.Header.HashMerkleRoot = root
+
+	_, err = suite.Server.blockValidation.validateSubtrees(context.Background(), block, 1)
+
+	require.Error(t, err, "a duplicated transaction must be rejected even though the merkle root matches")
+	require.True(t, errors.IsBlockCorrupt(err),
+		"a peer-supplied body defect is corrupt, not invalid — the honest hash must not be condemned: got %v", err)
+	require.False(t, errors.Is(err, errors.ErrBlockInvalid))
+}
+
+// TestValidateSubtrees_NonCoinbaseBodyRejected — the subtree-carrying shape had no
+// block.CoinbaseTx.IsCoinbase() check anywhere on this route. The shape check in
+// getBlockTransactions inspects subtreeData.Txs[0], a different object.
+//
+// Checked after CheckMerkleRoot, where the body is bound, so BlockInvalid is the
+// correct class: the header commits to this transaction.
+func TestValidateSubtrees_NonCoinbaseBodyRejected(t *testing.T) {
+	suite := NewCatchupTestSuite(t)
+	defer suite.Cleanup()
+
+	spend := bt.NewTx()
+	require.NoError(t, spend.From("6a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b", 0, "76a914000000000000000000000000000000000000000088ac", 1000))
+	require.NoError(t, spend.AddP2PKHOutputFromAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", 900))
+	spend.Inputs[0].UnlockingScript = bscript.NewFromBytes(make([]byte, 16))
+	require.False(t, spend.IsCoinbase())
+
+	st, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, st.AddCoinbaseNode())
+	require.NoError(t, st.AddNode(chainhash.HashH([]byte("tx a")), 1, 0))
+
+	block := testhelpers.CreateTestBlocks(t, 1)[0]
+	block.CoinbaseTx = spend
+	block.Subtrees = []*chainhash.Hash{st.RootHash()}
+	block.SubtreeSlices = []*subtreepkg.Subtree{st}
+
+	root, err := st.RootHashWithReplaceRootNode(spend.TxIDChainHash(), 0, uint64(spend.Size()))
+	require.NoError(t, err)
+	block.Header.HashMerkleRoot = root
+
+	_, err = suite.Server.blockValidation.validateSubtrees(context.Background(), block, 1)
+
+	require.Error(t, err, "a subtree-carrying body whose coinbase is an ordinary spend must be rejected")
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid),
+		"the body is bound, so this is genuine invalidity: got %v", err)
+}
+
+// TestIsConsensusCoinbase_RejectsNonNullPrevoutIndex — go-bt's IsCoinbase is a
+// disjunction: a null prevout HASH plus EITHER a 0xFFFFFFFF prevout index OR a
+// 0xFFFFFFFF sequence number. Consensus (COutPoint::IsNull) requires the null hash
+// AND the 0xFFFFFFFF index; the sequence number says nothing about coinbase-ness.
+//
+// So a transaction with prevout (0x00..00, 0) and sequence 0xFFFFFFFF is accepted
+// by go-bt and rejected by svnode — a chain-split shape if it decides a consensus
+// verdict.
+func TestIsConsensusCoinbase_RejectsNonNullPrevoutIndex(t *testing.T) {
+	tx := bt.NewTx()
+	require.NoError(t, tx.From("0000000000000000000000000000000000000000000000000000000000000000", 0, "", 0))
+	tx.Inputs[0].SequenceNumber = 0xFFFFFFFF
+	tx.Inputs[0].UnlockingScript = bscript.NewFromBytes(make([]byte, 16))
+
+	require.True(t, tx.IsCoinbase(), "precondition: go-bt accepts this shape")
+	require.False(t, model.IsConsensusCoinbase(tx),
+		"prevout index 0 is not a null outpoint; consensus requires 0xFFFFFFFF")
+
+	// The genuine shape must still be accepted.
+	real := bt.NewTx()
+	require.NoError(t, real.From("0000000000000000000000000000000000000000000000000000000000000000", 0xFFFFFFFF, "", 0))
+	real.Inputs[0].UnlockingScript = bscript.NewFromBytes(make([]byte, 16))
+	require.True(t, model.IsConsensusCoinbase(real))
+}

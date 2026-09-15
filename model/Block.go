@@ -1057,6 +1057,31 @@ func bindClassifiedError(merkleRootChecked bool, format string, args ...interfac
 	return errors.NewBlockCorruptError(format, args...)
 }
 
+// IsConsensusCoinbase reports whether tx has the coinbase shape consensus requires:
+// exactly one input whose previous outpoint is NULL — a zero hash AND an index of
+// 0xFFFFFFFF. This is svnode's CTransaction::IsCoinBase (vin.size() == 1 &&
+// vin[0].prevout.IsNull(), where COutPoint::IsNull() is hash.IsNull() && n == uint32(-1)).
+//
+// Deliberately NOT go-bt's Tx.IsCoinbase, which accepts a null hash plus EITHER a
+// 0xFFFFFFFF prevout index OR a 0xFFFFFFFF sequence number. The sequence number says
+// nothing about coinbase-ness, so that disjunction admits a transaction svnode rejects:
+// prevout (0x00..00, 0) with sequence 0xFFFFFFFF. Anywhere the answer decides a consensus
+// verdict, the looser predicate is a chain-split shape, so use this one.
+func IsConsensusCoinbase(tx *bt.Tx) bool {
+	if tx == nil || len(tx.Inputs) != 1 {
+		return false
+	}
+
+	in := tx.Inputs[0]
+	if in.PreviousTxOutIndex != 0xFFFFFFFF {
+		return false
+	}
+
+	var nullHash [32]byte
+
+	return bytes.Equal(in.PreviousTxID(), nullHash[:])
+}
+
 // CoinbaseScriptSigLengthInBounds reports whether the coinbase scriptSig (unlocking script)
 // length is within the consensus bound: parity with bitcoin-sv CheckCoinbase (bad-cb-length),
 // inclusive 2 <= size <= params.MaxCoinbaseScriptSigSize. The caller must guarantee coinbaseTx has
