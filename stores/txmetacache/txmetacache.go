@@ -32,7 +32,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
-	"github.com/ordishs/gocore"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -201,8 +200,8 @@ func NewTxMetaCache(
 
 	initPrometheusMetrics()
 
-	// base size (MB) from config
-	maxMB, _ := gocore.Config().GetInt("txMetaCacheMaxMB", 256)
+	// base size (MB) from the tagged setting
+	maxMB := tSettings.SubtreeValidation.TxMetaCacheMaxMB
 	// override if caller passed one
 	if len(maxMBOverride) > 0 && maxMBOverride[0] > 0 {
 		maxMB = maxMBOverride[0]
