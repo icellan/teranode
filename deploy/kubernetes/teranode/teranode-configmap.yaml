@@ -22,8 +22,9 @@ data:
   # "teranode-operator-secrets" Secret alongside blockchain_store/utxostore. It gates
   # the protected gRPC admin RPCs (setban/clearbanned, connect/disconnect peer,
   # alert-driven bans, reset reputation), which cross service boundaries. Without it,
-  # admin auth is disabled and those admin RPCs are reachable without any key; use a
-  # strong random value (32+ chars) to secure them.
+  # P2P rejects protected admin and data-plane reporting RPCs, preventing proven
+  # sync-peer selection. Blockchain and Legacy disable gRPC admin auth and warn.
+  # Set the same strong random value (32+ chars) on every service.
   # recommended settings to tweak based on your deployment
   # KAFKA_PARTITIONS_HIGH: "512"
   # txMetaCacheMaxMB: "32768"

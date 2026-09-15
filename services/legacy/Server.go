@@ -755,9 +755,8 @@ func (s *Server) logPeerStats(ctx context.Context) {
 // resolveAdminAPIKey returns the configured admin API key for the legacy
 // gRPC server. An empty key is returned as-is rather than replaced with a
 // generated one: util.StartGRPCServer only installs the auth interceptor
-// when the key is non-empty, so a generated key no client could ever learn
-// would just mask the fact that BanPeer/UnbanPeer are unauthenticated. A
-// single warning is logged in that case so the exposure is visible. A known
+// when the key is non-empty. This service deliberately disables authentication
+// on an empty key and logs a warning identifying the exposed admin methods. A known
 // placeholder key is refused outright: it would install the interceptor and
 // claim the surface is protected while the credential is public knowledge.
 func (s *Server) resolveAdminAPIKey() (string, error) {

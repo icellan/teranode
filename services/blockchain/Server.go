@@ -652,11 +652,9 @@ func sanitizeSubscriberSource(source string) string {
 
 // resolveAdminAPIKey returns the configured admin API key for the blockchain
 // gRPC server (which also serves PeerRegistryService on the same listener).
-// An empty key is returned as-is rather than replaced with a generated one:
-// util.StartGRPCServer only installs the auth interceptor when the key is
-// non-empty, so a generated key no client could ever learn would just mask
-// the fact that the RPCs in protectedMethods are unauthenticated. A single
-// warning is logged in that case so the exposure is visible. A known
+// This service deliberately disables gRPC authentication on an empty key:
+// util.StartGRPCServer only installs the interceptor for a non-empty key.
+// A startup warning identifies the exposed state-mutating RPCs. A known
 // placeholder key is refused outright: it would install the interceptor and
 // claim the surface is protected while the credential is public knowledge.
 func (b *Blockchain) resolveAdminAPIKey() (string, error) {

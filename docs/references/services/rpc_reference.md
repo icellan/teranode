@@ -426,10 +426,11 @@ getpeerinfo, invalidateblock, reconsiderblock, setban, isbanned, listbanned, cle
 
 For GRPC services, certain administrative operations require additional API key authentication:
 
-- **Protected Methods**: `BanPeer`, `UnbanPeer`, `ClearBanned`, `AddBanScore`, `ResetReputation`, `ConnectPeer` and `DisconnectPeer` in P2P, and `BanPeer`, `UnbanPeer` and `ClearBanned` in Legacy, and every state-mutating RPC on the Blockchain service — including `SendNotification`, `ReportPeerFailure`, `SetBlockSubtreesSet`, `AddBlock`, `InvalidateBlock`, `RevalidateBlock`, `SetState`, `Run`/`Idle`/`SendFSMEvent`, `GetNextBlockID` and the `PeerRegistryService` mutation RPCs
+- **Protected Methods**: `BanPeer`, `UnbanPeer`, `ClearBanned`, `AddBanScore`, `ResetReputation`, `ConnectPeer` and `DisconnectPeer` plus all ten internal catchup, validation, and download reporting RPCs in P2P (the full `authProtectedMethods` set), and `BanPeer`, `UnbanPeer` and `ClearBanned` in Legacy, and every state-mutating RPC on the Blockchain service — including `SendNotification`, `ReportPeerFailure`, `SetBlockSubtreesSet`, `AddBlock`, `InvalidateBlock`, `RevalidateBlock`, `SetState`, `Run`/`Idle`/`SendFSMEvent`, `GetNextBlockID` and the `PeerRegistryService` mutation RPCs
 - **Configuration**: Set via `grpc_admin_api_key` setting in the configuration file. It ships empty
-- **Empty key**: Admin authentication is disabled and the protected RPCs are reachable without any key. Each service logs a single startup warning naming the exposure. No key is generated — an earlier version fabricated a random key that no client could learn, which only masked the exposure
-- **Placeholder keys**: Known placeholder values such as `testkey` are rejected at startup with a configuration error
+- **Empty key**: P2P generates a random key and rejects protected calls with `Unauthenticated`, including data-plane reports needed for sync-peer selection. Blockchain and Legacy disable gRPC admin authentication and warn that protected RPCs are reachable without credentials
+- **Placeholder keys**: P2P ignores known placeholders and uses its random-key, fail-closed path. Blockchain and Legacy refuse startup with a configuration error
+- **Weak keys**: P2P rejects short real keys on non-loopback listeners outside regtest; use a shared random secret of at least 32 characters
 - **Usage**: API key must be included in GRPC requests as metadata with the key `x-api-key`
 - **HTTP**: The blockchain service's `POST /invalidate/:hash` and `POST /revalidate/:hash` routes take the same key in an `x-api-key` header, and are disabled outright when no key is configured
 

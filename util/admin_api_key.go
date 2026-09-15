@@ -53,9 +53,9 @@ func MinAdminAPIKeyLength() int { return minAdminAPIKeyLength }
 
 // WarnIfAdminAPIKeyExposed logs a warning if a configured (non-empty) admin API
 // key is weak, or is served on a listener where it can be read in transit.
-// Placeholder rejection is handled separately by ValidateAdminAPIKey (util/grpc.go),
-// which fails startup outright rather than warning - a publicly-known
-// credential is a hard configuration error, not just a hygiene issue.
+// Blockchain/Legacy reject placeholders through ValidateAdminAPIKey (util/grpc.go).
+// P2P ignores them and generates an unavailable random key. Neither policy accepts
+// a publicly-known credential.
 //
 // A short key draws a length warning: it matches the cmd/diagnose weak-key
 // threshold (32+ recommended).
@@ -67,7 +67,7 @@ func MinAdminAPIKeyLength() int { return minAdminAPIKeyLength }
 // and level 1 encrypts without verifying the server certificate
 // (MITM-exploitable, see loadTLSCredentials), so both warn; level 2+
 // (verified TLS) is treated as safe. Callers should only invoke this once the
-// key has already passed ValidateAdminAPIKey and is known non-empty.
+// key is known to be non-empty and not a placeholder.
 func WarnIfAdminAPIKeyExposed(logger ulogger.Logger, serviceName, apiKey, listenAddress string, securityLevel int) {
 	trimmed := strings.TrimSpace(apiKey)
 	if trimmed == "" {
