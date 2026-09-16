@@ -19,6 +19,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain/work"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
@@ -395,6 +396,24 @@ func (s *SQL) storeBlock(ctx context.Context, block *model.Block, peerID string,
 	}
 
 	storeAsInvalid := previousBlockInvalid || storeBlockOptions.Invalid
+
+	// BIP34 coinbase-height guard. Deliberately NOT applied when the block is being stored as
+	// invalid: storing invalid=true IS the record that the block failed a consensus rule, so
+	// re-deriving that same rule as a precondition on the write makes the failure unrecordable.
+	// BIP34 is the case where the two collide exactly — the validator's bad-cb-height verdict and
+	// this guard test the identical condition — and without this gate the invalid write fails, the
+	// error is swallowed by the caller, and the block is re-validated at full cost on every
+	// re-announcement instead of being remembered (bitcoin-sv/teranode#4692). The same reasoning
+	// covers a block stored invalid because its parent is invalid. Any future consensus-shaped
+	// guard added to this insert path belongs on this side of the gate.
+	//
+	// validateCoinbaseHeight returns nil for height 0, so hoisting the call out of the non-genesis
+	// branch of getPreviousBlockData does not start enforcing anything on genesis.
+	if !storeAsInvalid {
+		if err := s.validateCoinbaseHeight(block, height); err != nil {
+			return 0, 0, nil, false, err
+		}
+	}
 
 	// Genesis is always on the main chain (it IS the chain). Override the caller's
 	// value, which may be false when the DB was empty and getBestBlockID returned nothing.
@@ -791,11 +810,6 @@ func (s *SQL) getPreviousBlockData(
 		}
 
 		height = previousHeight + 1
-
-		// BIP34 Coinbase Height Validation using the helper function
-		if err := s.validateCoinbaseHeight(block, height); err != nil {
-			return false, 0, 0, nil, false, err
-		}
 	}
 
 	return genesis, height, previousBlockID, previousChainWork, previousBlockInvalid, nil
@@ -956,7 +970,9 @@ func (s *SQL) calculateMedianTimePastForHeight(ctx context.Context, height uint3
 	// MTP requires at least 11 previous blocks
 	// For early blocks (height < 11), return 0
 	// MTP of block N is the median of timestamps from blocks [N-11, N-1] (previous 11 blocks)
-	const medianTimeBlocks = 11
+	// The span is the consensus constant (svnode CBlockIndex::nMedianTimeSpan), declared once in
+	// settings so this store, model.medianTimeBlocks and the header-count floor cannot drift.
+	const medianTimeBlocks = settings.MedianTimeSpan
 	if height < medianTimeBlocks {
 		return 0, nil
 	}

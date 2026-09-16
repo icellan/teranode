@@ -381,6 +381,10 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	apiGroup.GET("/block/:hash/forks", h.GetBlockForks)
 	apiGroup.GET("/block/:hash/nearestforks", h.GetNearestForkHeights)
 
+	apiGroup.GET("/block/height/:height", h.GetBlockByHeight(BINARY_STREAM), heavyMW()...)
+	apiGroup.GET("/block/height/:height/hex", h.GetBlockByHeight(HEX), heavyMW()...)
+	apiGroup.GET("/block/height/:height/json", h.GetBlockByHeight(JSON), heavyMW()...)
+
 	apiGroup.GET("/block/:hash/subtrees/json", h.GetBlockSubtrees(JSON))
 
 	apiGroup.GET("/search", h.Search)
@@ -416,12 +420,6 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	apiGroup.GET("/merkle_proof/:hash", h.GetMerkleProof(BINARY_STREAM))
 	apiGroup.GET("/merkle_proof/:hash/hex", h.GetMerkleProof(HEX))
 	apiGroup.GET("/merkle_proof/:hash/json", h.GetMerkleProof(JSON))
-
-	if h.settings.StatsPrefix != "" {
-		e.GET(h.settings.StatsPrefix+"stats", AdaptStdHandler(gocore.HandleStats))
-		e.GET(h.settings.StatsPrefix+"reset", AdaptStdHandler(gocore.ResetStats))
-		e.GET(h.settings.StatsPrefix+"*", AdaptStdHandler(gocore.HandleOther))
-	}
 
 	// Create auth handler for protecting admin endpoints (used regardless of dashboard state)
 	authHandler := dashboard.NewAuthHandler(h.logger, h.settings)

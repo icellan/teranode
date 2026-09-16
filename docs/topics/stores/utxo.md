@@ -46,7 +46,7 @@ It handles the core functionalities of the UTXO Store:
 - **Delete**: Remove UTXOs from the store.
 - **Block Height Management**: Set and retrieve the current blockchain height, which can be crucial for determining the spendability of certain UTXOs based on locktime conditions.
 - **FreezeUTXOs / UnFreezeUTXOs**: Mark UTXOs as frozen or unfrozen, in scenarios involving alert systems or temporary holds on specific UTXOs.
-- **ReAssignUTXO**: Reassign a UTXO to a different owner.
+- **ReAssignUTXO**: Update a frozen output's commitment and maturity gate. Ownership changes currently strand the output for both owners; see the [reassignment limitation](../services/alert.md#24-utxo-reassignment).
 
 **Principles**:
 
@@ -329,9 +329,9 @@ To know more about the Transaction Validator, please check its specific service 
 
 ### 4.7. UTXO Batch Processing and External Storage mode
 
-Aerospike is the primary datastore for the UTXO store. However, to overcome Aerospike's record size limitation of 1MB, the system implements an external storage mechanism for large transactions.
+Aerospike is the primary datastore for the UTXO store. However, to overcome Aerospike's record size limitation, the system implements an external storage mechanism for large transactions.
 
-If a transaction is too large to fit in a single Aerospike record (indicated by a `RECORD_TOO_BIG` error), or if the system is configured to externalize all transactions, the UTXO store will store the full transaction data in an external storage (typically AWS S3, but any external storage can be used).
+A transaction is stored externally when its extended size exceeds `MaxTxSizeInStoreInBytes` (32KB), when it needs more than one record (more outputs than `utxostore_utxoBatchSize`), or if the system is configured to externalize all transactions (`utxostore_externalizeAllTransactions`). A `RECORD_TOO_BIG` error from Aerospike is handled as a fallback retry via the same external-storage path. In all these cases, the UTXO store will store the full transaction data in an external storage (typically AWS S3, but any external storage can be used).
 
 In such cases, the full transaction data is stored externally, while metadata and UTXOs are still stored in Aerospike, potentially across multiple records. The Aerospike record will have an `external` flag set to true, indicating that the full transaction data is stored externally.
 
@@ -349,7 +349,7 @@ The cache handles concurrent reads efficiently, preventing multiple simultaneous
 
 #### Lock Record Pattern for Multi-Record Transactions
 
-When a transaction has more than 20,000 outputs (configurable via `utxo_store_batch_size`), it must be split across multiple Aerospike records. The lock record pattern ensures these multi-record operations complete atomically, preventing data corruption from partial writes or concurrent access.
+When a transaction has more outputs than `utxostore_utxoBatchSize` (default 128), it must be split across multiple Aerospike records. The lock record pattern ensures these multi-record operations complete atomically, preventing data corruption from partial writes or concurrent access.
 
 **Key Components:**
 
@@ -391,12 +391,13 @@ The UTXO Store supports advanced UTXO management features, which can be utilized
     - If frozen, it removes the freeze mark
     - If not frozen, it returns an error
 
-3. **Reassigning UTXOs**: UTXOs can be reassigned to a new transaction output, but only if they are frozen first.
+3. **Reassigning UTXOs**: Updates the commitment of a frozen output.
+    - **Known regression:** changing the owner leaves the output unspendable by both owners after mandatory re-extension, even after maturity. Do not use ownership-changing reassignment. See the [reassignment limitation](../services/alert.md#24-utxo-reassignment) and [issue 1725](https://github.com/bsv-blockchain/teranode/issues/1725).
     - Verifies the UTXO exists and is frozen
     - Updates the UTXO hash to the new value
-    - Sets spendable block height to current + 1,000 blocks (defined by `ReAssignedUtxoSpendableAfterBlocks` constant)
+    - Sets the maturity height to current + 1,000 blocks by default; SQL honors the configured override, while Aerospike currently always uses the constant
     - Logs the reassignment for audit purposes
-    - **Important**: Reassigned UTXOs cannot be spent until 1,000 blocks have passed after the reassignment to ensure network consensus and prevent disputes
+    - **Important**: Passing the maturity gate alone does not make a changed-owner output spendable
 
 ### 4.9. Unmined Transaction Management
 
@@ -606,7 +607,7 @@ UTXO Store Package Structure (stores/utxo)
 The UTXO Store is a data store component that is used by various services. It is not run independently. To use the UTXO Store locally, run services that depend on it, such as the Validator or UTXO Persister:
 
 ```shell
-SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] go run . -validator=1 
+SETTINGS_CONTEXT=dev.[YOUR_CONTEXT] go run . -validator=1
 ```
 
 Please refer to the [Locally Running Services Documentation](../../howto/locallyRunningServices.md) document for more information on running services locally.
