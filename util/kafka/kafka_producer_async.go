@@ -153,9 +153,20 @@ type KafkaAsyncProducer struct {
 	// lifecycleMu serialises Start against Stop. Without it the two interleave: a Stop that
 	// runs before Start has stored the publish channel sees a nil field, closes nothing, and
 	// then blocks in publishWg.Wait() on a publish goroutine whose channel is never closed.
-	// Both methods complete without waiting on anything that needs this mutex, so holding it
-	// across either body cannot deadlock.
+	//
+	// Lock order is lifecycleMu -> channelMu; nothing acquires them the other way round, and
+	// the goroutines Start goes on to spawn never take lifecycleMu before signalling Start,
+	// so there is no cycle. It is NOT held for a bounded time though: Stop keeps it across
+	// publishWg.Wait() and an untimed client.Flush(), which is why Stop's idempotent fast
+	// path deliberately sits in front of this mutex rather than behind it.
 	lifecycleMu sync.Mutex
+
+	// stopped marks a producer whose Stop() has run. Stop closes the underlying client
+	// (franz-go's Close, or InMemoryAsyncProducer.Close, which closes its input channel under
+	// a sync.Once) — both terminal. Start must refuse a stopped producer rather than reset
+	// shuttingDown/closed and hand the publish loop a corpse whose first send panics with
+	// "send on closed channel".
+	stopped atomic.Bool
 
 	// For in-memory support
 	inMemoryProducer *inmemorykafka.InMemoryAsyncProducer
@@ -601,6 +612,11 @@ func (c *KafkaAsyncProducer) Start(ctx context.Context, ch chan *Message) {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 
+	if c.stopped.Load() {
+		c.Config.Logger.Errorf("[kafka] Start called on a producer already stopped for topic %s, ignoring", c.Config.Topic)
+		return
+	}
+
 	c.shuttingDown.Store(false)
 	c.closed.Store(false)
 
@@ -730,6 +746,17 @@ func (c *KafkaAsyncProducer) Stop() error {
 		return nil
 	}
 
+	// Check shuttingDown BEFORE taking lifecycleMu, not just under it. StopProducerCtx
+	// abandons a Stop that outruns its deadline, and that orphan keeps running — holding
+	// lifecycleMu across publishWg.Wait() and an untimed client.Flush(). If the idempotent
+	// fast path sat behind the mutex, every later Stop() and Start() would block on that
+	// orphan forever. The re-check under the lock is what actually serialises; this one only
+	// keeps a second Stop cheap. It does not weaken the Start/Stop ordering fix: in that race
+	// the flag is still false here, so Stop goes on to take the mutex.
+	if c.shuttingDown.Load() {
+		return nil
+	}
+
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 
@@ -738,6 +765,7 @@ func (c *KafkaAsyncProducer) Stop() error {
 	}
 
 	c.shuttingDown.Store(true)
+	c.stopped.Store(true)
 
 	if c.closed.Load() {
 		return nil
