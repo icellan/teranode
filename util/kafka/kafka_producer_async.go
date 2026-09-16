@@ -150,6 +150,13 @@ type KafkaAsyncProducer struct {
 	channelMu      sync.RWMutex        // Mutex to protect publishChannel access
 	publishWg      sync.WaitGroup      // WaitGroup to track publish goroutine
 
+	// lifecycleMu serialises Start against Stop. Without it the two interleave: a Stop that
+	// runs before Start has stored the publish channel sees a nil field, closes nothing, and
+	// then blocks in publishWg.Wait() on a publish goroutine whose channel is never closed.
+	// Both methods complete without waiting on anything that needs this mutex, so holding it
+	// across either body cannot deadlock.
+	lifecycleMu sync.Mutex
+
 	// For in-memory support
 	inMemoryProducer *inmemorykafka.InMemoryAsyncProducer
 	isInMemory       bool
@@ -590,6 +597,10 @@ func (c *KafkaAsyncProducer) Start(ctx context.Context, ch chan *Message) {
 	if c == nil {
 		return
 	}
+
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
 	c.shuttingDown.Store(false)
 	c.closed.Store(false)
 
@@ -615,10 +626,10 @@ func (c *KafkaAsyncProducer) Start(ctx context.Context, ch chan *Message) {
 			defer c.publishWg.Done()
 			wg.Done()
 
-			c.channelMu.RLock()
-			ch := c.publishChannel
-			c.channelMu.RUnlock()
-
+			// Range over the ch we were handed, not c.publishChannel: Stop() nils that field
+			// under the write lock, so re-reading it here races Stop() and can yield nil — a
+			// nil channel never ranges, so publishWg.Done() never runs and Stop() blocks
+			// forever in publishWg.Wait().
 			c.runProducerWorker(internalCtx, ch)
 		}()
 
@@ -644,6 +655,23 @@ func (c *KafkaAsyncProducer) Start(ctx context.Context, ch chan *Message) {
 	wg.Wait()
 }
 
+// runInMemoryPublishLoop drains ch into the in-memory broker until ch is closed or the
+// producer is marked closed.
+//
+// It ranges over the ch it is handed, never over c.publishChannel. Stop() nils that field
+// under the write lock, so re-reading it here would race Stop() and could yield nil — and a
+// nil channel never ranges, so the caller's deferred publishWg.Done() would never run and
+// Stop() would block forever in publishWg.Wait().
+func (c *KafkaAsyncProducer) runInMemoryPublishLoop(ch chan *Message) {
+	for msgBytes := range ch {
+		if c.closed.Load() {
+			return
+		}
+
+		c.inMemoryProducer.Produce(c.Config.Topic, msgBytes.Key, msgBytes.Value)
+	}
+}
+
 // startInMemory handles the in-memory producer case
 func (c *KafkaAsyncProducer) startInMemory(ctx context.Context, ch chan *Message) {
 	wg := sync.WaitGroup{}
@@ -662,17 +690,7 @@ func (c *KafkaAsyncProducer) startInMemory(ctx context.Context, ch chan *Message
 			defer c.publishWg.Done()
 			wg.Done()
 
-			c.channelMu.RLock()
-			ch := c.publishChannel
-			c.channelMu.RUnlock()
-
-			for msgBytes := range ch {
-				if c.closed.Load() {
-					break
-				}
-
-				c.inMemoryProducer.Produce(c.Config.Topic, msgBytes.Key, msgBytes.Value)
-			}
+			c.runInMemoryPublishLoop(ch)
 		}()
 
 		// Handle successes
@@ -711,6 +729,9 @@ func (c *KafkaAsyncProducer) Stop() error {
 	if c == nil {
 		return nil
 	}
+
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
 
 	if c.shuttingDown.Load() {
 		return nil
