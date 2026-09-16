@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,11 +31,17 @@ const maxCachedHeaderBytes uint64 = 64 << 20
 // - CacheOperation.Set() only writes if generation matches (query wasn't invalidated)
 // - This ensures stale results from pre-invalidation queries aren't cached
 type GenerationalCache struct {
-	writeMu     sync.Mutex
-	headerBytes uint64
-	ttlCache    *ttlcache.Cache[chainhash.Hash, any]
-	generation  atomic.Uint64
-	stopped     atomic.Bool
+	writeMu       sync.Mutex
+	headerBytes   uint64
+	headerCharges map[chainhash.Hash]headerCacheCharge
+	ttlCache      *ttlcache.Cache[chainhash.Hash, any]
+	generation    atomic.Uint64
+	stopped       atomic.Bool
+}
+
+type headerCacheCharge struct {
+	item  *ttlcache.Item[chainhash.Hash, any]
+	bytes uint64
 }
 
 // NewGenerationalCache creates a new generational cache instance.
@@ -57,11 +64,28 @@ func NewGenerationalCache(capacity int) *GenerationalCache {
 	}
 
 	gc := &GenerationalCache{
-		ttlCache: ttlcache.New[chainhash.Hash, any](opts...),
+		ttlCache:      ttlcache.New[chainhash.Hash, any](opts...),
+		headerCharges: make(map[chainhash.Hash]headerCacheCharge),
 	}
+	gc.ttlCache.OnEviction(func(_ context.Context, _ ttlcache.EvictionReason, item *ttlcache.Item[chainhash.Hash, any]) {
+		gc.releaseHeaderCharge(item)
+	})
 	// Auto-start the cache cleanup goroutine
 	go gc.ttlCache.Start()
 	return gc
+}
+
+// ttlcache v3.3 runs eviction callbacks on separate goroutines. Serialize them
+// with writes, and match the item identity so a delayed callback cannot release
+// the charge for a newer entry at the same key (including after DeleteAll).
+func (gc *GenerationalCache) releaseHeaderCharge(item *ttlcache.Item[chainhash.Hash, any]) {
+	gc.writeMu.Lock()
+	defer gc.writeMu.Unlock()
+	key := item.Key()
+	if charge, ok := gc.headerCharges[key]; ok && charge.item == item {
+		gc.headerBytes -= charge.bytes
+		delete(gc.headerCharges, key)
+	}
 }
 
 // NewOp starts a cache-safe operation by capturing the current generation.
@@ -80,6 +104,7 @@ func (gc *GenerationalCache) DeleteAll() {
 	gc.writeMu.Lock()
 	defer gc.writeMu.Unlock()
 	gc.headerBytes = 0
+	clear(gc.headerCharges)
 	gc.ttlCache.DeleteAll()
 	gc.generation.Add(1)
 }
@@ -128,14 +153,19 @@ func (co *CacheOperation) Set(value any, ttl time.Duration) bool {
 	defer gc.writeMu.Unlock()
 	// Only cache if generation matches (cache wasn't invalidated during operation)
 	if co.generation == co.generationalCache.generation.Load() {
-		// Conservatively charge replacements and expired entries until the next
-		// chain invalidation. At the budget, serve new header results without
-		// caching them so large queries cannot flush unrelated hot-path entries.
-		if gc.headerBytes+cost > maxCachedHeaderBytes {
+		// Replacements do not emit eviction callbacks. Credit the old charge
+		// here, including an expired entry whose callback has not run yet.
+		retainedBytes := gc.headerBytes - gc.headerCharges[co.key].bytes + cost
+		if retainedBytes > maxCachedHeaderBytes {
 			return false
 		}
-		gc.headerBytes += cost
-		gc.ttlCache.Set(co.key, value, ttl)
+		item := gc.ttlCache.Set(co.key, value, ttl)
+		gc.headerBytes = retainedBytes
+		if cost == 0 {
+			delete(gc.headerCharges, co.key)
+		} else {
+			gc.headerCharges[co.key] = headerCacheCharge{item: item, bytes: cost}
+		}
 		return true
 	}
 	// Generation changed - skip caching stale result
