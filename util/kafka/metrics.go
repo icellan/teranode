@@ -33,10 +33,7 @@ var prometheusConsumerPanicsRecovered *prometheus.CounterVec
 
 var prometheusConsumerMetricsInitOnce sync.Once
 
-// initConsumerMetrics lazily registers consumer-side metrics. Named
-// consistently with the gRPC-side grpc_panics_recovered_total counter
-// (added independently for the gRPC panic barrier) so the two panic
-// barriers are easy to find together on a dashboard.
+// initConsumerMetrics lazily registers consumer-side metrics.
 func initConsumerMetrics() {
 	prometheusConsumerMetricsInitOnce.Do(_initConsumerMetrics)
 }

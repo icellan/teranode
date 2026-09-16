@@ -433,15 +433,7 @@ func (v *Server) Start(ctx context.Context, readyCh chan<- struct{}) (retErr err
 
 		height := kafkaMsg.Height
 
-		options := optionsFromKafkaMessage(kafkaMsg.Options)
-
-		// A queue-full shed on the ingest path must not advance the offset
-		// past an un-handed-off tx; retry the handoff in place, bounded by
-		// validator_blockAssemblyShedRetryTimeout and then unwound and dropped
-		// (propagation has already returned success), not retried forever.
-		// Applies uniformly regardless of what the message's Options field
-		// carried, so it is set here rather than inside optionsFromKafkaMessage.
-		options.WaitForBlockAssembly = true
+		options := kafkaValidationOptions(kafkaMsg.Options)
 
 		// should not pass in a height when validating from Kafka, should just be current utxo store height
 		if _, err = v.validator.ValidateWithOptions(consumerCtx, tx, height, options); err != nil {
@@ -522,6 +514,27 @@ func optionsFromKafkaMessage(opts *kafkamessage.KafkaTxValidationOptions) *Optio
 		SkipPolicyChecks:     opts.SkipPolicyChecks,
 		CreateConflicting:    opts.CreateConflicting,
 	}
+}
+
+// kafkaValidationOptions builds the Options passed to ValidateWithOptions for a
+// message received on the validatortxs Kafka topic. It starts from
+// optionsFromKafkaMessage's nil-safe extraction of the wire-level fields, then
+// always sets WaitForBlockAssembly.
+//
+// WaitForBlockAssembly is NOT carried on the wire (KafkaTxValidationOptions has
+// no such field) - it is a property of this ingest path, not of the message
+// content: a queue-full shed on the block-assembly handoff must not advance the
+// Kafka offset past an un-handed-off tx, so the handoff is retried in place,
+// bounded by validator_blockAssemblyShedRetryTimeout and then unwound and
+// dropped (propagation has already returned success to its caller), rather than
+// retried forever. Applying it here, after optionsFromKafkaMessage, means it is
+// set unconditionally for every Kafka-sourced tx regardless of whether Options
+// was present on the wire.
+func kafkaValidationOptions(opts *kafkamessage.KafkaTxValidationOptions) *Options {
+	options := optionsFromKafkaMessage(opts)
+	options.WaitForBlockAssembly = true
+
+	return options
 }
 
 // Stop gracefully shuts down the validator server and all associated components.
