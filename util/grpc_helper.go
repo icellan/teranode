@@ -613,9 +613,8 @@ func CreateAuthInterceptor(apiKey string, protectedMethods map[string]bool) grpc
 			return nil, status.Error(codes.Unauthenticated, "missing API key")
 		}
 
-		// Validate API key. Constant-time so the comparison does not leak the
-		// key through response timing - this is the only credential check in
-		// the path.
+		// Compare equal-length keys in constant time. Different lengths are
+		// rejected immediately, so this does not hide the configured key length.
 		if subtle.ConstantTimeCompare([]byte(keys[0]), apiKeyBytes) != 1 {
 			grpcAuthRejectionsTotal.WithLabelValues(info.FullMethod).Inc()
 			return nil, status.Error(codes.Unauthenticated, "invalid API key")

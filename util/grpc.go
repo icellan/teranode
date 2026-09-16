@@ -30,19 +30,12 @@ type AuthOptions struct {
 	ExtraUnaryInterceptors []grpc.UnaryServerInterceptor
 }
 
-// ValidateAdminAPIKey rejects known-placeholder admin API keys (see
-// IsPlaceholderAdminAPIKey in admin_api_key.go), and any key that differs from
-// its own trimmed form. The latter catches a whitespace-only key: TrimSpace
-// collapses it to "", so without this check it would compare equal to no
-// placeholder, install the auth interceptor, and then depend on the transport
-// preserving leading/trailing whitespace in a header - a confusing outage
-// waiting to happen. An empty key is allowed and means "admin auth disabled"
-// - that is a visible, warned-about posture. A placeholder key is not, so it
-// is a hard configuration error.
-// Settings loaded from configuration are already trimmed. The whitespace check
-// also protects callers that construct Settings directly.
+// ValidateAdminAPIKey rejects known placeholders and untrimmed keys. Normal
+// configuration loading trims keys first; the whitespace check protects callers
+// that construct Settings directly. Empty keys are allowed here; each service
+// applies its own empty-key authentication policy.
 func ValidateAdminAPIKey(apiKey string) error {
-	if trimmed := strings.TrimSpace(apiKey); trimmed != apiKey {
+	if strings.TrimSpace(apiKey) != apiKey {
 		return errors.NewConfigurationError("grpc_admin_api_key has leading or trailing whitespace - remove it, or leave the key empty to run with admin auth explicitly disabled")
 	}
 

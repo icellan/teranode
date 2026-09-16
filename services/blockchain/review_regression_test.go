@@ -3,6 +3,7 @@ package blockchain
 import (
 	"context"
 	"math"
+	"net"
 	"net/url"
 	"testing"
 	"time"
@@ -85,7 +86,7 @@ func TestClientGetMedianTimePastRange_RealServer(t *testing.T) {
 	want, err := server.GetMedianTimePastRange(callCtx, 0, 30)
 	require.NoError(t, err)
 	require.Equal(t, uint32(1014400), want[30]) // median of heights 19..29
-	for _, clientCap := range []int{10, 100} {
+	for _, clientCap := range []int{10, 100, 0, -1} {
 		clientSettings := *tSettings
 		clientSettings.BlockChain.MaxMedianTimePastHeights = clientCap
 		client := &Client{client: rpcClient, settings: &clientSettings}
@@ -137,9 +138,46 @@ func TestPublicReadCountsAreBounded(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) { require.Equal(t, codes.InvalidArgument, status.Code(call())) })
 	}
-	server.settings.BlockChain.MaxBlockHeadersPerRequest = 1_000_001
-	genesis, _, err := server.store.GetBestBlockHeader(ctx)
+}
+
+// Block assembly requests tip height + 1 IDs during startup and Reset. That
+// request must keep working as the chain grows beyond the header-response cap.
+func TestClientGetBlockHeaderIDs_AboveHeaderCap(t *testing.T) {
+	fixture := setup(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for height := uint32(1); height <= 3; height++ {
+		block := createTestBlockAtHeight(fixture, t, height, 1000000+height*600)
+		_, _, err := fixture.server.store.StoreBlock(ctx, block, "")
+		require.NoError(t, err)
+	}
+	tip, _, err := fixture.server.store.GetBestBlockHeader(ctx)
 	require.NoError(t, err)
-	_, err = server.GetBlockHeaderIDs(ctx, &blockchain_api.GetBlockHeadersRequest{StartHash: genesis.Hash().CloneBytes(), NumberOfHeaders: 1_000_001})
-	require.NoError(t, err, "operators can raise the cap for whole-chain startup reads")
+	want, err := fixture.server.store.GetBlockHeaderIDs(ctx, tip.Hash(), 4)
+	require.NoError(t, err)
+	require.Len(t, want, 4)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	blockchain_api.RegisterBlockchainAPIServer(server, fixture.server)
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(server.Stop)
+	conn, err := grpc.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conn.Close()) })
+	client := &Client{client: blockchain_api.NewBlockchainAPIClient(conn)}
+
+	// Both the default million-header boundary and a lowered operator cap are
+	// independent of the ID query. The store stops at genesis, retaining order.
+	for _, cap := range []int{defaultMaxBlockHeadersPerRequest, 1} {
+		fixture.server.settings.BlockChain.MaxBlockHeadersPerRequest = cap
+		got, err := client.GetBlockHeaderIDs(ctx, tip.Hash(), defaultMaxBlockHeadersPerRequest+1)
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+		_, err = client.client.GetBlockHeaders(ctx, &blockchain_api.GetBlockHeadersRequest{
+			StartHash: tip.Hash().CloneBytes(), NumberOfHeaders: defaultMaxBlockHeadersPerRequest + 1,
+		})
+		require.Equal(t, codes.InvalidArgument, status.Code(err), "full headers remain capped")
+	}
 }

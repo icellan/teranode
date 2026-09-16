@@ -129,11 +129,10 @@ func (co *CacheOperation) Set(value any, ttl time.Duration) bool {
 	// Only cache if generation matches (cache wasn't invalidated during operation)
 	if co.generation == co.generationalCache.generation.Load() {
 		// Conservatively charge replacements and expired entries until the next
-		// clear. On budget exhaustion evict cached responses before admitting more.
-		// This is eviction, not a chain change, so in-flight queries remain valid.
+		// chain invalidation. At the budget, serve new header results without
+		// caching them so large queries cannot flush unrelated hot-path entries.
 		if gc.headerBytes+cost > maxCachedHeaderBytes {
-			gc.ttlCache.DeleteAll()
-			gc.headerBytes = 0
+			return false
 		}
 		gc.headerBytes += cost
 		gc.ttlCache.Set(co.key, value, ttl)

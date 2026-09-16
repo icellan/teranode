@@ -226,11 +226,16 @@ func TestGenerationalCache_HeaderByteBudget(t *testing.T) {
 	gc := NewGenerationalCache(100000)
 	defer gc.Stop()
 	value := [2]interface{}{make([]*model.BlockHeader, 8192), make([]*model.BlockHeaderMeta, 8192)}
-	for i := byte(1); i <= 17; i++ {
+	hotKey := chainhash.Hash{100}
+	require.True(t, gc.NewOp(hotKey).Set(true, time.Hour))
+	for i := byte(1); i <= 16; i++ {
 		require.True(t, gc.NewOp(chainhash.Hash{i}).Set(value, time.Hour))
 	}
-	require.Nil(t, gc.NewOp(chainhash.Hash{1}).Get(), "entry cap alone would retain all header results")
-	require.NotNil(t, gc.NewOp(chainhash.Hash{17}).Get())
+	require.False(t, gc.NewOp(chainhash.Hash{17}).Set(value, time.Hour))
+	require.Nil(t, gc.NewOp(chainhash.Hash{17}).Get())
+	require.NotNil(t, gc.NewOp(chainhash.Hash{1}).Get(), "budget exhaustion must not evict existing responses")
+	require.NotNil(t, gc.NewOp(hotKey).Get(), "header queries must not flush unrelated hot-path entries")
+	require.True(t, gc.NewOp(chainhash.Hash{101}).Set(true, time.Hour), "uncharged values remain cacheable")
 	oversized := [2]interface{}{make([]*model.BlockHeader, 140000), make([]*model.BlockHeaderMeta, 140000)}
 	require.False(t, gc.NewOp(chainhash.Hash{18}).Set(oversized, time.Hour))
 	require.Nil(t, gc.NewOp(chainhash.Hash{18}).Get())

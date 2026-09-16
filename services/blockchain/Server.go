@@ -578,8 +578,8 @@ func (b *Blockchain) maxMedianTimePastHeights() int {
 	return b.settings.BlockChain.MaxMedianTimePastHeights
 }
 
-// maxBlockHeadersPerRequest is configurable because block assembly reads all
-// header IDs on restart, including on chains taller than the default bound.
+// maxBlockHeadersPerRequest bounds full-header and block-summary responses.
+// Lightweight header-ID queries are bounded by the available ancestry instead.
 func (b *Blockchain) maxBlockHeadersPerRequest() uint64 {
 	if b.settings == nil || b.settings.BlockChain.MaxBlockHeadersPerRequest <= 0 {
 		return defaultMaxBlockHeadersPerRequest
@@ -688,9 +688,9 @@ func (b *Blockchain) resolveAdminAPIKey() (string, error) {
 // bound any allocation the caller can drive - see the range clamps in
 // GetBlocksByHeight, GetMedianTimePastByHeights, and the caller-supplied
 // count clamps (maxBlockHeadersPerRequest) in GetBlockHeaders,
-// GetBlockHeadersFromOldest, GetBlockHeaderIDs and LocateBlockHeaders.
-// GetBlockHeadersByHeight and GetBlockHeadersFromTill retain their range
-// contracts for whole-chain consumers; their store preallocations are bounded.
+// GetBlockHeadersFromOldest and LocateBlockHeaders.
+// GetBlockHeaderIDs, GetBlockHeadersByHeight and GetBlockHeadersFromTill retain
+// their contracts for whole-chain consumers; store preallocations are bounded.
 // GenerationalCache caps entry count with blockchain_generationalCacheCapacity
 // and separately budgets retained header-query payloads to 64 MiB per cache.
 // In-flight responses and non-header cache values are outside that byte budget.
@@ -2378,7 +2378,7 @@ func (b *Blockchain) GetMedianTimePastByHeights(ctx context.Context, req *blockc
 			}
 		}
 
-		if span := maxHeight - minHeight; span >= uint32(maxHeights) {
+		if maxHeight-minHeight >= uint32(maxHeights) {
 			return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetMedianTimePastByHeights] heights span %d..%d exceeds the maximum of %d", minHeight, maxHeight, maxHeights))
 		}
 	}
@@ -2731,9 +2731,9 @@ func (b *Blockchain) GetBlockHeaderIDs(ctx context.Context, request *blockchain_
 		return nil, err
 	}
 
-	if uint64(request.NumberOfHeaders) > b.maxBlockHeadersPerRequest() {
-		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlockHeaderIDs] %d headers requested, maximum is %d", request.NumberOfHeaders, b.maxBlockHeadersPerRequest()))
-	}
+	// Block assembly needs all IDs during startup and Reset, regardless of the
+	// full-header response cap. IDs cost four bytes each; the available ancestry
+	// bounds the result, and the store caps preallocation and retained cache bytes.
 
 	ids, err := b.store.GetBlockHeaderIDs(ctx, startHash, request.NumberOfHeaders)
 	if err != nil {
