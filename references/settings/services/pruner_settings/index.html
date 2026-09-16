@@ -932,6 +932,8 @@
       
         
       
+        
+      
     
     
     
@@ -2109,6 +2111,34 @@
   
   
   
+    <li class="md-nav__item">
+      <a href="../../../../howto/miners/minersHowToMonitoring/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Monitoring
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
     
     
       
@@ -2135,10 +2165,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_9" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_10" >
         
           
-          <label class="md-nav__link" for="__nav_2_11_9" id="__nav_2_11_9_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_2_11_10" id="__nav_2_11_10_label" tabindex="0">
             
   
   
@@ -2156,8 +2186,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_9_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_2_11_9">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2_11_10">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -6185,10 +6215,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#pruner_force_ignore_block_persister_height" class="md-nav__link">
+  <a href="#pruner_utxosetttl" class="md-nav__link">
     <span class="md-ellipsis">
       
-        pruner_force_ignore_block_persister_height
+        pruner_utxoSetTTL
       
     </span>
   </a>
@@ -6196,10 +6226,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#pruner_utxosetttl" class="md-nav__link">
+  <a href="#pruner_relaxremovalcommitlevel" class="md-nav__link">
     <span class="md-ellipsis">
       
-        pruner_utxoSetTTL
+        pruner_relaxRemovalCommitLevel
       
     </span>
   </a>
@@ -7497,10 +7527,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#pruner_force_ignore_block_persister_height" class="md-nav__link">
+  <a href="#pruner_utxosetttl" class="md-nav__link">
     <span class="md-ellipsis">
       
-        pruner_force_ignore_block_persister_height
+        pruner_utxoSetTTL
       
     </span>
   </a>
@@ -7508,10 +7538,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#pruner_utxosetttl" class="md-nav__link">
+  <a href="#pruner_relaxremovalcommitlevel" class="md-nav__link">
     <span class="md-ellipsis">
       
-        pruner_utxoSetTTL
+        pruner_relaxRemovalCommitLevel
       
     </span>
   </a>
@@ -8272,6 +8302,7 @@
 <li><code>false</code> (default): Normal pruning during catchup (safe with retention &gt;= 288 blocks)</li>
 <li><code>true</code>: Skip all pruning during catchup state</li>
 </ul>
+<p>Note: this defers rather than eliminates the prune burst - a node that skips a long catchup hits one much larger DAH sweep on entering the RUNNING state.</p>
 <h3 id="pruner_blockassemblywaittimeout">pruner_blockAssemblyWaitTimeout<a class="headerlink" href="#pruner_blockassemblywaittimeout" title="Permanent link">&para;</a></h3>
 <p><strong>Type</strong>: Duration</p>
 <p><strong>Default</strong>: <code>10m</code></p>
@@ -8294,18 +8325,56 @@
 <li><code>OnBlockPersisted</code> (default): Triggers on BlockPersisted notifications (coordinated with Block Persister)</li>
 <li><code>OnBlockMined</code>: Triggers on Block notifications with mined_set=true</li>
 </ul>
-<h3 id="pruner_force_ignore_block_persister_height">pruner_force_ignore_block_persister_height<a class="headerlink" href="#pruner_force_ignore_block_persister_height" title="Permanent link">&para;</a></h3>
-<p><strong>Type</strong>: Boolean</p>
-<p><strong>Default</strong>: <code>false</code></p>
-<p><strong>Environment Variable</strong>: <code>pruner_force_ignore_block_persister_height</code></p>
-<p><strong>Description</strong>: Force ignore block persister height tracking</p>
-<p>When enabled, uses Block notifications with mined_set=true instead of BlockPersisted notifications from Block Persister for determining safe prune height.</p>
+<p>To use Block notifications with mined_set=true instead of BlockPersisted notifications from Block Persister for determining safe prune height, set <code>pruner_block_trigger=OnBlockMined</code>.</p>
 <h3 id="pruner_utxosetttl">pruner_utxoSetTTL<a class="headerlink" href="#pruner_utxosetttl" title="Permanent link">&para;</a></h3>
 <p><strong>Type</strong>: Boolean</p>
 <p><strong>Default</strong>: <code>false</code></p>
 <p><strong>Environment Variable</strong>: <code>pruner_utxoSetTTL</code></p>
 <p><strong>Description</strong>: Use TTL expiration instead of hard delete for UTXO records</p>
 <p>When enabled, sets Aerospike record TTL to 1 second instead of hard deleting. This produces optimized tombstones and reduces write amplification.</p>
+<h3 id="pruner_relaxremovalcommitlevel">pruner_relaxRemovalCommitLevel<a class="headerlink" href="#pruner_relaxremovalcommitlevel" title="Permanent link">&para;</a></h3>
+<p><strong>Type</strong>: Boolean</p>
+<p><strong>Default</strong>: <code>true</code></p>
+<p><strong>Environment Variable</strong>: <code>pruner_relaxRemovalCommitLevel</code></p>
+<p><strong>Description</strong>: Acknowledge the pruner's own record removals from the master replica only</p>
+<p>Controls the Aerospike commit level for the pruner's record removals — hard deletes, and
+the 1-second TTL touches used when <code>pruner_utxoSetTTL</code> is enabled.</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>true</code> (default)</td>
+<td><code>COMMIT_MASTER</code> — the call returns once the master replica has the removal; replicas catch up asynchronously.</td>
+</tr>
+<tr>
+<td><code>false</code></td>
+<td><code>COMMIT_ALL</code> — wait for every replica, the same as every other Teranode write.</td>
+</tr>
+</tbody>
+</table>
+<p>Relaxing is safe here because pruning is idempotent and self-healing: the pruner only
+removes records that are already provably safe to drop, and a replica that misses a
+removal is re-found by the <code>delete_at_height</code> partition scan on the next session and
+re-pruned. Waiting for a full-replication ACK buys no correctness, only latency in the
+per-block removal burst.</p>
+<p><strong>Scope</strong> — record removal only:</p>
+<ul>
+<li>Pruner <strong>parent updates</strong> (the <code>deletedChildren</code> map writes and the <code>addDeletedChildren</code>
+  UDF) mutate records that survive the prune and always use <code>COMMIT_ALL</code>.</li>
+<li>Every write <strong>outside</strong> the pruner always uses <code>COMMIT_ALL</code>. There is no cluster-wide
+  commit-level setting: UTXO record creation, the transaction-creation lock, the conflict
+  WAL, setMined, unspend and the preserve / delete-at-height writes are none of them
+  self-healing, so relaxing them would trade a resync for throughput.</li>
+<li>Only has an effect on namespaces with <code>replication-factor</code> &gt; 1. On a single-copy
+  namespace both values behave identically.</li>
+</ul>
+<p><strong>When to set <code>false</code></strong>: only to rule the relaxation out while diagnosing missing-record
+or replication issues.</p>
 <h3 id="pruner_skipblobdeletion">pruner_skipBlobDeletion<a class="headerlink" href="#pruner_skipblobdeletion" title="Permanent link">&para;</a></h3>
 <p><strong>Type</strong>: Boolean</p>
 <p><strong>Default</strong>: <code>false</code></p>
@@ -8403,7 +8472,7 @@
 </span></code></pre></div>
 <p><strong>Purpose:</strong></p>
 <p>When Phase 1 preservation runs, parent transactions get their <code>PreserveUntil</code> flag set to:</p>
-<div class="language-go highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="nx">PreserveUntil</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">currentHeight</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">parentPreservationBlocks</span>
+<div class="language-go highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="nx">PreserveUntil</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">currentHeight</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">parentPreservationBlocks</span>
 </span></code></pre></div>
 <p>This prevents parent UTXOs from being deleted for the specified number of blocks, ensuring resubmitted transactions can validate.</p>
 <p><strong>Tuning:</strong></p>
@@ -8476,10 +8545,10 @@
 <li><strong>Wait Time</strong>: Service waits for index to be ready before starting pruning</li>
 </ul>
 <p><strong>Manual Index Creation (if needed):</strong></p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>asadm<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;asinfo -v &#39;sindex-create:ns=teranode;set=utxos;indexname=pruner_dah_index;indextype=NUMERIC;binname=deleteAtHeight&#39;&quot;</span>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>asadm<span class="w"> </span>-e<span class="w"> </span><span class="s2">"asinfo -v 'sindex-create:ns=teranode;set=utxos;indexname=pruner_dah_index;indextype=NUMERIC;binname=deleteAtHeight'"</span>
 </span></code></pre></div>
 <p><strong>Index Verification:</strong></p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a>asadm<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;show indexes&quot;</span>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a>asadm<span class="w"> </span>-e<span class="w"> </span><span class="s2">"show indexes"</span>
 </span></code></pre></div>
 <p>Expected output:</p>
 <div class="language-text highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a>Namespace   Set     Index Name        Bin Name          Type
@@ -8658,7 +8727,7 @@
 <div class="language-text highlight"><pre><span></span><code><span id="__span-31-1"><a id="__codelineno-31-1" name="__codelineno-31-1" href="#__codelineno-31-1"></a># settings.conf
 </span><span id="__span-31-2"><a id="__codelineno-31-2" name="__codelineno-31-2" href="#__codelineno-31-2"></a>startPruner = true
 </span><span id="__span-31-3"><a id="__codelineno-31-3" name="__codelineno-31-3" href="#__codelineno-31-3"></a>
-</span><span id="__span-31-4"><a id="__codelineno-31-4" name="__codelineno-31-4" href="#__codelineno-31-4"></a># Disable for coinbase nodes (they don&#39;t need pruning)
+</span><span id="__span-31-4"><a id="__codelineno-31-4" name="__codelineno-31-4" href="#__codelineno-31-4"></a># Disable for coinbase nodes (they don't need pruning)
 </span><span id="__span-31-5"><a id="__codelineno-31-5" name="__codelineno-31-5" href="#__codelineno-31-5"></a>startPruner.docker.host.teranode1.coinbase = false
 </span><span id="__span-31-6"><a id="__codelineno-31-6" name="__codelineno-31-6" href="#__codelineno-31-6"></a>startPruner.docker.host.teranode2.coinbase = false
 </span><span id="__span-31-7"><a id="__codelineno-31-7" name="__codelineno-31-7" href="#__codelineno-31-7"></a>
@@ -8720,7 +8789,7 @@
 </li>
 <li>
 <p>Verify Aerospike index exists:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-36-1"><a id="__codelineno-36-1" name="__codelineno-36-1" href="#__codelineno-36-1"></a>asadm<span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;show indexes&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>pruner_dah_index
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-36-1"><a id="__codelineno-36-1" name="__codelineno-36-1" href="#__codelineno-36-1"></a>asadm<span class="w"> </span>-e<span class="w"> </span><span class="s2">"show indexes"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>pruner_dah_index
 </span></code></pre></div>
 </li>
 <li>

@@ -932,6 +932,8 @@
       
         
       
+        
+      
     
     
     
@@ -2109,6 +2111,34 @@
   
   
   
+    <li class="md-nav__item">
+      <a href="../../../howto/miners/minersHowToMonitoring/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Monitoring
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
     
     
       
@@ -2135,10 +2165,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_9" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_10" >
         
           
-          <label class="md-nav__link" for="__nav_2_11_9" id="__nav_2_11_9_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_2_11_10" id="__nav_2_11_10_label" tabindex="0">
             
   
   
@@ -2156,8 +2186,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_9_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_2_11_9">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2_11_10">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -7509,7 +7539,7 @@
 <p>The system consists of three main components:</p>
 <ul>
 <li><strong>Peer Registry</strong>: A thread-safe data store that tracks all peer information and interaction history</li>
-<li><strong>Peer Selector</strong>: A stateless component that selects optimal peers based on reputation and other criteria</li>
+<li><strong>Peer Selector</strong>: A component that selects optimal peers based on reputation and other criteria, optionally probing peer availability over HTTP (with a short-lived result cache)</li>
 <li><strong>Reputation Scoring</strong>: An algorithm that calculates peer reliability scores (0-100) based on success rates, response times, and behavior patterns</li>
 </ul>
 <p>This architecture enables intelligent peer selection for critical operations like blockchain synchronization (catchup), ensuring that Teranode preferentially interacts with reliable peers while avoiding problematic ones.</p>
@@ -7590,7 +7620,7 @@
 <tr>
 <td><code>IsConnected</code></td>
 <td><code>bool</code></td>
-<td>Whether peer is directly connected</td>
+<td>Whether the peer has an open libp2p connection AND has authored at least one gossip message since process start (liveness derives from the message bus's topic-peer set, so a connected-but-silent peer stays unflagged — and, unflagged, is evictable like any idle entry once its activity exceeds <code>p2p_peer_registry_ttl</code>). Set on the gossip path for live senders — a new neighbour is flagged on its first message — reconciled both ways by a periodic sweep in the p2p service (no libp2p disconnect callback exists; a stale flag can persist for up to one <code>p2p_peer_map_cleanup_interval</code> after a disconnect), and never restored from persistence</td>
 </tr>
 <tr>
 <td><code>IsBanned</code></td>
@@ -7652,7 +7682,7 @@
 </tbody>
 </table>
 <h3 id="32-peer-selector">3.2. Peer Selector<a class="headerlink" href="#32-peer-selector" title="Permanent link">&para;</a></h3>
-<p>The <code>PeerSelector</code> is a stateless, pure-function component that implements the peer selection algorithm. It takes a list of peers and selection criteria, returning the optimal peer for a given operation.</p>
+<p>The <code>PeerSelector</code> implements the peer selection algorithm. It takes a list of peers and selection criteria, returning the optimal peer for a given operation. When HTTP health checking is enabled it probes candidate DataHub URLs before selecting (concurrently, with an overall deadline) and keeps a short-lived cache of probe results, so it is not a pure function. Those URLs come from peers, so the probes use a client that refuses to connect to internal addresses even when a peer-supplied hostname only resolves to one.</p>
 <p><strong>Selection Criteria:</strong></p>
 <div class="language-go highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kd">type</span><span class="w"> </span><span class="nx">SelectionCriteria</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">    </span><span class="nx">LocalHeight</span><span class="w">         </span><span class="kt">int32</span><span class="w">         </span><span class="c1">// Current local blockchain height</span>
@@ -7810,31 +7840,31 @@
 <ol>
 <li>Filter for peers that explicitly announce as "full" storage mode</li>
 <li>
-<p>Sort candidates by:</p>
+<p>Rank candidates by:</p>
 </li>
 <li>
-<p>Reputation score (highest first) - <strong>primary</strong></p>
+<p>Proven recent full-block delivery - <strong>primary</strong></p>
 </li>
-<li>Ban score (lowest first) - <strong>secondary</strong></li>
-<li>Block height (highest first) - <strong>tertiary</strong></li>
-<li>Peer ID (for deterministic ordering) - <strong>quaternary</strong></li>
-<li>Select the top candidate (or second if top was previous peer)</li>
+<li>Locally validated chain work (highest first) - <strong>secondary</strong></li>
+<li>Reputation score (highest first) - <strong>tertiary</strong></li>
+<li>Average response time (lowest first, peers with measurements first) - <strong>quaternary</strong></li>
+<li>Ban score (lowest first) - <strong>quinary</strong></li>
+<li>Validated block height (highest first) - <strong>senary</strong></li>
+<li>Exclude the previously selected peer when any alternative exists</li>
+<li>Select uniformly at random among the top-ranked candidates that tie on
+   every criterion above</li>
 </ol>
+<p>There is deliberately no peer-ID tiebreak: peer IDs are attacker-grindable
+(cheap libp2p keypair generation), so a deterministic ID ordering would let a
+Sybil attacker mint an ID that always wins selection among otherwise equal
+candidates. Random selection within the top band caps a Sybil set's capture
+probability at its proportional share of that band.</p>
 <h4 id="phase-2-pruned-node-fallback">Phase 2: Pruned Node Fallback<a class="headerlink" href="#phase-2-pruned-node-fallback" title="Permanent link">&para;</a></h4>
 <p>If no full nodes are available and fallback is enabled:</p>
 <ol>
 <li>Filter for peers not in "full" mode but meeting other criteria</li>
-<li>
-<p>Sort by:</p>
-</li>
-<li>
-<p>Reputation score (highest first)</p>
-</li>
-<li>Ban score (lowest first)</li>
-<li>Block height (lowest first) - <strong>prefer youngest pruned nodes</strong></li>
-<li>Peer ID</li>
+<li>Rank and select using the same criteria and random tiebreak as Phase 1</li>
 </ol>
-<p>The preference for younger pruned nodes minimizes UTXO pruning risk during catchup.</p>
 <h3 id="53-fallback-to-pruned-nodes">5.3. Fallback to Pruned Nodes<a class="headerlink" href="#53-fallback-to-pruned-nodes" title="Permanent link">&para;</a></h3>
 <p>Pruned node fallback is controlled by the <code>p2p_allow_pruned_node_fallback</code> setting:</p>
 <ul>
@@ -7844,7 +7874,7 @@
 <p>When using pruned nodes:</p>
 <ul>
 <li>Warning is logged about potential UTXO pruning risk</li>
-<li>Youngest (lowest height) pruned node is preferred</li>
+<li>Candidates are ranked with the same criteria as full nodes</li>
 <li>Reputation still prioritized over height</li>
 </ul>
 <h2 id="6-integration-with-other-services">6. Integration with Other Services<a class="headerlink" href="#6-integration-with-other-services" title="Permanent link">&para;</a></h2>
@@ -7876,19 +7906,19 @@
 <h3 id="71-cache-file-format">7.1. Cache File Format<a class="headerlink" href="#71-cache-file-format" title="Permanent link">&para;</a></h3>
 <p>The peer registry persists its data to <code>teranode_peer_registry.json</code>:</p>
 <div class="language-json highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">{</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="nt">&quot;version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1.0&quot;</span><span class="p">,</span>
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="nt">&quot;last_updated&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2025-11-19T10:30:00Z&quot;</span><span class="p">,</span>
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">  </span><span class="nt">&quot;peers&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">    </span><span class="nt">&quot;QmPeerID1...&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">      </span><span class="nt">&quot;interaction_attempts&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">150</span><span class="p">,</span>
-</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">      </span><span class="nt">&quot;interaction_successes&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">145</span><span class="p">,</span>
-</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">      </span><span class="nt">&quot;interaction_failures&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
-</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="w">      </span><span class="nt">&quot;reputation_score&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">87.5</span><span class="p">,</span>
-</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">      </span><span class="nt">&quot;avg_response_ms&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">250</span><span class="p">,</span>
-</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">      </span><span class="nt">&quot;blocks_received&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span><span class="p">,</span>
-</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">      </span><span class="nt">&quot;height&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">850000</span><span class="p">,</span>
-</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="w">      </span><span class="nt">&quot;data_hub_url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://peer1.example.com&quot;</span><span class="p">,</span>
-</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="w">      </span><span class="nt">&quot;storage&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;full&quot;</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="s2">"1.0"</span><span class="p">,</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="nt">"last_updated"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2025-11-19T10:30:00Z"</span><span class="p">,</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">  </span><span class="nt">"peers"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">    </span><span class="nt">"QmPeerID1..."</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">      </span><span class="nt">"interaction_attempts"</span><span class="p">:</span><span class="w"> </span><span class="mi">150</span><span class="p">,</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">      </span><span class="nt">"interaction_successes"</span><span class="p">:</span><span class="w"> </span><span class="mi">145</span><span class="p">,</span>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">      </span><span class="nt">"interaction_failures"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="w">      </span><span class="nt">"reputation_score"</span><span class="p">:</span><span class="w"> </span><span class="mf">87.5</span><span class="p">,</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">      </span><span class="nt">"avg_response_ms"</span><span class="p">:</span><span class="w"> </span><span class="mi">250</span><span class="p">,</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">      </span><span class="nt">"blocks_received"</span><span class="p">:</span><span class="w"> </span><span class="mi">100</span><span class="p">,</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">      </span><span class="nt">"height"</span><span class="p">:</span><span class="w"> </span><span class="mi">850000</span><span class="p">,</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="w">      </span><span class="nt">"data_hub_url"</span><span class="p">:</span><span class="w"> </span><span class="s2">"https://peer1.example.com"</span><span class="p">,</span>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="w">      </span><span class="nt">"storage"</span><span class="p">:</span><span class="w"> </span><span class="s2">"full"</span>
 </span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="w">    </span><span class="p">}</span>
 </span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="w">  </span><span class="p">}</span>
 </span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="p">}</span>

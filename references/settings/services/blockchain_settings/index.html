@@ -932,6 +932,8 @@
       
         
       
+        
+      
     
     
     
@@ -2109,6 +2111,34 @@
   
   
   
+    <li class="md-nav__item">
+      <a href="../../../../howto/miners/minersHowToMonitoring/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Monitoring
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
     
     
       
@@ -2135,10 +2165,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_9" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2_11_10" >
         
           
-          <label class="md-nav__link" for="__nav_2_11_9" id="__nav_2_11_9_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_2_11_10" id="__nav_2_11_10_label" tabindex="0">
             
   
   
@@ -2156,8 +2186,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_9_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_2_11_9">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_2_11_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2_11_10">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -7137,14 +7167,14 @@
 <td>int</td>
 <td>5000</td>
 <td>blockchain_store_dbTimeoutMillis</td>
-<td>Database operation timeout (store-level)</td>
+<td>Per-operation FSM checkpoint-read and persistence timeout; non-positive uses 5000 ms</td>
 </tr>
 <tr>
 <td>InitializeNodeInState</td>
 <td>string</td>
-<td>""</td>
+<td>"" (<code>IDLE</code> for <code>operator</code>/<code>docker.m</code>)</td>
 <td>blockchain_initializeNodeInState</td>
-<td><strong>UNUSED</strong> - Defined but not referenced in code</td>
+<td>Fresh-node FSM state: IDLE, CATCHINGBLOCKS, or RUNNING. Empty means CATCHINGBLOCKS; persisted state takes precedence and bypasses this setting’s validation; invalid values fail fresh-node startup</td>
 </tr>
 <tr>
 <td>PostgresPool</td>
@@ -7155,6 +7185,11 @@
 </tr>
 </tbody>
 </table>
+<p><strong>Configured RUNNING:</strong> on a checkpointed network, use only with a pre-seeded
+store whose tip is at or above the highest checkpoint. A lower tip or a tip-read
+failure aborts startup without falling back to CATCHINGBLOCKS. Choose
+<code>CATCHINGBLOCKS</code> to synchronize a fresh node. Networks without checkpoints allow
+configured RUNNING directly.</p>
 <h3 id="postgresql-connection-pool-postgrespool">PostgreSQL Connection Pool (PostgresPool)<a class="headerlink" href="#postgresql-connection-pool-postgrespool" title="Permanent link">&para;</a></h3>
 <p>When using PostgreSQL as the blockchain store, these nested settings configure connection pooling and resilience. All settings are prefixed with <code>blockchain_postgres_pool_</code>.</p>
 <table>
@@ -7278,7 +7313,19 @@
 <ul>
 <li><code>StoreURL</code> determines database backend</li>
 <li>Service fails during daemon startup if null</li>
-<li><code>StoreDBTimeoutMillis</code> passed to blockchain store for database timeout configuration</li>
+<li><code>StoreDBTimeoutMillis</code> bounds FSM checkpoint reads and persistence writes in the
+  blockchain service; it is not a general store query timeout.</li>
+<li>Zero or negative values use the 5000 ms default, rather than disabling timeouts.</li>
+<li>Checkpoint reads respect an earlier caller deadline. Admitted writes run with
+  their own bounded context even after the caller disconnects.</li>
+<li>A RUN transition can consume two independent store budgets while holding the
+  transition lock. Notification delivery and the complete RPC are not bounded
+  by this setting. Large values can delay other transitions after a caller exits.</li>
+<li>The store helper does not retry. Automatic catchup promotion retries transient
+  failures at most three times with cancellable backoff and warns on exhaustion.
+  Explicit operator requests can be retried after store recovery.</li>
+<li>Tune using observed store latency under load; the five-second default is not
+  a measured production p99 guarantee.</li>
 </ul>
 <h2 id="service-dependencies">Service Dependencies<a class="headerlink" href="#service-dependencies" title="Permanent link">&para;</a></h2>
 <table>
