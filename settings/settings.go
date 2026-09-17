@@ -348,6 +348,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ProcessTxMetaUsingStoreBatchSize:          getInt("blockvalidation_processTxMetaUsingStore_BatchSize", 1024, alternativeContext...),
 			ProcessTxMetaUsingStoreConcurrency:        getInt("blockvalidation_processTxMetaUsingStore_Concurrency", max(4, runtime.NumCPU()/2), alternativeContext...),
 			ProcessTxMetaUsingStoreMissingTxThreshold: getInt("blockvalidation_processTxMetaUsingStore_MissingTxThreshold", 1, alternativeContext...),
+			ProcessTxMetaUsingStoreRetries:            getInt("blockvalidation_processTxMetaUsingStore_Retries", 3, alternativeContext...),
 			SkipCheckParentMined:                      getBool("blockvalidation_skipCheckParentMined", false, alternativeContext...),
 			SubtreeFoundChConcurrency:                 getInt("blockvalidation_subtreeFoundChConcurrency", 1, alternativeContext...),
 			SubtreeValidationAbandonThreshold:         getInt("blockvalidation_subtree_validation_abandon_threshold", 1, alternativeContext...),

@@ -7,6 +7,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
@@ -16,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/retry"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
 )
@@ -52,6 +54,55 @@ func putUnresolvedMetaDataSlice(s *[]*utxo.UnresolvedMetaData) {
 	}
 	*s = (*s)[:0]
 	unresolvedMetaDataSlicePool.Put(s)
+}
+
+// batchDecorateRetryBackoff is the base unit for the linear backoff between
+// BatchDecorate attempts. It is deliberately short: the failing call is itself
+// bounded by the store client's own timeout, so that timeout — not this value —
+// dominates the spacing between attempts.
+const batchDecorateRetryBackoff = 100 * time.Millisecond
+
+// batchDecorateWithRetry runs BatchDecorate against the UTXO store, retrying
+// only transient failures (see errors.IsRetryableError: a storage or network
+// fault, never a cancelled context or a malformed request).
+//
+// A transient store failure must not become a validation verdict on a block.
+// BatchDecorate only reads, and it re-resolves each item in place, so replaying
+// it over the same slice is idempotent. Without this, a single client-side
+// timeout in one of a block's many batches fails the whole block, and because
+// nothing upstream distinguishes "the store stalled" from "the block is bad",
+// the node can wedge behind a block it will never accept.
+//
+// Every failed attempt is logged at WARN — retry.Retry itself only logs the
+// first five attempts at DEBUG, which is invisible in a production deployment
+// and leaves no trace of a store that is quietly degrading.
+func (u *Server) batchDecorateWithRetry(ctx context.Context, items []*utxo.UnresolvedMetaData) error {
+	var lastErr error
+
+	//nolint:errcheck // the attempt error is carried out via lastErr, which distinguishes "gave up" from "not retryable"
+	_, _ = retry.Retry(ctx, u.logger, func() (struct{}, error) {
+		lastErr = u.utxoStore.BatchDecorate(ctx, items, TxMetaFieldsForDecorate...)
+		if lastErr == nil {
+			return struct{}{}, nil
+		}
+
+		if !errors.IsRetryableError(lastErr) {
+			u.logger.Warnf("[processTxMetaUsingStore] batch decorate of %d txs failed with a non-retryable error: %v", len(items), lastErr)
+
+			// Returning nil stops retry.Retry; lastErr is what the caller sees.
+			return struct{}{}, nil
+		}
+
+		u.logger.Warnf("[processTxMetaUsingStore] batch decorate of %d txs failed with a transient store error, retrying: %v", len(items), lastErr)
+
+		return struct{}{}, lastErr
+	},
+		retry.WithMessage("[processTxMetaUsingStore] batch decorate"),
+		retry.WithRetryCount(u.settings.BlockValidation.ProcessTxMetaUsingStoreRetries),
+		retry.WithBackoffDurationType(batchDecorateRetryBackoff),
+	)
+
+	return lastErr
 }
 
 // processTxMetaUsingStore attempts to retrieve transaction metadata from the underlying store
@@ -124,7 +175,7 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 					}
 				}
 
-				if err := u.utxoStore.BatchDecorate(gCtx, missingTxHashesCompacted, TxMetaFieldsForDecorate...); err != nil {
+				if err := u.batchDecorateWithRetry(gCtx, missingTxHashesCompacted); err != nil {
 					return errors.NewStorageError("error running batch decorate on utxo store for missing transactions", err)
 				}
 
