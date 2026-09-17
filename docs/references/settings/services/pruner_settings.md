@@ -10,11 +10,10 @@ Settings are organized under the `Pruner` struct in `settings.Settings`.
 |---------|------|---------|---------------------|-------|
 | GRPCListenAddress | string | ":8096" | pruner_grpcListenAddress | **CRITICAL** - gRPC server bind address |
 | GRPCAddress | string | "localhost:8096" | pruner_grpcAddress | gRPC client address other services dial |
-| SkipDuringCatchup | bool | false | pruner_skipDuringCatchup | Skip all pruning while the FSM is catching up (see "Settings not wired to configuration" below) |
+| SkipDuringCatchup | bool | false | pruner_skipDuringCatchup | Skip all pruning while the FSM is catching up |
 | BlockAssemblyWaitTimeout | time.Duration | 10m | pruner_blockAssemblyWaitTimeout | Maximum wait for Block Assembly to be ready before pruning |
 | ConnectionPoolWarningThreshold | float64 | 0.7 | pruner_connectionPoolWarningThreshold | Aerospike connection pool utilization (0.0-1.0) above which the chunk group limit is auto-reduced |
 | BlockTrigger | string | "OnBlockPersisted" | pruner_block_trigger | What triggers a pruning cycle ("OnBlockPersisted" or "OnBlockMined") |
-| ForceIgnoreBlockPersisterHeight | bool | false | pruner_force_ignore_block_persister_height | Use Block notifications with mined_set=true instead of the Block Persister height (see "Settings not wired to configuration" below) |
 | UTXODefensiveEnabled | bool | false | pruner_utxoDefensiveEnabled | Verify every spending child is mined and stable before deleting a parent |
 | UTXODefensiveBatchReadSize | int | 10000 (Go default; settings.conf ships 1024) | pruner_utxoDefensiveBatchReadSize | Children verified per Aerospike BatchGet in defensive mode |
 | UTXOChunkSize | int | 1000 (Go default; settings.conf ships 1024) | pruner_utxoChunkSize | Records accumulated per parallel chunk |
@@ -28,7 +27,7 @@ Settings are organized under the `Pruner` struct in `settings.Settings`.
 | BlobDeletionBatchSize | int | 1000 | pruner_blobDeletionBatchSize | Maximum blob deletions per pruning trigger |
 | BlobDeletionMaxRetries | int | 3 | pruner_blobDeletionMaxRetries | Retry attempts for a failed blob deletion |
 | SkipPreserveParents | bool | false | pruner_skipPreserveParents | Skip Phase 1 - parent preservation for unmined transactions |
-| SkipProcessExpiredPreservations | bool | false | pruner_skipProcessExpiredPreservations | Skip Phase 1b - expiry of old parent preservations (see "Settings not wired to configuration" below) |
+| SkipProcessExpiredPreservations | bool | false | pruner_skipProcessExpiredPreservations | Skip Phase 1b - expiry of old parent preservations |
 | MinBlockHeight | uint32 | 0 | pruner_min_block_height | Skip all pruning until block height exceeds this value |
 | SkipDeletions | bool | false | pruner_skipDeletions | Skip deletion operations during pruning |
 | UTXOPrunedSetMaxEntries | int | 10000000 | pruner_utxoPrunedSetMaxEntries | Soft cap on the in-memory pruned-TX set (0 = built-in 2B default, not unlimited) |
@@ -61,15 +60,6 @@ These control pruning behaviour at the UTXO store level. Full reference:
 | UnminedTxRetention | uint32 | 144 (globalBlockHeightRetention/2, with the default global retention of 288) | utxostore_unminedTxRetention | Blocks an unmined transaction is retained before its parents are considered for preservation |
 | ParentPreservationBlocks | uint32 | 1440 (blocksInADayOnAverage*10) | utxostore_parentPreservationBlocks | Blocks a preserved parent of an old unmined transaction is kept |
 | DisableDAHCleaner | bool | false | utxostore_disableDAHCleaner | **CRITICAL** - Disable Delete-At-Height pruning (Phase 2) |
-
-## Settings not wired to configuration
-
-`SkipDuringCatchup`, `ForceIgnoreBlockPersisterHeight` and `SkipProcessExpiredPreservations` carry
-`key` struct tags and are read by `services/pruner`, but `settings.NewSettings()` never populates
-them - they always hold the Go zero value `false`. Setting `pruner_skipDuringCatchup`,
-`pruner_force_ignore_block_persister_height` or `pruner_skipProcessExpiredPreservations` in
-settings.conf or the environment therefore has no effect today. The documented defaults above match
-the effective behaviour; the keys are documented because the fields exist and are consumed.
 
 ## Configuration Dependencies
 
@@ -118,10 +108,6 @@ issues, or as a workaround for pruning errors.
 - `OnBlockPersisted` (default): triggers on BlockPersisted notifications, coordinated with the Block
   Persister
 - `OnBlockMined`: triggers on Block notifications with mined_set=true
-
-`ForceIgnoreBlockPersisterHeight` selects the same Block-notification source for the safe prune
-height instead of the Block Persister's height tracking - useful when the Block Persister is not
-deployed or its height tracking is unreliable.
 
 `MinBlockHeight` gates everything: while the chain height is at or below it, all operations (parent
 preservation, DAH deletion, blob deletion) are skipped. Useful when bootstrapping a fresh
