@@ -5,6 +5,7 @@ package subtreevalidation
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,8 +42,15 @@ var TxMetaFieldsForDecorate = []fields.FieldName{fields.Fee, fields.SizeInBytes,
 // is the safety property, not a coincidence: a meta without TxInpoints must
 // never reach the txmeta cache, because a later subtree-meta serialize rejects
 // the inpoints-less node and the block wedges (see TxMetaCache.BatchDecorate).
-// Deriving both from one flag means a caller cannot take the cheap read and
-// still poison the cache.
+// decorateReadPath is the only place the two are chosen, so a caller cannot take
+// the cheap read and still poison the cache.
+//
+// One deliberate consequence: asking for TxInpoints is what routes an
+// externally-stored tx through its blob, so dropping the field means block
+// validation no longer notices a missing or corrupt external blob here. That
+// detection was only ever incidental — it forced a revalidation that would hit
+// the same broken blob — and the blob is still read wherever it is actually
+// needed.
 var txMetaFieldsForBlockValidation = []fields.FieldName{fields.Fee, fields.SizeInBytes, fields.Conflicting, fields.BlockIDs, fields.Creating}
 
 // unresolvedMetaDataSlicePool reduces allocation pressure by reusing
@@ -81,47 +89,105 @@ func putUnresolvedMetaDataSlice(s *[]*utxo.UnresolvedMetaData) {
 // dominates the spacing between attempts.
 const batchDecorateRetryBackoff = 100 * time.Millisecond
 
-// batchDecorateWithRetry runs BatchDecorate against the UTXO store, retrying
-// only transient failures (see errors.IsRetryableError: a storage or network
-// fault, never a cancelled context or a malformed request).
+// storeRetryCount is the configured retry count, clamped to a non-negative
+// value. retry.Retry reads -1 as "retry forever", so passing the setting through
+// unclamped would turn an operator typo in
+// blockvalidation_processTxMetaUsingStore_Retries into every batch of a block
+// hammering a dead store until the context is cancelled.
+func (u *Server) storeRetryCount() int {
+	return max(0, u.settings.BlockValidation.ProcessTxMetaUsingStoreRetries)
+}
+
+// withStoreRetry runs a read against the UTXO store, retrying only transient
+// failures (see errors.IsRetryableError: a storage or network fault, never a
+// cancelled context or a malformed request).
 //
 // A transient store failure must not become a validation verdict on a block.
-// BatchDecorate only reads, and it re-resolves each item in place, so replaying
-// it over the same slice is idempotent. Without this, a single client-side
-// timeout in one of a block's many batches fails the whole block, and because
-// nothing upstream distinguishes "the store stalled" from "the block is bad",
-// the node can wedge behind a block it will never accept.
+// These reads re-resolve their target in place, so replaying one is idempotent.
+// Without this, a single client-side timeout in one of a block's many batches
+// fails the whole block, and because nothing upstream distinguishes "the store
+// stalled" from "the block is bad", the node can wedge behind a block it will
+// never accept.
 //
 // Every failed attempt is logged at WARN — retry.Retry itself only logs the
 // first five attempts at DEBUG, which is invisible in a production deployment
 // and leaves no trace of a store that is quietly degrading.
-func (u *Server) batchDecorateWithRetry(ctx context.Context, store utxo.Store, items []*utxo.UnresolvedMetaData, decorateFields []fields.FieldName) error {
+func (u *Server) withStoreRetry(ctx context.Context, what string, read func() error) error {
 	var lastErr error
 
 	//nolint:errcheck // the attempt error is carried out via lastErr, which distinguishes "gave up" from "not retryable"
 	_, _ = retry.Retry(ctx, u.logger, func() (struct{}, error) {
-		lastErr = store.BatchDecorate(ctx, items, decorateFields...)
+		lastErr = read()
 		if lastErr == nil {
 			return struct{}{}, nil
 		}
 
 		if !errors.IsRetryableError(lastErr) {
-			u.logger.Warnf("[processTxMetaUsingStore] batch decorate of %d txs failed with a non-retryable error: %v", len(items), lastErr)
+			u.logger.Warnf("[processTxMetaUsingStore] %s failed with a non-retryable error: %v", what, lastErr)
 
 			// Returning nil stops retry.Retry; lastErr is what the caller sees.
 			return struct{}{}, nil
 		}
 
-		u.logger.Warnf("[processTxMetaUsingStore] batch decorate of %d txs failed with a transient store error, retrying: %v", len(items), lastErr)
+		u.logger.Warnf("[processTxMetaUsingStore] %s failed with a transient store error, retrying: %v", what, lastErr)
 
 		return struct{}{}, lastErr
 	},
-		retry.WithMessage("[processTxMetaUsingStore] batch decorate"),
-		retry.WithRetryCount(u.settings.BlockValidation.ProcessTxMetaUsingStoreRetries),
+		retry.WithMessage("[processTxMetaUsingStore] "+what),
+		retry.WithRetryCount(u.storeRetryCount()),
 		retry.WithBackoffDurationType(batchDecorateRetryBackoff),
 	)
 
+	// retry.Retry abandons its loop on a cancelled context, leaving lastErr
+	// holding the store error from the attempt it gave up on. Returning that
+	// would report a shutdown — or a sibling goroutine's failure cancelling the
+	// errgroup — as a storage fault, which blockvalidation classifies as
+	// recoverable and redelivers the block for.
+	if lastErr != nil && ctx.Err() != nil {
+		return errors.NewContextCanceledError(errProcessTxMetaContextDone, ctx.Err())
+	}
+
 	return lastErr
+}
+
+// batchDecorateWithRetry runs BatchDecorate against the UTXO store. See
+// withStoreRetry for why a transient failure here must not fail the block.
+func (u *Server) batchDecorateWithRetry(ctx context.Context, store utxo.Store, items []*utxo.UnresolvedMetaData, decorateFields []fields.FieldName) error {
+	return u.withStoreRetry(ctx, fmt.Sprintf("batch decorate of %d txs", len(items)), func() error {
+		return store.BatchDecorate(ctx, items, decorateFields...)
+	})
+}
+
+// decorateReadPath resolves which store a decorate read goes through and which
+// fields it asks for.
+//
+// The two are returned together on purpose. The reduced field set is safe only
+// on a read that cannot populate the txmeta cache, so nothing outside this
+// function gets to pick one without the other: a meta without TxInpoints that
+// reaches the cache wedges a later subtree-meta serialize (see
+// TxMetaCache.BatchDecorate). A caching store that cannot be unwrapped
+// therefore keeps the full set rather than trusting the cache's own guard.
+func (u *Server) decorateReadPath(skipCachePopulation bool) (utxo.Store, []fields.FieldName) {
+	if !skipCachePopulation {
+		return u.utxoStore, TxMetaFieldsForDecorate
+	}
+
+	if cache, ok := u.utxoStore.(*txmetacache.TxMetaCache); ok {
+		// Unwrapped: the read goes straight to the origin, so it neither probes
+		// nor populates the cache.
+		return cache.UnderlyingStore(), txMetaFieldsForBlockValidation
+	}
+
+	if _, cached := u.utxoStore.(txMetaCacheOps); cached {
+		// Something in front of the store caches tx meta but is not the cache we
+		// know how to unwrap. The read still passes through it, so it has to ask
+		// for everything the cache needs.
+		return u.utxoStore, TxMetaFieldsForDecorate
+	}
+
+	// No tx meta cache in front of the store — every cache in this service is
+	// reached through txMetaCacheOps — so the read is already cache-free.
+	return u.utxoStore, txMetaFieldsForBlockValidation
 }
 
 // processTxMetaUsingStore attempts to retrieve transaction metadata from the underlying store
@@ -131,8 +197,12 @@ func (u *Server) batchDecorateWithRetry(ctx context.Context, store utxo.Store, i
 //   - ctx: Context for cancellation and tracing
 //   - txHashes: Slice of transaction hashes to process
 //   - txMetaSlice: Pre-allocated slice to store retrieved metadata
+//   - blockIds: Block IDs of the current chain, used to resolve conflicting txs
 //   - batched: If true, uses batch operations for retrieval
 //   - failFast: If true, fails quickly when missing transaction threshold is exceeded
+//   - skipCachePopulation: If true, reads bypass the txmeta cache and ask for the
+//     reduced block-validation field set (the two are inseparable — see
+//     decorateReadPath)
 //
 // Returns:
 //   - int: Number of transactions missing from store
@@ -157,23 +227,12 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(u.logger, g, validateSubtreeInternalConcurrency)
 
-	// Resolve which store these reads go through. skipCachePopulation unwraps the
-	// txmeta cache and reads the origin directly, so the reads neither probe nor
-	// populate it. Used by the block-validation path, where a populated entry is
-	// never read back (see TxMetaCache.UnderlyingStore). Without a cache in front
-	// the unwrap is a no-op.
-	store := u.utxoStore
-	decorateFields := TxMetaFieldsForDecorate
-
-	if skipCachePopulation {
-		if cache, ok := u.utxoStore.(*txmetacache.TxMetaCache); ok {
-			store = cache.UnderlyingStore()
-		}
-
-		// Safe only because the cache is bypassed above — see
-		// txMetaFieldsForBlockValidation.
-		decorateFields = txMetaFieldsForBlockValidation
-	}
+	// Resolve which store these reads go through and what they ask it for.
+	// skipCachePopulation unwraps the txmeta cache and reads the origin directly,
+	// so the reads neither probe nor populate it. Used by the block-validation
+	// path, where a populated entry is never read back (see
+	// TxMetaCache.UnderlyingStore).
+	store, decorateFields := u.decorateReadPath(skipCachePopulation)
 
 	var missed atomic.Int32
 
@@ -213,6 +272,12 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 				}
 
 				if err := u.batchDecorateWithRetry(gCtx, store, missingTxHashesCompacted, decorateFields); err != nil {
+					if gCtx.Err() != nil {
+						// Cancelled, not faulty: don't hand upstream a storage
+						// error it would redeliver the block for.
+						return errors.NewContextCanceledError(errProcessTxMetaContextDone, gCtx.Err())
+					}
+
 					return errors.NewStorageError("error running batch decorate on utxo store for missing transactions", err)
 				}
 
@@ -304,7 +369,18 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 
 						if !txMetaSlice[i+j].isSet {
 							txMeta := &meta.Data{}
-							if err := store.GetMeta(gCtx, &txHash, txMeta); err != nil {
+
+							// Retried for the same reason as the batched path: a
+							// transient store failure here would otherwise fail
+							// the whole block. This branch is reachable whenever
+							// subtreevalidation_batch_missing_transactions is off.
+							if err := u.withStoreRetry(gCtx, "get tx meta", func() error {
+								return store.GetMeta(gCtx, &txHash, txMeta)
+							}); err != nil {
+								if gCtx.Err() != nil {
+									return errors.NewContextCanceledError(errProcessTxMetaContextDone, gCtx.Err())
+								}
+
 								return errors.NewStorageError("error getting tx meta from utxo store", err)
 							}
 

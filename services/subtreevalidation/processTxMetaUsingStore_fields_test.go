@@ -127,3 +127,37 @@ func TestProcessTxMetaUsingStore_ReducedFieldsImplyCacheSkipped(t *testing.T) {
 	require.False(t, contains(txMetaFieldsForBlockValidation, fields.TxInpoints),
 		"the reduced set is the one that must never be cached")
 }
+
+// unknownCachingStore caches tx meta (it implements txMetaCacheOps) but is not
+// the concrete cache processTxMetaUsingStore knows how to unwrap — a second
+// cache layer, or a future tracing/metrics decorator.
+type unknownCachingStore struct {
+	fieldRecordingStore
+}
+
+func (s *unknownCachingStore) Delete(_ context.Context, _ *chainhash.Hash) error { return nil }
+func (s *unknownCachingStore) SetCacheFromBytes(_, _ []byte) error               { return nil }
+func (s *unknownCachingStore) SetCacheMulti(_, _ [][]byte) error                 { return nil }
+func (s *unknownCachingStore) SetCacheMultiSequential(_, _ [][]byte) error       { return nil }
+func (s *unknownCachingStore) SetCacheMultiSequentialWithHashes(_, _ [][]byte, _ []uint64) error {
+	return nil
+}
+
+// The reduced field set must be chosen only where the cache is provably out of
+// the way. If a caching store cannot be unwrapped, the read still goes through
+// it, so it has to keep asking for the full set — otherwise an inpoints-less
+// meta reaches a cache and a later subtree-meta serialize wedges the block.
+func TestProcessTxMetaUsingStore_UnwrappableCacheKeepsFullFields(t *testing.T) {
+	store := &unknownCachingStore{}
+	server := newFieldTestServer(store)
+
+	txHashes := []chainhash.Hash{{1}}
+	txMetaSlice := make([]metaSliceItem, 1)
+
+	_, err := server.processTxMetaUsingStore(context.Background(), txHashes, txMetaSlice, map[uint32]bool{}, true, false, true)
+	require.NoError(t, err)
+
+	requested := store.requested(t)
+	require.Equal(t, TxMetaFieldsForDecorate, requested,
+		"a cache that cannot be bypassed must still get the full field set: %v", requested)
+}

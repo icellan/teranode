@@ -110,7 +110,7 @@ func TestProcessTxMetaUsingStore_RetriesTransientStorageError(t *testing.T) {
 	}
 
 	// The operator has to be able to see that the store is misbehaving.
-	warnings := logger.WarnBuf.String()
+	warnings := logger.warnings()
 	require.NotEmpty(t, warnings, "retried storage failures must be logged")
 	require.Contains(t, warnings, "batch decorate", "expected a warning naming the failing operation, got: %s", warnings)
 	require.Contains(t, warnings, "TIMEOUT", "expected the underlying store error in the warning, got: %s", warnings)
@@ -174,4 +174,119 @@ func TestProcessTxMetaUsingStore_StopsRetryingOnContextCancel(t *testing.T) {
 	_, err := server.processTxMetaUsingStore(ctx, hashes, metaSlice, map[uint32]bool{}, true, false, false)
 	require.Error(t, err)
 	require.Less(t, store.callCount(), 100, "retries must stop once the context is cancelled")
+}
+
+// A misconfigured retry count must stay bounded. retry.Retry uses -1 as its
+// "retry forever" sentinel, so passing the setting through unclamped would turn
+// an operator typo into block validation hammering a dead store until the
+// context is cancelled — with every batch of the block doing it at once.
+func TestProcessTxMetaUsingStore_NegativeRetryCountIsBounded(t *testing.T) {
+	for _, retries := range []int{-1, -5} {
+		store := &flakyBatchDecorateStore{
+			failures: 1 << 30,
+			err:      errors.NewStorageError("error in aerospike map store batch records", errors.NewError("ResultCode: TIMEOUT")),
+		}
+		server := newRetryTestServer(t, store, newCapturingLogger(), retries)
+
+		hashes, metaSlice := retryTestHashes(4)
+
+		_, err := server.processTxMetaUsingStore(context.Background(), hashes, metaSlice, map[uint32]bool{}, true, false, false)
+		require.Error(t, err)
+		require.Equal(t, 1, store.callCount(), "a negative retry count (%d) must clamp to no retries, not infinite ones", retries)
+	}
+}
+
+// Zero is documented as "previous behaviour": one attempt, no retry.
+func TestProcessTxMetaUsingStore_ZeroRetriesMakesOneAttempt(t *testing.T) {
+	store := &flakyBatchDecorateStore{
+		failures: 1 << 30,
+		err:      errors.NewStorageError("error in aerospike map store batch records", errors.NewError("ResultCode: TIMEOUT")),
+	}
+	server := newRetryTestServer(t, store, newCapturingLogger(), 0)
+
+	hashes, metaSlice := retryTestHashes(4)
+
+	_, err := server.processTxMetaUsingStore(context.Background(), hashes, metaSlice, map[uint32]bool{}, true, false, false)
+	require.Error(t, err)
+	require.Equal(t, 1, store.callCount(), "retries=0 must make exactly one attempt")
+}
+
+// A cancelled context is a shutdown, not a storage fault. Reporting the stale
+// store error from the abandoned attempt would have blockvalidation classify the
+// Kafka message as a recoverable storage failure and redeliver the block.
+func TestProcessTxMetaUsingStore_CancelledContextIsNotAStorageError(t *testing.T) {
+	store := &flakyBatchDecorateStore{
+		failures: 1 << 30,
+		err:      errors.NewStorageError("error in aerospike map store batch records", errors.NewError("ResultCode: TIMEOUT")),
+	}
+	server := newRetryTestServer(t, store, newCapturingLogger(), 100)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store.onCall = func(attempt int) {
+		if attempt == 2 {
+			cancel()
+		}
+	}
+
+	hashes, metaSlice := retryTestHashes(4)
+
+	_, err := server.processTxMetaUsingStore(ctx, hashes, metaSlice, map[uint32]bool{}, true, false, false)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrContextCanceled), "a cancelled context must surface as a context error, got: %v", err)
+	require.False(t, errors.Is(err, errors.ErrStorageError), "a cancelled context must not be reported as a storage fault, got: %v", err)
+}
+
+// flakyGetMetaStore fails the first `failures` GetMeta calls, then succeeds.
+// The unbatched path is only reached when
+// subtreevalidation_batch_missing_transactions is turned off.
+type flakyGetMetaStore struct {
+	utxo.Store
+
+	mu       sync.Mutex
+	calls    int
+	failures int
+	err      error
+}
+
+func (s *flakyGetMetaStore) GetMeta(_ context.Context, _ *chainhash.Hash, data *meta.Data) error {
+	s.mu.Lock()
+	s.calls++
+	attempt := s.calls
+	s.mu.Unlock()
+
+	if attempt <= s.failures {
+		return s.err
+	}
+
+	*data = meta.Data{Fee: 1, SizeInBytes: 191}
+
+	return nil
+}
+
+func (s *flakyGetMetaStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.calls
+}
+
+// The unbatched path must not turn a transient store failure into a
+// block-validation verdict either: it is reachable by configuration, so leaving
+// it unretried leaves the block-307 wedge one setting away.
+func TestProcessTxMetaUsingStore_UnbatchedRetriesTransientStorageError(t *testing.T) {
+	store := &flakyGetMetaStore{
+		failures: 2,
+		err:      errors.NewStorageError("error in aerospike map store batch records", errors.NewError("ResultCode: TIMEOUT")),
+	}
+	server := newRetryTestServer(t, store, newCapturingLogger(), 3)
+
+	hashes, metaSlice := retryTestHashes(1)
+
+	missed, err := server.processTxMetaUsingStore(context.Background(), hashes, metaSlice, map[uint32]bool{}, false, false, false)
+	require.NoError(t, err, "a transient storage error must be retried on the unbatched path too")
+	require.Equal(t, 0, missed)
+	require.True(t, metaSlice[0].isSet)
+	require.Equal(t, 3, store.callCount(), "expected 2 failed attempts followed by a successful one")
 }
