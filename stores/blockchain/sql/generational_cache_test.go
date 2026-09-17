@@ -1,6 +1,8 @@
 package sql
 
 import (
+	"encoding/binary"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -291,34 +293,55 @@ func TestGenerationalCache_HeaderBudgetReclaimed(t *testing.T) {
 	})
 }
 
-func TestGenerationalCache_DelayedEvictionAfterReplacement(t *testing.T) {
+func TestGenerationalCache_DeletedEntriesReleaseBudget(t *testing.T) {
 	gc := NewGenerationalCache(0)
 	defer gc.Stop()
+	value := [2]interface{}{make([]*model.BlockHeader, 131072), make([]*model.BlockHeaderMeta, 131072)}
 	key := chainhash.Hash{1}
-	value := make([]uint32, 10000)
 	require.True(t, gc.NewOp(key).Set(value, time.Hour))
-	oldItem := gc.NewOp(key).Get()
-	require.NotNil(t, oldItem)
-	gc.DeleteAll()
-	require.True(t, gc.NewOp(key).Set(value, time.Hour))
-	newItem := gc.NewOp(key).Get()
-	require.NotSame(t, oldItem, newItem)
-
-	// Simulate the old entry's asynchronous callback arriving after reinsertion.
-	// It must neither free the new charge nor underflow a reset byte counter.
-	gc.releaseHeaderCharge(oldItem)
-	gc.writeMu.Lock()
-	headerBytes := gc.headerBytes
-	gc.writeMu.Unlock()
-	require.Equal(t, uint64(40000), headerBytes)
-	require.Same(t, newItem, gc.NewOp(key).Get())
-
 	gc.ttlCache.Delete(key)
-	require.Eventually(t, func() bool {
-		gc.writeMu.Lock()
-		defer gc.writeMu.Unlock()
-		return gc.headerBytes == 0
-	}, time.Second, time.Millisecond, "explicit deletion must return the current entry's charge")
+	require.True(t, gc.NewOp(chainhash.Hash{2}).Set(value, time.Hour))
+	require.False(t, gc.NewOp(key).Set(value, time.Hour), "live entries still consume the budget")
+}
+
+func TestGenerationalCache_BookkeepingBoundedAfterEviction(t *testing.T) {
+	gc := NewGenerationalCache(2)
+	defer gc.Stop()
+	for i := uint32(0); i < 4096; i++ {
+		var key chainhash.Hash
+		binary.LittleEndian.PutUint32(key[:], i)
+		require.True(t, gc.NewOp(key).Set([]uint32{1}, time.Hour))
+	}
+	require.LessOrEqual(t, len(gc.headerCharges), 1024, "small evicted values must not accumulate unbounded accounting")
+}
+
+func TestGenerationalCache_DeleteAllDoesNotSpawnPerEntryGoroutines(t *testing.T) {
+	gc := NewGenerationalCache(10000)
+	defer gc.Stop()
+	for i := uint32(0); i < 10000; i++ {
+		var key chainhash.Hash
+		binary.LittleEndian.PutUint32(key[:], i)
+		require.True(t, gc.NewOp(key).Set(true, time.Hour))
+	}
+	baseline := runtime.NumGoroutine()
+	stop := make(chan struct{})
+	observed := make(chan int, 1)
+	go func() {
+		peak := baseline
+		for {
+			peak = max(peak, runtime.NumGoroutine())
+			select {
+			case <-stop:
+				observed <- peak
+				return
+			default:
+				runtime.Gosched()
+			}
+		}
+	}()
+	gc.DeleteAll()
+	close(stop)
+	require.Less(t, <-observed-baseline, 1000, "invalidation must not start one callback goroutine per cached entry")
 }
 
 func TestGenerationalCache_ConcurrentHeaderAccounting(t *testing.T) {

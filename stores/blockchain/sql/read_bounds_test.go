@@ -34,4 +34,10 @@ func TestSQLReadBounds(t *testing.T) {
 	require.Len(t, got, 25)
 	require.Len(t, metas, 25)
 	require.Less(t, cap(got), 20000)
+	// A large fork query must allocate for its actual results, not its count.
+	got, metas, err = s.GetForkedBlockHeaders(ctx, headers[24].Hash(), 1<<20)
+	require.NoError(t, err)
+	require.Less(t, cap(got), 20000)
+	require.Less(t, cap(metas), 20000)
+
 }

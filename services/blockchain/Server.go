@@ -3046,8 +3046,14 @@ func (b *Blockchain) SendNotification(ctx context.Context, req *blockchain_api.N
 			b.logger.Warnf("[Blockchain][SendNotification] Notifications channel full, dropping PING notification")
 		}
 	} else {
+		var shutdown <-chan struct{}
+		if b.AppCtx != nil {
+			shutdown = b.AppCtx.Done()
+		}
 		select {
 		case b.notifications <- req:
+		case <-shutdown:
+			return nil, status.FromContextError(b.AppCtx.Err()).Err()
 		case <-ctx.Done():
 			return nil, status.FromContextError(ctx.Err()).Err()
 		}

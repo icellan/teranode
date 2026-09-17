@@ -1,7 +1,6 @@
 package sql
 
 import (
-	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,15 +32,10 @@ const maxCachedHeaderBytes uint64 = 64 << 20
 type GenerationalCache struct {
 	writeMu       sync.Mutex
 	headerBytes   uint64
-	headerCharges map[chainhash.Hash]headerCacheCharge
+	headerCharges map[chainhash.Hash]uint64
 	ttlCache      *ttlcache.Cache[chainhash.Hash, any]
 	generation    atomic.Uint64
 	stopped       atomic.Bool
-}
-
-type headerCacheCharge struct {
-	item  *ttlcache.Item[chainhash.Hash, any]
-	bytes uint64
 }
 
 // NewGenerationalCache creates a new generational cache instance.
@@ -65,26 +59,23 @@ func NewGenerationalCache(capacity int) *GenerationalCache {
 
 	gc := &GenerationalCache{
 		ttlCache:      ttlcache.New[chainhash.Hash, any](opts...),
-		headerCharges: make(map[chainhash.Hash]headerCacheCharge),
+		headerCharges: make(map[chainhash.Hash]uint64),
 	}
-	gc.ttlCache.OnEviction(func(_ context.Context, _ ttlcache.EvictionReason, item *ttlcache.Item[chainhash.Hash, any]) {
-		gc.releaseHeaderCharge(item)
-	})
 	// Auto-start the cache cleanup goroutine
 	go gc.ttlCache.Start()
 	return gc
 }
 
-// ttlcache v3.3 runs eviction callbacks on separate goroutines. Serialize them
-// with writes, and match the item identity so a delayed callback cannot release
-// the charge for a newer entry at the same key (including after DeleteAll).
-func (gc *GenerationalCache) releaseHeaderCharge(item *ttlcache.Item[chainhash.Hash, any]) {
-	gc.writeMu.Lock()
-	defer gc.writeMu.Unlock()
-	key := item.Key()
-	if charge, ok := gc.headerCharges[key]; ok && charge.item == item {
-		gc.headerBytes -= charge.bytes
-		delete(gc.headerCharges, key)
+// sweepDepartedCharges runs with writeMu held. Has does not change LRU order.
+// Reconcile on budget pressure, or when accounting has accumulated twice the
+// live entry count (with a 1024-entry floor), bounding stale bookkeeping too.
+func (gc *GenerationalCache) sweepDepartedCharges() {
+	gc.ttlCache.DeleteExpired()
+	for key, cost := range gc.headerCharges {
+		if !gc.ttlCache.Has(key) {
+			gc.headerBytes -= cost
+			delete(gc.headerCharges, key)
+		}
 	}
 }
 
@@ -153,18 +144,20 @@ func (co *CacheOperation) Set(value any, ttl time.Duration) bool {
 	defer gc.writeMu.Unlock()
 	// Only cache if generation matches (cache wasn't invalidated during operation)
 	if co.generation == co.generationalCache.generation.Load() {
-		// Replacements do not emit eviction callbacks. Credit the old charge
-		// here, including an expired entry whose callback has not run yet.
-		retainedBytes := gc.headerBytes - gc.headerCharges[co.key].bytes + cost
+		retainedBytes := gc.headerBytes - gc.headerCharges[co.key] + cost
+		if retainedBytes > maxCachedHeaderBytes || (len(gc.headerCharges) >= 1024 && len(gc.headerCharges) > 2*gc.ttlCache.Len()) {
+			gc.sweepDepartedCharges()
+			retainedBytes = gc.headerBytes - gc.headerCharges[co.key] + cost
+		}
 		if retainedBytes > maxCachedHeaderBytes {
 			return false
 		}
-		item := gc.ttlCache.Set(co.key, value, ttl)
+		gc.ttlCache.Set(co.key, value, ttl)
 		gc.headerBytes = retainedBytes
 		if cost == 0 {
 			delete(gc.headerCharges, co.key)
 		} else {
-			gc.headerCharges[co.key] = headerCacheCharge{item: item, bytes: cost}
+			gc.headerCharges[co.key] = cost
 		}
 		return true
 	}
