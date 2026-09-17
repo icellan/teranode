@@ -27,6 +27,24 @@ const errProcessTxMetaContextDone = "[processTxMetaUsingStore] context done"
 
 var TxMetaFieldsForDecorate = []fields.FieldName{fields.Fee, fields.SizeInBytes, fields.TxInpoints, fields.Conflicting, fields.BlockIDs, fields.Creating}
 
+// txMetaFieldsForBlockValidation is TxMetaFieldsForDecorate without TxInpoints.
+//
+// Block validation never reads them: on that path txMetaSlice is consulted only
+// for isSet, and the one reader of .txInpoints in this service is the
+// peer-announced path, which builds the subtree meta file. TxInpoints is the
+// largest field in the record — every parent hash, 32 bytes per input — so
+// asking for it costs a bigger response to ship and parse and, on the store
+// side, the ~7.5% of subtree-validator CPU that processInputsToTxInpoints
+// takes to rebuild something nothing looks at.
+//
+// This set is only ever used on a read that also skips the cache. That pairing
+// is the safety property, not a coincidence: a meta without TxInpoints must
+// never reach the txmeta cache, because a later subtree-meta serialize rejects
+// the inpoints-less node and the block wedges (see TxMetaCache.BatchDecorate).
+// Deriving both from one flag means a caller cannot take the cheap read and
+// still poison the cache.
+var txMetaFieldsForBlockValidation = []fields.FieldName{fields.Fee, fields.SizeInBytes, fields.Conflicting, fields.BlockIDs, fields.Creating}
+
 // unresolvedMetaDataSlicePool reduces allocation pressure by reusing
 // []*utxo.UnresolvedMetaData slices during batch tx metadata processing.
 var unresolvedMetaDataSlicePool = sync.Pool{}
@@ -77,12 +95,12 @@ const batchDecorateRetryBackoff = 100 * time.Millisecond
 // Every failed attempt is logged at WARN — retry.Retry itself only logs the
 // first five attempts at DEBUG, which is invisible in a production deployment
 // and leaves no trace of a store that is quietly degrading.
-func (u *Server) batchDecorateWithRetry(ctx context.Context, store utxo.Store, items []*utxo.UnresolvedMetaData) error {
+func (u *Server) batchDecorateWithRetry(ctx context.Context, store utxo.Store, items []*utxo.UnresolvedMetaData, decorateFields []fields.FieldName) error {
 	var lastErr error
 
 	//nolint:errcheck // the attempt error is carried out via lastErr, which distinguishes "gave up" from "not retryable"
 	_, _ = retry.Retry(ctx, u.logger, func() (struct{}, error) {
-		lastErr = store.BatchDecorate(ctx, items, TxMetaFieldsForDecorate...)
+		lastErr = store.BatchDecorate(ctx, items, decorateFields...)
 		if lastErr == nil {
 			return struct{}{}, nil
 		}
@@ -145,11 +163,16 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 	// never read back (see TxMetaCache.UnderlyingStore). Without a cache in front
 	// the unwrap is a no-op.
 	store := u.utxoStore
+	decorateFields := TxMetaFieldsForDecorate
 
 	if skipCachePopulation {
 		if cache, ok := u.utxoStore.(*txmetacache.TxMetaCache); ok {
 			store = cache.UnderlyingStore()
 		}
+
+		// Safe only because the cache is bypassed above — see
+		// txMetaFieldsForBlockValidation.
+		decorateFields = txMetaFieldsForBlockValidation
 	}
 
 	var missed atomic.Int32
@@ -189,7 +212,7 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 					}
 				}
 
-				if err := u.batchDecorateWithRetry(gCtx, store, missingTxHashesCompacted); err != nil {
+				if err := u.batchDecorateWithRetry(gCtx, store, missingTxHashesCompacted, decorateFields); err != nil {
 					return errors.NewStorageError("error running batch decorate on utxo store for missing transactions", err)
 				}
 
