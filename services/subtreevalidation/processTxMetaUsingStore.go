@@ -13,6 +13,7 @@ import (
 	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/txmetacache"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -76,12 +77,12 @@ const batchDecorateRetryBackoff = 100 * time.Millisecond
 // Every failed attempt is logged at WARN — retry.Retry itself only logs the
 // first five attempts at DEBUG, which is invisible in a production deployment
 // and leaves no trace of a store that is quietly degrading.
-func (u *Server) batchDecorateWithRetry(ctx context.Context, items []*utxo.UnresolvedMetaData) error {
+func (u *Server) batchDecorateWithRetry(ctx context.Context, store utxo.Store, items []*utxo.UnresolvedMetaData) error {
 	var lastErr error
 
 	//nolint:errcheck // the attempt error is carried out via lastErr, which distinguishes "gave up" from "not retryable"
 	_, _ = retry.Retry(ctx, u.logger, func() (struct{}, error) {
-		lastErr = u.utxoStore.BatchDecorate(ctx, items, TxMetaFieldsForDecorate...)
+		lastErr = store.BatchDecorate(ctx, items, TxMetaFieldsForDecorate...)
 		if lastErr == nil {
 			return struct{}{}, nil
 		}
@@ -123,7 +124,7 @@ func (u *Server) batchDecorateWithRetry(ctx context.Context, items []*utxo.Unres
 // individual GetMeta calls. It will return a ThresholdExceededError if failFast
 // is true and the number of missing transactions exceeds the configured threshold.
 func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainhash.Hash, txMetaSlice []metaSliceItem,
-	blockIds map[uint32]bool, batched bool, failFast bool) (int, error) {
+	blockIds map[uint32]bool, batched bool, failFast bool, skipCachePopulation bool) (int, error) {
 	if len(txHashes) != len(txMetaSlice) {
 		return 0, errors.NewInvalidArgumentError("txHashes and txMetaSlice must be the same length")
 	}
@@ -137,6 +138,19 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(u.logger, g, validateSubtreeInternalConcurrency)
+
+	// Resolve which store these reads go through. skipCachePopulation unwraps the
+	// txmeta cache and reads the origin directly, so the reads neither probe nor
+	// populate it. Used by the block-validation path, where a populated entry is
+	// never read back (see TxMetaCache.UnderlyingStore). Without a cache in front
+	// the unwrap is a no-op.
+	store := u.utxoStore
+
+	if skipCachePopulation {
+		if cache, ok := u.utxoStore.(*txmetacache.TxMetaCache); ok {
+			store = cache.UnderlyingStore()
+		}
+	}
 
 	var missed atomic.Int32
 
@@ -175,7 +189,7 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 					}
 				}
 
-				if err := u.batchDecorateWithRetry(gCtx, missingTxHashesCompacted); err != nil {
+				if err := u.batchDecorateWithRetry(gCtx, store, missingTxHashesCompacted); err != nil {
 					return errors.NewStorageError("error running batch decorate on utxo store for missing transactions", err)
 				}
 
@@ -267,7 +281,7 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 
 						if !txMetaSlice[i+j].isSet {
 							txMeta := &meta.Data{}
-							if err := u.utxoStore.GetMeta(gCtx, &txHash, txMeta); err != nil {
+							if err := store.GetMeta(gCtx, &txHash, txMeta); err != nil {
 								return errors.NewStorageError("error getting tx meta from utxo store", err)
 							}
 

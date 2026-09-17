@@ -100,7 +100,7 @@ func TestProcessTxMetaUsingStore_RetriesTransientStorageError(t *testing.T) {
 
 	hashes, metaSlice := retryTestHashes(4)
 
-	missed, err := server.processTxMetaUsingStore(context.Background(), hashes, metaSlice, map[uint32]bool{}, true, false)
+	missed, err := server.processTxMetaUsingStore(context.Background(), hashes, metaSlice, map[uint32]bool{}, true, false, false)
 	require.NoError(t, err, "a transient storage error must be retried, not turned into a block-validation verdict")
 	require.Equal(t, 0, missed)
 	require.Equal(t, 3, store.callCount(), "expected 2 failed attempts followed by a successful one")
@@ -127,7 +127,7 @@ func TestProcessTxMetaUsingStore_GivesUpAfterRetryLimit(t *testing.T) {
 
 	hashes, metaSlice := retryTestHashes(4)
 
-	_, err := server.processTxMetaUsingStore(context.Background(), hashes, metaSlice, map[uint32]bool{}, true, false)
+	_, err := server.processTxMetaUsingStore(context.Background(), hashes, metaSlice, map[uint32]bool{}, true, false, false)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errors.ErrStorageError), "the storage cause must survive wrapping, got: %v", err)
 	require.Equal(t, 3, store.callCount(), "expected the initial attempt plus 2 retries")
@@ -144,7 +144,7 @@ func TestProcessTxMetaUsingStore_DoesNotRetryNonRetryableError(t *testing.T) {
 
 	hashes, metaSlice := retryTestHashes(4)
 
-	_, err := server.processTxMetaUsingStore(context.Background(), hashes, metaSlice, map[uint32]bool{}, true, false)
+	_, err := server.processTxMetaUsingStore(context.Background(), hashes, metaSlice, map[uint32]bool{}, true, false, false)
 	require.Error(t, err)
 	require.Equal(t, 1, store.callCount(), "a non-retryable error must not be retried")
 }
@@ -171,7 +171,7 @@ func TestProcessTxMetaUsingStore_StopsRetryingOnContextCancel(t *testing.T) {
 
 	hashes, metaSlice := retryTestHashes(4)
 
-	_, err := server.processTxMetaUsingStore(ctx, hashes, metaSlice, map[uint32]bool{}, true, false)
+	_, err := server.processTxMetaUsingStore(ctx, hashes, metaSlice, map[uint32]bool{}, true, false, false)
 	require.Error(t, err)
 	require.Less(t, store.callCount(), 100, "retries must stop once the context is cancelled")
 }
