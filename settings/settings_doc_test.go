@@ -1067,59 +1067,13 @@ func TestSettingsDocExampleKeysExist(t *testing.T) {
 	}
 }
 
-// settingsConfPath returns the repo-root settings.conf path relative to this
-// test file.
-func settingsConfPath(t *testing.T) string {
-	t.Helper()
-
-	_, thisFile, _, ok := runtime.Caller(0)
-	require.True(t, ok, "unable to determine test file location")
-
-	repoRoot := filepath.Dir(filepath.Dir(thisFile))
-
-	return filepath.Join(repoRoot, "settings.conf")
-}
-
 // settingsConfBaseKeyRe matches the base key (before any settings-context
 // suffix) of a settings.conf assignment line: "key.context.sub = value" or
 // "key = value".
 var settingsConfBaseKeyRe = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_]*)`)
 
-// settingsConfBaseKeys returns the set of distinct base keys assigned
-// anywhere in settings.conf, with any ".context" suffix stripped (context
-// suffixes are not part of ExportMetadata() and are not gocore ${VAR}
-// interpolation targets either).
-func settingsConfBaseKeys(t *testing.T) map[string]bool {
-	t.Helper()
-
-	confBytes, err := os.ReadFile(settingsConfPath(t))
-	require.NoError(t, err, "reading settings.conf")
-
-	keys := make(map[string]bool)
-
-	for _, line := range strings.Split(string(confBytes), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-
-		eq := strings.Index(trimmed, "=")
-		if eq == -1 {
-			continue
-		}
-
-		lhs := strings.TrimSpace(trimmed[:eq])
-
-		m := settingsConfBaseKeyRe.FindString(lhs)
-		if m == "" {
-			continue
-		}
-
-		keys[m] = true
-	}
-
-	return keys
-}
+// settingsConfPath and settingsConfBaseKeys are defined once, in
+// settings_conf_dead_key_test.go, and shared by both test files.
 
 // settingsConfBaseValues returns, for every settings.conf assignment line
 // whose key has no ".context" suffix (i.e. the base/default-context value,
