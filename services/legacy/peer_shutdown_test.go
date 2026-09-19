@@ -11,12 +11,90 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/legacy/netsync"
 	"github.com/bsv-blockchain/teranode/services/legacy/peer"
+	"github.com/bsv-blockchain/teranode/services/p2p"
 	"github.com/bsv-blockchain/teranode/settings"
 	blockchainstore "github.com/bsv-blockchain/teranode/stores/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
+
+func TestBanEvent_ShutdownCancelsWait(t *testing.T) {
+	for _, stage := range []string{"send", "reply"} {
+		for _, stop := range []string{"shutdown", "context"} {
+			t.Run(stage+"/"+stop, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				s := &server{logger: ulogger.TestLogger{}, quit: make(chan struct{}), query: make(chan interface{})}
+				done := make(chan struct{})
+				go func() {
+					s.handleBanEvent(ctx, p2p.BanEvent{Action: "add", IP: "127.0.0.1"})
+					close(done)
+				}()
+				var reply chan error
+				if stage == "reply" {
+					select {
+					case query := <-s.query:
+						reply = query.(disconnectNodeMsg).reply
+					case <-time.After(5 * time.Second):
+						t.Fatal("ban event did not submit its query")
+					}
+				}
+				if stop == "shutdown" {
+					close(s.quit)
+				} else {
+					cancel()
+				}
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Error("ban event remained blocked after cancellation")
+					// Release the old implementation so a failing regression leaks no goroutine.
+					if reply == nil {
+						reply = (<-s.query).(disconnectNodeMsg).reply
+					}
+					reply <- nil
+					<-done
+					return
+				}
+				if reply != nil {
+					select {
+					case reply <- nil:
+					default:
+						t.Error("late reply would block the peer handler after the caller exits")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestBanListener_StopsWithoutContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := &server{logger: ulogger.TestLogger{}, quit: make(chan struct{}), banChan: make(chan p2p.BanEvent)}
+	s.wg.Add(1)
+	done := make(chan struct{})
+	go func() { s.listenForBanEvents(ctx); close(done) }()
+	close(s.quit)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Error("ban listener did not exit on server shutdown")
+		cancel()
+		<-done
+		return
+	}
+	joined := make(chan struct{})
+	go func() { s.WaitForShutdown(); close(joined) }()
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Error("ban listener did not release its shutdown registration")
+		s.wg.Done()
+		<-joined
+	}
+}
 
 func TestServerStop_JoinsPeerShutdown(t *testing.T) {
 	inner := &server{logger: ulogger.TestLogger{}, quit: make(chan struct{})}

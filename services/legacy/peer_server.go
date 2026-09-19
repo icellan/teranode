@@ -2905,7 +2905,7 @@ func (s *server) Start() {
 		return
 	}
 	// Register all workers before Stop can begin waiting for them.
-	s.wg.Add(2)
+	s.wg.Add(3)
 	if s.nat != nil {
 		s.wg.Add(1)
 	}
@@ -3743,13 +3743,20 @@ func pickNoun(n uint64, singular, plural string) string {
 
 // listenForBanEvents continuously listens for ban events from the P2P service
 // and handles them by disconnecting banned peers. This method runs in a goroutine
-// and will exit when the context is canceled.
+// and is joined during shutdown. It exits when the context is canceled or the
+// server stops, including while a disconnect query is in flight.
 func (s *server) listenForBanEvents(ctx context.Context) {
+	defer s.wg.Done()
 	for {
 		select {
+		case <-s.quit:
+			return
 		case <-ctx.Done():
 			return
-		case event := <-s.banChan:
+		case event, ok := <-s.banChan:
+			if !ok {
+				return
+			}
 			s.handleBanEvent(ctx, event)
 		}
 	}
@@ -3758,7 +3765,7 @@ func (s *server) listenForBanEvents(ctx context.Context) {
 // handleBanEvent processes a ban event from the P2P service by disconnecting
 // peers that match the banned IP address or subnet. Only "add" ban actions
 // are processed; other actions are ignored.
-func (s *server) handleBanEvent(_ context.Context, event p2p.BanEvent) {
+func (s *server) handleBanEvent(ctx context.Context, event p2p.BanEvent) {
 	if event.Action != "add" {
 		return // We only care about new bans
 	}
@@ -3771,15 +3778,26 @@ func (s *server) handleBanEvent(_ context.Context, event p2p.BanEvent) {
 			peerIP := net.ParseIP(sp.Addr())
 			return sp.Addr() == event.IP || (event.Subnet != nil && event.Subnet.Contains(peerIP))
 		},
-		reply: make(chan error),
+		// The peer handler may reply after this listener stops waiting.
+		reply: make(chan error, 1),
 	}
 
 	// Send the message to the peer handler
-	s.query <- disconnectMsg
+	select {
+	case s.query <- disconnectMsg:
+	case <-s.quit:
+		return
+	case <-ctx.Done():
+		return
+	}
 
 	// Wait for the reply
-	err := <-disconnectMsg.reply
-	if err != nil {
-		s.logger.Errorf("Error disconnecting banned peers: %v", err)
+	select {
+	case err := <-disconnectMsg.reply:
+		if err != nil {
+			s.logger.Errorf("Error disconnecting banned peers: %v", err)
+		}
+	case <-s.quit:
+	case <-ctx.Done():
 	}
 }

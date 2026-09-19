@@ -845,7 +845,8 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	defer u.restoreFSMState(ctx, catchupCtx)
 
 	// Carry ownership through tracing and detached subtree-data downloads.
-	artifacts := &catchupArtifacts{Store: u.subtreeStore, files: make(map[catchupArtifactKey]*catchupArtifact)}
+	artifacts := &catchupArtifacts{Store: u.subtreeStore, files: make(map[catchupArtifactKey]*catchupArtifact),
+		cleanupConcurrency: u.settings.BlockValidation.SubtreeFetchConcurrency}
 	ctx = context.WithValue(ctx, catchupArtifactsKey{}, artifacts)
 
 	// Create error group for concurrent operations
@@ -887,6 +888,10 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 		// failures (such as peer rate limits) so the next attempt can progress.
 		if errors.Is(err, errors.ErrBlockInvalid) || errors.Is(err, errors.ErrTxInvalid) {
 			artifacts.cleanup(u.logger)
+		} else {
+			// Evict identified corrupt cached files, while preserving downloads
+			// made before a transient failure. All readers and writers have joined.
+			artifacts.repair(u.logger)
 		}
 		catchupCtx.catchupError = err
 	}
@@ -1179,9 +1184,9 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 			prometheusCatchupErrors.WithLabelValues(peerID, "validation_failure").Inc()
 		}
 
-		// A body-authentication failure must abort without retrying the body through
-		// a state-mutating path or deleting another block's shared subtree files.
-		if errors.Is(err, errors.ErrBlockInvalid) {
+		// Invalid bodies and local service failures (including corrupt cached
+		// artifacts) must abort without mutation or wholesale shared-file deletion.
+		if errors.Is(err, errors.ErrBlockInvalid) || errors.Is(err, errors.ErrServiceError) {
 			return false, err
 		}
 		// Block is incomplete (e.g. seeded peer without full block data) — abort catchup for this peer.

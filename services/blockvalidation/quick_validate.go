@@ -364,6 +364,7 @@ type subtreeResult struct {
 	subtreeIdx        int
 	fullSubtreeExists bool // True if full .subtree file already exists (checked during prefetch)
 	borrowed          bool // nodes owned by the whole-block preflight
+	localFileType     fileformat.FileType
 	err               error
 }
 
@@ -822,7 +823,8 @@ func (u *BlockValidation) readSubtreeNodes(ctx context.Context, block *model.Blo
 			subtree, err = subtreepkg.NewSubtreeFromReader(bufferedReader)
 		}
 		if err != nil {
-			return subtreeResult{err: errors.NewBlockInvalidError("[getBlockTransactions][%s] failed to deserialize subtree %s", block.Hash().String(), subtreeHash.String(), err)}
+			return subtreeResult{err: catchupArtifactError(ctx, *subtreeHash, localFileType,
+				errors.NewBlockInvalidError("[getBlockTransactions][%s] failed to deserialize subtree %s", block.Hash().String(), subtreeHash.String(), err))}
 		}
 
 	}
@@ -841,6 +843,7 @@ func (u *BlockValidation) readSubtreeNodes(ctx context.Context, block *model.Blo
 		subtreeIdx:        subtreeIdx,
 		fullSubtreeExists: fullSubtreeExists,
 		borrowed:          borrowed,
+		localFileType:     localFileType,
 	}
 }
 
@@ -874,7 +877,8 @@ func (u *BlockValidation) readSubtree(ctx context.Context, block *model.Block, s
 	// the subtree data reader will make sure the data matches the transaction ids from the subtree
 	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, bufferedReader)
 	if err != nil {
-		return subtreeResult{err: errors.NewBlockInvalidError("[getBlockTransactions][%s] failed to deserialize subtree data %s: %v", block.Hash().String(), subtreeHash.String(), err)}
+		return subtreeResult{err: catchupArtifactError(ctx, *subtreeHash, fileformat.FileTypeSubtreeData,
+			errors.NewBlockInvalidError("[getBlockTransactions][%s] failed to deserialize subtree data %s", block.Hash().String(), subtreeHash.String(), err))}
 	}
 
 	// Validate transactions in this subtree
@@ -882,12 +886,14 @@ func (u *BlockValidation) readSubtree(ctx context.Context, block *model.Block, s
 		if subtreeIdx == 0 && idx == 0 {
 			// First tx in first subtree must be coinbase
 			if tx != nil && !tx.IsCoinbase() {
-				return subtreeResult{err: errors.NewBlockInvalidError("[getBlockTransactions][%s] invalid coinbase tx at index %d in subtree %s", block.Hash().String(), idx, subtreeHash.String())}
+				return subtreeResult{err: catchupArtifactError(ctx, *subtreeHash, fileformat.FileTypeSubtreeData,
+					errors.NewBlockInvalidError("[getBlockTransactions][%s] invalid coinbase tx at index %d in subtree %s", block.Hash().String(), idx, subtreeHash.String()))}
 			}
 			subtreeData.Txs[idx] = nil // set to nil to indicate coinbase
 		} else {
 			if tx == nil {
-				return subtreeResult{err: errors.NewBlockInvalidError("[getBlockTransactions][%s] missing tx at index %d in subtree %s", block.Hash().String(), idx, subtreeHash.String())}
+				return subtreeResult{err: catchupArtifactError(ctx, *subtreeHash, fileformat.FileTypeSubtreeData,
+					errors.NewBlockInvalidError("[getBlockTransactions][%s] missing tx at index %d in subtree %s", block.Hash().String(), idx, subtreeHash.String()))}
 			}
 		}
 	}
@@ -1634,14 +1640,22 @@ func (u *BlockValidation) authenticateQuickBlockBody(ctx context.Context, block 
 			}
 			st := result.subtree
 			body.SubtreeSlices[i] = st
-			if len(st.Nodes) == 0 || (i == 0 && !st.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue)) {
-				return errors.NewBlockInvalidError("[quickValidateBlock][%s] first subtree must start with the coinbase placeholder and subtrees must not be empty", block.Hash().String())
+			if len(st.Nodes) == 0 {
+				return catchupArtifactError(gCtx, *hash, result.localFileType,
+					errors.NewBlockInvalidError("[quickValidateBlock][%s] subtree must not be empty", block.Hash().String()))
 			}
 			// Deserialization reads a cached root from the file. Recompute it
 			// from nodes instead of trusting that cache or the blob-store key.
-			root, err := st.RootHashWithReplaceRootNode(&st.Nodes[0].Hash, st.Nodes[0].Fee, st.Nodes[0].SizeInBytes)
-			if err != nil || root == nil || !root.IsEqual(hash) || !st.RootHash().IsEqual(hash) {
-				return errors.NewBlockInvalidError("[quickValidateBlock][%s] subtree %s nodes do not match its root", block.Hash().String(), hash.String(), err)
+			// No node is being replaced: avoid copying mmap-backed nodes to heap.
+			merkles, err := subtreepkg.BuildMerkleTreeStoreFromBytes(st.Nodes)
+			if err != nil || merkles == nil || len(*merkles) == 0 || !(*merkles)[len(*merkles)-1].IsEqual(hash) || !st.RootHash().IsEqual(hash) {
+				return catchupArtifactError(gCtx, *hash, result.localFileType,
+					errors.NewBlockInvalidError("[quickValidateBlock][%s] subtree %s nodes do not match its root", block.Hash().String(), hash.String()))
+			}
+			// Once the stored nodes match their key, their position in the body
+			// is the announcing peer's responsibility, not a cache corruption.
+			if i == 0 && !st.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+				return errors.NewBlockInvalidError("[quickValidateBlock][%s] first subtree must start with the coinbase placeholder", block.Hash().String())
 			}
 			return nil
 		})
@@ -1656,10 +1670,8 @@ func (u *BlockValidation) authenticateQuickBlockBody(ctx context.Context, block 
 		return cleanup, errors.NewBlockInvalidError("[quickValidateBlock][%s] body does not match header merkle root", block.Hash().String(), err)
 	}
 	var authenticatedCount uint64
-	for i, st := range body.SubtreeSlices {
-		if i > 0 && i < len(body.SubtreeSlices)-1 && st.Length() != body.SubtreeSlices[0].Length() {
-			return cleanup, errors.NewBlockInvalidError("[quickValidateBlock][%s] subtree %d has inconsistent length", block.Hash().String(), i)
-		}
+	// CheckMerkleRoot above already enforces subtree lengths and partitioning.
+	for _, st := range body.SubtreeSlices {
 		authenticatedCount += uint64(st.Length())
 	}
 	if len(body.Subtrees) == 0 {
