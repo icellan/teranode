@@ -201,7 +201,7 @@ func getPostgresPoolSettings(servicePrefix string, alternativeContext ...string)
 
 	// Only return settings if at least one is configured (non-zero)
 	if maxOpenConns == 0 && maxIdleConns == 0 && connMaxLifetime == 0 && connMaxIdleTime == 0 &&
-		retryMaxAttempts == 0 && retryBaseDelay == 0 && circuitBreakerEnabled == nil &&
+		retryMaxAttempts == 0 && retryBaseDelay == 0 && !retryEnabled && circuitBreakerEnabled == nil &&
 		circuitBreakerFailureThreshold == 0 && circuitBreakerHalfOpenMax == 0 &&
 		circuitBreakerCooldown == 0 && circuitBreakerFailureWindow == 0 {
 		return nil

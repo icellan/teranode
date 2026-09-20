@@ -327,4 +327,13 @@ func TestGetPostgresPoolSettings_CircuitBreaker(t *testing.T) {
 		require.NotNil(t, poolSettings.CircuitBreakerEnabled)
 		require.False(t, *poolSettings.CircuitBreakerEnabled)
 	})
+
+	t.Run("retryEnabled alone counts as configured", func(t *testing.T) {
+		gocore.Config().Set("retryservice_postgres_retryEnabled", "true")
+		defer gocore.Config().Unset("retryservice_postgres_retryEnabled")
+
+		poolSettings := getPostgresPoolSettings("retryservice")
+		require.NotNil(t, poolSettings, "setting only retryEnabled must not be treated as unconfigured")
+		require.True(t, poolSettings.RetryEnabled)
+	})
 }
