@@ -297,12 +297,25 @@ func (m *Mock) GetSubtreeData(ctx context.Context, hash *chainhash.Hash) (*subtr
 func (m *Mock) GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, func(), error) {
 	args := m.Called(ctx, hash)
 
-	if args.Error(1) != nil {
-		return nil, func() {}, args.Error(1)
+	// Callers may supply their own release func as the second return value in order
+	// to observe when the permit is dropped; the two-value form stays supported.
+	release := func() {}
+	errIndex := 1
+
+	if len(args) > 2 {
+		errIndex = 2
+
+		if supplied, ok := args.Get(1).(func()); ok && supplied != nil {
+			release = supplied
+		}
+	}
+
+	if args.Error(errIndex) != nil {
+		return nil, release, args.Error(errIndex)
 	}
 
 	// return the mocked response
-	return args.Get(0).(map[chainhash.Hash]*bt.Tx), func() {}, args.Error(1)
+	return args.Get(0).(map[chainhash.Hash]*bt.Tx), release, args.Error(errIndex)
 }
 
 func (m *Mock) GetSubtreeExists(_ context.Context, hash *chainhash.Hash) (bool, error) {

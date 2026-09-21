@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -355,4 +357,69 @@ func TestConcatTransactionBytesAllocatesExactly(t *testing.T) {
 	require.Len(t, concatenated, 2*len(testTX1RawBytes)+len(testTX2RawBytes))
 	require.Equal(t, len(concatenated), cap(concatenated),
 		"capacity must match the serialized length, not a per-record reservation")
+}
+
+// permitWriteProbe records whether the subtree-map permit had already been released
+// at the moment the response body started being written.
+type permitWriteProbe struct {
+	http.ResponseWriter
+
+	released         chan struct{}
+	releasedAtWrite  atomic.Bool
+	observedAnyWrite atomic.Bool
+}
+
+func (p *permitWriteProbe) Write(b []byte) (int, error) {
+	p.observedAnyWrite.Store(true)
+
+	select {
+	case <-p.released:
+		p.releasedAtWrite.Store(true)
+	default:
+	}
+
+	return p.ResponseWriter.Write(b)
+}
+
+// TestGetTransactionsReleasesSubtreePermitBeforeResponseWrite pins the permit to the
+// lifetime of the subtree map rather than the lifetime of the response.
+//
+// asset_concurrency_get_subtree_transactions defaults to 2, while a catching-up peer
+// issues subtreevalidation_getMissingTransactions (32) concurrent batch requests. If
+// the permit is held across the response write, which is paced by the peer's read
+// speed, the node serves two catchup batches at a time and the rest stall on the
+// semaphore for the 30s acquire deadline.
+func TestGetTransactionsReleasesSubtreePermitBeforeResponseWrite(t *testing.T) {
+	initPrometheusMetrics()
+
+	subtreeHash := testSubtree.RootHash()
+
+	body := make([]byte, 0, chainhash.HashSize)
+	body = append(body, testTX1Hash.CloneBytes()...)
+
+	httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, bytes.NewReader(body))
+
+	released := make(chan struct{})
+	probe := &permitWriteProbe{ResponseWriter: responseRecorder, released: released}
+	echoContext.Response().Writer = probe
+
+	txMap := map[chainhash.Hash]*bt.Tx{*testTX1Hash: testTx1}
+
+	mockRepo.On("GetSubtreeExists", mock.Anything, mock.Anything).Return(true, nil).Once()
+	// The repository contract guarantees release is sync.Once-guarded, so mirror
+	// that here: the handler legitimately calls it once eagerly and once via defer.
+	var releaseOnce sync.Once
+
+	mockRepo.On("GetSubtreeTransactions", mock.Anything, mock.Anything).
+		Return(txMap, func() { releaseOnce.Do(func() { close(released) }) }, nil).Once()
+
+	echoContext.SetPath("/subtree/:hash/txs")
+	echoContext.SetParamNames("hash")
+	echoContext.SetParamValues(subtreeHash.String())
+
+	require.NoError(t, httpServer.GetTransactions()(echoContext))
+
+	require.True(t, probe.observedAnyWrite.Load(), "expected the handler to write a response body")
+	require.True(t, probe.releasedAtWrite.Load(),
+		"subtree map permit must be released once the fan-out is done, not held across the client-paced response write")
 }
