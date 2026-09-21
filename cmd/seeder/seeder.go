@@ -991,7 +991,7 @@ func checkSkipUTXOImport(ctx context.Context, blockStore blob.Store, blockchainS
 	}
 
 	if !stateExists {
-		return false, errors.NewProcessingError("lastProcessed.dat exists but no BlockAssembler checkpoint was found in the blockchain store — a previous run likely imported the UTXO set but failed before the checkpoint was written; re-run with -force to recover the checkpoint from the existing UTXO import (no UTXO re-import is needed)")
+		return false, errors.NewProcessingError("lastProcessed.dat exists but no BlockAssembler checkpoint was found in the blockchain store — a previous run likely imported the UTXO set but failed before the checkpoint was written; re-run with -force to recover the checkpoint from the existing UTXO import (no UTXO re-import is needed). If that run failed on a truncated headers file, -force alone hits the same header check again: replace the headers file with a complete one first")
 	}
 
 	return true, nil
