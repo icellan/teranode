@@ -94,9 +94,9 @@ func NewAuthHandler(logger ulogger.Logger, settings *settings.Settings) *AuthHan
 
 		logger.Debugf("Auth initialized")
 	} else if settings.Asset.RequireAuthCredentials {
-		logger.Warnf("rpc_user/rpc_pass are not both set: admin routes will reject every request (asset_requireAuthCredentials=true)")
+		logger.Warnf("rpc_user/rpc_pass are not both set: admin routes (FSM state, block invalidate/revalidate, settings) will reject every request until they are configured")
 	} else {
-		logger.Warnf("SECURITY: rpc_user/rpc_pass are not both set, so admin routes (FSM state, block invalidate/revalidate, settings) accept unauthenticated requests - set rpc_user and rpc_pass, or set asset_requireAuthCredentials=true to reject them instead")
+		logger.Warnf("SECURITY: asset_requireAuthCredentials is false and rpc_user/rpc_pass are not both set, so admin routes (FSM state, block invalidate/revalidate, settings) accept unauthenticated requests - set rpc_user and rpc_pass")
 	}
 
 	return &AuthHandler{
@@ -112,11 +112,11 @@ func (h *AuthHandler) CheckAuth(r *http.Request) bool {
 	// keep the historic fail-open behaviour (the startup warning names the risk).
 	if h.settings.RPC.RPCUser == "" || h.settings.RPC.RPCPass == "" {
 		if h.settings.Asset.RequireAuthCredentials {
-			h.logger.Warnf("Rejecting request: rpc_user/rpc_pass are not both set and asset_requireAuthCredentials is enabled")
+			h.logger.Warnf("Rejecting admin request: rpc_user/rpc_pass are not both set")
 			return false
 		}
 
-		h.logger.Infof("No auth configured, allowing request")
+		h.logger.Warnf("SECURITY: allowing an unauthenticated admin request because rpc_user/rpc_pass are unset and asset_requireAuthCredentials is false")
 
 		return true
 	}
