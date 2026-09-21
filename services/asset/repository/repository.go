@@ -105,6 +105,7 @@ type Repository struct {
 	semGetSubtreeHead         *semaphore.Weighted
 	semGetUtxo                *semaphore.Weighted
 	semGetLegacyBlockReader   *semaphore.Weighted
+	semSubtreeStream          *semaphore.Weighted
 }
 
 // NewRepository creates a new Repository instance with the provided dependencies.
@@ -166,6 +167,7 @@ func NewRepository(logger ulogger.Logger, tSettings *settings.Settings, utxoStor
 	repo.semGetSubtreeHead = initSemaphore(tSettings.Asset.ConcurrencyGetSubtreeHead, "GetSubtreeHead")
 	repo.semGetUtxo = initSemaphore(tSettings.Asset.ConcurrencyGetUtxo, "GetUtxo")
 	repo.semGetLegacyBlockReader = initSemaphore(tSettings.Asset.ConcurrencyGetLegacyBlockReader, "GetLegacyBlockReader")
+	repo.semSubtreeStream = initSemaphore(tSettings.Asset.SubtreeStreamConcurrency, "SubtreeStream")
 
 	return repo, nil
 }
