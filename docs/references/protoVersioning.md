@@ -80,7 +80,7 @@ package blockchain_api;
      See how `validator_txmeta_wireFormat` lets two Kafka tx-meta batch formats
      (`v1`/`v2`) coexist on the same topic during a rollout
      ([kafkaMessageFormat.md](kafkaMessageFormat.md)), and how the P2P/legacy
-     admin gRPC auth gate (`adminProtectedMethods()` in
+     admin gRPC auth gate (`authProtectedMethods()` in
      `services/p2p/Server.go`, the `protectedMethods` map in
      `services/legacy/Server.go`) was rolled out method-by-method rather than
      as an atomic cutover -- the same "old and new must coexist mid-rollout"
@@ -88,7 +88,7 @@ package blockchain_api;
 
 2. Sweep for hardcoded fully-qualified names that a package rename or addition
    doesn't update automatically:
-   - The admin-auth allowlists -- `adminProtectedMethods()` in
+   - The admin-auth allowlists -- `authProtectedMethods()` in
      `services/p2p/Server.go` and the `protectedMethods` map in
      `services/legacy/Server.go` -- key on literal method path strings
      (`"/p2p_api.PeerService/BanPeer"`). `util/grpc_helper.go`'s
