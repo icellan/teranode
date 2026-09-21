@@ -200,6 +200,56 @@ func TestGetNBlocks(t *testing.T) {
 		}
 	})
 
+	t.Run("Asset.MaxNBlocks tightens the cap below 1000", func(t *testing.T) {
+		httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
+		httpServer.settings.Asset.MaxNBlocks = 10
+
+		mockRepo.On("GetBlocks", mock.Anything, uint32(10)).Return(blocks, nil)
+
+		echoContext.SetPath("/blocks/n/:hash")
+		echoContext.SetParamNames("hash")
+		echoContext.SetParamValues("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+		echoContext.QueryParams().Set("n", "500")
+
+		err := httpServer.GetNBlocks(JSON)(echoContext)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusOK, responseRecorder.Code)
+
+		mockRepo.AssertExpectations(t)
+	})
+
+	t.Run("Asset.MaxNBlocks default of 0 preserves the 1000 catchup ceiling", func(t *testing.T) {
+		httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
+
+		mockRepo.On("GetBlocks", mock.Anything, uint32(1000)).Return(blocks, nil)
+
+		echoContext.SetPath("/blocks/n/:hash")
+		echoContext.SetParamNames("hash")
+		echoContext.SetParamValues("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+		echoContext.QueryParams().Set("n", "5000")
+
+		err := httpServer.GetNBlocks(JSON)(echoContext)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusOK, responseRecorder.Code)
+
+		mockRepo.AssertExpectations(t)
+	})
+
+	t.Run("Negative number of blocks is rejected before preallocation", func(t *testing.T) {
+		httpServer, _, echoContext, _ := GetMockHTTP(t, nil)
+
+		echoContext.SetPath("/blocks/n/:hash")
+		echoContext.SetParamNames("hash")
+		echoContext.SetParamValues("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+		echoContext.QueryParams().Set("n", "-1")
+
+		err := httpServer.GetNBlocks(JSON)(echoContext)
+		echoErr := &echo.HTTPError{}
+		require.True(t, errors.As(err, &echoErr))
+
+		assert.Equal(t, http.StatusBadRequest, echoErr.Code)
+	})
+
 	t.Run("Invalid hash", func(t *testing.T) {
 		httpServer, _, echoContext, _ := GetMockHTTP(t, nil)
 

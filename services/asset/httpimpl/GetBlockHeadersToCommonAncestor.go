@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	safeconversion "github.com/bsv-blockchain/go-safe-conversion"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/util/tracing"
@@ -142,7 +143,12 @@ func (h *HTTP) GetBlockHeadersToCommonAncestor(mode ReadMode) func(c echo.Contex
 			headerMetas []*model.BlockHeaderMeta
 		)
 
-		headers, headerMetas, err = h.repository.GetBlockHeadersToCommonAncestor(ctx, hash, hashes, uint32(numberOfHeaders)) // nolint:gosec
+		numberOfHeadersUint32, err := safeconversion.IntToUint32(numberOfHeaders)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("invalid number of headers", err).Error())
+		}
+
+		headers, headerMetas, err = h.repository.GetBlockHeadersToCommonAncestor(ctx, hash, hashes, numberOfHeadersUint32)
 		if err != nil {
 			if errors.Is(err, errors.ErrNotFound) || strings.Contains(err.Error(), "not found") {
 				return echo.NewHTTPError(http.StatusNotFound, err.Error())
@@ -168,6 +174,10 @@ func (h *HTTP) parseBlockLocatorHashes(hashesStr string) ([]*chainhash.Hash, err
 	}
 
 	numHashes := len(hashesStr) / 64
+	if numHashes > maxBlockLocatorHashes {
+		return nil, errors.NewInvalidArgumentError("too many block locator hashes")
+	}
+
 	hashes := make([]*chainhash.Hash, numHashes)
 
 	for i := 0; i < numHashes; i++ {
@@ -195,12 +205,20 @@ func (h *HTTP) parseNumberOfHeaders(nStr string) (int, error) {
 		return 0, errors.NewInvalidArgumentError("invalid number of headers")
 	}
 
+	if n < 0 {
+		return 0, errors.NewInvalidArgumentError("number of headers must not be negative")
+	}
+
 	if n == 0 {
 		return 100, nil
 	}
 
 	if n > 10_000 {
-		return 10_000, nil
+		n = 10_000
+	}
+
+	if maxHeaders := h.settings.Asset.MaxBlockHeaders; maxHeaders > 0 && n > maxHeaders {
+		n = maxHeaders
 	}
 
 	return n, nil

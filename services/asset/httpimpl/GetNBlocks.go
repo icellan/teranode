@@ -136,6 +136,10 @@ func (h *HTTP) GetNBlocks(mode ReadMode) func(c echo.Context) error {
 			if numberOfBlocks > 1000 {
 				numberOfBlocks = 1000
 			}
+
+			if maxBlocks := h.settings.Asset.MaxNBlocks; maxBlocks > 0 && numberOfBlocks > maxBlocks {
+				numberOfBlocks = maxBlocks
+			}
 		}
 
 		if len(hashStr) != 64 {

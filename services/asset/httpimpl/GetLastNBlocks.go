@@ -114,6 +114,14 @@ func (h *HTTP) GetLastNBlocks(c echo.Context) error {
 		}
 	}
 
+	if n < 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("'n' parameter must not be negative").Error())
+	}
+
+	if maxN := int64(h.settings.Asset.MaxLastNBlocks); maxN > 0 && n > maxN {
+		return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("'n' parameter exceeds maximum allowed value").Error())
+	}
+
 	fromHeight := uint64(0)
 	if queryFromHeight != "" {
 		fromHeight, err = strconv.ParseUint(queryFromHeight, 10, 32)
