@@ -41,7 +41,10 @@ func TestOptimisticMiningDocNoStalePhrases(t *testing.T) {
 	stalePhrases := []string{
 		"before full script validation completes",
 		"Full script validation continues in parallel",
-		"subtree validation runs in background",
+		// Deliberately stops before "background": both "runs in background" and
+		// "runs in the background" have been in the tree, so anchoring on either
+		// one alone would let the other back in.
+		"subtree validation runs in",
 	}
 
 	for _, phrase := range stalePhrases {
