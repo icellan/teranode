@@ -10,6 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -492,4 +495,200 @@ func TestPeerAuthMiddleware_BodyPassesThroughToHandler(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Equal(t, body, received, "handler must still observe the original body after digest check")
+}
+
+// TestPeerAuthMiddleware_ReplayBlockedAcrossHexCase — hex is case-insensitive,
+// so an upper-cased spelling of the same credential headers decodes to the same
+// key and signature and must hit the same replay entry.
+func TestPeerAuthMiddleware_ReplayBlockedAcrossHexCase(t *testing.T) {
+	initPrometheusMetrics()
+
+	privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	peerID, err := peer.IDFromPublicKey(privKey.GetPublic())
+	require.NoError(t, err)
+
+	cache := &peerTierCache{tiers: map[peer.ID]peerTier{peerID: tierMiner}, logger: ulogger.TestLogger{}}
+	e, captured := newAuthEcho(t, cache, allowAll(cache))
+
+	original := httptest.NewRequest(http.MethodGet, "/test", nil)
+	signTestRequest(t, original, privKey)
+
+	rec1 := httptest.NewRecorder()
+	e.ServeHTTP(rec1, original)
+	require.Equal(t, http.StatusOK, rec1.Code)
+	require.Equal(t, tierMiner, *captured)
+
+	// Same credentials, upper-cased hex spelling.
+	replay := httptest.NewRequest(http.MethodGet, "/test", nil)
+	for k, v := range original.Header {
+		replay.Header[k] = v
+	}
+	replay.Header.Set(peerAuthHeaderPubKey, strings.ToUpper(original.Header.Get(peerAuthHeaderPubKey)))
+	replay.Header.Set(peerAuthHeaderSignature, strings.ToUpper(original.Header.Get(peerAuthHeaderSignature)))
+
+	rec2 := httptest.NewRecorder()
+	e.ServeHTTP(rec2, replay)
+	require.Equal(t, http.StatusOK, rec2.Code)
+	require.Equal(t, tierUnverified, *captured, "hex case variant of the same signature must be treated as a replay")
+}
+
+// TestPeerAuthMiddleware_ConcurrentReplayElevatesOnce — the replay claim must be
+// atomic: racing copies of one signed request must yield exactly one elevation.
+// Concurrency is the defect under test, so goroutines here are deliberate.
+func TestPeerAuthMiddleware_ConcurrentReplayElevatesOnce(t *testing.T) {
+	initPrometheusMetrics()
+
+	privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	peerID, err := peer.IDFromPublicKey(privKey.GetPublic())
+	require.NoError(t, err)
+
+	cache := &peerTierCache{tiers: map[peer.ID]peerTier{peerID: tierMiner}, logger: ulogger.TestLogger{}}
+
+	var elevated atomic.Int64
+	e := echo.New()
+	e.Use(newPeerAuthVerifier(ulogger.TestLogger{}, cache, allowAll(cache)).Middleware())
+	e.POST("/test", func(c echo.Context) error {
+		if c.Get("peer_tier").(peerTier) != tierUnverified {
+			elevated.Add(1)
+		}
+		return c.NoContent(http.StatusOK)
+	})
+
+	body := bytes.Repeat([]byte("a"), 64*1024)
+	signed := httptest.NewRequest(http.MethodPost, "/test", bytes.NewReader(body))
+	signTestRequest(t, signed, privKey)
+
+	const copies = 24
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(copies)
+	for i := 0; i < copies; i++ {
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPost, "/test", bytes.NewReader(body))
+			for k, v := range signed.Header {
+				req.Header[k] = v
+			}
+			<-start
+			e.ServeHTTP(httptest.NewRecorder(), req)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	require.Equal(t, int64(1), elevated.Load(), "exactly one racing copy of a signed request may be elevated")
+}
+
+// countingBody records how many bytes the middleware pulled off the request body.
+type countingBody struct {
+	r    io.Reader
+	read atomic.Int64
+}
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	b.read.Add(int64(n))
+	return n, err
+}
+
+func (b *countingBody) Close() error { return nil }
+
+// TestPeerAuthMiddleware_NonAllowlistedBodyNotRead — an attacker-generated key
+// is cheap to mint, so a peer that cannot be elevated must not cost a full body
+// read and SHA-256 before it is rejected.
+func TestPeerAuthMiddleware_NonAllowlistedBodyNotRead(t *testing.T) {
+	initPrometheusMetrics()
+
+	privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	peerID, err := peer.IDFromPublicKey(privKey.GetPublic())
+	require.NoError(t, err)
+
+	// Registry knows the peer, but the operator has not allowlisted it.
+	cache := &peerTierCache{tiers: map[peer.ID]peerTier{peerID: tierMiner}, logger: ulogger.TestLogger{}}
+	e, captured := newAuthEcho(t, cache, nil)
+
+	body := bytes.Repeat([]byte("z"), 256*1024)
+	req := httptest.NewRequest(http.MethodPost, "/test", bytes.NewReader(body))
+	signTestRequest(t, req, privKey)
+
+	counter := &countingBody{r: bytes.NewReader(body)}
+	req.Body = counter
+	req.ContentLength = int64(len(body))
+
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, tierUnverified, *captured)
+	require.Zero(t, counter.read.Load(), "a peer that cannot be elevated must be rejected before the body is read")
+}
+
+// TestPeerAuthMiddleware_BadSignatureBodyNotRead — a signature that does not
+// verify must be rejected before the body is buffered and hashed.
+func TestPeerAuthMiddleware_BadSignatureBodyNotRead(t *testing.T) {
+	initPrometheusMetrics()
+
+	privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	peerID, err := peer.IDFromPublicKey(privKey.GetPublic())
+	require.NoError(t, err)
+
+	cache := &peerTierCache{tiers: map[peer.ID]peerTier{peerID: tierMiner}, logger: ulogger.TestLogger{}}
+	e, captured := newAuthEcho(t, cache, allowAll(cache))
+
+	body := bytes.Repeat([]byte("z"), 256*1024)
+	req := httptest.NewRequest(http.MethodPost, "/test", bytes.NewReader(body))
+	signTestRequest(t, req, privKey)
+	req.Header.Set(peerAuthHeaderSignature, hex.EncodeToString(make([]byte, 64)))
+
+	counter := &countingBody{r: bytes.NewReader(body)}
+	req.Body = counter
+	req.ContentLength = int64(len(body))
+
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, tierUnverified, *captured)
+	require.Zero(t, counter.read.Load(), "an unverifiable signature must be rejected before the body is read")
+}
+
+// TestPeerAuthMiddleware_OversizedSignedBodyRejected — a signed body above
+// maxSignedBodyBytes is refused outright rather than buffered.
+func TestPeerAuthMiddleware_OversizedSignedBodyRejected(t *testing.T) {
+	initPrometheusMetrics()
+
+	privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	peerID, err := peer.IDFromPublicKey(privKey.GetPublic())
+	require.NoError(t, err)
+
+	cache := &peerTierCache{tiers: map[peer.ID]peerTier{peerID: tierMiner}, logger: ulogger.TestLogger{}}
+
+	logger := ulogger.TestLogger{}
+	e := echo.New()
+	handlerCalled := false
+	e.Use(newPeerAuthVerifier(logger, cache, allowAll(cache)).Middleware())
+	e.POST("/test", func(c echo.Context) error {
+		handlerCalled = true
+		return c.NoContent(http.StatusOK)
+	})
+
+	body := bytes.Repeat([]byte("q"), maxSignedBodyBytes+1)
+	req := httptest.NewRequest(http.MethodPost, "/test", bytes.NewReader(body))
+	signTestRequest(t, req, privKey)
+
+	counter := &countingBody{r: bytes.NewReader(body)}
+	req.Body = counter
+	req.ContentLength = int64(len(body))
+
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+	require.False(t, handlerCalled, "oversized signed request must not reach the handler")
+	require.Zero(t, counter.read.Load(), "oversized signed body must be rejected on the declared length, not buffered")
 }
