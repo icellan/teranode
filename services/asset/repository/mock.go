@@ -294,15 +294,15 @@ func (m *Mock) GetSubtreeData(ctx context.Context, hash *chainhash.Hash) (*subtr
 	return args.Get(0).(*subtree.Data), args.Error(1)
 }
 
-func (m *Mock) GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, error) {
+func (m *Mock) GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, func(), error) {
 	args := m.Called(ctx, hash)
 
 	if args.Error(1) != nil {
-		return nil, args.Error(1)
+		return nil, func() {}, args.Error(1)
 	}
 
 	// return the mocked response
-	return args.Get(0).(map[chainhash.Hash]*bt.Tx), args.Error(1)
+	return args.Get(0).(map[chainhash.Hash]*bt.Tx), func() {}, args.Error(1)
 }
 
 func (m *Mock) GetSubtreeExists(_ context.Context, hash *chainhash.Hash) (bool, error) {

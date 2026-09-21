@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -61,7 +62,7 @@ type Interface interface {
 	GetSubtree(ctx context.Context, hash *chainhash.Hash) (*subtree.Subtree, error)
 	GetSubtreePage(ctx context.Context, hash *chainhash.Hash, offset, limit int) (*subtree.Subtree, int, int, error)
 	GetSubtreeData(ctx context.Context, hash *chainhash.Hash) (*subtree.Data, error)
-	GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, error)
+	GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, func(), error)
 	GetSubtreeExists(ctx context.Context, hash *chainhash.Hash) (bool, error)
 	GetSubtreeHead(ctx context.Context, hash *chainhash.Hash) (*subtree.Subtree, int, error)
 	FindBlocksContainingSubtree(ctx context.Context, subtreeHash *chainhash.Hash) ([]uint32, []uint32, []int, error)
@@ -860,11 +861,28 @@ func (repo *Repository) getSubtreeDataInternal(ctx context.Context, hash *chainh
 	return subtreeData, nil
 }
 
-func (repo *Repository) GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, error) {
+// GetSubtreeTransactions returns every transaction in the subtree, keyed by txid,
+// together with a release function the caller MUST call once it is done with the
+// map (the returned function is never nil, including on the error paths).
+//
+// The concurrency permit from asset_concurrency_get_subtree_transactions is held
+// until release is called rather than until this function returns. What the
+// permit budgets is the map — a subtree can hold millions of transactions and the
+// caller keeps it alive for the whole request — not the few milliseconds spent
+// building it. Releasing on return let an unbounded number of complete maps
+// coexist.
+func (repo *Repository) GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, func(), error) {
 	if err := acquireSemaphorePermit(ctx, repo.semGetSubtreeTransactions, "GetSubtreeTransactions"); err != nil {
-		return nil, err
+		return nil, func() {}, err
 	}
-	defer releaseSemaphorePermit(repo.semGetSubtreeTransactions)
+
+	var releaseOnce sync.Once
+
+	release := func() {
+		releaseOnce.Do(func() {
+			releaseSemaphorePermit(repo.semGetSubtreeTransactions)
+		})
+	}
 
 	ctx, _, _ = tracing.Tracer("repository").Start(ctx, "GetSubtreeTransactions",
 		tracing.WithDebugLogMessage(repo.logger, "[Repository] GetSubtreeTransactions: %s", hash.String()),
@@ -874,12 +892,16 @@ func (repo *Repository) GetSubtreeTransactions(ctx context.Context, hash *chainh
 	subtreeData, err := repo.getSubtreeDataInternal(ctx, hash)
 	if err != nil {
 		// always return an empty map if no transactions are found
-		return make(map[chainhash.Hash]*bt.Tx), err
+		release()
+
+		return make(map[chainhash.Hash]*bt.Tx), func() {}, err
 	}
 
 	if subtreeData == nil || len(subtreeData.Txs) == 0 {
 		// always return an empty map if no transactions are found
-		return make(map[chainhash.Hash]*bt.Tx), errors.ErrNotFound
+		release()
+
+		return make(map[chainhash.Hash]*bt.Tx), func() {}, errors.ErrNotFound
 	}
 
 	transactionMap := make(map[chainhash.Hash]*bt.Tx, len(subtreeData.Txs))
@@ -892,7 +914,7 @@ func (repo *Repository) GetSubtreeTransactions(ctx context.Context, hash *chainh
 		transactionMap[*tx.TxIDChainHash()] = tx
 	}
 
-	return transactionMap, nil
+	return transactionMap, release, nil
 }
 
 // GetSubtreeExists checks whether a subtree exists in the subtree store.
