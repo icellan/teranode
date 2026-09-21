@@ -166,9 +166,10 @@ type peerAuthVerifier struct {
 	replayCache *ttlcache.Cache[string, struct{}]
 
 	// allowlist is the set of peer IDs eligible for tierPeer/tierMiner. An
-	// empty allowlist means **no peer is eligible** — every authenticated
-	// peer is treated as tierUnverified for rate-limit purposes. Operators
-	// opt in by setting asset_peerAuthAllowlist.
+	// empty allowlist means no peer is eligible: a signed request is rejected
+	// at the membership check, before the replay claim, the signature
+	// verification and the body digest, and stays at tierUnverified.
+	// Operators opt in by setting asset_peerAuthAllowlist.
 	allowlist map[peer.ID]struct{}
 }
 
