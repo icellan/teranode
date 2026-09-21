@@ -59,15 +59,17 @@ func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhas
 
 	r, w := io.Pipe()
 
-	// Release semaphore after initial setup is complete but before streaming begins.
-	// The semaphore protects the database query (GetBlockByHash) and pipe creation,
-	// but streaming is I/O-bound and doesn't need CPU-based concurrency limiting.
-	// File operations have their own semaphore protection (readSemaphore with 768 slots).
-	// This allows unlimited concurrent streams while protecting database/initialization.
-	releaseSemaphorePermit(repo.semGetLegacyBlockReader)
-
 	g, gCtx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) {
+		// Hold the permit for the whole producer, not just for setup. The expensive
+		// part of a legacy block read happens here, after this function has returned:
+		// subtree reads, UTXO reconstruction, serialization and pipe writes, all paced
+		// by the client reading the other end. A blocked producer keeps an arena and,
+		// on the stored-subtree branch, one of the file store's global read permits.
+		// Releasing at setup left the configured concurrency bounding nothing. This
+		// defer is registered first so it runs last, after the pipe has been closed.
+		defer releaseSemaphorePermit(repo.semGetLegacyBlockReader)
+
 		// This goroutine outlives the request: the caller gets the pipe reader back
 		// and reads from it after GetLegacyBlockReader has returned, so nothing in
 		// the HTTP layer can recover a panic in here. Fail the pipe on panic too,
@@ -632,6 +634,20 @@ func (repo *Repository) getTxs(ctx context.Context, txHashes []chainhash.Hash, t
 			default:
 				for _, data := range missingTxHashesCompacted {
 					if data.Data == nil || data.Err != nil {
+						missed.Add(1)
+						continue
+					}
+
+					// A record reconstructed from a UTXO-set snapshot is non-nil and
+					// carries no per-item error, so the miss counter above never sees
+					// it — but it has no inputs and may have nil output holes, so it
+					// either panics in WriteTo or serializes into a short transaction
+					// that does not hash to the requested txid. Either way it must not
+					// reach the writer: the subtree-data path finalises whatever it
+					// streams, and a bad blob is sticky until DAH pruning. Same gate as
+					// the single-transaction boundary (isRequestedTransaction) and as
+					// blockpersister.CreateSubtreeDataFileStreaming.
+					if !isRequestedTransaction(data.Data, &data.Hash) {
 						missed.Add(1)
 						continue
 					}
