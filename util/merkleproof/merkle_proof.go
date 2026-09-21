@@ -93,6 +93,35 @@ type MerkleProofConstructor interface {
 	IsBlockOnMainChain(blockID, blockHeight uint32) (bool, error)
 }
 
+// BlockRoots holds the block-level values a merkle proof needs that can only be derived from the
+// block's first and final subtrees:
+//
+//   - FirstRoot: the root of subtree 0 with the coinbase placeholder replaced by the real coinbase
+//     txid, or nil when subtree 0 carries no placeholder.
+//   - LastRoot: the lifted (padded) root of an incomplete final subtree, or nil when the final
+//     subtree is complete.
+//   - TargetHeight: the first subtree's height, which the lift is computed against.
+//
+// All three are a pure function of the block: a block's subtree list is fixed by its header and
+// subtrees are content-addressed, so an entry never needs invalidating.
+type BlockRoots struct {
+	FirstRoot    *chainhash.Hash
+	LastRoot     *chainhash.Hash
+	TargetHeight int
+}
+
+// BlockRootsCache is an optional extension of MerkleProofConstructor. When the repository passed to
+// ConstructMerkleProof also implements it, the block-level roots are memoized per block, so repeat
+// proof requests against the same block deserialize only the transaction's own subtree instead of
+// up to three complete subtrees. Implementations must be safe for concurrent use.
+type BlockRootsCache interface {
+	// BlockRoots returns the memoized roots for the given block, and whether an entry was present.
+	BlockRoots(blockHash *chainhash.Hash) (*BlockRoots, bool)
+
+	// SetBlockRoots memoizes the roots for the given block.
+	SetBlockRoots(blockHash *chainhash.Hash, roots *BlockRoots)
+}
+
 // ConstructMerkleProof constructs a complete merkle proof for a given transaction.
 // It builds the proof path from the transaction through its subtree to the block's merkle root.
 //
@@ -189,10 +218,6 @@ func ConstructMerkleProof(txID *chainhash.Hash, repo MerkleProofConstructor) (*M
 		coinbaseHash = block.CoinbaseTx.TxIDChainHash()
 	}
 
-	firstHasPlaceholder := func(st *subtree.Subtree) bool {
-		return st != nil && len(st.Nodes) > 0 && st.Nodes[0].Hash.Equal(subtree.CoinbasePlaceholderHashValue)
-	}
-
 	// Find the transaction index within the subtree
 	txIndexInSubtree := -1
 	for i, node := range subtreeData.Nodes {
@@ -205,7 +230,7 @@ func ConstructMerkleProof(txID *chainhash.Hash, repo MerkleProofConstructor) (*M
 	// The coinbase transaction itself is stored as the placeholder in the first subtree, so a direct
 	// hash lookup fails. Treat a request for the coinbase txid as index 0 of the first subtree.
 	if txIndexInSubtree == -1 && subtreeIdx == 0 && coinbaseHash != nil &&
-		txID.IsEqual(coinbaseHash) && firstHasPlaceholder(subtreeData) {
+		txID.IsEqual(coinbaseHash) && hasCoinbasePlaceholder(subtreeData) {
 		txIndexInSubtree = 0
 	}
 
@@ -213,57 +238,28 @@ func ConstructMerkleProof(txID *chainhash.Hash, repo MerkleProofConstructor) (*M
 		return nil, terr.NewProcessingError("transaction not found in subtree")
 	}
 
-	// Load the first subtree (it is needed both for the coinbase-replaced root and, when the final
-	// subtree is incomplete, for the target height used to lift it).
-	var firstSubtree *subtree.Subtree
-	if subtreeIdx == 0 {
-		firstSubtree = subtreeData
-	} else if len(block.Subtrees) > 0 {
-		firstSubtree, err = repo.GetSubtree(block.Subtrees[0])
-		if err != nil {
-			return nil, terr.NewProcessingError("failed to get first subtree data", err)
-		}
-	}
-
-	// Compute the coinbase-replaced root of the first subtree, when it carries a placeholder.
-	var firstRoot *chainhash.Hash
-	if coinbaseHash != nil && firstHasPlaceholder(firstSubtree) {
-		firstRoot, err = firstSubtree.RootHashWithReplaceRootNode(coinbaseHash, 0, uint64(block.CoinbaseTx.Size())) //nolint:gosec
-		if err != nil {
-			return nil, terr.NewProcessingError("failed to replace coinbase placeholder in first subtree", err)
-		}
-	}
-
-	// Compute the lifted (padded) root of the final subtree when it is incomplete, mirroring
-	// model.Block.CheckMerkleRoot, so it occupies the slot of a full-capacity subtree in the top tree.
+	// The block-level roots (coinbase-replaced first root, lifted final root and the height the
+	// lift is measured against) are a pure function of the block, but deriving them costs up to two
+	// extra complete-subtree deserializations on top of the transaction's own subtree. When the
+	// repository offers a cache, reuse them across requests for the same block.
 	lastIdx := len(block.Subtrees) - 1
+	blockHash := block.Hash()
 
-	var (
-		lastRoot     *chainhash.Hash
-		targetHeight int
-	)
+	rootsCache, _ := repo.(BlockRootsCache)
 
-	if lastIdx > 0 && firstSubtree != nil {
-		targetLength := firstSubtree.Length()
-		targetHeight = firstSubtree.Height
-
-		var lastSubtree *subtree.Subtree
-		if subtreeIdx == lastIdx {
-			lastSubtree = subtreeData
-		} else {
-			lastSubtree, err = repo.GetSubtree(block.Subtrees[lastIdx])
-			if err != nil {
-				return nil, terr.NewProcessingError("failed to get final subtree data", err)
-			}
+	roots, cached := blockRootsFromCache(rootsCache, blockHash)
+	if !cached {
+		roots, err = deriveBlockRoots(repo, block, subtreeData, subtreeIdx, lastIdx, coinbaseHash)
+		if err != nil {
+			return nil, err
 		}
 
-		if lastSubtree.Length() < targetLength {
-			lastRoot, err = lastSubtree.RootHashPadded(targetHeight)
-			if err != nil {
-				return nil, terr.NewProcessingError("failed to pad final subtree", err)
-			}
+		if rootsCache != nil {
+			rootsCache.SetBlockRoots(blockHash, roots)
 		}
 	}
+
+	firstRoot, lastRoot, targetHeight := roots.FirstRoot, roots.LastRoot, roots.TargetHeight
 
 	// Build the effective subtree-root leaves for the block-level (top) merkle tree: the placeholder
 	// root of the first subtree is replaced with the coinbase-replaced root, and an incomplete final
@@ -304,8 +300,7 @@ func ConstructMerkleProof(txID *chainhash.Hash, repo MerkleProofConstructor) (*M
 		return nil, terr.NewProcessingError("failed to generate block merkle proof", err)
 	}
 
-	// Get block hash and header
-	blockHash := block.Hash()
+	// Get the block header
 	blockHeader, err := repo.GetBlockHeader(blockHash)
 	if err != nil {
 		return nil, terr.NewProcessingError("failed to get block header", err)
@@ -378,6 +373,96 @@ func ConstructMerkleProof(txID *chainhash.Hash, repo MerkleProofConstructor) (*M
 	}
 
 	return proof, nil
+}
+
+// hasCoinbasePlaceholder reports whether a subtree stores the coinbase placeholder at index 0, as
+// the first subtree of a block does.
+func hasCoinbasePlaceholder(st *subtree.Subtree) bool {
+	return st != nil && len(st.Nodes) > 0 && st.Nodes[0].Hash.Equal(subtree.CoinbasePlaceholderHashValue)
+}
+
+// blockRootsFromCache reads the memoized block roots, tolerating a nil cache and a nil entry.
+func blockRootsFromCache(cache BlockRootsCache, blockHash *chainhash.Hash) (*BlockRoots, bool) {
+	if cache == nil {
+		return nil, false
+	}
+
+	roots, ok := cache.BlockRoots(blockHash)
+	if !ok || roots == nil {
+		return nil, false
+	}
+
+	return roots, true
+}
+
+// deriveBlockRoots computes the block-level root overrides the top-level merkle tree needs:
+//
+//   - the first subtree's root with the coinbase placeholder replaced by the real coinbase txid
+//     (the block header's merkle root is computed that way, see model.Block.CheckMerkleRoot);
+//   - the final subtree's lifted root when it is incomplete, so it occupies the slot of a
+//     full-capacity subtree.
+//
+// It loads at most the block's first and final subtrees, reusing subtreeData when the transaction's
+// own subtree is one of them.
+func deriveBlockRoots(repo MerkleProofConstructor, block *model.Block, subtreeData *subtree.Subtree,
+	subtreeIdx, lastIdx int, coinbaseHash *chainhash.Hash) (*BlockRoots, error) {
+	firstRoot, targetLength, targetHeight, err := deriveFirstSubtreeRoot(repo, block, subtreeData, subtreeIdx, lastIdx, coinbaseHash)
+	if err != nil {
+		return nil, err
+	}
+
+	roots := &BlockRoots{FirstRoot: firstRoot, TargetHeight: targetHeight}
+
+	// targetLength is zero for a single-subtree block: there is no final subtree to lift.
+	if targetLength == 0 {
+		return roots, nil
+	}
+
+	lastSubtree := subtreeData
+	if subtreeIdx != lastIdx {
+		lastSubtree, err = repo.GetSubtree(block.Subtrees[lastIdx])
+		if err != nil {
+			return nil, terr.NewProcessingError("failed to get final subtree data", err)
+		}
+	}
+
+	if lastSubtree.Length() < targetLength {
+		roots.LastRoot, err = lastSubtree.RootHashPadded(targetHeight)
+		if err != nil {
+			return nil, terr.NewProcessingError("failed to pad final subtree", err)
+		}
+	}
+
+	return roots, nil
+}
+
+// deriveFirstSubtreeRoot loads the block's first subtree and returns only the values derived from
+// it. Keeping the load inside its own frame means the first subtree becomes unreachable before the
+// final subtree is materialized, so a single proof request never holds three complete subtrees at
+// once. targetLength is zero when the block has no final subtree to lift.
+func deriveFirstSubtreeRoot(repo MerkleProofConstructor, block *model.Block, subtreeData *subtree.Subtree,
+	subtreeIdx, lastIdx int, coinbaseHash *chainhash.Hash) (firstRoot *chainhash.Hash, targetLength, targetHeight int, err error) {
+	firstSubtree := subtreeData
+	if subtreeIdx != 0 {
+		firstSubtree, err = repo.GetSubtree(block.Subtrees[0])
+		if err != nil {
+			return nil, 0, 0, terr.NewProcessingError("failed to get first subtree data", err)
+		}
+	}
+
+	if coinbaseHash != nil && hasCoinbasePlaceholder(firstSubtree) {
+		firstRoot, err = firstSubtree.RootHashWithReplaceRootNode(coinbaseHash, 0, uint64(block.CoinbaseTx.Size())) //nolint:gosec
+		if err != nil {
+			return nil, 0, 0, terr.NewProcessingError("failed to replace coinbase placeholder in first subtree", err)
+		}
+	}
+
+	if lastIdx > 0 && firstSubtree != nil {
+		targetLength = firstSubtree.Length()
+		targetHeight = firstSubtree.Height
+	}
+
+	return firstRoot, targetLength, targetHeight, nil
 }
 
 // VerifyMerkleProof verifies a merkle proof and returns whether it's valid.
