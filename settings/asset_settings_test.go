@@ -116,7 +116,6 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 		require.False(t, s.Asset.EnforcePostAuth)
 		require.Equal(t, 0, s.Asset.MaxWebsocketConnections)
 		require.Equal(t, int64(0), s.Asset.WebsocketReadLimit)
-		require.Equal(t, int64(0), s.Asset.PeerAuthMaxBodyBytes)
 		require.Equal(t, 0, s.Asset.SubtreeStreamConcurrency)
 		require.True(t, s.Asset.PublicErrorDetail)
 		require.True(t, s.Asset.PublicHealthDetail)
@@ -169,9 +168,6 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 		}},
 		{"asset_websocketReadLimit", "1048576", func(t *testing.T, s *Settings) {
 			require.Equal(t, int64(1048576), s.Asset.WebsocketReadLimit)
-		}},
-		{"asset_peerAuthMaxBodyBytes", "2097152", func(t *testing.T, s *Settings) {
-			require.Equal(t, int64(2097152), s.Asset.PeerAuthMaxBodyBytes)
 		}},
 		{"asset_subtreeStreamConcurrency", "8", func(t *testing.T, s *Settings) {
 			require.Equal(t, 8, s.Asset.SubtreeStreamConcurrency)

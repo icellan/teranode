@@ -254,7 +254,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			EnforcePostAuth:          getBool("asset_enforcePostAuth", false, alternativeContext...),
 			MaxWebsocketConnections:  getInt("asset_maxWebsocketConnections", 0, alternativeContext...),
 			WebsocketReadLimit:       getInt64("asset_websocketReadLimit", 0, alternativeContext...),
-			PeerAuthMaxBodyBytes:     getInt64("asset_peerAuthMaxBodyBytes", 0, alternativeContext...),
 			SubtreeStreamConcurrency: getInt("asset_subtreeStreamConcurrency", 0, alternativeContext...),
 			PublicErrorDetail:        getBool("asset_publicErrorDetail", true, alternativeContext...),
 			PublicHealthDetail:       getBool("asset_publicHealthDetail", true, alternativeContext...),
