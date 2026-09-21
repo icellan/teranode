@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"time"
 
 	aero "github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -21,6 +22,31 @@ type aerospikeRecord struct {
 	Node       string                 `json:"node"`
 	Bins       map[string]interface{} `json:"bins"`
 	Generation uint32                 `json:"generation"`
+}
+
+// newAerospikeRecord builds the JSON view of a store record.
+//
+// Node is nil whenever the client did not attribute the record to a cluster
+// node (a cached or client-side-constructed record), and dereferencing it here
+// panicked on an unauthenticated route.
+func newAerospikeRecord(response *aero.Record) aerospikeRecord {
+	record := aerospikeRecord{
+		Bins:       response.Bins,
+		Generation: response.Generation,
+	}
+
+	if response.Key != nil {
+		record.Key = response.Key.String()
+		record.Digest = hex.EncodeToString(response.Key.Digest())
+		record.Namespace = response.Key.Namespace()
+		record.SetName = response.Key.SetName()
+	}
+
+	if response.Node != nil {
+		record.Node = response.Node.GetName()
+	}
+
+	return record
 }
 
 // GetTxMetaByTxID creates an HTTP handler for retrieving transaction metadata directly
@@ -87,13 +113,13 @@ type aerospikeRecord struct {
 // Example Usage:
 //
 //	# Get metadata in JSON format
-//	GET /tx/meta/<txid>
+//	GET /txmeta_raw/<txid>/json
 //
 //	# Get metadata in hex format
-//	GET /tx/meta/<txid>/hex
+//	GET /txmeta_raw/<txid>/hex
 //
 //	# Get metadata in binary format
-//	GET /tx/meta/<txid>/raw
+//	GET /txmeta_raw/<txid>
 //
 // Notes:
 //   - Requires Aerospike database connection
@@ -101,11 +127,17 @@ type aerospikeRecord struct {
 //   - Direct access to underlying storage system
 func (h *HTTP) GetTxMetaByTxID(mode ReadMode) func(c echo.Context) error {
 	return func(c echo.Context) error {
-		_, _, deferFn := tracing.Tracer("asset").Start(c.Request().Context(), "GetTxMetaByTxID_http",
+		ctx, _, deferFn := tracing.Tracer("asset").Start(c.Request().Context(), "GetTxMetaByTxID_http",
 			tracing.WithParentStat(AssetStat),
 		)
 
 		defer deferFn()
+
+		// This route serves the raw store record. An operator who does not need
+		// it can take it off the public surface without a redeploy.
+		if !h.settings.Asset.TxMetaRawEnabled {
+			return echo.NewHTTPError(http.StatusNotFound, "txmeta_raw is disabled")
+		}
 
 		// get
 		storeURL := h.settings.UtxoStore.UtxoStore
@@ -146,7 +178,19 @@ func (h *HTTP) GetTxMetaByTxID(mode ReadMode) func(c echo.Context) error {
 			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 		}
 
-		response, err := client.Get(nil, key)
+		// A typed-nil policy leaves TotalTimeout at zero, which sends the shared
+		// Aerospike semaphore acquire down its uncancelable blocking-send path:
+		// a public caller then waits forever for a permit while internal
+		// callers, which do pass a timeout, fail. Always pass a real policy,
+		// bounded by the request deadline when the caller supplied one.
+		policy := aero.NewPolicy()
+		if deadline, ok := ctx.Deadline(); ok {
+			if remaining := time.Until(deadline); remaining > 0 {
+				policy.TotalTimeout = remaining
+			}
+		}
+
+		response, err := client.Get(policy, key)
 		if err != nil {
 			h.logger.Errorf("[Asset_http] GetUTXOsByTXID error getting transaction meta data: %s", err.Error())
 
@@ -160,15 +204,7 @@ func (h *HTTP) GetTxMetaByTxID(mode ReadMode) func(c echo.Context) error {
 			if tx, ok := response.Bins["tx"].([]byte); ok {
 				response.Bins["tx"] = hex.EncodeToString(tx)
 			}
-			record := aerospikeRecord{
-				Key:        response.Key.String(),
-				Digest:     hex.EncodeToString(response.Key.Digest()),
-				Namespace:  response.Key.Namespace(),
-				SetName:    response.Key.SetName(),
-				Node:       response.Node.GetName(),
-				Bins:       response.Bins,
-				Generation: response.Generation,
-			}
+			record := newAerospikeRecord(response)
 
 			b, err := json.MarshalIndent(record, "", "  ")
 			if err != nil {
