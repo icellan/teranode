@@ -367,3 +367,21 @@ func TestGetNBlocks(t *testing.T) {
 		assert.Equal(t, "INVALID_ARGUMENT (1): bad read mode", echoErr.Message)
 	})
 }
+
+// TestConcatBlockBytesAllocatesExactly guards against a speculative preallocation
+// sized from the block count rather than the serialized length. Reserving a fixed
+// 32KB per block let a 1000-block request reserve ~32MB before a single byte was
+// serialized, which an unauthenticated caller could trigger at will.
+func TestConcatBlockBytesAllocatesExactly(t *testing.T) {
+	blocks := []*model.Block{testBlock, testBlock, testBlock}
+
+	concatenated, err := concatBlockBytes(blocks)
+	require.NoError(t, err)
+
+	expected, err := testBlock.Bytes()
+	require.NoError(t, err)
+	require.Len(t, concatenated, len(expected)*len(blocks))
+
+	require.Equal(t, len(concatenated), cap(concatenated),
+		"capacity must match the serialized length, not a per-block reservation")
+}
