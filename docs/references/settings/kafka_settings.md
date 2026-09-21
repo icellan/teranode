@@ -228,6 +228,7 @@ This constraint is validated during consumer creation for both URL-based and dir
 ### Subtree Validation Service
 
 - **Consumer**: `SubtreesConfig` - consumes subtrees for validation
+- **Consumer**: `TxMetaConfig` - consumes transaction metadata (consumer group gets the random 16-character suffix described above)
 - **Producer**: `InvalidSubtreesConfig` - publishes invalid subtrees (optional)
 
 ### Validator Service
