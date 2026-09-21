@@ -12,22 +12,23 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/kafka"
-	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/protobuf/proto"
 )
 
-// TestValidate_MissingParentTransactionAnnounced proves the observability half
-// of the Kafka trust-boundary fix: a transaction whose parent UTXO has not yet
-// been seen must still be announced on the rejected-tx topic, distinguishing
-// "missing parent" from a genuinely invalid tx. Before this fix,
-// ErrTxMissingParent fell through the `errors.Is(err, errors.ErrTxInvalid)`
-// guard untouched, so this silently dropped tx never reached the topic at
-// all.
-func TestValidate_MissingParentTransactionAnnounced(t *testing.T) {
+// TestValidate_MissingParentTransactionNotAnnounced pins that a transaction
+// whose parent has not yet been seen is NOT published to the rejected-tx
+// topic. An internal rejection carries an empty peer_id, and the p2p
+// rejectedTxHandler re-broadcasts exactly those to the whole network, so
+// announcing here would gossip "rejected" for a transaction that is valid and
+// will succeed once its parent lands - at a rate proportional to the
+// out-of-order delivery this Kafka topic produces by design.
+//
+// The drop stays observable through prometheusMissingParentTransactions,
+// incremented on the Kafka intake path in Server.go.
+func TestValidate_MissingParentTransactionNotAnnounced(t *testing.T) {
 	tracing.SetupMockTracer()
 
 	// Extended tx (has inline previous-output info) whose referenced parent
@@ -76,15 +77,6 @@ func TestValidate_MissingParentTransactionAnnounced(t *testing.T) {
 	require.True(t, errors.Is(err, errors.ErrTxMissingParent), "expected ErrTxMissingParent, got: %v", err)
 
 	require.Equal(t, 0, len(txmetaKafkaProducerClient.PublishChannel()), "txMetaKafkaChan should be empty")
-	require.Equal(t, 1, len(rejectedTxKafkaProducerClient.PublishChannel()), "missing-parent rejection must be announced on the rejected-tx topic")
-
-	msg := <-rejectedTxKafkaProducerClient.PublishChannel()
-
-	var rejected kafkamessage.KafkaRejectedTxTopicMessage
-	require.NoError(t, proto.Unmarshal(msg.Value, &rejected))
-	require.Equal(t, tx.TxIDChainHash().String(), rejected.TxHash)
-
-	// The reason must be distinguishable from a genuinely-invalid tx so a
-	// submitter can tell "retry later" apart from "give up".
-	require.Contains(t, rejected.Reason, "missing parent")
+	require.Equal(t, 0, len(rejectedTxKafkaProducerClient.PublishChannel()),
+		"a missing-parent drop must not reach the rejected-tx topic: internal rejections are re-broadcast to the whole p2p network")
 }
