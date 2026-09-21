@@ -95,7 +95,7 @@ package blockchain_api;
      `CreateAuthInterceptor` **fails open**: a method path not present in the
      map bypasses authentication entirely. Under a side-by-side `v2`, the new
      package's method paths need their own entries or the `v2` RPCs ship
-     unauthenticated. P2P has `TestAdminProtectedMethodsCoverAllRPCs`
+     unauthenticated. P2P has `TestAuthProtectedMethodsCoverAllRPCs`
      (`services/p2p/server_auth_test.go`) deriving expected paths from
      `ServiceDesc.Methods` to catch omissions; the legacy map has no equivalent
      coverage test today -- add one if you touch that map.
@@ -122,7 +122,7 @@ This policy covers any `.proto` whose messages cross a process boundary:
 - `model/model.proto` and `errors/error.proto` -- these are wire-facing, not
   internal-only: `model.MiningCandidate` is the return type of
   `blockassembly_api.GetMiningCandidate`, and `errors.TError` is a response
-  field in `propagation_api.SendResponse` / `validator_api` batch responses,
+  field in `propagation_api.ProcessTransactionBatchResponse` / `validator_api` batch responses,
   so a breaking change to either breaks the API that embeds it;
 - `util/kafka/kafka_message/kafka_messages.proto` (`package kafkamessage`) --
   cross-node Kafka payloads referenced by qualified name in
