@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/teranode/errors"
@@ -66,6 +67,10 @@ type WebsocketConfig struct {
 	// says that server will try to negotiate it with client.
 	Compression bool
 
+	// MaxConnections caps the number of concurrently live websocket connections.
+	// Zero means unlimited.
+	MaxConnections int
+
 	// UseWriteBufferPool enables using buffer pool for writes.
 	UseWriteBufferPool bool
 }
@@ -77,7 +82,15 @@ type WebsocketHandler struct {
 	node    *centrifuge.Node
 	upgrade *websocket.Upgrader
 	config  WebsocketConfig
+
+	liveConnections    atomic.Int64 // connections currently holding a slot
+	refusedConnections atomic.Int64 // upgrades refused because the cap was full
+	capWarnedAt        atomic.Int64 // UnixNano of the last cap-reached WARN, 0 = never
 }
+
+// connCapWarnInterval bounds how often a refused upgrade is logged at WARN, so a client
+// retrying in a loop cannot flood the log.
+const connCapWarnInterval = 1 * time.Minute
 
 var writeBufferPool = &sync.Pool{}
 
@@ -130,9 +143,21 @@ func (s *WebsocketHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	compressionLevel := s.config.CompressionLevel
 	compressionMinSize := s.config.CompressionMinSize
 
+	// Take an admission slot before the upgrade: an upgrade that is accepted and then
+	// closed still costs a handshake and leaves the client believing it is connected.
+	if !s.acquireConnection() {
+		s.logConnectionRefused()
+		rw.Header().Set("Retry-After", "1")
+		http.Error(rw, "Asset websocket connection limit reached", http.StatusServiceUnavailable)
+
+		return
+	}
+
 	conn, err := s.upgrade.Upgrade(rw, r, nil)
 	if err != nil {
+		s.releaseConnection()
 		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "[Centrifuge] websocket upgrade error", map[string]any{"error": err.Error()}))
+
 		return
 	}
 
@@ -183,6 +208,9 @@ func (s *WebsocketHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 
 	// Separate goroutine for better GC of caller's data.
 	go func() {
+		// This goroutine owns the connection lifetime, so it also owns the slot.
+		defer s.releaseConnection()
+
 		opts := websocketTransportOptions{
 			pingInterval:       pingInterval,
 			writeTimeout:       writeTimeout,
@@ -247,6 +275,48 @@ func (s *WebsocketHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
+}
+
+// acquireConnection takes a slot from the concurrent-connection budget, reporting
+// whether one was available. A MaxConnections of zero means unlimited, which is the
+// shipped default and today's behaviour.
+func (s *WebsocketHandler) acquireConnection() bool {
+	limit := s.config.MaxConnections
+	if limit <= 0 {
+		return true
+	}
+
+	if s.liveConnections.Add(1) > int64(limit) {
+		s.liveConnections.Add(-1)
+		s.refusedConnections.Add(1)
+
+		return false
+	}
+
+	return true
+}
+
+// releaseConnection returns a slot taken by acquireConnection. It is called exactly
+// once per accepted upgrade, from whichever path ends that connection.
+func (s *WebsocketHandler) releaseConnection() {
+	if s.config.MaxConnections > 0 {
+		s.liveConnections.Add(-1)
+	}
+}
+
+// logConnectionRefused reports a refused upgrade, at WARN at most once per
+// connCapWarnInterval and at DEBUG in between, so the cap being reached is always
+// visible without a retrying client being able to flood the log.
+func (s *WebsocketHandler) logConnectionRefused() {
+	fields := map[string]any{"limit": s.config.MaxConnections, "refused": s.refusedConnections.Load()}
+
+	last, now := s.capWarnedAt.Load(), time.Now().UnixNano()
+	if now-last >= int64(connCapWarnInterval) && s.capWarnedAt.CompareAndSwap(last, now) {
+		s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelWarn, "[Centrifuge] websocket upgrade refused: asset_maxWebsocketConnections reached", fields))
+		return
+	}
+
+	s.node.Log(centrifuge.NewLogEntry(centrifuge.LogLevelDebug, "[Centrifuge] websocket upgrade refused: asset_maxWebsocketConnections reached", fields))
 }
 
 // websocketTransport implements the transport layer for WebSocket connections.
