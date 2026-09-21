@@ -134,12 +134,13 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	// fail loudly rather than silently falling back to "trust all private
 	// ranges" — operator typos must not weaken the trust boundary.
 	if tSettings.Asset.TrustedProxyCIDRs != "" {
-		// echo.TrustIPRange is additive: loopback, link-local and private
-		// networks stay trusted unless explicitly disabled, which would leave
-		// an explicit allowlist trusting every RFC1918 source. An operator who
-		// configures an allowlist means that list and nothing else.
+		// echo.TrustIPRange is additive: link-local and private networks stay
+		// trusted unless explicitly disabled, which would leave an explicit
+		// allowlist trusting every RFC1918 source. Loopback stays trusted: a
+		// loopback peer is same-host by definition and cannot be a remote
+		// attacker forging X-Forwarded-For, and dropping it would collapse
+		// RealIP to 127.0.0.1 for every request in a sidecar deployment.
 		trustOpts := []echo.TrustOption{
-			echo.TrustLoopback(false),
 			echo.TrustLinkLocal(false),
 			echo.TrustPrivateNet(false),
 		}
@@ -193,8 +194,11 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 		e.Use(banlist.CreateEchoMiddleware(banList))
 	}
 
-	// Default CORS config for non-dashboard endpoints. The same policy is
-	// reused for the dashboard config below so the two cannot diverge.
+	// One CORS middleware for the whole listener. Echo's CORS middleware
+	// answers a preflight with 204 and never calls next, so a second
+	// registration would be unreachable for OPTIONS; the single config
+	// therefore carries the union of the headers, including the dashboard's
+	// X-CSRF-Token.
 	corsAllowedOrigins := parseCORSAllowedOrigins(tSettings.Asset.CORSAllowedOrigins)
 	if len(corsAllowedOrigins) == 0 {
 		logger.Warnf("[Asset] asset_corsAllowedOrigins is empty: every browser origin is reflected and credentialed cross-origin responses are refused; list the operator origins that need cookie or Authorization access")
@@ -467,14 +471,6 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 		apiCatchupGroup := e.Group("/api/catchup")
 		apiCatchupGroup.GET("/status", h.GetCatchupStatus)
 
-		// Same policy as the default config above, plus the dashboard's CSRF
-		// header. Narrowing only one of the two configs would leave the other
-		// reflecting every origin.
-		dashboardConfig := assetCORSConfig(corsAllowedOrigins, "X-CSRF-Token")
-
-		// Apply CORS middleware to the entire Echo instance
-		e.Use(middleware.CORSWithConfig(dashboardConfig))
-
 		// Register handlers for all HTTP methods to support API endpoints
 		e.GET("*", dashboard.AppHandler)
 		e.POST("*", dashboard.AppHandler)
@@ -742,8 +738,7 @@ func parseCORSAllowedOrigins(raw string) []string {
 	return origins
 }
 
-// assetCORSConfig builds the CORS policy shared by the default and dashboard
-// middleware.
+// assetCORSConfig builds the single CORS policy for the Asset listener.
 //
 // With an explicit allowlist, only those origins are matched and credentialed
 // cross-origin responses are permitted. With an empty allowlist the legacy
@@ -751,17 +746,17 @@ func parseCORSAllowedOrigins(raw string) []string {
 // arbitrary origin *and* allowing credentials is what let a hostile same-site
 // origin ride an operator's ambient cookie into the admin routes on this
 // listener.
-func assetCORSConfig(allowedOrigins []string, extraAllowHeaders ...string) middleware.CORSConfig {
-	allowHeaders := make([]string, 0, 5+len(extraAllowHeaders))
-	allowHeaders = append(allowHeaders,
-		echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept,
-		echo.HeaderAuthorization, echo.HeaderXRequestedWith,
-	)
-	allowHeaders = append(allowHeaders, extraAllowHeaders...)
-
+func assetCORSConfig(allowedOrigins []string) middleware.CORSConfig {
 	cfg := middleware.CORSConfig{
-		AllowMethods:  []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPatch, http.MethodPost, http.MethodDelete, http.MethodOptions},
-		AllowHeaders:  allowHeaders,
+		AllowMethods: []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPatch, http.MethodPost, http.MethodDelete, http.MethodOptions},
+		// X-CSRF-Token is the dashboard's header. It is listed here rather
+		// than in a second, dashboard-only middleware because Echo's CORS
+		// middleware terminates every preflight itself, so only the first
+		// registered config is ever consulted for OPTIONS.
+		AllowHeaders: []string{
+			echo.HeaderOrigin, echo.HeaderContentType, echo.HeaderAccept,
+			echo.HeaderAuthorization, echo.HeaderXRequestedWith, "X-CSRF-Token",
+		},
 		ExposeHeaders: []string{echo.HeaderContentLength, echo.HeaderContentType},
 		MaxAge:        86400,
 	}

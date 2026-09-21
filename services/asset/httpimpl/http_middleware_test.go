@@ -1,6 +1,7 @@
 package httpimpl
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -120,9 +121,9 @@ func TestNew_DashboardCORSUsesTheSameAllowlist(t *testing.T) {
 }
 
 // TestNew_TrustedProxyCIDRsReplaceEchoDefaults — echo.TrustIPRange is additive:
-// loopback, link-local and private networks stay trusted unless explicitly
-// disabled. An operator who configures an allowlist means that list and nothing
-// else, otherwise any RFC1918 client can forge X-Forwarded-For.
+// link-local and private networks stay trusted unless explicitly disabled. An
+// operator who configures an allowlist means that list plus loopback and
+// nothing else, otherwise any RFC1918 client can forge X-Forwarded-For.
 func TestNew_TrustedProxyCIDRsReplaceEchoDefaults(t *testing.T) {
 	tSettings := baseTestSettings()
 	tSettings.Asset.TrustedProxyCIDRs = "203.0.113.0/24"
@@ -137,15 +138,6 @@ func TestNew_TrustedProxyCIDRsReplaceEchoDefaults(t *testing.T) {
 
 		require.Equal(t, "10.1.2.3", srv.e.IPExtractor(req),
 			"an RFC1918 peer outside the configured allowlist must not be trusted as a proxy")
-	})
-
-	t.Run("untrusted loopback client cannot forge XFF", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/alive", nil)
-		req.RemoteAddr = "127.0.0.1:4444"
-		req.Header.Set(echo.HeaderXForwardedFor, "8.8.8.8")
-
-		require.Equal(t, "127.0.0.1", srv.e.IPExtractor(req),
-			"loopback must not be trusted as a proxy when an explicit allowlist is configured")
 	})
 
 	t.Run("configured proxy is still trusted", func(t *testing.T) {
@@ -313,4 +305,64 @@ func TestSign_DeclaresItsScope(t *testing.T) {
 	require.NotEmpty(t, rec.Header().Get("X-Signature"))
 	require.Equal(t, signatureScopeResourceIdentifier, rec.Header().Get("X-Signature-Scope"),
 		"the signature scope must be stated on the wire so X-Signature is not mistaken for body integrity")
+}
+
+// TestNew_PreflightAdvertisesTheCSRFHeader — Echo's CORS middleware answers a
+// preflight with c.NoContent(204) and never calls next, so only the first
+// registered CORS middleware is ever reached for OPTIONS. A single root-level
+// config must therefore carry every header the listener accepts, including the
+// dashboard's X-CSRF-Token, whether or not the dashboard is enabled.
+func TestNew_PreflightAdvertisesTheCSRFHeader(t *testing.T) {
+	for _, dashboardEnabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("dashboard=%v", dashboardEnabled), func(t *testing.T) {
+			tSettings := baseTestSettings()
+			tSettings.Asset.CORSAllowedOrigins = "https://ops.example.com"
+			tSettings.Dashboard.Enabled = dashboardEnabled
+			tSettings.RPC = settings.RPCSettings{RPCUser: "bitcoin", RPCPass: "bitcoin"}
+
+			srv := newTestServer(t, tSettings)
+
+			req := httptest.NewRequest(http.MethodOptions, "/alive", nil)
+			req.Header.Set(echo.HeaderOrigin, "https://ops.example.com")
+			req.Header.Set(echo.HeaderAccessControlRequestMethod, http.MethodPost)
+			req.Header.Set(echo.HeaderAccessControlRequestHeaders, "X-CSRF-Token")
+			rec := httptest.NewRecorder()
+			srv.e.ServeHTTP(rec, req)
+
+			require.Equal(t, "https://ops.example.com", rec.Header().Get(echo.HeaderAccessControlAllowOrigin))
+			require.Contains(t, rec.Header().Get(echo.HeaderAccessControlAllowHeaders), "X-CSRF-Token",
+				"a credentialed cross-origin dashboard request preflighting X-CSRF-Token must be allowed")
+		})
+	}
+}
+
+// TestNew_TrustedProxyCIDRsKeepLoopbackTrusted — a loopback peer is same-host
+// by definition and cannot be an external attacker spoofing XFF. Dropping that
+// trust collapses RealIP to 127.0.0.1 for every request in the very common
+// sidecar / same-pod ingress topology, which keys the whole world into one
+// rate-limit bucket and makes a ban of one client a ban of everything.
+func TestNew_TrustedProxyCIDRsKeepLoopbackTrusted(t *testing.T) {
+	tSettings := baseTestSettings()
+	tSettings.Asset.TrustedProxyCIDRs = "203.0.113.0/24"
+
+	srv := newTestServer(t, tSettings)
+	require.NotNil(t, srv.e.IPExtractor)
+
+	t.Run("sidecar proxy on loopback", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/alive", nil)
+		req.RemoteAddr = "127.0.0.1:4444"
+		req.Header.Set(echo.HeaderXForwardedFor, "8.8.8.8")
+
+		require.Equal(t, "8.8.8.8", srv.e.IPExtractor(req),
+			"a same-host proxy must stay trusted so RealIP does not collapse to 127.0.0.1")
+	})
+
+	t.Run("loopback behind a configured edge proxy", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/alive", nil)
+		req.RemoteAddr = "127.0.0.1:4444"
+		req.Header.Set(echo.HeaderXForwardedFor, "8.8.8.8, 203.0.113.7")
+
+		require.Equal(t, "8.8.8.8", srv.e.IPExtractor(req),
+			"the chain must resolve through both the loopback hop and the allowlisted edge")
+	})
 }
