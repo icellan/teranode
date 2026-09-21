@@ -605,10 +605,11 @@ Teranode, not two &mdash; gRPC request/response, the Blockchain notification str
   transition. This is a gRPC *server-streaming* RPC, `rpc Subscribe (SubscribeRequest)
   returns (stream Notification)` (`services/blockchain/blockchain_api/blockchain_api.proto`),
   and `SendNotification` on the Blockchain server broadcasts to all active subscribers
-  without blocking on any of them. Five services subscribe today: P2P, Block Assembly,
-  Asset (main-chain cache), UTXO Persister and Pruner. Prefer this over introducing a new
-  Kafka topic for chain-state fan-out &mdash; there is no broker or topic configuration to add,
-  and every service that needs it already holds a blockchain client.
+  without blocking on any of them. Seven services subscribe today: P2P, Block Assembly,
+  Block Validation, Subtree Validation, Asset (main-chain cache), UTXO Persister and
+  Pruner. Prefer this over introducing a new Kafka topic for chain-state fan-out &mdash;
+  there is no broker or topic configuration to add, and every service that needs it
+  already holds a blockchain client.
 - **Use Kafka** when the path is asynchronous, fire-and-forget, one-to-many, or the
   producer does not need to know whether or when a consumer processes the message.
   Examples already in the codebase:
