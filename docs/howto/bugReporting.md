@@ -48,7 +48,7 @@ Before submitting a bug report, gather the following information:
 
 ## Severity
 
-New bug reports must select a severity using the "Severity" section of the bug report
+New bug reports should select a severity using the "Severity" section of the bug report
 template, and the maintainer triaging the issue applies the matching `severity:*` label.
 Choose the level that matches the observed impact:
 
@@ -79,8 +79,8 @@ titles are not being changed retroactively and existing issues are not being rel
 When creating a new issue, GitHub will automatically load a template. The template includes the following sections:
 
 ```markdown
-## Severity (required)
-Tick exactly one (see the severity criteria above):
+## Severity
+Project policy is to tick exactly one (see the severity criteria above):
 - [ ] severity:critical — consensus failure, data loss or corruption, funds at risk, or a node that cannot sync or stay up, with no workaround
 - [ ] severity:major — a core function is broken or badly degraded (sustained throughput loss, a service needing manual restarts), but a workaround exists
 - [ ] severity:minor — cosmetic, documentation, or low-impact issues with an easy workaround

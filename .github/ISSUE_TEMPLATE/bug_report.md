@@ -7,9 +7,9 @@ assignees: ''
 
 ---
 
-## Severity (required)
+## Severity
 
-Tick exactly one (see the [severity criteria](../../docs/howto/bugReporting.md#severity)):
+Project policy is to tick exactly one (see the [severity criteria](https://github.com/bsv-blockchain/teranode/blob/main/docs/howto/bugReporting.md#severity)):
 
 - [ ] severity:critical — consensus failure, data loss or corruption, funds at risk, or a node that cannot sync or stay up, with no workaround
 - [ ] severity:major — a core function is broken or badly degraded (sustained throughput loss, a service needing manual restarts), but a workaround exists
