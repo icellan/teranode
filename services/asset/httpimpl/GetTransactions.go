@@ -133,13 +133,17 @@ func (h *HTTP) GetTransactions() func(c echo.Context) error {
 
 		transactionFromSubtreeData := make(map[chainhash.Hash]*bt.Tx)
 
+		// The permit covers the map, so it is held for as long as the map is read -
+		// which ends with the fan-out below, not with the response. Holding it across
+		// the write would pace a node-wide semaphore off the client's read speed.
+		releaseSubtreeMap := func() {}
+		defer func() { releaseSubtreeMap() }()
+
 		if subtreeHash != nil {
 			// read the data from the subtreeData file and create a map of transaction hashes to transactions
 			txMap, release, err := h.repository.GetSubtreeTransactions(ctx, subtreeHash)
 
-			// the permit covers the map, not its construction, so it is held for as
-			// long as this handler keeps the map alive
-			defer release()
+			releaseSubtreeMap = release
 
 			if err != nil {
 				// this should not be an ERROR, but a warning, because it is not critical if the subtree data is not available
@@ -199,9 +203,16 @@ func (h *HTTP) GetTransactions() func(c echo.Context) error {
 			})
 		}
 
-		if err := g.Wait(); err != nil {
-			h.logger.Errorf("failed to get txs from repository: %s", err.Error())
-			return err
+		waitErr := g.Wait()
+
+		// The map is no longer read past this point, so drop the permit before the
+		// client-paced response write. release is sync.Once-guarded, so the deferred
+		// call above stays safe.
+		releaseSubtreeMap()
+
+		if waitErr != nil {
+			h.logger.Errorf("failed to get txs from repository: %s", waitErr.Error())
+			return waitErr
 		}
 
 		responseBytes := concatTransactionBytes(parts)
