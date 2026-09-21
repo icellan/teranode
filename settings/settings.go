@@ -248,7 +248,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			MaxBlockHeaders:          getInt("asset_maxBlockHeaders", 0, alternativeContext...),
 			MaxLastNBlocks:           getInt("asset_maxLastNBlocks", 0, alternativeContext...),
 			MaxNBlocks:               getInt("asset_maxNBlocks", 0, alternativeContext...),
-			RequireAuthCredentials:   getBool("asset_requireAuthCredentials", false, alternativeContext...),
+			RequireAuthCredentials:   getBool("asset_requireAuthCredentials", true, alternativeContext...),
 			SecureCookies:            getBool("asset_secureCookies", false, alternativeContext...),
 			CORSAllowedOrigins:       getString("asset_corsAllowedOrigins", "", alternativeContext...),
 			EnforcePostAuth:          getBool("asset_enforcePostAuth", false, alternativeContext...),
