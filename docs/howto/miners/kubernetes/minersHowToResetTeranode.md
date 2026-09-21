@@ -1,6 +1,6 @@
 # How to Reset Teranode (Kubernetes)
 
-Last modified: 15-June-2026
+Last modified: 7-September-2026
 
 ## Index
 

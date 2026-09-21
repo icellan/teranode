@@ -2,7 +2,7 @@
 
 <!-- markdownlint-disable MD046 -->
 
-Last modified: 1-July-2026
+Last modified: 7-September-2026
 
 ## Table of Contents
 
