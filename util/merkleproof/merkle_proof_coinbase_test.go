@@ -278,3 +278,106 @@ func TestConstructMerkleProofFinalSubtreePadding(t *testing.T) {
 		require.Equal(t, 2, st0.Height)
 	})
 }
+
+// testBlockRootsCache is a minimal BlockRootsCache; the production implementation lives in the
+// asset HTTP layer.
+type testBlockRootsCache struct {
+	entries map[chainhash.Hash]*BlockRoots
+}
+
+func (c *testBlockRootsCache) BlockRoots(blockHash *chainhash.Hash) (*BlockRoots, bool) {
+	roots, ok := c.entries[*blockHash]
+
+	return roots, ok
+}
+
+func (c *testBlockRootsCache) SetBlockRoots(blockHash *chainhash.Hash, roots *BlockRoots) {
+	c.entries[*blockHash] = roots
+}
+
+// cachingMock is a MockMerkleProofConstructor that also implements BlockRootsCache.
+type cachingMock struct {
+	*MockMerkleProofConstructor
+	*testBlockRootsCache
+}
+
+func newCachingMock(inner *MockMerkleProofConstructor) *cachingMock {
+	return &cachingMock{
+		MockMerkleProofConstructor: inner,
+		testBlockRootsCache:        &testBlockRootsCache{entries: map[chainhash.Hash]*BlockRoots{}},
+	}
+}
+
+// TestConstructMerkleProofBlockRootsCache pins the cost reduction: a merkle proof for a transaction
+// in a middle subtree materializes the target, first and final subtrees on a cold block, but only
+// the target subtree once the block's derived roots are memoized — and the proof is identical
+// either way.
+func TestConstructMerkleProofBlockRootsCache(t *testing.T) {
+	coinbaseTx, err := bt.NewTxFromString(testCoinbaseHex)
+	require.NoError(t, err)
+
+	tx := make([]*chainhash.Hash, 8)
+	for i := range tx {
+		h := chainhash.DoubleHashH([]byte{byte(i + 1)})
+		tx[i] = &h
+	}
+
+	// subtree 0: [placeholder, tx0, tx1, tx2] (complete, carries the coinbase placeholder)
+	// subtree 1: [tx3, tx4, tx5, tx6]         (complete)
+	// subtree 2: [tx7]                        (INCOMPLETE -> lifted)
+	newSubtrees := func() []*subtreepkg.Subtree {
+		return []*subtreepkg.Subtree{
+			newPlaceholderSubtree(t, tx[0], tx[1], tx[2]),
+			newRegularSubtree(t, tx[3], tx[4], tx[5], tx[6]),
+			newRegularSubtree(t, tx[7]),
+		}
+	}
+
+	cases := []struct {
+		name       string
+		subtreeIdx int
+		txHash     *chainhash.Hash
+		coldLoads  int
+		warmLoads  int
+	}{
+		// Middle subtree: target, first and final are three distinct subtrees.
+		{"middle subtree", 1, tx[4], 3, 1},
+		// First subtree: the target doubles as the first, so only two loads are cold.
+		{"first subtree", 0, tx[1], 2, 1},
+		// Final subtree: the target doubles as the final one.
+		{"final subtree", 2, tx[7], 2, 1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			subtrees := newSubtrees()
+
+			uncached := buildMock(t, subtrees, coinbaseTx, tc.subtreeIdx)
+			coldProof, err := ConstructMerkleProof(tc.txHash, uncached)
+			require.NoError(t, err)
+			require.Equal(t, tc.coldLoads, uncached.subtreeLoads,
+				"unexpected number of complete-subtree deserializations without a cache")
+
+			cached := newCachingMock(buildMock(t, subtrees, coinbaseTx, tc.subtreeIdx))
+
+			firstProof, err := ConstructMerkleProof(tc.txHash, cached)
+			require.NoError(t, err)
+			require.Equal(t, tc.coldLoads, cached.subtreeLoads, "cold request must behave as before")
+
+			cached.subtreeLoads = 0
+
+			warmProof, err := ConstructMerkleProof(tc.txHash, cached)
+			require.NoError(t, err)
+			require.Equal(t, tc.warmLoads, cached.subtreeLoads,
+				"warm request must load only the transaction's own subtree")
+
+			// Consensus-adjacent: the cache must not change a single byte of the proof.
+			require.Equal(t, coldProof, firstProof)
+			require.Equal(t, coldProof, warmProof)
+
+			valid, _, err := VerifyMerkleProof(warmProof)
+			require.NoError(t, err)
+			require.True(t, valid)
+		})
+	}
+}
