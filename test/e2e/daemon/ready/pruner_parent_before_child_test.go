@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/teranode/daemon"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/test"
@@ -397,5 +398,5 @@ func TestPrunerParentFullySpentNotDeletedBeforeChildren(t *testing.T) {
 	node.WaitForPruner(t, 10*time.Second, lastBlock.Height)
 
 	_, err = node.UtxoStore.Get(node.Ctx, parentHash)
-	require.Error(t, err)
+	require.ErrorIs(t, err, errors.ErrTxNotFound)
 }
