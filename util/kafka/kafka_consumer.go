@@ -1003,6 +1003,16 @@ func wrapConsumerFn(ctx context.Context, logger ulogger.Logger, topic string, co
 // self-inflicted outage indistinguishable from a wedged consumer. Skipping
 // past it is the only choice that cannot wedge the consumer; the panic is
 // logged with its stack trace and counted so it is not silently swallowed.
+//
+// This does narrow the withRetryAndStop contract, and deliberately so: that
+// option exists to guarantee a message is never skipped, but the guarantee
+// cannot be honoured through a panic without risking a permanent wedge. A
+// panic from transient state rather than from the message itself - a
+// nil-deref against a downstream client mid-shutdown, say, or a store
+// failure surfacing as a panic - is committed and skipped here even on a
+// stop-on-error topic, where a returned error would have halted the
+// consumer instead. The panic counter is per-topic precisely so that case
+// is visible rather than inferred.
 func recoverConsumerFn(logger ulogger.Logger, topic string, consumerFn func(message *KafkaMessage) error) func(message *KafkaMessage) error {
 	initConsumerMetrics()
 
