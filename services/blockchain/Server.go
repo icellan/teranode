@@ -1861,7 +1861,7 @@ func (b *Blockchain) GetBlockHeadersToCommonAncestor(ctx context.Context, req *b
 		}
 	}
 
-	blockHeaders, blockHeaderMetas, err := getBlockHeadersToCommonAncestor(ctx, b.store, targetHash, blockLocatorHashes, req.MaxHeaders)
+	blockHeaders, blockHeaderMetas, err := getBlockHeadersToCommonAncestor(ctx, b.store, targetHash, blockLocatorHashes, req.MaxHeaders, b.settings.Asset.MaxLocatorWalkDepth)
 	if err != nil {
 		return nil, errors.WrapGRPC(err)
 	}
@@ -3362,7 +3362,7 @@ func getBlockLocatorByWalk(ctx context.Context, store blockchain_store.Store, st
 	return locator, nil
 }
 
-func getBlockHeadersToCommonAncestor(ctx context.Context, store blockchain_store.Store, hashTarget *chainhash.Hash, blockLocatorHashes []*chainhash.Hash, maxHeaders uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+func getBlockHeadersToCommonAncestor(ctx context.Context, store blockchain_store.Store, hashTarget *chainhash.Hash, blockLocatorHashes []*chainhash.Hash, maxHeaders uint32, maxWalkDepth int) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	const (
 		numberOfHeaders = 1_000
 		searchLimit     = 10_000
@@ -3372,9 +3372,28 @@ func getBlockHeadersToCommonAncestor(ctx context.Context, store blockchain_store
 		commonAncestorMeta *model.BlockHeaderMeta
 	)
 
+	if len(blockLocatorHashes) == 0 {
+		return nil, nil, errors.NewNotFoundError("common ancestor hash not found: empty block locator")
+	}
+
 	blockLocatorMap := make(map[chainhash.Hash]struct{}, len(blockLocatorHashes))
+	locatorValues := make([]chainhash.Hash, 0, len(blockLocatorHashes))
+
 	for _, hash := range blockLocatorHashes {
 		blockLocatorMap[*hash] = struct{}{}
+		locatorValues = append(locatorValues, *hash)
+	}
+
+	// Pre-flight the locator with a single indexed lookup. A locator's hashes
+	// are exponentially spaced from the tip, so if none of them resolves to an
+	// ancestor of hashTarget the walk below can only end at the start of the
+	// chain with the same not-found error - after paging through the whole
+	// chain to get there. Answer it now instead. A store error here is not
+	// fatal: fall through to the walk, which stays authoritative.
+	if _, _, err := store.GetLatestBlockHeaderFromBlockLocator(ctx, hashTarget, locatorValues); err != nil {
+		if errors.Is(err, errors.ErrNotFound) {
+			return nil, nil, errors.NewNotFoundError("common ancestor hash not found for any block locator hash")
+		}
 	}
 
 	max := int(maxHeaders)
@@ -3382,8 +3401,16 @@ func getBlockHeadersToCommonAncestor(ctx context.Context, store blockchain_store
 	lastNHeaders := ring.New(max)
 	lastNMetas := ring.New(max)
 
+	headersWalked := 0
+
 out:
 	for searchCount := 0; searchCount < searchLimit; searchCount++ {
+		// maxWalkDepth <= 0 keeps today's behaviour: the walk is bounded only
+		// by the start of the chain and the search limit.
+		if maxWalkDepth > 0 && headersWalked >= maxWalkDepth {
+			break
+		}
+
 		headers, headerMetas, err := store.GetBlockHeaders(ctx, hashStart, numberOfHeaders)
 		if err != nil {
 			return nil, nil, errors.NewStorageError("failed to get block headers", err)
@@ -3392,6 +3419,8 @@ out:
 		if len(headers) <= 1 {
 			break
 		}
+
+		headersWalked += len(headers)
 
 		for idx, header := range headers {
 			lastNHeaders.Value = header
