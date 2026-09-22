@@ -246,6 +246,7 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 			tSettings.Asset.HTTPRateLimit,
 			tSettings.Asset.HTTPPeerRateMultiplier,
 			tSettings.Asset.HTTPMinerRateLimit,
+			0, // burst == rate; the global rate is already far above any client fan-out
 			"global",
 		)
 		e.Use(globalRL.Middleware())
@@ -261,10 +262,17 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	// Heavy-endpoint rate limiter (applied per-route below).
 	var heavyRateLimiter echo.MiddlewareFunc
 	if tSettings.Asset.HTTPHeavyRateLimit > 0 {
+		// The heavy routes carry peer catchup. A catching-up peer fans out
+		// subtreevalidation_getMissingTransactions concurrent unsigned (and so
+		// tier-unverified) requests at once, so the burst floors at that value.
+		heavyBurst, _ := resolveHeavyBurst(logger, tSettings.Asset.HTTPHeavyRateBurst, tSettings.SubtreeValidation.GetMissingTransactions)
+		logger.Infof("[Asset] heavy-endpoint rate limit: %d req/s, burst %d", tSettings.Asset.HTTPHeavyRateLimit, heavyBurst)
+
 		heavyRL := newTieredRateLimiter(
 			tSettings.Asset.HTTPHeavyRateLimit,
 			tSettings.Asset.HTTPPeerRateMultiplier,
 			tSettings.Asset.HTTPMinerRateLimit,
+			heavyBurst,
 			"heavy",
 		)
 		heavyRateLimiter = heavyRL.Middleware()
