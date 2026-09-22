@@ -286,7 +286,7 @@ type Validator struct {
 	// Memory cost: ~4 MB per million blocks (one uint32 per block), negligible for any
 	// foreseeable chain length.
 	//
-	// mtpMu guards concurrent access to mtpStore.
+	// mtpMu guards concurrent access to mtpStore and mtpLoadWindows.
 	//   - EnsureMTPLoaded serializes fetches with mtpLoadMu, leaving readers free
 	//     during RPCs. It takes mtpMu only to inspect or publish the store.
 	//   - validateTransaction acquires the read lock around its MTP lookups. This protects
@@ -299,6 +299,23 @@ type Validator struct {
 	mtpLoadMu sync.Mutex
 	mtpMu     sync.RWMutex
 	mtpStore  []uint32
+	// mtpLoadWindows tracks the height ranges ([from, to)) that in-flight
+	// EnsureMTPLoaded calls are about to patch for reorg repair. Guarded by mtpMu.
+	// EnsureMTPLoaded's fast path (see comment there) must fall through to
+	// mtpLoadMu when the requested height falls inside a published window, even
+	// though the store already covers it, since the in-flight loader may be about
+	// to overwrite that entry. mtpLoadMu today serializes loaders one at a time,
+	// so at most one window is ever published, but this is kept as a collection
+	// so correctness does not depend on that serialization staying single-loader.
+	mtpLoadWindows []mtpLoadWindow
+}
+
+// mtpLoadWindow is a half-open height range [From, To) that an in-flight
+// EnsureMTPLoaded call may rewrite while repairing reorg-invalidated MTP
+// entries. See mtpLoadWindows.
+type mtpLoadWindow struct {
+	From uint32
+	To   uint32
 }
 
 // New creates a new Validator instance with the provided configuration.
@@ -2764,10 +2781,24 @@ func (v *Validator) EnsureMTPLoaded(ctx context.Context, blockHeight uint32) err
 
 	needed := blockHeight
 
+	// Fast path: the store already covers `needed` and no in-flight loader is
+	// about to rewrite that entry. A loader publishes the [From, To) window it is
+	// about to patch (see mtpLoadWindows) before it releases mtpMu to perform the
+	// fetch, so a covered-but-in-flight height falls through to the mtpLoadMu wait
+	// below instead of racing the patch.
 	v.mtpMu.RLock()
 	covered := uint32(len(v.mtpStore)) > needed
-	v.mtpMu.RUnlock()
+	inFlight := false
 	if covered {
+		for _, w := range v.mtpLoadWindows {
+			if needed >= w.From && needed < w.To {
+				inFlight = true
+				break
+			}
+		}
+	}
+	v.mtpMu.RUnlock()
+	if covered && !inFlight {
 		return nil
 	}
 
@@ -2790,6 +2821,25 @@ func (v *Validator) EnsureMTPLoaded(ctx context.Context, blockHeight uint32) err
 	if currentLen > mtpReorgOverlap {
 		fromHeight = currentLen - mtpReorgOverlap
 	}
+
+	// Publish the window this load is about to patch so concurrent callers whose
+	// needed height falls inside it wait instead of taking the fast path above.
+	// Always removed on return, including on error, so a failed fetch cannot leave
+	// a stale window blocking future fast-path callers.
+	window := mtpLoadWindow{From: fromHeight, To: currentLen}
+	v.mtpMu.Lock()
+	v.mtpLoadWindows = append(v.mtpLoadWindows, window)
+	v.mtpMu.Unlock()
+	defer func() {
+		v.mtpMu.Lock()
+		for i, w := range v.mtpLoadWindows {
+			if w == window {
+				v.mtpLoadWindows = append(v.mtpLoadWindows[:i], v.mtpLoadWindows[i+1:]...)
+				break
+			}
+		}
+		v.mtpMu.Unlock()
+	}()
 
 	isInitialLoad := currentLen == 0
 	start := time.Now()
