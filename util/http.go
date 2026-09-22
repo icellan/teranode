@@ -939,8 +939,14 @@ func drainErrorBody(body io.ReadCloser) {
 //
 // The error type is chosen to let callers branch with errors.Is:
 //   - 404 → ErrNotFound
+//   - 429 → ErrServiceRateLimited (retryable; see DoHTTPRequestBodyReaderWithRetry)
 //   - 503 → ErrServiceUnavailable (typically retryable; see DoHTTPRequestBodyReaderWithRetry)
 //   - other → generic ServiceError
+//
+// 429 gets its own code rather than sharing ErrServiceUnavailable: that sentinel is
+// in errors.IsTransientLocalError, which legacy block sync reads as "a fault in this
+// node's own stack, so keep the delivering peer". A remote rate limit is neither a
+// local fault nor a peer fault, and must not perturb those decisions.
 //
 // The body is read up to maxHTTPErrorBodyBytes; anything beyond that is discarded
 // rather than retained in the error string, and the message says so. The snippet is
@@ -959,6 +965,8 @@ func buildHTTPError(resp *http.Response, rawURL string) error {
 		errFn = errors.NewNotFoundError
 	case http.StatusServiceUnavailable:
 		errFn = errors.NewServiceUnavailableError
+	case http.StatusTooManyRequests:
+		errFn = errors.NewServiceRateLimitedError
 	}
 
 	if resp.Body != nil {
@@ -1030,17 +1038,22 @@ var defaultRetryConfig = retryConfig{
 }
 
 // DoHTTPRequestBodyReaderWithRetry behaves like DoHTTPRequestBodyReader but retries on
-// HTTP 503 (Service Unavailable) with exponential backoff. Used for endpoints where the
-// server signals admission-control rejection (e.g. asset /subtree_data) and the right
-// behavior is to back off and retry rather than fail the caller.
+// HTTP 503 (Service Unavailable) and HTTP 429 (Too Many Requests) with exponential
+// backoff. Used for endpoints where the server signals admission-control rejection
+// (e.g. asset /subtree_data, or the tiered rate limiter in front of the asset service)
+// and the right behavior is to back off and retry rather than fail the caller.
 //
 // Behavior:
-//   - Retries only on errors satisfying errors.Is(err, errors.ErrServiceUnavailable).
+//   - Retries only on errors satisfying errors.Is(err, errors.ErrServiceUnavailable) or
+//     errors.Is(err, errors.ErrServiceRateLimited).
 //   - Other errors (404, 500, network errors) are returned immediately — they are not
 //     transient admission rejections.
-//   - Backoff is exponential starting at 250ms, doubling, capped at 5s. Up to 6 attempts.
-//   - Honors the server's Retry-After header on each 503 (clamped to maxDelay).
+//   - Backoff is exponential starting at 250ms, doubling, capped at 5s. Up to 6 attempts,
+//     so a server that never relents costs ~7.75s of backoff before the final error.
+//   - Honors the server's Retry-After header on each rejection (clamped to maxDelay).
 //   - ctx cancellation aborts the retry loop and returns the parent ctx error.
+//   - The final error keeps the classification of the last rejection, so a caller can
+//     still tell a rate limit apart from an unavailable server after the ladder runs out.
 //
 // Each attempt is a fresh GET — for POST callers passing requestBody, the body is re-sent
 // each time. Make sure that's idempotent before using this helper for non-GET workloads.
@@ -1057,7 +1070,7 @@ func doHTTPRequestBodyReaderWithRetry(ctx context.Context, url string, cfg retry
 		if err == nil {
 			return body, nil
 		}
-		if !errors.Is(err, errors.ErrServiceUnavailable) {
+		if !errors.Is(err, errors.ErrServiceUnavailable) && !errors.Is(err, errors.ErrServiceRateLimited) {
 			return nil, err
 		}
 		lastErr = err
@@ -1083,11 +1096,20 @@ func doHTTPRequestBodyReaderWithRetry(ctx context.Context, url string, cfg retry
 		}
 	}
 
-	return nil, errors.NewServiceUnavailableError("http request [%s] still 503 after %d attempts: %v", url, cfg.maxAttempts, lastErr)
+	// Preserve the classification of the last rejection: collapsing a 429 into
+	// ErrServiceUnavailable here would reintroduce exactly the local-vs-remote
+	// confusion the separate code exists to avoid.
+	errFn := errors.NewServiceUnavailableError
+	if errors.Is(lastErr, errors.ErrServiceRateLimited) {
+		errFn = errors.NewServiceRateLimitedError
+	}
+
+	return nil, errFn("http request [%s] still rejected after %d attempts: %v", url, cfg.maxAttempts, lastErr)
 }
 
 // doHTTPRequestForStreamingWithRetryAfter is doHTTPRequestForStreaming + extracts
-// the Retry-After header on non-OK responses. On success returns (body, 0, nil).
+// the Retry-After header on non-OK responses. The extraction is status-agnostic, so
+// it covers 429 as well as 503. On success returns (body, 0, nil).
 func doHTTPRequestForStreamingWithRetryAfter(ctx context.Context, rawURL string, requestBody ...[]byte) (io.ReadCloser, time.Duration, error) {
 	cancelFn := func() {}
 	if _, ok := ctx.Deadline(); !ok {

@@ -2,8 +2,10 @@ package httpimpl
 
 import (
 	"context"
+	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +21,11 @@ import (
 // the bound, an IPv6 attacker rotating source addresses across a /64 (2^64
 // addresses) could grow the map to many GB before the 5-minute cleanup runs.
 const unverifiedLRUCapacity = 50_000
+
+// maxRetryAfterSeconds caps the Retry-After a 429 may advertise. Only a bucket
+// configured far below one request per hour can reach it; the cap exists so a
+// misconfiguration cannot hand a client an absurd — or numerically unusable — wait.
+const maxRetryAfterSeconds = 3600
 
 // limiterEntry holds a rate limiter and the last time it was accessed.
 type limiterEntry struct {
@@ -147,12 +154,47 @@ func (rl *tieredRateLimiter) limiterFor(c echo.Context) *rate.Limiter {
 
 // allowAtBucket consumes one token from the given limiter and returns the next
 // handler or HTTP 429.
+//
+// The 429 carries Retry-After so a client backs off by an amount derived from this
+// bucket's own refill rate rather than guessing. Peer catchup
+// (subtreevalidation.getMissingTransactionsBatch) retries on 429 and honours the
+// header; without it the client falls back to a fixed ladder unrelated to the limit
+// it actually hit.
 func (rl *tieredRateLimiter) allowAtBucket(c echo.Context, next echo.HandlerFunc, lim *rate.Limiter) error {
 	if !lim.Allow() {
 		prometheusAssetHTTPRateLimited.WithLabelValues(rl.tierLabel).Inc()
+		c.Response().Header().Set("Retry-After", rl.retryAfterSeconds(lim))
+
 		return c.JSON(http.StatusTooManyRequests, map[string]string{"message": "rate limit exceeded"})
 	}
 	return next(c)
+}
+
+// retryAfterSeconds renders the Retry-After value for a rejection on lim: the time
+// the bucket needs to refill one token, in whole seconds.
+//
+// Floored at 1 second because RFC 7231 delta-seconds cannot express a sub-second
+// wait, and 0 would tell the client to retry immediately — which is exactly the
+// hammering the limiter is there to stop. A non-positive rate (a disabled or
+// misconfigured bucket) also yields the floor rather than dividing by zero, and the
+// result is capped so a near-zero rate cannot produce a value that overflows the
+// int conversion or asks a catching-up peer to sleep for a day.
+func (rl *tieredRateLimiter) retryAfterSeconds(lim *rate.Limiter) string {
+	limit := float64(lim.Limit())
+	if limit <= 0 {
+		return "1"
+	}
+
+	secs := math.Ceil(1 / limit)
+	if secs < 1 {
+		secs = 1
+	}
+
+	if secs > maxRetryAfterSeconds {
+		secs = maxRetryAfterSeconds
+	}
+
+	return strconv.Itoa(int(secs))
 }
 
 // unverifiedBucket returns the rate.Limiter for the given key in the bounded

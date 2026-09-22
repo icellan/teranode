@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -588,4 +589,60 @@ func TestPublishInvalidSubtree_EndToEndMemoryKafka(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for invalid subtree kafka message")
 	}
+}
+
+// TestGetMissingTransactionsBatch_RetriesOn429 — a peer that rate-limits us is
+// behaving correctly, so the 429 must be retried rather than treated as the peer
+// failing to provide the data. No invalid-subtree report may be published.
+func TestGetMissingTransactionsBatch_RetriesOn429(t *testing.T) {
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	subtreeHash := chainhash.HashH([]byte("test-subtree-429"))
+	baseURL := testPeerURL
+
+	server := &Server{
+		logger:                       ulogger.TestLogger{},
+		settings:                     tSettings,
+		subtreeStore:                 memory.New(),
+		invalidSubtreeKafkaProducer:  &mockKafkaProducer{},
+		invalidSubtreeDeDuplicateMap: expiringmap.New[string, struct{}](time.Minute * 1),
+	}
+	defer server.invalidSubtreeDeDuplicateMap.Stop()
+
+	tx, err := bt.NewTxFromString("010000000000000000ef0152a9231baa4e4b05dc30c8fbb7787bab5f460d4d33b039c39dd8cc006f3363e4020000006b483045022100ce3605307dd1633d3c14de4a0cf0df1439f392994e561b648897c4e540baa9ad02207af74878a7575a95c9599e9cdc7e6d73308608ee59abcd90af3ea1a5c0cca41541210275f8390df62d1e951920b623b8ef9c2a67c4d2574d408e422fb334dd1f3ee5b6ffffffff706b9600000000001976a914a32f7eaae3afd5f73a2d6009b93f91aa11d16eef88ac05404b4c00000000001976a914aabb8c2f08567e2d29e3a64f1f833eee85aaf74d88ac80841e00000000001976a914a4aff400bef2fa074169453e703c611c6b9df51588ac204e0000000000001976a9144669d92d46393c38594b2f07587f01b3e5289f6088ac204e0000000000001976a914a461497034343a91683e86b568c8945fb73aca0288ac99fe2a00000000001976a914de7850e419719258077abd37d4fcccdb0a659b9388ac00000000")
+	require.NoError(t, err)
+
+	var attempts int32
+
+	url := fmt.Sprintf("%s/subtree/%s/txs", baseURL, subtreeHash.String())
+	httpmock.RegisterResponder("POST", url,
+		func(req *http.Request) (*http.Response, error) {
+			// The body must arrive intact on every attempt, including the retries.
+			sent, readErr := io.ReadAll(req.Body)
+			require.NoError(t, readErr)
+			require.Len(t, sent, 32)
+
+			if atomic.AddInt32(&attempts, 1) == 1 {
+				resp := httpmock.NewStringResponse(http.StatusTooManyRequests, "rate limit exceeded")
+				resp.Header.Set("Retry-After", "1")
+
+				return resp, nil
+			}
+
+			return httpmock.NewBytesResponse(http.StatusOK, tx.ExtendedBytes()), nil
+		})
+
+	missingTxHashes := []utxo.UnresolvedMetaData{
+		{Hash: *tx.TxIDChainHash(), Idx: 0},
+	}
+
+	txs, err := server.getMissingTransactionsBatch(context.Background(), subtreeHash, missingTxHashes, baseURL, "")
+	require.NoError(t, err)
+	require.Len(t, txs, 1)
+	require.Equal(t, int32(2), atomic.LoadInt32(&attempts), "the 429 must have been retried")
+
+	kafkaProducer := server.invalidSubtreeKafkaProducer.(*mockKafkaProducer)
+	require.Empty(t, kafkaProducer.messages, "a rate-limited peer must not be reported as invalid")
 }

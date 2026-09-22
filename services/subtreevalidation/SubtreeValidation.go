@@ -300,7 +300,13 @@ func (u *Server) getMissingTransactionsBatch(ctx context.Context, subtreeHash ch
 	// do a POST http request to baseUrl + subtree hash + txs endpoint
 	u.logger.Debugf("[getMissingTransactionsBatch][%s] getting %d txs from peer %s", subtreeHash.String(), len(txHashes), txsURL)
 
-	body, err := util.DoHTTPRequestBodyReader(ctx, txsURL, txIDBytes)
+	// Retrying helper, not the plain one: the peer's asset service rate-limits
+	// (429) and sheds load (503), and both are recoverable. Without the ladder a
+	// single rejection lands in publishInvalidSubtree below and degrades the
+	// reputation of a peer that was behaving correctly. Re-sending the body on each
+	// attempt is safe here — the request is a list of txids and the endpoint is a
+	// pure read, so every attempt asks for exactly the same transactions.
+	body, err := util.DoHTTPRequestBodyReaderWithRetry(ctx, txsURL, txIDBytes)
 	if err != nil {
 		// Peer cannot provide requested transactions - report as invalid subtree
 		u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, peerID, "peer_cannot_provide_transactions")
