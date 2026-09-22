@@ -519,16 +519,31 @@ const (
 	maxNotificationMetadataEntries  = 16
 	maxNotificationMetadataFieldLen = 256
 
-	// maxBlockHeadersPerRequest bounds GetBlockHeaders' caller-supplied
-	// numberOfHeaders. The store's preallocFor already bounds the initial
-	// slice capacity, but not the result set: the value flows straight into a
-	// SQL LIMIT. Mainnet is currently well under this bound (~920k blocks), so
-	// it does not stop a request for the whole chain - it caps a single
-	// response at roughly 80MB of headers. This RPC is unauthenticated. The
-	// bound is generous rather than tight because legitimate callers (e.g.
-	// BlockAssembler's chain-movement catch-up) can legitimately ask for tens
-	// of thousands of headers.
+	// maxBlockHeadersPerRequest bounds the header-only RPCs' (GetBlockHeaders,
+	// GetBlockHeadersFromOldest, GetBlockHeadersToCommonAncestor,
+	// GetBlockHeadersFromCommonAncestor, GetBlockHeadersFromHeight,
+	// LocateBlockHeaders) caller-supplied header counts. The store's
+	// preallocFor already bounds the initial slice capacity, but not the
+	// result set: the value flows straight into a SQL LIMIT. Mainnet is
+	// currently well under this bound (~920k blocks), so it does not stop a
+	// request for the whole chain - it caps a single response at roughly
+	// 80MB of headers. These RPCs are unauthenticated. The bound is generous
+	// rather than tight because legitimate callers (e.g. BlockAssembler's
+	// chain-movement catch-up) can legitimately ask for tens of thousands of
+	// headers.
+	//
+	// Block-summary RPCs (GetLastNBlocks, GetLastNInvalidBlocks) return
+	// []model.BlockInfo, not bare 80-byte headers, so they are bounded by
+	// maxBlocksByHeightRange and maxInvalidBlocksPerRequest instead - see
+	// those accessors.
 	defaultMaxBlockHeadersPerRequest = 1_000_000
+
+	// defaultMaxInvalidBlocksPerRequest is the fallback bound for
+	// GetLastNInvalidBlocks when settings is nil. It matches the RPC
+	// service's reconsiderInvalidChildren, the largest known in-tree caller;
+	// the actual result is also bounded by how many blocks are persisted as
+	// invalid, which is normally small.
+	defaultMaxInvalidBlocksPerRequest = 10_000
 )
 
 // maxBlocksByHeightRange bounds the height window GetBlocksByHeight will
@@ -558,13 +573,28 @@ func (b *Blockchain) maxMedianTimePastHeights() int {
 	return b.settings.BlockChain.MaxMedianTimePastHeights
 }
 
-// maxBlockHeadersPerRequest bounds full-header and block-summary responses.
-// Lightweight header-ID queries are bounded by the available ancestry instead.
+// maxBlockHeadersPerRequest bounds full-header responses. Lightweight
+// header-ID queries are bounded by the available ancestry instead, and
+// block-summary responses are bounded by maxBlocksByHeightRange /
+// maxInvalidBlocksPerRequest instead.
 func (b *Blockchain) maxBlockHeadersPerRequest() uint64 {
 	if b.settings == nil || b.settings.BlockChain.MaxBlockHeadersPerRequest <= 0 {
 		return defaultMaxBlockHeadersPerRequest
 	}
 	return uint64(b.settings.BlockChain.MaxBlockHeadersPerRequest)
+}
+
+// maxInvalidBlocksPerRequest bounds GetLastNInvalidBlocks' caller-supplied
+// count. The RPC returns []model.BlockInfo (header plus miner and size
+// metadata), not bare headers, so it is bounded separately from
+// maxBlockHeadersPerRequest. Settings-backed so an operator can raise it
+// without a rebuild; defaultMaxInvalidBlocksPerRequest is used only when
+// settings is nil.
+func (b *Blockchain) maxInvalidBlocksPerRequest() uint64 {
+	if b.settings == nil || b.settings.BlockChain.MaxInvalidBlocksPerRequest <= 0 {
+		return defaultMaxInvalidBlocksPerRequest
+	}
+	return uint64(b.settings.BlockChain.MaxInvalidBlocksPerRequest)
 }
 
 // knownSubscriberSources is the closed set of in-tree Subscribe() sources. It
@@ -573,15 +603,17 @@ func (b *Blockchain) maxBlockHeadersPerRequest() uint64 {
 // are never garbage collected, so an unbounded label is a memory leak an
 // attacker drives by reconnecting with random source names.
 var knownSubscriberSources = map[string]bool{
-	SubscriberLegacy:            true,
-	SubscriberP2P:               true,
-	SubscriberUTXOStore:         true,
-	SubscriberBlockAssembler:    true,
-	SubscriberBlockValidation:   true,
-	SubscriberSubtreeValidation: true,
-	SubscriberPruner:            true,
-	SubscriberAssetService:      true,
-	SubscriberUTXOPersister:     true,
+	SubscriberLegacy:              true,
+	SubscriberP2P:                 true,
+	SubscriberUTXOStore:           true,
+	SubscriberBlockAssembler:      true,
+	SubscriberBlockValidation:     true,
+	SubscriberSubtreeValidation:   true,
+	SubscriberPruner:              true,
+	SubscriberAssetService:        true,
+	SubscriberUTXOPersister:       true,
+	SubscriberFileBlockHeight:     true,
+	SubscriberAssetMainChainCache: true,
 }
 
 // metricSourceLabel maps a subscriber source onto a bounded label value.
@@ -1426,15 +1458,16 @@ func (b *Blockchain) GetBlock(ctx context.Context, request *blockchain_api.GetBl
 
 // GetBlocks retrieves multiple blocks starting from a specific hash.
 func (b *Blockchain) GetBlocks(ctx context.Context, req *blockchain_api.GetBlocksRequest) (*blockchain_api.GetBlocksResponse, error) {
-	if uint64(req.Count) > uint64(b.maxBlocksByHeightRange()) {
-		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlocks] invalid count %d, maximum is %d", req.Count, uint64(b.maxBlocksByHeightRange())))
-	}
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBlocks",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainGetBlockHeaders),
 		tracing.WithLogMessage(b.logger, "[GetBlocks] called for %s", util.ReverseAndHexEncodeSlice(req.Hash)),
 	)
 	defer deferFn()
+
+	if uint64(req.Count) > uint64(b.maxBlocksByHeightRange()) {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlocks] invalid count %d, maximum is %d", req.Count, uint64(b.maxBlocksByHeightRange())))
+	}
 
 	startHash, err := chainhash.NewHash(req.Hash)
 	if err != nil {
@@ -1601,14 +1634,15 @@ func (b *Blockchain) GetBlockGraphData(ctx context.Context, req *blockchain_api.
 
 // GetLastNBlocks retrieves the most recent N blocks from the blockchain.
 func (b *Blockchain) GetLastNBlocks(ctx context.Context, request *blockchain_api.GetLastNBlocksRequest) (*blockchain_api.GetLastNBlocksResponse, error) {
-	if uint64(request.NumberOfBlocks) > b.maxBlockHeadersPerRequest() {
-		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetLastNBlocks] invalid count %d, maximum is %d", request.NumberOfBlocks, b.maxBlockHeadersPerRequest()))
-	}
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetLastNBlocks",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainGetLastNBlocks),
 	)
 	defer deferFn()
+
+	if uint64(request.NumberOfBlocks) > uint64(b.maxBlocksByHeightRange()) {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetLastNBlocks] invalid count %d, maximum is %d", request.NumberOfBlocks, b.maxBlocksByHeightRange()))
+	}
 
 	blockInfo, err := b.store.GetLastNBlocks(ctx, request.NumberOfBlocks, request.IncludeOrphans, request.FromHeight)
 	if err != nil {
@@ -1622,13 +1656,14 @@ func (b *Blockchain) GetLastNBlocks(ctx context.Context, request *blockchain_api
 
 // GetLastNInvalidBlocks retrieves the most recent N blocks that have been marked as invalid.
 func (b *Blockchain) GetLastNInvalidBlocks(ctx context.Context, request *blockchain_api.GetLastNInvalidBlocksRequest) (*blockchain_api.GetLastNInvalidBlocksResponse, error) {
-	if uint64(request.N) > b.maxBlockHeadersPerRequest() {
-		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetLastNInvalidBlocks] invalid count %d, maximum is %d", request.N, b.maxBlockHeadersPerRequest()))
-	}
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetLastNInvalidBlocks",
 		tracing.WithParentStat(b.stats),
 	)
 	defer deferFn()
+
+	if uint64(request.N) > b.maxInvalidBlocksPerRequest() {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetLastNInvalidBlocks] invalid count %d, maximum is %d", request.N, b.maxInvalidBlocksPerRequest()))
+	}
 
 	blockInfo, err := b.store.GetLastNInvalidBlocks(ctx, request.N)
 	if err != nil {
@@ -1996,14 +2031,15 @@ func (b *Blockchain) GetBlockHeaders(ctx context.Context, req *blockchain_api.Ge
 }
 
 func (b *Blockchain) GetBlockHeadersToCommonAncestor(ctx context.Context, req *blockchain_api.GetBlockHeadersToCommonAncestorRequest) (*blockchain_api.GetBlockHeadersResponse, error) {
-	if req.MaxHeaders == 0 || uint64(req.MaxHeaders) > b.maxBlockHeadersPerRequest() {
-		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlockHeadersToCommonAncestor] invalid count %d, maximum is %d", req.MaxHeaders, b.maxBlockHeadersPerRequest()))
-	}
 	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBlockHeaders",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainGetBlockHeaders),
 	)
 	defer deferFn()
+
+	if req.MaxHeaders == 0 || uint64(req.MaxHeaders) > b.maxBlockHeadersPerRequest() {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlockHeadersToCommonAncestor] invalid count %d, maximum is %d", req.MaxHeaders, b.maxBlockHeadersPerRequest()))
+	}
 
 	var err error
 
@@ -2129,7 +2165,9 @@ func (b *Blockchain) GetBlockHeadersByHeight(ctx context.Context, req *blockchai
 	// uint32 subtraction into ~4 billion, which the store now guards.
 	//
 	// The window itself is deliberately uncapped - utxopersister legitimately
-	// asks for 1..tip - so the store bounds its preallocation instead.
+	// asks for 1..tip. The store only bounds its initial preallocation
+	// (maxResultPrealloc); the result slice still grows to whatever the
+	// query actually returns, so this is not a result-set bound.
 	if req.EndHeight < req.StartHeight {
 		return &blockchain_api.GetBlockHeadersByHeightResponse{}, nil
 	}
@@ -3427,7 +3465,14 @@ func (b *Blockchain) CatchUpBlocks(ctx context.Context, _ *emptypb.Empty) (*empt
 
 // ReportPeerFailure handles reports of peer download failures and broadcasts to subscribers.
 func (b *Blockchain) ReportPeerFailure(ctx context.Context, req *blockchain_api.ReportPeerFailureRequest) (*emptypb.Empty, error) {
-	b.logger.Warnf("[ReportPeerFailure] Peer %s failed: type=%s, reason=%s", req.PeerId, req.FailureType, req.Reason)
+	// Caller-supplied fields on this unauthenticated RPC are sanitized before
+	// they reach the log line or the notification metadata map, matching
+	// sanitizeSubscriberSource's treatment of Subscribe's source field.
+	peerID := truncateUTF8(req.PeerId, maxNotificationMetadataFieldLen)
+	failureType := truncateUTF8(req.FailureType, maxNotificationMetadataFieldLen)
+	reason := truncateUTF8(req.Reason, maxNotificationMetadataFieldLen)
+
+	b.logger.Warnf("[ReportPeerFailure] Peer %s failed: type=%s, reason=%s", peerID, failureType, reason)
 
 	// Send notification to all subscribers (including P2P)
 	notification := &blockchain_api.Notification{
@@ -3435,9 +3480,9 @@ func (b *Blockchain) ReportPeerFailure(ctx context.Context, req *blockchain_api.
 		Hash: req.Hash,
 		Metadata: &blockchain_api.NotificationMetadata{
 			Metadata: map[string]string{
-				"peer_id":      req.PeerId,
-				"failure_type": req.FailureType,
-				"reason":       truncateUTF8(req.Reason, maxNotificationMetadataFieldLen),
+				"peer_id":      peerID,
+				"failure_type": failureType,
+				"reason":       reason,
 			},
 		},
 	}
@@ -3738,6 +3783,10 @@ out:
 
 // GetBlockHeadersFromCommonAncestor retrieves block headers from a common ancestor.
 func (b *Blockchain) GetBlockHeadersFromCommonAncestor(ctx context.Context, request *blockchain_api.GetBlockHeadersFromCommonAncestorRequest) (*blockchain_api.GetBlockHeadersResponse, error) {
+	if uint64(request.MaxHeaders) > b.maxBlockHeadersPerRequest() {
+		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlockHeadersFromCommonAncestor] %d headers requested, maximum is %d", request.MaxHeaders, b.maxBlockHeadersPerRequest()))
+	}
+
 	targetHash, err := chainhash.NewHash(request.TargetHash)
 	if err != nil {
 		return nil, errors.WrapGRPC(errors.NewInvalidArgumentError("[Blockchain][GetBlockHeadersFromCommonAncestor] request's target hash is not valid", err))
@@ -4183,10 +4232,21 @@ func (b *Blockchain) cleanupExpiredBatchTokens() {
 	}
 }
 
-// truncateUTF8 bounds diagnostic text without splitting a Unicode code point.
+// truncateUTF8 bounds diagnostic text without splitting a Unicode code
+// point, and strips control characters so a caller-supplied value cannot
+// forge log lines it is embedded in.
 func truncateUTF8(value string, limit int) string {
+	value = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+
+		return r
+	}, value)
+
 	if len(value) > limit {
 		value = value[:limit]
 	}
+
 	return strings.ToValidUTF8(value, "")
 }
