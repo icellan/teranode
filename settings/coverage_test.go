@@ -21,6 +21,20 @@ func TestMetadataCoverage(t *testing.T) {
 	require.NotNil(t, registry)
 	require.GreaterOrEqual(t, len(registry.Settings), 300, "Should have at least 300 settings after complete migration")
 
+	// PostgresPool fields document a *PostgresSettings struct as a single
+	// opaque override setting: extractFields only recurses into a nested
+	// struct field when its own key tag is empty, so dropping either tag
+	// below silently stops emitting the struct-level setting and instead
+	// flattens its children into keys that already exist elsewhere - both
+	// changes TestNoMissingTags cannot see, since its walk always descends
+	// into settings-package structs regardless of their own key tag.
+	exportedKeys := make(map[string]bool, len(registry.Settings))
+	for _, setting := range registry.Settings {
+		exportedKeys[setting.Key] = true
+	}
+	require.True(t, exportedKeys["blockchain_postgres_pool"], "BlockChainSettings.PostgresPool must keep its key tag")
+	require.True(t, exportedKeys["utxostore_postgres_pool"], "UtxoStoreSettings.PostgresPool must keep its key tag")
+
 	// Verify all categories are present
 	require.NotEmpty(t, registry.Categories)
 	require.Contains(t, registry.Categories, CategoryGlobal)
