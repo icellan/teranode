@@ -383,8 +383,8 @@ func processHeaders(ctx context.Context, logger ulogger.Logger, blockchainStore 
 	// count against without any file format change.
 	if recordsRead != uint64(height)+1 {
 		return errors.NewProcessingError(
-			"utxo-headers file %s record count mismatch (likely truncated): expected %d header records (heights 0..%d), read %d",
-			headersFile, uint64(height)+1, height, recordsRead)
+			"utxo-headers file %s record count mismatch (likely truncated): expected %d header records (heights 0..%d), read %d; the %d blocks read so far have already been persisted",
+			headersFile, uint64(height)+1, height, recordsRead, recordsRead)
 	}
 
 	logger.Infof("FINISHED  %16s headers with %16s transactions", formatNumber(headersProcessed), formatNumber(txCount))
@@ -442,7 +442,7 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 		// instant, versus hours to re-import an already-complete UTXO set.
 		var recoverable bool
 
-		recoverable, err = checkpointRecoverable(ctx, blockStore, blockchainStore)
+		recoverable, err = checkpointRecoverable(ctx, blockStore, blockchainStore, utxoFile)
 		if err != nil {
 			return nil, err
 		}
@@ -540,11 +540,13 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 
 	heightStr := fmt.Sprintf("%d\n", height)
 
-	// WithAllowOverwrite is required here: a -force recovery run (see
-	// checkpointRecoverable) re-imports the UTXO set over a store that
-	// already holds lastProcessed.dat from the run that produced this same
-	// complete set, and the marker write must not itself be the reason that
-	// recovery fails.
+	// WithAllowOverwrite is required here: processUTXOs only runs when
+	// checkpointRecoverable's cheap path was not taken - lastProcessed.dat may
+	// not exist yet, but it may also already be present and simply not apply
+	// to this utxoFile (a different recorded height, or a BlockAssembler
+	// checkpoint that already exists) - so a full re-import can find
+	// lastProcessed.dat from an earlier run already present, and the marker
+	// write must not itself be the reason that re-import fails.
 	if err = blockStore.Set(ctx, nil, fileformat.FileTypeDat, []byte(heightStr), bloboptions.WithFilename("lastProcessed"), bloboptions.WithNoHashPrefix(), bloboptions.WithAllowOverwrite(true)); err != nil {
 		return nil, errors.NewStorageError("failed to write height of %d to lastProcessed.dat", height, err)
 	}
@@ -690,18 +692,38 @@ func readUTXOSetTip(utxoFile string) (*utxoSetTip, error) {
 
 // checkpointRecoverable reports whether the store is in the specific state a
 // prior run's failure to write the BlockAssembler checkpoint after a complete
-// UTXO import leaves behind: lastProcessed.dat present - proof the UTXO
-// import itself finished, since processUTXOs only writes it after every
-// worker has finished successfully - but no checkpoint. In this state -force
-// must not re-import the (already complete) UTXO set; the caller recovers the
-// tip cheaply via readUTXOSetTip instead.
-func checkpointRecoverable(ctx context.Context, blockStore blob.Store, blockchainStore blockchain.Store) (bool, error) {
-	exists, err := blockStore.Exists(ctx, nil, fileformat.FileTypeDat, bloboptions.WithFilename("lastProcessed"), bloboptions.WithNoHashPrefix())
+// UTXO import leaves behind: lastProcessed.dat present - proof *an* import
+// finished, since processUTXOs only writes it after every worker has finished
+// successfully - with its recorded height matching utxoFile's own preamble
+// height, proving the marker belongs to this same UTXO set rather than some
+// other snapshot - but no checkpoint. In this state -force must not re-import
+// the (already complete) UTXO set; the caller recovers the tip cheaply via
+// readUTXOSetTip instead.
+//
+// A marker present but recording a different height falls through to a full
+// re-import: it proves some import finished, but not that it was of
+// utxoFile, so utxoFile itself has not necessarily been imported at all.
+func checkpointRecoverable(ctx context.Context, blockStore blob.Store, blockchainStore blockchain.Store, utxoFile string) (bool, error) {
+	b, err := blockStore.Get(ctx, nil, fileformat.FileTypeDat, bloboptions.WithFilename("lastProcessed"), bloboptions.WithNoHashPrefix())
 	if err != nil {
-		return false, errors.NewStorageError("failed to check if lastProcessed.dat exists", err)
+		if errors.Is(err, errors.ErrNotFound) {
+			return false, nil
+		}
+
+		return false, errors.NewStorageError("failed to read lastProcessed.dat", err)
 	}
 
-	if !exists {
+	markerHeight, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 32)
+	if err != nil {
+		return false, errors.NewProcessingError("failed to parse height from lastProcessed.dat", err)
+	}
+
+	tip, err := readUTXOSetTip(utxoFile)
+	if err != nil {
+		return false, err
+	}
+
+	if uint64(tip.height) != markerHeight {
 		return false, nil
 	}
 

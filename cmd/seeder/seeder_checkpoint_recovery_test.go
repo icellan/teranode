@@ -16,13 +16,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestProcessHeaders_ReRun_FailsOnAlreadyStoredBlock is the reproduction for
-// the first half of the ordishs P1 on PR #1604: the prescribed "-force"
-// recovery re-runs processHeaders, which re-stores every block from the
-// headers file - including ones a prior run already stored. Before the fix,
-// StoreBlock's BlockExistsError is fatal, so the recovery run fails before it
-// ever reaches the BlockAssembler checkpoint write.
-func TestProcessHeaders_ReRun_FailsOnAlreadyStoredBlock(t *testing.T) {
+// TestProcessHeaders_ReRun_IsIdempotentOnAlreadyStoredBlock is the
+// reproduction for the first half of the ordishs P1 on PR #1604: the
+// prescribed "-force" recovery re-runs processHeaders, which re-stores every
+// block from the headers file - including ones a prior run already stored.
+// Before the fix, StoreBlock's BlockExistsError is fatal, so the recovery run
+// would have failed before it ever reached the BlockAssembler checkpoint
+// write; the fix treats ErrBlockExists as an idempotent replay instead.
+func TestProcessHeaders_ReRun_IsIdempotentOnAlreadyStoredBlock(t *testing.T) {
 	ctx := context.Background()
 	store := newTestBlockchainStore(t)
 
@@ -117,7 +118,9 @@ func TestCheckpointRecoverable_MarkerWithoutCheckpoint_ReportsRecoverable(t *tes
 
 	markLastProcessed(t, ctx, blockStore)
 
-	recoverable, err := checkpointRecoverable(ctx, blockStore, blockchainStore)
+	utxoFile := writeUtxoSetPreamble(t, chainhash.Hash{}, 1)
+
+	recoverable, err := checkpointRecoverable(ctx, blockStore, blockchainStore, utxoFile)
 	require.NoError(t, err)
 	require.True(t, recoverable)
 }
@@ -130,7 +133,9 @@ func TestCheckpointRecoverable_NoMarker_NotRecoverable(t *testing.T) {
 	blockchainStore := newTestBlockchainStore(t)
 	blockStore := newTestBlobStore(t)
 
-	recoverable, err := checkpointRecoverable(ctx, blockStore, blockchainStore)
+	utxoFile := writeUtxoSetPreamble(t, chainhash.Hash{}, 1)
+
+	recoverable, err := checkpointRecoverable(ctx, blockStore, blockchainStore, utxoFile)
 	require.NoError(t, err)
 	require.False(t, recoverable)
 }
@@ -148,9 +153,39 @@ func TestCheckpointRecoverable_MarkerWithCheckpoint_NotRecoverable(t *testing.T)
 	block := storeBlockAboveGenesis(t, ctx, blockchainStore)
 	require.NoError(t, writeBlockAssemblerState(ctx, ulogger.TestLogger{}, blockchainStore, &utxoSetTip{hash: *block.Hash(), height: 1}))
 
-	recoverable, err := checkpointRecoverable(ctx, blockStore, blockchainStore)
+	utxoFile := writeUtxoSetPreamble(t, chainhash.Hash{}, 1)
+
+	recoverable, err := checkpointRecoverable(ctx, blockStore, blockchainStore, utxoFile)
 	require.NoError(t, err)
 	require.False(t, recoverable)
+}
+
+// TestCheckpointRecoverable_MarkerHeightMismatchesUtxoFile_NotRecoverable is
+// the reproduction for the ordishs P1 regression on PR #1604: the marker only
+// proves *an* import finished, not that it was for the utxoFile this run was
+// invoked with. Sequence: seed from snapshot A (tip 800000), the header pass
+// rejects A's truncated utxo-headers file after the UTXO pass already wrote
+// lastProcessed.dat, the operator fetches a complete snapshot B (tip 810000)
+// and re-runs with -force. checkpointRecoverable must see that the marker's
+// recorded height does not match snapshot B's preamble height and refuse the
+// cheap path - taking it here would commit a BlockAssembler checkpoint at B's
+// tip over a UTXO store that still holds A's set.
+func TestCheckpointRecoverable_MarkerHeightMismatchesUtxoFile_NotRecoverable(t *testing.T) {
+	ctx := context.Background()
+	blockchainStore := newTestBlockchainStore(t)
+	blockStore := newTestBlobStore(t)
+
+	// Marker left behind by the import of snapshot A (tip height 800000).
+	err := blockStore.Set(ctx, nil, fileformat.FileTypeDat, []byte("800000\n"),
+		bloboptions.WithFilename("lastProcessed"), bloboptions.WithNoHashPrefix())
+	require.NoError(t, err)
+
+	// The -force re-run is now pointed at snapshot B (tip height 810000).
+	utxoFile := writeUtxoSetPreamble(t, chainhash.Hash{}, 810000)
+
+	recoverable, err := checkpointRecoverable(ctx, blockStore, blockchainStore, utxoFile)
+	require.NoError(t, err)
+	require.False(t, recoverable, "a marker for a different snapshot must not be treated as proof this utxoFile was already imported")
 }
 
 // TestLastProcessedMarker_RewriteWithoutAllowOverwrite_Fails is the
