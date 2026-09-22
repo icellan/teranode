@@ -151,6 +151,25 @@ func TestReportPeerFailure_LongReasonStillNotifies(t *testing.T) {
 	require.True(t, utf8.ValidString(reason))
 }
 
+// TestReportPeerFailure_StripsControlCharacters pins that caller-supplied
+// PeerId, FailureType and Reason on this unauthenticated RPC cannot forge log
+// lines or notification metadata with embedded newlines, matching
+// sanitizeSubscriberSource's treatment of Subscribe's source field.
+func TestReportPeerFailure_StripsControlCharacters(t *testing.T) {
+	b := newTestBlockchainForNotifications(t, 1)
+	_, err := b.ReportPeerFailure(context.Background(), &blockchain_api.ReportPeerFailureRequest{
+		PeerId:      "evil\nINFO fake log line",
+		FailureType: "catchup\r\n",
+		Hash:        make([]byte, chainhash.HashSize),
+		Reason:      "bad\x00reason\x7f",
+	})
+	require.NoError(t, err)
+	notification := <-b.notifications
+	require.Equal(t, "evilINFO fake log line", notification.Metadata.Metadata["peer_id"])
+	require.Equal(t, "catchup", notification.Metadata.Metadata["failure_type"])
+	require.Equal(t, "badreason", notification.Metadata.Metadata["reason"])
+}
+
 func TestSendNotification_PayloadBounds(t *testing.T) {
 	ctx := context.Background()
 	validHash := make([]byte, chainhash.HashSize)
@@ -230,6 +249,12 @@ func TestSanitizeSubscriberSource(t *testing.T) {
 	require.Equal(t, SubscriberP2P, metricSourceLabel(SubscriberP2P))
 	require.Equal(t, "other", metricSourceLabel(strings.Repeat("x", 64)))
 	require.Equal(t, "other", metricSourceLabel("unknown"))
+
+	// daemon.go and the asset mainchain cache Subscribe() with literals that
+	// must stay in this closed set, or they collapse into "other" alongside
+	// arbitrary attacker-supplied source names.
+	require.Equal(t, SubscriberFileBlockHeight, metricSourceLabel(SubscriberFileBlockHeight))
+	require.Equal(t, SubscriberAssetMainChainCache, metricSourceLabel(SubscriberAssetMainChainCache))
 }
 
 func TestGRPCPanicRecoveryKeepsProcessAlive(t *testing.T) {
@@ -249,9 +274,10 @@ func TestGRPCPanicRecoveryKeepsProcessAlive(t *testing.T) {
 
 // TestHashValidationRejectsShortHashes covers every handler that converts a
 // caller-supplied slice into a chainhash.Hash. Before validation these panicked
-// on any slice shorter than 32 bytes, killing the process - and three of them
-// (GetBlockIsMined, GetSuitableBlock, GetHashOfAncestorBlock) are public, so no
-// API key was needed to do it.
+// on any slice shorter than 32 bytes, killing the process. Start() passes nil
+// AuthOptions to util.StartGRPCServer, so no blockchain RPC checks an admin
+// API key - all seven handlers, not just the three public ones, were reachable
+// without one.
 func TestHashValidationRejectsShortHashes(t *testing.T) {
 	ctx := context.Background()
 
