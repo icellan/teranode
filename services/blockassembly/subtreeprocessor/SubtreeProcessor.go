@@ -362,8 +362,17 @@ type SubtreeProcessor struct {
 	// txMapDirs, when non-empty, enables disk-backed DiskTxMap across these directories.
 	txMapDirs []string
 
-	// diskTxMap is the disk-backed tx map (non-nil when txMapDirs is set).
-	diskTxMap *DiskTxMap
+	// retiredTxMaps holds DiskTxMap generations rotated out by
+	// resetSubtreeState. A retired generation stays open and readable until its
+	// owner releases it, because moveForwardBlock's remainder pass reads the
+	// pre-block TxInpoints out of it and the rollback closures may reinstate it
+	// as the active map. See releaseRetiredTxMaps.
+	//
+	// There is no diskTxMap field: the active disk map is always whatever
+	// currentTxMap points at, reached through diskMap(). Mirroring it in a
+	// second field would silently desynchronise on every rollback closure that
+	// restores currentTxMap without knowing about the mirror.
+	retiredTxMaps []*DiskTxMap
 
 	// txMapPool is a reusable transactionMap built in CreateTransactionMap.
 	// Allocated lazily on the first call (sized for that block) and Clear()ed
@@ -381,8 +390,8 @@ type SubtreeProcessor struct {
 
 	// currentTxMapShadow is the inactive half of a double-buffered currentTxMap
 	// used to avoid per-block 4096-shard SyncedMap allocations in
-	// resetSubtreeState. nil when diskTxMap is in use (that path reuses
-	// in place via Clear).
+	// resetSubtreeState. nil when a DiskTxMap is in use (that path carries its
+	// second generation in retiredTxMaps instead).
 	currentTxMapShadow *SplitTxInpointsMap
 
 	// splitMapBuckets is the bucket count used for the in-memory
@@ -643,7 +652,6 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 			logger.Warnf("DiskTxMap creation failed, using in-memory map: %v", diskErr)
 		} else {
 			stp.currentTxMap = diskMap
-			stp.diskTxMap = diskMap
 			reportDiskMapStats(diskMap.Stats())
 		}
 	}
@@ -651,8 +659,9 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 	// Pre-allocate the shadow half of the double-buffered currentTxMap so that
 	// resetSubtreeState can swap pointers instead of allocating a fresh
 	// 4096-shard SyncedMap structure on every block. Only applicable to the
-	// in-memory path — DiskTxMap already reuses storage in place via Clear().
-	if stp.diskTxMap == nil {
+	// in-memory path — the DiskTxMap path carries its second generation in
+	// retiredTxMaps, rotated in per block by resetSubtreeState.
+	if stp.diskMap() == nil {
 		stp.currentTxMapShadow = NewSplitTxInpointsMap(splitBuckets)
 	}
 
@@ -2424,10 +2433,10 @@ func (stp *SubtreeProcessor) processCompleteSubtree(skipNotification bool) (err 
 
 	// Update SubtreeIndex for all txs in this subtree so removeTxFromSubtrees can do O(1) lookup.
 	// Store chainedIdx+1 so that 0 (zero value) means "unassigned" and is safe across serialization.
-	if stp.diskTxMap != nil {
+	if dm := stp.diskMap(); dm != nil {
 		idx := int16(chainedIdx + 1)
 		for _, node := range currentSubtree.Nodes {
-			_ = stp.diskTxMap.UpdateSubtreeIndex(node.Hash, idx)
+			_ = dm.UpdateSubtreeIndex(node.Hash, idx)
 		}
 	}
 
@@ -2528,10 +2537,10 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subt
 			stp.chainedSubtrees = append(stp.chainedSubtrees, currentSt)
 
 			// Update SubtreeIndex for diskTxMap bookkeeping
-			if stp.diskTxMap != nil {
+			if dm := stp.diskMap(); dm != nil {
 				idx := int16(len(stp.chainedSubtrees)) // chainedSubtrees just grew by 1
 				for _, node := range currentSt.Nodes {
-					_ = stp.diskTxMap.UpdateSubtreeIndex(node.Hash, idx)
+					_ = dm.UpdateSubtreeIndex(node.Hash, idx)
 				}
 			}
 
@@ -2592,11 +2601,11 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subt
 
 		// Update SubtreeIndex for diskTxMap bookkeeping before appending
 		baseIdx := len(stp.chainedSubtrees)
-		if stp.diskTxMap != nil {
+		if dm := stp.diskMap(); dm != nil {
 			for i, st := range fullSubtrees {
 				idx := int16(baseIdx + i + 1) // +1 so 0 means "unassigned"
 				for _, node := range st.Nodes {
-					_ = stp.diskTxMap.UpdateSubtreeIndex(node.Hash, idx)
+					_ = dm.UpdateSubtreeIndex(node.Hash, idx)
 				}
 			}
 		}
@@ -2838,7 +2847,7 @@ func (stp *SubtreeProcessor) removeTxFromSubtrees(ctx context.Context, hash chai
 	if foundIndex == -1 {
 		// Use SubtreeIndex for O(1) lookup when DiskTxMap is active.
 		// SubtreeIndex is stored as chainedIdx+1, so >0 means assigned.
-		if stp.diskTxMap != nil {
+		if stp.diskMap() != nil {
 			if inpoints, found := stp.currentTxMap.Get(hash); found && inpoints.SubtreeIndex > 0 {
 				chainedIdx := int(inpoints.SubtreeIndex - 1)
 				if chainedIdx < len(stp.chainedSubtrees) {
@@ -3415,7 +3424,14 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	// pooling for the duration of this call. Single-goroutine — no
 	// synchronisation needed.
 	stp.disableCurrentTxMapPool = true
-	defer func() { stp.disableCurrentTxMapPool = false }()
+	defer func() {
+		stp.disableCurrentTxMapPool = false
+
+		// Runs after the rollback defers below, so releaseRetiredTxMaps sees the
+		// final currentTxMap and skips it if a rollback reinstated a retired
+		// generation. Everything else rotated out during the loop is dead.
+		stp.releaseRetiredTxMaps()
+	}()
 
 	if moveBackBlocks == nil {
 		return errors.NewProcessingError("you must pass in blocks to move down the chain")
@@ -3456,6 +3472,15 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 		rollback := func() {
 			stp.chainedSubtrees = originalChainedSubtrees
 			stp.currentSubtree.Store(originalCurrentSubtree)
+
+			// On the DiskTxMap path the map this rollback drops is a generation
+			// a later loop iteration rotated in, not the pre-loop one. Park it
+			// so the deferred releaseRetiredTxMaps still gives its Badger
+			// directory back instead of stranding it on disk.
+			if displaced := stp.diskMap(); displaced != nil && stp.currentTxMap != originalCurrentTxMap {
+				stp.retiredTxMaps = append(stp.retiredTxMaps, displaced)
+			}
+
 			stp.currentTxMap = originalCurrentTxMap
 			stp.currentBlockHeader.Store(currentBlockHeader)
 			stp.setTxCountFromSubtrees()
@@ -4685,13 +4710,25 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 // still holds the previous block's contents, which is exactly what callers
 // who captured a pointer before reset need to read from. The shadow is
 // Clear()ed at moveForwardBlock commit, after readers are guaranteed to have
-// finished — see swapCurrentTxMapBack for the rollback inverse.
-func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool) (err error) {
-	// Track whether the in-memory pool swap has already been performed in this
-	// call. If a later step fails (notably stp.newSubtree below) we must roll
-	// the swap back here, atomically, because moveForwardBlock's own rollback
-	// defer is not yet registered when this function returns — and would not
-	// fire on an error path that exits before that registration.
+// finished — see swapCurrentTxMapBack for the rollback inverse. The DiskTxMap
+// path gets its second generation from DiskTxMap.Rotate() instead, parked on
+// retiredTxMaps; the contract is otherwise identical.
+//
+// The reset deliberately destroys nothing. It returns the subtrees it displaced
+// rather than Close()ing them, because moveForwardBlock captures currentSubtree
+// and the chained subtrees before calling this and then reads their Nodes in
+// processRemainderTransactionsAndDequeue. Close() on an mmap-backed subtree
+// munmaps the region and unlinks the backing file while Nodes still points into
+// it, so closing here segfaults the process on the success path as soon as
+// blockassembly_subtreeMmapDir is set. The caller closes them at its commit
+// point, once the rollback closures that would reinstate them can no longer
+// fire; see closeRetiredSubtrees.
+func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool) (retiredSubtrees []*subtreepkg.Subtree, err error) {
+	// Track whether the tx-map swap has already been performed in this call. If
+	// a later step fails (notably stp.newSubtree below) we must roll the swap
+	// back here, atomically, because moveForwardBlock's own rollback defer is
+	// not yet registered when this function returns — and would not fire on an
+	// error path that exits before that registration.
 	var swappedHere bool
 
 	defer func() {
@@ -4700,12 +4737,25 @@ func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool)
 		}
 	}()
 
-	if stp.diskTxMap != nil {
-		reportDiskMapStats(stp.diskTxMap.Stats())
-		stp.diskTxMap.Clear()
+	if dm := stp.diskMap(); dm != nil {
+		reportDiskMapStats(dm.Stats())
+
+		// Rotate rather than Clear in place: the caller still reads the
+		// pre-reset TxInpoints out of this generation while the surviving
+		// entries are written into the fresh one. Clearing in place destroyed
+		// the read source, so every remainder lookup missed and
+		// processRemainderTxHashes failed the block with "not found in
+		// currentTxMap".
+		fresh, rotateErr := dm.Rotate()
+		if rotateErr != nil {
+			return nil, errors.NewServiceError("[resetSubtreeState] error rotating disk tx map", rotateErr)
+		}
+
+		stp.retiredTxMaps = append(stp.retiredTxMaps, dm)
+		stp.currentTxMap = fresh
+		swappedHere = true
+
 		clearDiskMapStats()
-		// DiskTxMap.Clear() recreates internal state but keeps the same object.
-		// This is safe because DiskTxMap is only assigned once in the constructor.
 	} else if stp.disableCurrentTxMapPool {
 		// Multi-block reorg in progress: fall back to fresh allocation so the
 		// pre-loop captured pointer in reorgBlocks continues to reference the
@@ -4724,21 +4774,39 @@ func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool)
 		subtreeSize = 1024 * 1024
 	}
 
-	if cs := stp.currentSubtree.Load(); cs != nil {
-		cs.Close()
-	}
+	// Build the replacement before displacing anything, so a failure here
+	// leaves the previous state fully intact for the caller to roll back onto.
 	newSubtree, err := stp.newSubtree(subtreeSize)
 	if err != nil {
-		return err
+		return nil, err
 	}
+
+	previousSubtree := stp.currentSubtree.Load()
 	stp.currentSubtree.Store(newSubtree)
 
-	stp.closeChainedSubtrees()
+	detached := stp.detachChainedSubtrees()
+
+	retiredSubtrees = make([]*subtreepkg.Subtree, 0, len(detached)+1)
+	if previousSubtree != nil {
+		retiredSubtrees = append(retiredSubtrees, previousSubtree)
+	}
+
+	retiredSubtrees = append(retiredSubtrees, detached...)
 
 	// Add first coinbase placeholder transaction
 	_ = stp.currentSubtree.Load().AddCoinbaseNode()
 
-	return nil
+	return retiredSubtrees, nil
+}
+
+// closeRetiredSubtrees releases subtrees handed back by resetSubtreeState. For
+// mmap-backed subtrees this unmaps the region and unlinks the backing file, so
+// it must only be called once every reader of their Nodes has finished and no
+// rollback closure can reinstate them — that is, at the caller's commit point.
+func closeRetiredSubtrees(subtrees []*subtreepkg.Subtree) {
+	for _, st := range subtrees {
+		st.Close()
+	}
 }
 
 // processRemainderTransactionsAndDequeue processes remaining transactions from the block
@@ -4975,12 +5043,22 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 	originalCurrentSubtree := stp.currentSubtree.Load()
 	originalCurrentTxMap := stp.currentTxMap
 
-	// Reset subtree state. After this, stp.currentTxMap is the freshly-empty
-	// shadow and the previous content is in stp.currentTxMapShadow (== the
-	// originalCurrentTxMap captured just above). If any subsequent step
-	// fails, we must swap them back so callers see the pre-reset state and
-	// the double-buffer invariant (current=active, shadow=empty) is restored.
-	if err = stp.resetSubtreeState(createProperlySizedSubtrees); err != nil {
+	// Reset subtree state. After this, stp.currentTxMap is a freshly-empty map
+	// and the previous content — the originalCurrentTxMap captured just above —
+	// is held aside: in currentTxMapShadow on the in-memory path, in
+	// retiredTxMaps on the DiskTxMap path. That is what the remainder pass below
+	// reads from while it writes the survivors into the new map. If any
+	// subsequent step fails, we must swap them back so callers see the pre-reset
+	// state and the invariant (current=active, held-aside=previous) is restored.
+	//
+	// retiredSubtrees are the pre-reset currentSubtree and chained subtrees,
+	// which the reset deliberately leaves mapped: originalCurrentSubtree and
+	// chainedSubtrees above are those same pointers and their Nodes are read
+	// throughout processRemainderTransactionsAndDequeue. They are closed at the
+	// commit point below.
+	var retiredSubtrees []*subtreepkg.Subtree
+
+	if retiredSubtrees, err = stp.resetSubtreeState(createProperlySizedSubtrees); err != nil {
 		return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error resetting subtree state", block.String(), err)
 	}
 
@@ -5019,6 +5097,14 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 	// clean slate.
 	stp.clearCurrentTxMapShadow()
 
+	// Same commit point for the displaced subtrees: every reader of their Nodes
+	// has finished and no rollback closure can reinstate them any more, so the
+	// mmap regions and their backing files can go. On an error return they are
+	// deliberately left open — the rollback closures put them back into
+	// chainedSubtrees / currentSubtree, and the next successful reset (or Stop)
+	// releases them.
+	closeRetiredSubtrees(retiredSubtrees)
+
 	// Log memory stats after block processing if debug logging is enabled
 	if stp.logger.LogLevel() <= 0 { // 0 is DEBUG level
 		var memStats runtime.MemStats
@@ -5055,7 +5141,23 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 // the shadow ends up empty for the next cycle. Clearing on the error path
 // adds work, but errors are rare and the alternative is corrupt state.
 func (stp *SubtreeProcessor) swapCurrentTxMapBack() {
-	if stp.diskTxMap != nil || stp.disableCurrentTxMapPool {
+	if dm := stp.diskMap(); dm != nil {
+		// Disk path: discard the generation resetSubtreeState rotated in, along
+		// with whatever a failed attempt partially wrote into it, and reinstate
+		// the retired one — it still holds the pre-reset data the caller is
+		// rolling back onto.
+		previous := stp.popRetiredTxMap()
+		if previous == nil {
+			return
+		}
+
+		_ = dm.Close()
+		stp.currentTxMap = previous
+
+		return
+	}
+
+	if stp.disableCurrentTxMapPool {
 		return
 	}
 
@@ -5064,11 +5166,54 @@ func (stp *SubtreeProcessor) swapCurrentTxMapBack() {
 	stp.currentTxMap, stp.currentTxMapShadow = stp.currentTxMapShadow, stp.currentTxMap.(*SplitTxInpointsMap)
 }
 
+// popRetiredTxMap removes and returns the most recently retired DiskTxMap
+// generation, or nil when none is outstanding.
+func (stp *SubtreeProcessor) popRetiredTxMap() *DiskTxMap {
+	if len(stp.retiredTxMaps) == 0 {
+		return nil
+	}
+
+	last := len(stp.retiredTxMaps) - 1
+	previous := stp.retiredTxMaps[last]
+	stp.retiredTxMaps = stp.retiredTxMaps[:last]
+
+	return previous
+}
+
+// releaseRetiredTxMaps closes every retired DiskTxMap generation, giving its
+// Badger directories back. The currently active map is skipped: a rollback may
+// have reinstated a retired generation, and closing it would pull the disk out
+// from under live state.
+func (stp *SubtreeProcessor) releaseRetiredTxMaps() {
+	active := stp.diskMap()
+
+	for _, retired := range stp.retiredTxMaps {
+		if retired != active {
+			_ = retired.Close()
+		}
+	}
+
+	stp.retiredTxMaps = nil
+}
+
 // clearCurrentTxMapShadow empties the inactive half of the double-buffered
 // currentTxMap, leaving it ready to become "current" on the next reset.
 // No-op when DiskTxMap is in use or when the pool is disabled.
 func (stp *SubtreeProcessor) clearCurrentTxMapShadow() {
-	if stp.diskTxMap != nil || stp.disableCurrentTxMapPool {
+	if stp.diskMap() != nil {
+		// During a multi-block reorg the pre-loop captured pointer in
+		// reorgBlocks must stay valid across every iteration, so retired
+		// generations are held until the reorg ends and released there.
+		if stp.disableCurrentTxMapPool {
+			return
+		}
+
+		stp.releaseRetiredTxMaps()
+
+		return
+	}
+
+	if stp.disableCurrentTxMapPool {
 		return
 	}
 
@@ -5700,10 +5845,10 @@ func (stp *SubtreeProcessor) parallelBuildRemainderSubtrees(ctx context.Context,
 		stp.chainedSubtreeCount.Add(1)
 		stp.chainedSubtreesTotalSize.Add(oldSubtree.SizeInBytes)
 
-		if stp.diskTxMap != nil {
+		if dm := stp.diskMap(); dm != nil {
 			idx := int16(chainedIdx + 1)
 			for _, node := range oldSubtree.Nodes {
-				_ = stp.diskTxMap.UpdateSubtreeIndex(node.Hash, idx)
+				_ = dm.UpdateSubtreeIndex(node.Hash, idx)
 			}
 		}
 
@@ -6564,10 +6709,16 @@ func (stp *SubtreeProcessor) Stop(ctx context.Context) {
 		if cs := stp.currentSubtree.Load(); cs != nil {
 			cs.Close()
 		}
-		// Clean up DiskTxMap
-		if stp.diskTxMap != nil {
-			reportDiskMapStats(stp.diskTxMap.Stats())
-			_ = stp.diskTxMap.Close()
+		// Clean up DiskTxMap, including any generation retired by a
+		// moveForwardBlock that never reached its commit point.
+		for _, retired := range stp.retiredTxMaps {
+			_ = retired.Close()
+		}
+		stp.retiredTxMaps = nil
+
+		if dm := stp.diskMap(); dm != nil {
+			reportDiskMapStats(dm.Stats())
+			_ = dm.Close()
 			clearDiskMapStats()
 		}
 	})
@@ -6587,15 +6738,34 @@ func (stp *SubtreeProcessor) newSubtree(leafCount int) (*subtreepkg.Subtree, err
 	return subtreepkg.NewTreeByLeafCount(leafCount)
 }
 
-// closeChainedSubtrees closes all mmap-backed chained subtrees and resets the slice.
+// closeChainedSubtrees detaches all chained subtrees and closes them, which for
+// mmap-backed subtrees unmaps their Nodes region. Only safe where no caller
+// still holds a pointer into them; resetSubtreeState uses detachChainedSubtrees
+// and defers the close to its caller's commit point instead.
 func (stp *SubtreeProcessor) closeChainedSubtrees() {
+	closeRetiredSubtrees(stp.detachChainedSubtrees())
+}
+
+// detachChainedSubtrees empties the chained subtree slice and returns what it
+// held, without closing anything.
+func (stp *SubtreeProcessor) detachChainedSubtrees() []*subtreepkg.Subtree {
 	stp.chainedSubtreesMu.Lock()
-	toClose := stp.chainedSubtrees
+	defer stp.chainedSubtreesMu.Unlock()
+
+	detached := stp.chainedSubtrees
 	stp.chainedSubtrees = make([]*subtreepkg.Subtree, 0, ExpectedNumberOfSubtrees)
 	stp.chainedSubtreeCount.Store(0)
 	stp.chainedSubtreesTotalSize.Store(0)
-	stp.chainedSubtreesMu.Unlock()
-	for _, st := range toClose {
-		st.Close()
-	}
+
+	return detached
+}
+
+// diskMap returns the active DiskTxMap, or nil when the in-memory
+// SplitTxInpointsMap is in use. It reads through currentTxMap rather than a
+// cached field so that every path which restores currentTxMap — including the
+// rollback closures in the dispatcher and in reorgBlocks — moves the disk map
+// with it.
+func (stp *SubtreeProcessor) diskMap() *DiskTxMap {
+	dm, _ := stp.currentTxMap.(*DiskTxMap)
+	return dm
 }

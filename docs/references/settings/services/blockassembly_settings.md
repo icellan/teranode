@@ -183,6 +183,21 @@ indication the feature never turned on. Set to a fast SSD/NVMe mount; do not
 point at a filesystem that can fill up during normal operation, since a full
 disk degrades throughput for the in-progress block.
 
+`blockassembly_txMapDirs` is validated entry by entry, and two shapes are
+rejected outright rather than accepted with surprising behaviour:
+
+- **An empty entry**, which a stray or doubled `|` produces
+  (`/mnt/nvme0/txmap|`). The list is split on `|` and only trimmed, so the
+  empty string survives into it and would be resolved to the system temp
+  directory — putting a share of the map on a RAM-backed tmpfs, the opposite
+  of what the setting asks for.
+- **A repeated directory** (compared after path cleaning, so `/mnt/x` and
+  `/mnt/x/` count as the same). The disk count comes from the number of
+  entries, and each one gets its own store, write batch and slice of the write
+  buffer, so a duplicate stripes across more logical shards than there are
+  devices and delivers neither the throughput nor the buffer sizing the
+  directory count implies.
+
 ## Hardcoded Settings (Not Configurable)
 
 | Setting | Value | Usage |

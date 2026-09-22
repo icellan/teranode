@@ -118,3 +118,62 @@ func buildTestBlockAssembler(t *testing.T, tSettings *settings.Settings) (*Block
 
 	return NewBlockAssembler(t.Context(), ulogger.TestLogger{}, tSettings, stats, store, nil, blockchainClient, nil)
 }
+
+// TestNewBlockAssembler_TxMapDirs_EmptyEntry_FailsFast pins the review finding
+// that an empty list entry slipped through the writability check.
+// ValidateWritableDir treats "" as "feature disabled" and returns nil, which is
+// right for the setting as a whole but wrong per entry: gocore's GetMulti splits
+// on "|" and only trims, so a trailing pipe, a doubled pipe or a whitespace-only
+// entry yields "" in the middle of an otherwise valid list. NewDiskTxMap would
+// then size itself for N disks and tempstore.New would map the empty base path
+// to os.TempDir(), routing a share of the inpoints onto a RAM-backed tmpfs —
+// silently inverting the purpose of the setting.
+func TestNewBlockAssembler_TxMapDirs_EmptyEntry_FailsFast(t *testing.T) {
+	initPrometheusMetrics()
+
+	for name, dirs := range map[string][]string{
+		"trailing empty":    {t.TempDir(), ""},
+		"leading empty":     {"", t.TempDir()},
+		"whitespace only":   {t.TempDir(), "   "},
+		"single empty item": {""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tSettings := createTestSettings(t)
+			tSettings.BlockAssembly.SubtreeMmapDir = ""
+			tSettings.BlockAssembly.TxMapDirs = dirs
+
+			_, err := buildTestBlockAssembler(t, tSettings)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "empty directory")
+		})
+	}
+}
+
+// TestNewBlockAssembler_TxMapDirs_DuplicateEntry_FailsFast covers the other
+// hand-editing slip in a "|"-separated list. DiskTxMap takes numDisks from
+// len(paths) and builds one independent Badger shard, write batch and write-
+// channel slice per entry, so a repeated path subdivides the hash space as if
+// more physical devices backed it than actually do. The shards carry distinct
+// prefixes so nothing collides, but the operator sees N directories and gets
+// neither the striping nor the write-buffer sizing that implies.
+func TestNewBlockAssembler_TxMapDirs_DuplicateEntry_FailsFast(t *testing.T) {
+	initPrometheusMetrics()
+
+	dir := t.TempDir()
+
+	for name, dirs := range map[string][]string{
+		"exact duplicate":    {dir, dir},
+		"trailing separator": {dir, dir + string(filepath.Separator)},
+		"unclean path":       {dir, filepath.Join(dir, "sub", "..")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tSettings := createTestSettings(t)
+			tSettings.BlockAssembly.SubtreeMmapDir = ""
+			tSettings.BlockAssembly.TxMapDirs = dirs
+
+			_, err := buildTestBlockAssembler(t, tSettings)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "duplicate directory")
+		})
+	}
+}

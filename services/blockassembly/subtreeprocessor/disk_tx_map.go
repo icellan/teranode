@@ -352,6 +352,29 @@ func (m *DiskTxMap) Clear() {
 	m.count.Store(0)
 }
 
+// Rotate returns a fresh, empty DiskTxMap configured exactly like m, leaving m
+// itself untouched and fully readable.
+//
+// It exists because moveForwardBlock's remainder pass reads the pre-block
+// TxInpoints out of the map it captured before resetSubtreeState while writing
+// the surviving ones into the post-block map. The in-memory path serves both
+// roles from a double buffer (currentTxMap / currentTxMapShadow); Clear()ing in
+// place cannot, because it destroys the read source. Rotating gives the disk
+// path the same two generations, and costs no more than Clear() already did:
+// Clear() also builds a new Badger store per shard and closes the old one, the
+// only difference being that the old one stays open here until the caller
+// releases it at its commit point.
+//
+// tempstore.New() names each directory with a nanosecond timestamp and the pid,
+// so the new generation never collides with the one it replaces.
+func (m *DiskTxMap) Rotate() (*DiskTxMap, error) {
+	return NewDiskTxMap(DiskTxMapOptions{
+		BasePaths:      m.basePaths,
+		Prefix:         m.prefix,
+		FilterCapacity: m.capacity,
+	})
+}
+
 // Flush persists all pending writes across all disk shards.
 func (m *DiskTxMap) Flush() error {
 	m.flushAllDisks()

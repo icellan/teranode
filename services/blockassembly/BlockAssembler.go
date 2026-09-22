@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -250,7 +251,37 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 		stpOpts = append(stpOpts, subtreeprocessor.WithMmapDir(tSettings.BlockAssembly.SubtreeMmapDir))
 	}
 	if len(tSettings.BlockAssembly.TxMapDirs) > 0 {
+		// Each entry becomes an independent Badger shard in DiskTxMap, so the
+		// list needs two checks ValidateWritableDir cannot make on its own.
+		//
+		// An empty entry: ValidateWritableDir returns nil for "" because empty
+		// means "feature disabled" for the setting as a whole, but that rule
+		// does not hold per entry. gocore's GetMulti splits on "|" and only
+		// trims, so a trailing pipe, a doubled pipe or a whitespace-only entry
+		// survives into the list, and tempstore.New maps an empty base path to
+		// os.TempDir() — putting a share of the inpoints on a RAM-backed tmpfs,
+		// which is the opposite of what configuring this setting asks for.
+		//
+		// A repeated entry: DiskTxMap takes its disk count from len(paths) and
+		// gives each one its own store, write batch and slice of the write
+		// buffer. Duplicates therefore stripe the hash space across more logical
+		// shards than there are devices. Nothing collides (the shards carry
+		// distinct prefixes), but the operator gets neither the throughput nor
+		// the buffer sizing the directory count implies.
+		seen := make(map[string]struct{}, len(tSettings.BlockAssembly.TxMapDirs))
+
 		for _, dir := range tSettings.BlockAssembly.TxMapDirs {
+			if strings.TrimSpace(dir) == "" {
+				return nil, errors.NewConfigurationError("blockassembly_txMapDirs contains an empty directory entry (check for a stray or doubled '|' separator)")
+			}
+
+			clean := filepath.Clean(dir)
+			if _, duplicate := seen[clean]; duplicate {
+				return nil, errors.NewConfigurationError("blockassembly_txMapDirs contains duplicate directory %s", clean)
+			}
+
+			seen[clean] = struct{}{}
+
 			if err := util.ValidateWritableDir(dir); err != nil {
 				return nil, errors.NewConfigurationError("blockassembly_txMapDirs is not usable", err)
 			}

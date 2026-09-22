@@ -81,6 +81,14 @@ var (
 	prometheusBlockValidationSetMinedDrops           prometheus.Counter
 	prometheusBlockValidationSetMinedEnqueueOverflow prometheus.Counter
 
+	// mmap-to-heap fallback counter: incremented every time an mmap-backed
+	// subtree deserialization fails and falls back to the heap. The matching log
+	// line is emitted only for the first failure, because the fallback sits on a
+	// per-subtree path and a filled disk would otherwise produce one line per
+	// subtree of every block. This counter is the alertable signal: a non-zero
+	// rate means blockvalidation_subtreeMmapDir is configured but not engaging.
+	prometheusBlockValidationSubtreeMmapFallback prometheus.Counter
+
 	// outpoint-only fast-path counter: incremented once per block when the
 	// below-checkpoint outpoint-only path is active (setting on, height ≤ highest
 	// checkpoint). A rising rate indicates the fast path is in use during IBD.
@@ -239,6 +247,15 @@ func _initPrometheusMetrics() {
 			Subsystem: "blockvalidation",
 			Name:      "setmined_drops_total",
 			Help:      "Total number of blocks dropped from the setTxMined retry loop after exceeding the retry ceiling. Non-zero values are page-worthy and require manual intervention; the specific block hash is recorded in the logs.",
+		},
+	)
+
+	prometheusBlockValidationSubtreeMmapFallback = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "blockvalidation",
+			Name:      "subtree_mmap_fallback_total",
+			Help:      "Total number of subtree deserializations that failed to mmap and fell back to heap allocation. A sustained non-zero rate means the configured blockvalidation_subtreeMmapDir is no longer usable (disk full, permissions changed) and the off-heap path is silently not engaging.",
 		},
 	)
 

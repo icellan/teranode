@@ -321,20 +321,34 @@ type BlockValidation struct {
 	spendRetryBackoff time.Duration
 }
 
+// subtreeMmapFallbackLogOnce gates the mmap-to-heap fallback log line. The
+// fallback sits on a per-subtree path (fetchAndStoreSubtree runs it for every
+// subtree of every block), so a directory that goes unwritable mid-catchup would
+// otherwise emit one warning per subtree — the volume that gets a line filtered
+// out of a log pipeline rather than noticed. One line names the condition;
+// prometheusBlockValidationSubtreeMmapFallback carries the rate.
+var subtreeMmapFallbackLogOnce sync.Once
+
 // subtreeFromBytesWithMmap creates a subtree from bytes, using mmap if dir is non-empty.
 // Falls back to heap allocation on mmap failure. The startup path (Server.Init)
 // validates the configured directory is writable, so a failure here is expected
 // to be a transient runtime condition (e.g. disk filled up after startup) rather
-// than a persistent misconfiguration; it is logged rather than silently swallowed
-// so the degraded (heap) state stays visible to the operator.
+// than a persistent misconfiguration; it is logged and counted rather than
+// silently swallowed so the degraded (heap) state stays visible to the operator.
 func subtreeFromBytesWithMmap(logger ulogger.Logger, b []byte, mmapDir string) (*subtreepkg.Subtree, error) {
 	if mmapDir != "" {
 		st, err := subtreepkg.NewSubtreeFromReaderMmap(bytes.NewReader(b), mmapDir)
 		if err != nil {
 			// mmap failed — fall back to heap. This can happen if the mmap dir
 			// became unwritable (disk full, permissions changed) after startup.
+			if prometheusBlockValidationSubtreeMmapFallback != nil {
+				prometheusBlockValidationSubtreeMmapFallback.Inc()
+			}
+
 			if logger != nil {
-				logger.Warnf("[subtreeFromBytesWithMmap] mmap deserialization failed for dir %s, falling back to heap: %v", mmapDir, err)
+				subtreeMmapFallbackLogOnce.Do(func() {
+					logger.Warnf("[subtreeFromBytesWithMmap] mmap deserialization failed for dir %s, falling back to heap (logged once; see teranode_blockvalidation_subtree_mmap_fallback_total for the rate): %v", mmapDir, err)
+				})
 			}
 
 			return subtreepkg.NewSubtreeFromBytes(b)

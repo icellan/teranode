@@ -797,6 +797,18 @@ func (u *Server) fetchSubtreeAndDataFromPeer(ctx context.Context, block *model.B
 		return err
 	}
 
+	// With blockvalidation_subtreeMmapDir set, fetchAndStoreSubtree's local
+	// short-circuit — the common branch during catchup — returns an mmap-backed
+	// subtree, and only Close() unmaps the region and unlinks its backing file.
+	// The subtree is a local that fetchAndStoreSubtreeData only reads and never
+	// stores, so model.Block.ReleaseSubtreeNodes never sees it and nothing else
+	// would release it: one mapping and one capacity*48-byte file would leak per
+	// subtree until the process hit vm.max_map_count. The quick-validate path
+	// gets this right already via SubtreeProcessingBatch.Close().
+	defer func() {
+		_ = subtree.Close()
+	}()
+
 	return u.fetchAndStoreSubtreeData(ctx, block, subtreeHash, subtree, peerID, baseURL, bypassCache, freshness)
 }
 
