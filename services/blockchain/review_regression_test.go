@@ -135,9 +135,53 @@ func TestPublicReadCountsAreBounded(t *testing.T) {
 			_, err := server.GetBlockHeadersToCommonAncestor(ctx, &blockchain_api.GetBlockHeadersToCommonAncestorRequest{})
 			return err
 		},
+		"headers from common ancestor": func() error {
+			_, err := server.GetBlockHeadersFromCommonAncestor(ctx, &blockchain_api.GetBlockHeadersFromCommonAncestorRequest{
+				TargetHash: hash, MaxHeaders: math.MaxUint32,
+			})
+			return err
+		},
 	} {
 		t.Run(name, func(t *testing.T) { require.Equal(t, codes.InvalidArgument, status.Code(call())) })
 	}
+}
+
+// TestBlockSummaryReadsUseBlockShapedBounds pins that GetLastNBlocks and
+// GetLastNInvalidBlocks are bounded separately from the header-only RPCs:
+// they return []model.BlockInfo, not bare 80-byte headers, so reusing
+// maxBlockHeadersPerRequest (sized for a whole-chain header response) would
+// leave the same OOM primitive open for the heavier block-summary shape.
+//
+// GetLastNInvalidBlocks in particular cannot reuse maxBlocksByHeightRange's
+// tighter 2000 default: the RPC service's reconsiderInvalidChildren asks for
+// 10000 in production (services/rpc/handlers.go), so its bound must
+// accommodate that in-tree caller.
+func TestBlockSummaryReadsUseBlockShapedBounds(t *testing.T) {
+	server := setup(t).server
+	ctx := context.Background()
+
+	// GetLastNBlocks: bounded by maxBlocksByHeightRange (2000 default), not
+	// maxBlockHeadersPerRequest (1,000,000 default).
+	_, err := server.GetLastNBlocks(ctx, &blockchain_api.GetLastNBlocksRequest{
+		NumberOfBlocks: int64(server.maxBlocksByHeightRange()),
+	})
+	require.NoError(t, err, "count at the block-range cap must be accepted")
+
+	_, err = server.GetLastNBlocks(ctx, &blockchain_api.GetLastNBlocksRequest{
+		NumberOfBlocks: int64(server.maxBlocksByHeightRange()) + 1,
+	})
+	require.Equal(t, codes.InvalidArgument, status.Code(err), "count above the block-range cap must be rejected")
+
+	// GetLastNInvalidBlocks: bounded by maxInvalidBlocksPerRequest (10000
+	// default), which must cover reconsiderInvalidChildren's fixed request
+	// of 10000.
+	_, err = server.GetLastNInvalidBlocks(ctx, &blockchain_api.GetLastNInvalidBlocksRequest{N: 10000})
+	require.NoError(t, err, "reconsiderInvalidChildren's request size of 10000 must be accepted")
+
+	_, err = server.GetLastNInvalidBlocks(ctx, &blockchain_api.GetLastNInvalidBlocksRequest{
+		N: int64(server.maxInvalidBlocksPerRequest()) + 1,
+	})
+	require.Equal(t, codes.InvalidArgument, status.Code(err), "count above the invalid-block cap must be rejected")
 }
 
 // Block assembly requests tip height + 1 IDs during startup and Reset. That
