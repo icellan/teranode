@@ -160,7 +160,7 @@ func collectKeyTags(typ reflect.Type, seen map[reflect.Type]bool) []string {
 
 		// key:"-" marks a field as deliberately not a setting (same marker
 		// export.go honours), so it is not a key that anything should read.
-		if key, ok := field.Tag.Lookup("key"); ok && key != "" && key != "-" {
+		if key, ok := field.Tag.Lookup("key"); ok && key != "" && key != keyTagExempt {
 			keys = append(keys, key)
 		}
 
