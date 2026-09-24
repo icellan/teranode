@@ -816,6 +816,7 @@ func (b *Block) ValidWithBinding(ctx context.Context, logger ulogger.Logger, sub
 	// take the skip. It also selects the classification of every body-derived consensus
 	// failure below, via bindErr.
 	merkleRootChecked := false
+	dedupedDuringLoad := false
 
 	if len(b.Subtrees) == 0 {
 		// The coinbase-only binding. Factored into CheckCoinbaseOnlyBodyBound so the
@@ -830,8 +831,20 @@ func (b *Block) ValidWithBinding(ctx context.Context, logger ulogger.Logger, sub
 		// only do the subtree checks if we have a subtree store
 		// missing the subtreeStore should only happen when we are validating an internal block
 		//
-		// 6. Get and validate any missing subtrees.
-		if err = b.GetAndValidateSubtrees(ctx, logger, subtreeStore, settings.Block.GetAndValidateSubtreesConcurrency); err != nil {
+		// 6. Get and validate any missing subtrees. With the in-memory txMap the
+		// duplicate check runs on each subtree as it loads rather than as a second
+		// pass afterwards; any txMap it allocates is released by the defer below.
+		// Its only verdict is BlockCorrupt, the same class as the merkle checks it
+		// now runs ahead of.
+		defer b.releaseTxMap()
+
+		if len(settings.Block.DiskMapDirs) == 0 {
+			dedupedDuringLoad, err = b.getAndValidateSubtreesWithDedup(ctx, logger, subtreeStore, settings.Block.GetAndValidateSubtreesConcurrency)
+		} else {
+			err = b.GetAndValidateSubtrees(ctx, logger, subtreeStore, settings.Block.GetAndValidateSubtreesConcurrency)
+		}
+
+		if err != nil {
 			return false, merkleRootChecked, err
 		}
 
@@ -905,9 +918,13 @@ func (b *Block) ValidWithBinding(ctx context.Context, logger ulogger.Logger, sub
 	// exit wherever it was installed.
 	defer b.releaseTxMap()
 
-	err = b.checkDuplicateTransactions(ctx, logger, settings.Block.CheckDuplicateTransactionsConcurrency, settings.Block.DiskMapDirs)
-	if err != nil {
-		return false, merkleRootChecked, err
+	// Already done during the subtree load unless that path did not run: a
+	// disk-backed map, subtrees that were already loaded, or no subtree store.
+	if !dedupedDuringLoad {
+		err = b.checkDuplicateTransactions(ctx, logger, settings.Block.CheckDuplicateTransactionsConcurrency, settings.Block.DiskMapDirs)
+		if err != nil {
+			return false, merkleRootChecked, err
+		}
 	}
 
 	// flush disk-backed txMap so all writes are readable before phase 2
@@ -1510,11 +1527,19 @@ func (b *Block) txMapEntryCount() uint64 {
 // Returns:
 // - error: if a duplicate transaction is found or if there is an error adding the transaction to the txMap
 func (b *Block) checkDuplicateTransactionsInSubtree(subtree *subtreepkg.Subtree, subIdx, subtreeSize int) (err error) {
+	return b.putSubtreeInTxMap(b.String(), subtree, subIdx, subtreeSize)
+}
+
+// putSubtreeInTxMap is checkDuplicateTransactionsInSubtree with the block label
+// supplied by the caller. getAndValidateSubtreesWithDedup runs it while
+// GetAndValidateSubtrees holds subtreeSlicesMu, and b.String() takes that same
+// mutex, so formatting an error there would deadlock instead of failing.
+func (b *Block) putSubtreeInTxMap(blockLabel string, subtree *subtreepkg.Subtree, subIdx, subtreeSize int) (err error) {
 	// The caller reads SubtreeSlices without holding subtreeSlicesMu, so the
 	// entry it captured may have been nil-ed by a concurrent release. Transient
 	// — the block is requeued and reloaded, never invalidated.
 	if subtree == nil {
-		return errors.NewProcessingError("[checkDuplicateTransactionsInSubtree][%s] subtree %d was released during validation", b.String(), subIdx)
+		return errors.NewProcessingError("[checkDuplicateTransactionsInSubtree][%s] subtree %d was released during validation", blockLabel, subIdx)
 	}
 
 	var idx64 uint64
@@ -1536,16 +1561,16 @@ func (b *Block) checkDuplicateTransactionsInSubtree(subtree *subtreepkg.Subtree,
 
 		idx64, err = safeconversion.IntToUint64(baseIdx + txIdx)
 		if err != nil {
-			return errors.NewProcessingError("[BLOCK][%s] failed to convert index to uint64", b.String(), err)
+			return errors.NewProcessingError("[BLOCK][%s] failed to convert index to uint64", blockLabel, err)
 		}
 
 		// in a tx map, Put is mutually exclusive, can only be called once per key
 		if err = b.txMap.Put(subtreeNode.Hash, idx64); err != nil {
 			if errors.Is(err, errors.ErrTxExists) || strings.Contains(err.Error(), "hash already exists in map") {
-				return errors.NewBlockCorruptError("[BLOCK][%s] block contains duplicate transaction %s", b.String(), subtreeNode.Hash.String())
+				return errors.NewBlockCorruptError("[BLOCK][%s] block contains duplicate transaction %s", blockLabel, subtreeNode.Hash.String())
 			}
 
-			return errors.NewStorageError("[BLOCK][%s] error adding transaction %s to txMap", b.String(), subtreeNode.Hash.String(), err)
+			return errors.NewStorageError("[BLOCK][%s] error adding transaction %s to txMap", blockLabel, subtreeNode.Hash.String(), err)
 		}
 	}
 
@@ -2045,6 +2070,51 @@ func (b *Block) GetSubtrees(ctx context.Context, logger ulogger.Logger, subtreeS
 }
 
 func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, getAndValidateSubtreesConcurrency int) error {
+	return b.getAndValidateSubtrees(ctx, logger, subtreeStore, getAndValidateSubtreesConcurrency, nil, nil)
+}
+
+// getAndValidateSubtreesWithDedup loads the subtrees and runs the duplicate
+// check on each one as it lands, instead of in a second pass over the whole
+// block afterwards. Subtree 0 is loaded first to size the txMap from the body
+// as len(Subtrees) x its length (an upper bound: only the last subtree may be
+// short), and the index scheme is checkDuplicateTransactions' own.
+//
+// deduped reports whether the check ran. It is false when the subtrees were
+// already loaded (nothing is fetched) or the block has none; the caller then
+// falls back to checkDuplicateTransactions.
+func (b *Block) getAndValidateSubtreesWithDedup(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, getAndValidateSubtreesConcurrency int) (deduped bool, err error) {
+	var subtreeSize int
+
+	// b.Hash(), not b.String(): the hooks run under subtreeSlicesMu.
+	blockLabel := b.Hash().String()
+
+	onFirst := func(first *subtreepkg.Subtree) error {
+		b.txMapCount = uint64(len(b.Subtrees)) * uint64(first.Length()) // nolint: gosec
+		b.txMap = GetTxMap(b.txMapCount)
+		subtreeSize = first.Size()
+		deduped = true
+
+		return nil
+	}
+
+	onLoaded := func(sIdx int, subtree *subtreepkg.Subtree) error {
+		return b.putSubtreeInTxMap(blockLabel, subtree, sIdx, subtreeSize)
+	}
+
+	if err = b.getAndValidateSubtrees(ctx, logger, subtreeStore, getAndValidateSubtreesConcurrency, onFirst, onLoaded); err != nil {
+		return false, err
+	}
+
+	return deduped, nil
+}
+
+// getAndValidateSubtrees is GetAndValidateSubtrees with optional load hooks.
+// When onFirst is set, subtree 0 is loaded before the rest start and onFirst
+// runs on it; onLoaded then runs on every subtree (0 included, after onFirst)
+// straight after it is loaded and bound to its key. Both run while
+// subtreeSlicesMu is held.
+func (b *Block) getAndValidateSubtrees(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, getAndValidateSubtreesConcurrency int,
+	onFirst func(first *subtreepkg.Subtree) error, onLoaded func(sIdx int, subtree *subtreepkg.Subtree) error) error {
 	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "GetAndValidateSubtrees",
 		tracing.WithHistogram(prometheusBlockGetAndValidateSubtrees),
 		tracing.WithLogMessage(logger, "[GetAndValidateSubtrees][%s] fetching and validating subtrees", b.String()),
@@ -2139,7 +2209,7 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 			blockID := b.ID
 			subtreeHash := subtreeHash
 
-			g.Go(func() error {
+			loadSubtree := func() error {
 				// retry to get the subtree from the store 3 times, there are instances when we get an EOF error,
 				// probably when being moved to permanent storage in another service
 				subtree := &subtreepkg.Subtree{}
@@ -2223,6 +2293,38 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 
 				sizeInBytes.Add(subtree.SizeInBytes)
 				txCount.Add(uint64(subtree.Length())) // nolint: gosec
+
+				return nil
+			}
+
+			if i == 0 && onFirst != nil {
+				// Nothing else is in flight yet, so run it here and let onFirst see
+				// subtree 0 before any other subtree can reach onLoaded.
+				if err := loadSubtree(); err != nil {
+					return err
+				}
+
+				if err := onFirst(b.SubtreeSlices[0]); err != nil {
+					return err
+				}
+
+				if onLoaded != nil {
+					if err := onLoaded(0, b.SubtreeSlices[0]); err != nil {
+						return err
+					}
+				}
+
+				continue
+			}
+
+			g.Go(func() error {
+				if err := loadSubtree(); err != nil {
+					return err
+				}
+
+				if onLoaded != nil {
+					return onLoaded(i, b.SubtreeSlices[i])
+				}
 
 				return nil
 			})
