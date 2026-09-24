@@ -7,6 +7,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/stretchr/testify/require"
 )
 
@@ -19,6 +20,7 @@ func TestGetTxMap_ReusesPooledInstance(t *testing.T) {
 	require.NoError(t, m1.Put(h, 1))
 	require.Equal(t, 1, m1.Length())
 	PutTxMap(m1, 100_000)
+	waitForRecycles()
 
 	// Second Get for the same size class should yield a cleared map.
 	// We can't guarantee it's the same instance because sync.Pool is
@@ -81,6 +83,7 @@ func TestGetParentSpendsMap_RoundTrip(t *testing.T) {
 		require.True(t, ok)
 	}
 	PutParentSpendsMap(m1, 1_000_000)
+	waitForRecycles()
 
 	// Re-Get should produce a cleared map for the same size class.
 	m2 := GetParentSpendsMap(1_000_000)
@@ -130,28 +133,17 @@ func TestTxMapPool_ConcurrentReuse(t *testing.T) {
 	wg.Wait()
 }
 
-// TestRecycleInBackground pins that returning a map to its pool does not block
-// the caller on Clear, and that the map only reaches the pool once cleared.
-// Clearing a ~470M-entry txMap took ~4s inline at the end of Block.Valid, on
-// the critical path before the block is accepted.
+// TestRecycleInBackground pins that releasing a map does not block the caller
+// on Clear. Clearing a ~470M-entry txMap took ~4s inline at the end of
+// Block.Valid, on the critical path before the block is accepted.
 func TestRecycleInBackground(t *testing.T) {
-	clearStarted := make(chan struct{})
+	tracker := newRecycleTracker()
 	releaseClear := make(chan struct{})
-	putCalled := make(chan struct{})
-
-	var cleared, clearedBeforePut bool
 
 	returned := make(chan struct{})
 
 	go func() {
-		recycleInBackground(func() {
-			close(clearStarted)
-			<-releaseClear
-			cleared = true
-		}, func() {
-			clearedBeforePut = cleared
-			close(putCalled)
-		})
+		recycleInBackground(tracker, &sync.Pool{}, struct{}{}, func() { <-releaseClear })
 		close(returned)
 	}()
 
@@ -161,21 +153,103 @@ func TestRecycleInBackground(t *testing.T) {
 		t.Fatal("recycleInBackground blocked on clear")
 	}
 
-	<-clearStarted
+	idle := make(chan struct{})
+
+	go func() {
+		tracker.waitIdle()
+		close(idle)
+	}()
 
 	select {
-	case <-putCalled:
-		t.Fatal("map was pooled before clear finished")
-	default:
+	case <-idle:
+		t.Fatal("recycle reported done before clear finished")
+	case <-time.After(50 * time.Millisecond):
 	}
 
 	close(releaseClear)
 
 	select {
-	case <-putCalled:
+	case <-idle:
 	case <-time.After(5 * time.Second):
-		t.Fatal("map was never pooled")
+		t.Fatal("recycle never finished")
+	}
+}
+
+// TestGetTxMap_WaitsForInFlightRecycle pins that a Get landing while a map of
+// its class is still being cleared waits for that map instead of allocating a
+// second one. With the load-time dedup the next block's Get runs milliseconds
+// into its validation, well inside the previous block's multi-second clear, so
+// allocating fresh there held two largest-class maps at once.
+func TestGetTxMap_WaitsForInFlightRecycle(t *testing.T) {
+	const n = 1 << 12
+
+	idx := txMapClassIdxFor(n)
+	require.GreaterOrEqual(t, idx, 0)
+
+	// Drain the class so the only map it can yield is the one being recycled.
+	for txMapPools[idx].Get() != nil {
 	}
 
-	require.True(t, clearedBeforePut, "map must be cleared before it is pooled")
+	m := txmap.NewSplitSwissMapUint64(n, txMapBuckets)
+
+	var h chainhash.Hash
+	h[0] = 0x42
+	require.NoError(t, m.Put(h, 1))
+
+	releaseClear := make(chan struct{})
+
+	recycleInBackground(txMapRecycles[idx], txMapPools[idx], m, func() {
+		<-releaseClear
+		m.Clear()
+	})
+
+	got := make(chan *txmap.SplitSwissMapUint64)
+
+	go func() { got <- GetTxMap(n) }()
+
+	select {
+	case <-got:
+		t.Fatal("GetTxMap returned while a map of its class was still being cleared")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseClear)
+
+	select {
+	case g := <-got:
+		require.Same(t, m, g, "Get must hand out the recycled map, not a fresh one")
+		require.Equal(t, 0, g.Length())
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetTxMap never returned")
+	}
+}
+
+// TestPutTxMap_DropsMapGrownPastItsClass pins that a map filled beyond the
+// class it was drawn from is not pooled under that class. The load-time dedup
+// sizes from len(Subtrees) x subtree 0, which a longer final subtree can exceed.
+func TestPutTxMap_DropsMapGrownPastItsClass(t *testing.T) {
+	const n = 1 << 12
+
+	idx := txMapClassIdxFor(n)
+
+	for txMapPools[idx].Get() != nil {
+	}
+
+	m := GetTxMap(n)
+
+	for i := 0; i <= n; i++ {
+		var h chainhash.Hash
+		h[0], h[1], h[2] = byte(i), byte(i>>8), 0x99
+		require.NoError(t, m.Put(h, uint64(i)))
+	}
+
+	PutTxMap(m, n)
+
+	// A dropped map starts no recycle; a pooled one would leave one pending.
+	tracker := txMapRecycles[idx]
+	tracker.mu.Lock()
+	pending := tracker.pending
+	tracker.mu.Unlock()
+
+	require.Zero(t, pending, "a map grown past its class must be dropped, not pooled")
 }

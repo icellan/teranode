@@ -221,7 +221,7 @@ func TestCheckDuplicateTransactionsUsesFullCount(t *testing.T) {
 
 	block.releaseTxMap()
 	require.Nil(t, block.txMap)
-	pendingRecycles.Wait() // the clear runs off the caller's goroutine
+	waitForRecycles() // the clear runs off the caller's goroutine
 	require.Equal(t, 0, pooled.Length(), "released map must be cleared and pooled, not dropped")
 }
 
@@ -270,7 +270,7 @@ func TestCheckDuplicateTransactionsAboveUint32(t *testing.T) {
 	require.Equal(t, 3, pooled.Length())
 
 	block.releaseTxMap()
-	pendingRecycles.Wait() // the clear runs off the caller's goroutine
+	waitForRecycles() // the clear runs off the caller's goroutine
 	require.Equal(t, 0, pooled.Length(), "released map must be cleared and pooled, not dropped")
 }
 
