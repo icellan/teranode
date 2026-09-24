@@ -908,8 +908,9 @@ func (b *Block) ValidWithBinding(ctx context.Context, logger ulogger.Logger, sub
 	// fee-wrong is then classified by the stronger of the two rules (corrupt, re-download)
 	// rather than by the weaker one.
 	//
-	// b.txMap is allocated inside checkDuplicateTransactions (possibly mid-execution
-	// when a worker fails). The deferred releaseTxMap below ensures the pooled
+	// b.txMap is allocated inside checkDuplicateTransactions or, on the in-memory
+	// path, during the subtree load above (possibly mid-execution when a worker
+	// fails). The deferred releaseTxMap below ensures the pooled
 	// in-memory variant is returned to the pool on *every* exit path — including
 	// errors from checkDuplicateTransactions, the flush below, and
 	// validOrderAndBlessed. releaseTxMap is nil-safe, idempotent, and handles
@@ -938,12 +939,13 @@ func (b *Block) ValidWithBinding(ctx context.Context, logger ulogger.Logger, sub
 		ReportTxMapStats(diskMap.Stats())
 	}
 
-	// The duplicate-check write phase (checkDuplicateTransactions) is complete and
-	// flushed; validOrderAndBlessed below only reads b.txMap — one Get per tx plus
+	// The duplicate-check write phase (checkDuplicateTransactions, or the subtree
+	// load on the in-memory path) is complete and flushed; validOrderAndBlessed below only reads b.txMap — one Get per tx plus
 	// one per parent, fanned out across every core. Freeze it so those reads skip
 	// the per-bucket RWMutex.RLock, whose reader-counter atomic otherwise
 	// cache-line ping-pongs across cores and dominates the read phase on many-core
-	// validation nodes. checkDuplicateTransactions' internal errgroup.Wait is the
+	// validation nodes. The errgroup.Wait of whichever phase wrote the map
+	// (checkDuplicateTransactions or getAndValidateSubtrees) is the
 	// happens-before edge that guarantees all writes precede this Freeze.
 	// releaseTxMap resets the freeze on its way back to the pool (in-memory Clear)
 	// or discards the map (disk Close). The checks between here and step 12 read only
@@ -1212,7 +1214,8 @@ func (b *Block) CheckCoinbaseOnlyBodyBound() error {
 // disk-backed map, then nils b.txMap. Idempotent and nil-safe: safe to call
 // multiple times or before b.txMap is ever assigned. Invoked via defer from
 // Block.Valid so the pooled map is reclaimed on every exit path, including
-// errors during checkDuplicateTransactions or validOrderAndBlessed.
+// errors during the subtree load, checkDuplicateTransactions or
+// validOrderAndBlessed.
 func (b *Block) releaseTxMap() {
 	if b.txMap == nil {
 		return
@@ -1639,7 +1642,8 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 	// operator-supplied (block_parentSpendsCapacityMultiplier) and unvalidated.
 	//
 	// Recomputed here rather than read from b.txMapCount, deliberately: that
-	// field is only set by checkDuplicateTransactions, and callers that invoke
+	// field is only set by the duplicate check (checkDuplicateTransactions or the
+	// in-memory load path), and callers that invoke
 	// this method directly (rather than through Valid, which always runs step 11
 	// first) would otherwise size from a zero. Recomputing is one len() per
 	// subtree and keeps this method self-contained — please do not "tidy" it into
@@ -2076,8 +2080,10 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 // getAndValidateSubtreesWithDedup loads the subtrees and runs the duplicate
 // check on each one as it lands, instead of in a second pass over the whole
 // block afterwards. Subtree 0 is loaded first to size the txMap from the body
-// as len(Subtrees) x its length (an upper bound: only the last subtree may be
-// short), and the index scheme is checkDuplicateTransactions' own.
+// as len(Subtrees) x its length, and the index scheme is
+// checkDuplicateTransactions' own. That size is only a hint: the final subtree
+// may differ from the first in either direction, and a map filled past its
+// class is dropped rather than pooled on release (PutTxMap).
 //
 // deduped reports whether the check ran. It is false when the subtrees were
 // already loaded (nothing is fetched) or the block has none; the caller then
@@ -2106,6 +2112,24 @@ func (b *Block) getAndValidateSubtreesWithDedup(ctx context.Context, logger ulog
 	}
 
 	return deduped, nil
+}
+
+// loadFirstSubtree loads subtree 0 and runs the hooks on it, in order.
+func loadFirstSubtree(loadSubtree func() error, onFirst func(first *subtreepkg.Subtree) error,
+	onLoaded func(sIdx int, subtree *subtreepkg.Subtree) error, slices []*subtreepkg.Subtree) error {
+	if err := loadSubtree(); err != nil {
+		return err
+	}
+
+	if err := onFirst(slices[0]); err != nil {
+		return err
+	}
+
+	if onLoaded != nil {
+		return onLoaded(0, slices[0])
+	}
+
+	return nil
 }
 
 // getAndValidateSubtrees is GetAndValidateSubtrees with optional load hooks.
@@ -2299,19 +2323,12 @@ func (b *Block) getAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 
 			if i == 0 && onFirst != nil {
 				// Nothing else is in flight yet, so run it here and let onFirst see
-				// subtree 0 before any other subtree can reach onLoaded.
-				if err := loadSubtree(); err != nil {
+				// subtree 0 before any other subtree can reach onLoaded. Wait is still
+				// called on failure: only Wait cancels gCtx, which otherwise stays
+				// registered on ctx.
+				if err := loadFirstSubtree(loadSubtree, onFirst, onLoaded, b.SubtreeSlices); err != nil {
+					_ = g.Wait()
 					return err
-				}
-
-				if err := onFirst(b.SubtreeSlices[0]); err != nil {
-					return err
-				}
-
-				if onLoaded != nil {
-					if err := onLoaded(0, b.SubtreeSlices[0]); err != nil {
-						return err
-					}
 				}
 
 				continue

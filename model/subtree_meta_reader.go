@@ -69,6 +69,9 @@ func ValidateSubtreeMatchesKey(subtree *subtreepkg.Subtree, key *chainhash.Hash)
 // Every producer writes the count as the subtree's node count keyed by its root,
 // so any mismatch means a torn or foreign file. Callers with a regenerator behind
 // them should rebuild rather than trust the file.
+//
+// reader is read through a buffer, so it can be consumed past the end of the
+// meta; callers must not read from it afterwards.
 func NewSubtreeMetaFromValidatedReader(subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree, reader io.Reader) (*subtreepkg.Meta, error) {
 	if subtree == nil {
 		return nil, errors.NewProcessingError("cannot validate subtree meta for %s: subtree is nil", subtreeHash.String())

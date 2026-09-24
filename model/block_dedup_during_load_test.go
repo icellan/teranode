@@ -9,8 +9,10 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -131,4 +133,55 @@ func TestGetAndValidateSubtreesWithDedup_AlreadyLoaded(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, deduped)
 	require.Nil(t, b.txMap)
+}
+
+// TestBlock_Valid_DuplicateAcrossLoadedSubtrees drives a duplicated body
+// through Block.Valid with the subtrees fetched from a store, for both txMap
+// backings. DiskMapDirs is set explicitly on each case: a developer's
+// settings_local.conf can set block_diskMapDirs, which would otherwise silently
+// route every Valid-level test down the disk-backed (separate pass) branch.
+//
+// The fixture header is not bound to these subtrees, which is what separates
+// the two paths: the in-memory path finds the duplicate while loading, ahead of
+// the merkle check, and the separate pass reaches the merkle check first. Both
+// verdicts are BlockCorrupt, so moving the dedup ahead changes the message and
+// never the classification.
+func TestBlock_Valid_DuplicateAcrossLoadedSubtrees(t *testing.T) {
+	cases := []struct {
+		name    string
+		dirs    func(t *testing.T) []string
+		message string
+	}{
+		{"in_memory_during_load", func(*testing.T) []string { return nil }, "duplicate transaction"},
+		{"disk_separate_pass", func(t *testing.T) []string { return []string{t.TempDir()} }, "merkle root does not match"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tSettings := test.CreateBaseTestSettings(t)
+			tSettings.Block.DiskMapDirs = tc.dirs(t)
+
+			dup := randCorruptTestHash(t)
+			b, _, _, store := dedupLoadFixture(t, &dup)
+
+			currentChain := regtestGenesisParentChain(t, b.Header)
+			currentChainIDs := make([]uint32, 11)
+
+			for i := 0; i < 11; i++ {
+				currentChainIDs[i] = uint32(i) // nolint:gosec
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			valid, err := b.Valid(ctx, ulogger.TestLogger{}, store, nil, txmap.NewSyncedMap[chainhash.Hash, []uint32](),
+				currentChain, currentChainIDs, tSettings, nil)
+			require.False(t, valid)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.message)
+			require.True(t, errors.IsBlockCorrupt(err), "a duplicated body is corrupt, got: %v", err)
+			require.False(t, errors.Is(err, errors.ErrBlockInvalid), "must not poison")
+			require.Nil(t, b.txMap, "the txMap must be released on the error path")
+		})
+	}
 }
