@@ -167,8 +167,7 @@ func PutTxMap(m *txmap.SplitSwissMapUint64, n uint64) {
 	if idx < 0 {
 		return
 	}
-	m.Clear()
-	txMapPools[idx].Put(m)
+	recycleInBackground(m.Clear, func() { txMapPools[idx].Put(m) })
 }
 
 // parentSpendsBuckets is the fixed bucket count for every pooled
@@ -239,6 +238,26 @@ func PutParentSpendsMap(m *SplitSyncedParentMap, expectedInpoints uint64) {
 	if idx < 0 {
 		return
 	}
-	m.Clear()
-	parentSpendsPools[idx].Put(m)
+	recycleInBackground(m.Clear, func() { parentSpendsPools[idx].Put(m) })
 }
+
+// recycleInBackground clears a released map and then pools it, off the
+// caller's goroutine. Clearing a map sized for a large block takes seconds
+// (~4s for a ~470M-entry txMap), and both callers release at the end of block
+// validation, on the path before the block is accepted. The map only reaches
+// the pool after clear returns, so Get never hands out a dirty map; a Get that
+// lands while the clear is still running allocates fresh instead.
+func recycleInBackground(clear func(), put func()) {
+	pendingRecycles.Add(1)
+
+	go func() {
+		defer pendingRecycles.Done()
+
+		clear()
+		put()
+	}()
+}
+
+// pendingRecycles tracks in-flight recycleInBackground calls, so tests that
+// observe a released map can wait for its clear before asserting on it.
+var pendingRecycles sync.WaitGroup

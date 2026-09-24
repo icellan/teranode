@@ -3,6 +3,7 @@ package model
 import (
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
@@ -127,4 +128,54 @@ func TestTxMapPool_ConcurrentReuse(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
+}
+
+// TestRecycleInBackground pins that returning a map to its pool does not block
+// the caller on Clear, and that the map only reaches the pool once cleared.
+// Clearing a ~470M-entry txMap took ~4s inline at the end of Block.Valid, on
+// the critical path before the block is accepted.
+func TestRecycleInBackground(t *testing.T) {
+	clearStarted := make(chan struct{})
+	releaseClear := make(chan struct{})
+	putCalled := make(chan struct{})
+
+	var cleared, clearedBeforePut bool
+
+	returned := make(chan struct{})
+
+	go func() {
+		recycleInBackground(func() {
+			close(clearStarted)
+			<-releaseClear
+			cleared = true
+		}, func() {
+			clearedBeforePut = cleared
+			close(putCalled)
+		})
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recycleInBackground blocked on clear")
+	}
+
+	<-clearStarted
+
+	select {
+	case <-putCalled:
+		t.Fatal("map was pooled before clear finished")
+	default:
+	}
+
+	close(releaseClear)
+
+	select {
+	case <-putCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("map was never pooled")
+	}
+
+	require.True(t, clearedBeforePut, "map must be cleared before it is pooled")
 }
