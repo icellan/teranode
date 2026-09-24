@@ -825,11 +825,6 @@ var pendingWireExemptions = []pendingWireExemption{
 		key:    "blockchain_peerRegistrySaveInterval",
 		reason: "tagged 60s, resolves to 0s - not wired to a loader; being fixed in #1643",
 	},
-	{
-		key: "blockchain_subscription_timeout",
-		reason: "tagged 30s, resolves to 0s - has no reader anywhere in the codebase; #1643 deletes the dead field " +
-			"rather than wiring it",
-	},
 }
 
 // TestSettingsTagMatchesRuntimeForAllKeys is the sound version of the
@@ -917,16 +912,16 @@ var checkedRowsPerDoc = map[string]int{
 	"global_settings.md":            44,
 	"kafka_settings.md":             19,
 	"policy_settings.md":            25,
-	"alert_settings.md":             6,
+	"alert_settings.md":             10,
 	"asset_settings.md":             35,
-	"blockassembly_settings.md":     41,
+	"blockassembly_settings.md":     42,
 	"blockchain_settings.md":        11,
-	"blockpersister_settings.md":    9,
-	"blockvalidation_settings.md":   66,
+	"blockpersister_settings.md":    8,
+	"blockvalidation_settings.md":   67,
 	"coinbase_settings.md":          21,
 	"faucet_settings.md":            1,
 	"legacy_settings.md":            28,
-	"p2p_settings.md":               43,
+	"p2p_settings.md":               44,
 	"propagation_settings.md":       13,
 	"pruner_settings.md":            26,
 	"rpc_settings.md":               11,
