@@ -92,10 +92,10 @@
 # administrator credential. Set both below before exposing the node.
 #
 # The same pair also guards the Asset service admin routes (FSM state changes,
-# block invalidate/revalidate, settings export). While either value is empty
-# those routes accept unauthenticated requests unless you also set
-# asset_requireAuthCredentials = true, which makes them reject every request
-# instead. Asset logs a warning at startup when it is running fail-open.
+# block invalidate/revalidate, settings export). While rpc_user/rpc_pass are
+# empty, those routes reject every request, because asset_requireAuthCredentials
+# defaults to true. Set it to false to have them answer anonymously instead
+# (Asset logs a warning at startup when it is running fail-open).
 #
 # The RPC interface is exposed on port 9292. In the Docker deployment, this
 # is bound to localhost only (127.0.0.1:9292) for security.
@@ -103,7 +103,7 @@
 # rpc_user.docker.m = your_username
 # rpc_pass.docker.m = your_secure_password
 #
-# asset_requireAuthCredentials.docker.m = true
+# asset_requireAuthCredentials.docker.m = false
 
 # gRPC Admin API Key (peer ban/unban, connect/disconnect, reset reputation)
 # -------------------------------------------------------------------------
