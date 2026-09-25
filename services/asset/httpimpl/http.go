@@ -766,7 +766,19 @@ func assetCORSConfig(allowedOrigins []string) middleware.CORSConfig {
 		return cfg
 	}
 
-	cfg.AllowOrigins = allowedOrigins
+	// Echo's AllowOrigins matching honours "*"/"?" globs, subdomain matching
+	// and the literal "null", and grants Access-Control-Allow-Credentials to
+	// anything it matches. An operator-supplied allowlist entry must only
+	// ever match itself, so this is an exact set lookup instead.
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, origin := range allowedOrigins {
+		allowed[origin] = struct{}{}
+	}
+
+	cfg.AllowOriginFunc = func(origin string) (bool, error) {
+		_, ok := allowed[origin]
+		return ok, nil
+	}
 	cfg.AllowCredentials = true
 
 	return cfg
