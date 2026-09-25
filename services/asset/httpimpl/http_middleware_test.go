@@ -75,6 +75,41 @@ func TestAssetCORSConfig_ExplicitAllowlistIsStrict(t *testing.T) {
 	})
 }
 
+// TestAssetCORSConfig_AllowlistIsExactMatchOnly — Echo's built-in AllowOrigins
+// matching honours "*"/"?" globs, subdomain matching and the literal "null",
+// and grants Access-Control-Allow-Credentials to anything it matches. A
+// configured allowlist entry must only ever match itself, byte for byte.
+func TestAssetCORSConfig_AllowlistIsExactMatchOnly(t *testing.T) {
+	cfg := assetCORSConfig([]string{"https://ops.example.com"})
+
+	t.Run("exact origin is allowed", func(t *testing.T) {
+		rec := corsProbe(t, cfg, "https://ops.example.com")
+		require.Equal(t, "https://ops.example.com", rec.Header().Get(echo.HeaderAccessControlAllowOrigin))
+		require.Equal(t, "true", rec.Header().Get(echo.HeaderAccessControlAllowCredentials))
+	})
+
+	t.Run("subdomain of an allowed origin is not allowed", func(t *testing.T) {
+		rec := corsProbe(t, cfg, "https://evil.ops.example.com")
+		require.Empty(t, rec.Header().Get(echo.HeaderAccessControlAllowOrigin))
+		require.Empty(t, rec.Header().Get(echo.HeaderAccessControlAllowCredentials))
+	})
+
+	t.Run("glob-like configured entry only matches itself literally", func(t *testing.T) {
+		globCfg := assetCORSConfig([]string{"https://*.example.com"})
+
+		rec := corsProbe(t, globCfg, "https://ops.example.com")
+		require.Empty(t, rec.Header().Get(echo.HeaderAccessControlAllowOrigin),
+			"a glob-like allowlist entry must not expand into a pattern match")
+		require.Empty(t, rec.Header().Get(echo.HeaderAccessControlAllowCredentials))
+	})
+
+	t.Run("null origin is not allowed", func(t *testing.T) {
+		rec := corsProbe(t, cfg, "null")
+		require.Empty(t, rec.Header().Get(echo.HeaderAccessControlAllowOrigin))
+		require.Empty(t, rec.Header().Get(echo.HeaderAccessControlAllowCredentials))
+	})
+}
+
 // newTestServer builds a real HTTP server over a minimal repository so route
 // and middleware wiring can be exercised end to end.
 func newTestServer(t *testing.T, tSettings *settings.Settings) *HTTP {
