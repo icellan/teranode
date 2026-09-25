@@ -125,7 +125,7 @@ func (h *HTTP) GetUTXOs(mode ReadMode) func(c echo.Context) error {
 			responseBytes *= 2
 		}
 
-		if err := h.enforceBatchResponseBytes("GetUTXOs", responseBytes); err != nil {
+		if err := h.enforceBatchResponseBytes("GetUTXOs", responseBytes, h.settings.Asset.MaxBatchResponseBytes); err != nil {
 			return err
 		}
 
