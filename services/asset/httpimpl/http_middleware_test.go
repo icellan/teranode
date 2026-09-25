@@ -217,6 +217,46 @@ func TestNew_DashboardCORSUsesTheSameAllowlist(t *testing.T) {
 		"the dashboard CORS config must not reflect an unlisted origin either")
 }
 
+// TestNew_HeavyRateLimiterSplitsBurstByCatchupRoute — only the five routes
+// peer catchup depends on get the raised burst. Every other heavy route
+// (including POST /utxos, up to 1024-way Aerospike fan-out) must keep
+// burst == rate, so a bulk caller there can't spend the catchup floor.
+func TestNew_HeavyRateLimiterSplitsBurstByCatchupRoute(t *testing.T) {
+	tSettings := baseTestSettings()
+	tSettings.Asset.HTTPHeavyRateLimit = 2
+	tSettings.SubtreeValidation.GetMissingTransactions = 6
+
+	srv := newTestServer(t, tSettings)
+
+	fire := func(method, path string, n int) (tooMany int) {
+		for i := 0; i < n; i++ {
+			req := httptest.NewRequest(method, path, nil)
+			rec := httptest.NewRecorder()
+			srv.e.ServeHTTP(rec, req)
+			if rec.Code == http.StatusTooManyRequests {
+				tooMany++
+			}
+		}
+		return tooMany
+	}
+
+	t.Run("catchup route gets the raised burst", func(t *testing.T) {
+		path := fmt.Sprintf("/api/v1/subtree/%s", testHashHex)
+
+		require.Zero(t, fire(http.MethodGet, path, 6),
+			"burst should admit the full catchup fan-out of 6 before any 429")
+		require.Equal(t, 1, fire(http.MethodGet, path, 1),
+			"the request past the floor must be rejected")
+	})
+
+	t.Run("POST /utxos keeps burst == rate, not the catchup floor", func(t *testing.T) {
+		require.Zero(t, fire(http.MethodPost, "/api/v1/utxos", 2),
+			"burst should equal the sustained rate of 2")
+		require.Equal(t, 1, fire(http.MethodPost, "/api/v1/utxos", 1),
+			"the third request must be rejected: this route must not get the catchup floor")
+	})
+}
+
 // TestNew_TrustedProxyCIDRsReplaceEchoDefaults — echo.TrustIPRange is additive:
 // link-local and private networks stay trusted unless explicitly disabled. An
 // operator who configures an allowlist means that list plus loopback and

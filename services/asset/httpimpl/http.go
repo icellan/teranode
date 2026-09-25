@@ -259,28 +259,54 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	// children that are never evicted.
 	e.Use(accessLogMiddleware(logger))
 
-	// Heavy-endpoint rate limiter (applied per-route below).
-	var heavyRateLimiter echo.MiddlewareFunc
+	// Heavy-endpoint rate limiters (applied per-route below). Only the five
+	// routes peer catchup depends on (GET /subtree/:hash, GET
+	// /subtree_data/:hash, POST catchupTxsRoute, GET /blocks/:hash and GET
+	// /block/:hash — see catchupHeavyMW below) get the raised burst. Every
+	// other heavy route keeps burst == rate, so a bulk caller on an unrelated
+	// heavy route (e.g. POST /utxos, up to 1024-way Aerospike fan-out) can't
+	// spend the floor a catching-up peer needs.
+	var heavyRateLimiter, catchupRateLimiter echo.MiddlewareFunc
 	if tSettings.Asset.HTTPHeavyRateLimit > 0 {
-		// The heavy routes carry peer catchup. A catching-up peer fans out
-		// subtreevalidation_getMissingTransactions concurrent unsigned (and so
-		// tier-unverified) requests at once, so the burst floors at that value.
-		heavyBurst, _ := resolveHeavyBurst(logger, tSettings.Asset.HTTPHeavyRateBurst, tSettings.SubtreeValidation.GetMissingTransactions)
-		logger.Infof("[Asset] heavy-endpoint rate limit: %d req/s, burst %d", tSettings.Asset.HTTPHeavyRateLimit, heavyBurst)
-
 		heavyRL := newTieredRateLimiter(
+			tSettings.Asset.HTTPHeavyRateLimit,
+			tSettings.Asset.HTTPPeerRateMultiplier,
+			tSettings.Asset.HTTPMinerRateLimit,
+			0, // burst == rate; only the catchup routes get the raised floor
+			"heavy",
+		)
+		heavyRateLimiter = heavyRL.Middleware()
+		rateLimiters = append(rateLimiters, heavyRL)
+
+		// A catching-up peer fans out subtreevalidation_getMissingTransactions
+		// concurrent unsigned (and so tier-unverified) requests at once, so the
+		// catchup-route burst floors at that value.
+		heavyBurst, _ := resolveHeavyBurst(logger, tSettings.Asset.HTTPHeavyRateBurst, tSettings.SubtreeValidation.GetMissingTransactions, tSettings.Asset.HTTPHeavyRateLimit)
+		logger.Infof("[Asset] heavy-endpoint rate limit: %d req/s, burst %d (catchup routes), burst %d (other heavy routes)",
+			tSettings.Asset.HTTPHeavyRateLimit, heavyBurst, tSettings.Asset.HTTPHeavyRateLimit)
+
+		catchupRL := newTieredRateLimiter(
 			tSettings.Asset.HTTPHeavyRateLimit,
 			tSettings.Asset.HTTPPeerRateMultiplier,
 			tSettings.Asset.HTTPMinerRateLimit,
 			heavyBurst,
 			"heavy",
 		)
-		heavyRateLimiter = heavyRL.Middleware()
-		rateLimiters = append(rateLimiters, heavyRL)
+		catchupRateLimiter = catchupRL.Middleware()
+		rateLimiters = append(rateLimiters, catchupRL)
 	}
 	heavyMW := func() []echo.MiddlewareFunc {
 		if heavyRateLimiter != nil {
 			return []echo.MiddlewareFunc{heavyRateLimiter}
+		}
+		return nil
+	}
+	// catchupHeavyMW is heavyMW's counterpart for the five routes peer catchup
+	// depends on. It shares the sustained rate but gets the burst floored at
+	// the catchup fan-out (see resolveHeavyBurst).
+	catchupHeavyMW := func() []echo.MiddlewareFunc {
+		if catchupRateLimiter != nil {
+			return []echo.MiddlewareFunc{catchupRateLimiter}
 		}
 		return nil
 	}
@@ -369,11 +395,11 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	apiGroup.GET("/txmeta_raw/:hash/hex", h.GetTxMetaByTxID(HEX))
 	apiGroup.GET("/txmeta_raw/:hash/json", h.GetTxMetaByTxID(JSON))
 
-	apiGroup.GET("/subtree/:hash", h.GetSubtree(BINARY_STREAM), heavyMW()...)
+	apiGroup.GET("/subtree/:hash", h.GetSubtree(BINARY_STREAM), catchupHeavyMW()...)
 	apiGroup.GET("/subtree/:hash/hex", h.GetSubtree(HEX), heavyMW()...)
 	apiGroup.GET("/subtree/:hash/json", h.GetSubtree(JSON), heavyMW()...)
-	apiGroup.GET("/subtree_data/:hash", h.GetSubtreeData(), heavyMW()...)
-	apiGroup.POST("/subtree/:hash/txs", h.GetTransactions(), heavyMW()...) // BINARY_STREAM only
+	apiGroup.GET("/subtree_data/:hash", h.GetSubtreeData(), catchupHeavyMW()...)
+	apiGroup.POST(catchupTxsRoute, h.GetTransactions(), catchupHeavyMW()...) // BINARY_STREAM only
 
 	apiGroup.GET("/subtree/:hash/txs/json", h.GetSubtreeTxs(JSON))
 
@@ -397,13 +423,13 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	apiGroup.GET("/blocks", h.GetBlocks)
 	apiGroup.GET("/block_locator", h.GetBlockLocator)
 
-	apiGroup.GET("/blocks/:hash", h.GetNBlocks(BINARY_STREAM), heavyMW()...)
+	apiGroup.GET("/blocks/:hash", h.GetNBlocks(BINARY_STREAM), catchupHeavyMW()...)
 	apiGroup.GET("/blocks/:hash/hex", h.GetNBlocks(HEX), heavyMW()...)
 	apiGroup.GET("/blocks/:hash/json", h.GetNBlocks(JSON), heavyMW()...)
 
 	apiGroup.GET("/block_legacy/:hash", h.GetLegacyBlock(), heavyMW()...) // BINARY_STREAM (also supports ?type=miningcandidate)
 
-	apiGroup.GET("/block/:hash", h.GetBlockByHash(BINARY_STREAM), heavyMW()...)
+	apiGroup.GET("/block/:hash", h.GetBlockByHash(BINARY_STREAM), catchupHeavyMW()...)
 	apiGroup.GET("/block/:hash/hex", h.GetBlockByHash(HEX), heavyMW()...)
 	apiGroup.GET("/block/:hash/json", h.GetBlockByHash(JSON), heavyMW()...)
 	apiGroup.GET("/block/:hash/forks", h.GetBlockForks)
