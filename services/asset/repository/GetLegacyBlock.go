@@ -45,15 +45,27 @@ type chunkResult struct {
 //   - *io.PipeReader: Reader for streaming block data
 //   - error: Any error encountered during retrieval
 func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhash.Hash, wireBlock ...bool) (*io.PipeReader, error) {
-	if err := acquireSemaphorePermit(ctx, repo.semGetLegacyBlockReader, "GetLegacyBlockReader"); err != nil {
+	returnWireBlock := len(wireBlock) > 0 && wireBlock[0]
+
+	// The wire-format request (?wire=1) is only ever set by this node's own legacy peer
+	// server (pushBlockMsg), which serves SV peers over the p2p wire protocol. Anonymous
+	// HTTP clients share semGetLegacyBlockReader instead, so a burst of slow anonymous
+	// reads cannot exhaust the budget SV peer serving depends on.
+	sem := repo.semGetLegacyBlockReader
+	semName := "GetLegacyBlockReader"
+
+	if returnWireBlock {
+		sem = repo.semGetLegacyBlockReaderPeer
+		semName = "GetLegacyBlockReaderPeer"
+	}
+
+	if err := acquireSemaphorePermit(ctx, sem, semName); err != nil {
 		return nil, err
 	}
 
-	returnWireBlock := len(wireBlock) > 0 && wireBlock[0]
-
 	block, err := repo.GetBlockByHash(ctx, hash)
 	if err != nil {
-		releaseSemaphorePermit(repo.semGetLegacyBlockReader)
+		releaseSemaphorePermit(sem)
 		return nil, err
 	}
 
@@ -68,7 +80,7 @@ func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhas
 		// on the stored-subtree branch, one of the file store's global read permits.
 		// Releasing at setup left the configured concurrency bounding nothing. This
 		// defer is registered first so it runs last, after the pipe has been closed.
-		defer releaseSemaphorePermit(repo.semGetLegacyBlockReader)
+		defer releaseSemaphorePermit(sem)
 
 		// This goroutine outlives the request: the caller gets the pipe reader back
 		// and reads from it after GetLegacyBlockReader has returned, so nothing in
