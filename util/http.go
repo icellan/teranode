@@ -772,22 +772,26 @@ func executeHTTPRequest(ctx context.Context, cancelFn context.CancelFunc, rawURL
 	return executeHTTPRequestWithClient(ctx, cancelFn, httpClient, rawURL, requestBody...)
 }
 
-// executeHTTPRequestWithClient performs the request through client, which decides what
-// addresses may be reached.
-func executeHTTPRequestWithClient(ctx context.Context, cancelFn context.CancelFunc, client *http.Client, rawURL string, requestBody ...[]byte) (io.ReadCloser, context.CancelFunc, error) {
-
+// buildOutboundRequest constructs the http.Request shared by every path that talks to a
+// peer over HTTP: a GET by default, or a POST with an octet-stream body when requestBody
+// is supplied, signed by the configured request signer. Content-Type is
+// application/octet-stream because every internal POST that goes through this helper
+// sends raw bytes (e.g. /api/v1/subtree/{hash}/txs streams packed 32-byte tx hashes).
+// Tagging it as application/json caused a WAF in front of asset (ModSecurity) to run the
+// JSON body parser, fail on the binary payload, and reject the request with HTTP 400 —
+// degrading peer catchup reputation across the network.
+//
+// Kept as one function so the retry path (doHTTPRequestForStreamingWithRetryAfter) cannot
+// drift from the plain path (executeHTTPRequestWithClient) on content-type or signing, the
+// way it once did: the retry path used to build its own request and sent unsigned
+// application/json bodies, undoing both the WAF fix and peer-request signing on every
+// retried attempt.
+func buildOutboundRequest(ctx context.Context, rawURL string, requestBody ...[]byte) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, cancelFn, errors.NewServiceError("failed to create http request", err)
+		return nil, errors.NewServiceError("failed to create http request", err)
 	}
 
-	// If there is a request body assume we want a POST and write request body.
-	// Content-Type is application/octet-stream because every internal POST that
-	// goes through this helper sends raw bytes (e.g. /api/v1/subtree/{hash}/txs
-	// streams packed 32-byte tx hashes). Tagging it as application/json caused a
-	// WAF in front of asset (ModSecurity) to run the JSON body parser, fail on
-	// the binary payload, and reject the request with HTTP 400 — degrading peer
-	// catchup reputation across the network.
 	if len(requestBody) > 0 && requestBody[0] != nil {
 		req.Body = io.NopCloser(bytes.NewReader(requestBody[0]))
 		req.Method = http.MethodPost
@@ -797,6 +801,17 @@ func executeHTTPRequestWithClient(ctx context.Context, cancelFn context.CancelFu
 	// Sign the request if a signer is configured (silently skip on error)
 	if signer := loadHTTPRequestSigner(); signer != nil {
 		_ = signer.SignRequest(req)
+	}
+
+	return req, nil
+}
+
+// executeHTTPRequestWithClient performs the request through client, which decides what
+// addresses may be reached.
+func executeHTTPRequestWithClient(ctx context.Context, cancelFn context.CancelFunc, client *http.Client, rawURL string, requestBody ...[]byte) (io.ReadCloser, context.CancelFunc, error) {
+	req, err := buildOutboundRequest(ctx, rawURL, requestBody...)
+	if err != nil {
+		return nil, cancelFn, err
 	}
 
 	var resp *http.Response
@@ -1121,15 +1136,10 @@ func doHTTPRequestForStreamingWithRetryAfter(ctx context.Context, rawURL string,
 		return nil, 0, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	req, err := buildOutboundRequest(ctx, rawURL, requestBody...)
 	if err != nil {
 		cancelFn()
-		return nil, 0, errors.NewServiceError("failed to create http request", err)
-	}
-	if len(requestBody) > 0 && requestBody[0] != nil {
-		req.Body = io.NopCloser(bytes.NewReader(requestBody[0]))
-		req.Method = http.MethodPost
-		req.Header.Set("Content-Type", "application/json")
+		return nil, 0, err
 	}
 
 	resp, err := httpClient.Do(req)
