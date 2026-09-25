@@ -245,6 +245,13 @@ func ConstructMerkleProof(txID *chainhash.Hash, repo MerkleProofConstructor) (*M
 	lastIdx := len(block.Subtrees) - 1
 	blockHash := block.Hash()
 
+	// Fetched here (rather than only when building the proof) so a freshly derived root can be
+	// checked against it before caching.
+	blockHeader, err := repo.GetBlockHeader(blockHash)
+	if err != nil {
+		return nil, terr.NewProcessingError("failed to get block header", err)
+	}
+
 	rootsCache, _ := repo.(BlockRootsCache)
 
 	roots, cached := blockRootsFromCache(rootsCache, blockHash)
@@ -252,6 +259,21 @@ func ConstructMerkleProof(txID *chainhash.Hash, repo MerkleProofConstructor) (*M
 		roots, err = deriveBlockRoots(repo, block, subtreeData, subtreeIdx, lastIdx, coinbaseHash)
 		if err != nil {
 			return nil, err
+		}
+
+		// A bad derivation (e.g. via the SubtreeToCheck fallback in GetSubtree returning the wrong
+		// bytes for a subtree it can no longer identify) must not be memoized: an uncached miss only
+		// affects the request that hit it, but a cached one poisons every proof for this block until
+		// eviction. Verify the reconstructed top root against the header before writing the cache.
+		candidateRoots := buildEffectiveRoots(block.Subtrees, roots.FirstRoot, roots.LastRoot, lastIdx)
+
+		topRoot, err := computeTopRoot(candidateRoots)
+		if err != nil {
+			return nil, err
+		}
+
+		if !topRoot.IsEqual(blockHeader.HashMerkleRoot) {
+			return nil, terr.NewProcessingError("derived block roots do not reconstruct the block header merkle root")
 		}
 
 		if rootsCache != nil {
@@ -264,20 +286,7 @@ func ConstructMerkleProof(txID *chainhash.Hash, repo MerkleProofConstructor) (*M
 	// Build the effective subtree-root leaves for the block-level (top) merkle tree: the placeholder
 	// root of the first subtree is replaced with the coinbase-replaced root, and an incomplete final
 	// subtree's root is replaced with its lifted root.
-	effectiveRoots := block.Subtrees
-
-	if firstRoot != nil || lastRoot != nil {
-		effectiveRoots = make([]*chainhash.Hash, len(block.Subtrees))
-		copy(effectiveRoots, block.Subtrees)
-
-		if firstRoot != nil {
-			effectiveRoots[0] = firstRoot
-		}
-
-		if lastRoot != nil {
-			effectiveRoots[lastIdx] = lastRoot
-		}
-	}
+	effectiveRoots := buildEffectiveRoots(block.Subtrees, firstRoot, lastRoot, lastIdx)
 
 	// Generate the subtree-internal proof. For the first subtree, build it from a coinbase-replaced
 	// clone so the proof carries the real coinbase txid rather than the placeholder. Duplicate() copies
@@ -298,12 +307,6 @@ func ConstructMerkleProof(txID *chainhash.Hash, repo MerkleProofConstructor) (*M
 	blockProof, blockFlags, err := GenerateBlockMerkleProof(effectiveRoots, subtreeIdx)
 	if err != nil {
 		return nil, terr.NewProcessingError("failed to generate block merkle proof", err)
-	}
-
-	// Get the block header
-	blockHeader, err := repo.GetBlockHeader(blockHash)
-	if err != nil {
-		return nil, terr.NewProcessingError("failed to get block header", err)
 	}
 
 	// Convert subtree proof hashes from pointers to values and compute their left/right flags from the
@@ -379,6 +382,56 @@ func ConstructMerkleProof(txID *chainhash.Hash, repo MerkleProofConstructor) (*M
 // the first subtree of a block does.
 func hasCoinbasePlaceholder(st *subtree.Subtree) bool {
 	return st != nil && len(st.Nodes) > 0 && st.Nodes[0].Hash.Equal(subtree.CoinbasePlaceholderHashValue)
+}
+
+// buildEffectiveRoots returns the block-level subtree-root leaves used for the top merkle tree: the
+// placeholder root of the first subtree replaced with firstRoot (coinbase-replaced), and the final
+// subtree's root replaced with lastRoot (lifted), when either is non-nil. Returns subtrees unmodified
+// when both are nil.
+func buildEffectiveRoots(subtrees []*chainhash.Hash, firstRoot, lastRoot *chainhash.Hash, lastIdx int) []*chainhash.Hash {
+	if firstRoot == nil && lastRoot == nil {
+		return subtrees
+	}
+
+	effective := make([]*chainhash.Hash, len(subtrees))
+	copy(effective, subtrees)
+
+	if firstRoot != nil {
+		effective[0] = firstRoot
+	}
+
+	if lastRoot != nil {
+		effective[lastIdx] = lastRoot
+	}
+
+	return effective
+}
+
+// computeTopRoot reconstructs the block-level merkle root from the given subtree-root leaves, using
+// the same pairwise-hash reduction (odd node duplicated) that GenerateBlockMerkleProof's proof path
+// and VerifyMerkleProof's reconstruction both assume.
+func computeTopRoot(roots []*chainhash.Hash) (*chainhash.Hash, error) {
+	if len(roots) == 0 {
+		return nil, terr.NewProcessingError("no subtrees in block")
+	}
+
+	if len(roots) == 1 {
+		return roots[0], nil
+	}
+
+	nodes := make([]subtree.Node, len(roots))
+	for i, r := range roots {
+		nodes[i] = subtree.Node{Hash: *r}
+	}
+
+	store, err := subtree.BuildMerkleTreeStoreFromBytes(nodes)
+	if err != nil {
+		return nil, terr.NewProcessingError("failed to compute block merkle root", err)
+	}
+
+	root := (*store)[len(*store)-1]
+
+	return &root, nil
 }
 
 // blockRootsFromCache reads the memoized block roots, tolerating a nil cache and a nil entry.
