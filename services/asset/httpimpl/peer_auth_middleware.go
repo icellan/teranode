@@ -49,13 +49,40 @@ const replayCacheTTL = 15 * time.Second
 // At ~70 bytes per entry (key + ttlcache overhead) this is ~7 MB worst case.
 const replayCacheCapacity = 100_000
 
-// maxSignedBodyBytes caps how much request body the verifier will buffer and
-// hash on behalf of a signed request. Asset's signed surface is GET-shaped, so
-// this is far above any legitimate signed payload; it exists so that the
-// digest step can never be turned into an unbounded allocation, including when
-// asset_httpBodyLimit is left empty and the Echo body-limit middleware is
-// skipped entirely.
-const maxSignedBodyBytes = 1 << 20
+// defaultMaxSignedBodyBytes is the floor for the cap on how much request body
+// the verifier will buffer and hash on behalf of a signed request. Asset does
+// serve signed POST routes with non-trivial bodies — notably
+// POST /subtree/:hash/txs, which peer catchup uses to fetch missing
+// transactions (services/subtreevalidation/SubtreeValidation.go) — so the
+// effective cap is resolved per-instance from subtreevalidation's batch size
+// (see resolveMaxSignedBodyBytes) rather than fixed at this floor. It exists
+// so that the digest step can never be turned into an unbounded allocation,
+// including when asset_httpBodyLimit is left empty and the Echo body-limit
+// middleware is skipped entirely.
+const defaultMaxSignedBodyBytes = 1 << 20
+
+// signedBodyCapHeadroom is added on top of the raw catchup payload size
+// (32 bytes per requested tx hash) when deriving the signed-body cap, to
+// leave room for header/framing overhead without having to track it exactly.
+const signedBodyCapHeadroom = 4096
+
+// resolveMaxSignedBodyBytes derives the signed-body cap from
+// subtreevalidation_missingTransactionsBatchSize: POST /subtree/:hash/txs
+// carries 32 bytes per requested tx hash, up to that batch size, so a cap
+// fixed below 32*batchSize would 413 a legitimate allowlisted peer's catchup
+// request. The cap never drops below defaultMaxSignedBodyBytes.
+func resolveMaxSignedBodyBytes(missingTransactionsBatchSize int) int64 {
+	if missingTransactionsBatchSize <= 0 {
+		return defaultMaxSignedBodyBytes
+	}
+
+	needed := 32*int64(missingTransactionsBatchSize) + signedBodyCapHeadroom
+	if needed > defaultMaxSignedBodyBytes {
+		return needed
+	}
+
+	return defaultMaxSignedBodyBytes
+}
 
 // peerAuthHeaderTimestamp / Signature / PubKey are the request headers a
 // signed peer must set. The body-digest header is util.PeerAuthBodyDigestHeader.
@@ -171,15 +198,28 @@ type peerAuthVerifier struct {
 	// verification and the body digest, and stays at tierUnverified.
 	// Operators opt in by setting asset_peerAuthAllowlist.
 	allowlist map[peer.ID]struct{}
+
+	// maxSignedBodyBytes is the resolved cap for this verifier instance; see
+	// resolveMaxSignedBodyBytes.
+	maxSignedBodyBytes int64
 }
 
 // newPeerAuthVerifier constructs a verifier with its own replay cache and the
-// parsed allowlist of peer IDs eligible for tier elevation.
+// parsed allowlist of peer IDs eligible for tier elevation, using the default
+// signed-body cap. Production wiring should use newPeerAuthVerifierWithBodyCap
+// so the cap tracks subtreevalidation's batch size.
 func newPeerAuthVerifier(logger ulogger.Logger, tierCache *peerTierCache, allowlist map[peer.ID]struct{}) *peerAuthVerifier {
+	return newPeerAuthVerifierWithBodyCap(logger, tierCache, allowlist, defaultMaxSignedBodyBytes)
+}
+
+// newPeerAuthVerifierWithBodyCap is like newPeerAuthVerifier but takes an
+// explicit signed-body cap (see resolveMaxSignedBodyBytes).
+func newPeerAuthVerifierWithBodyCap(logger ulogger.Logger, tierCache *peerTierCache, allowlist map[peer.ID]struct{}, maxSignedBodyBytes int64) *peerAuthVerifier {
 	return &peerAuthVerifier{
-		logger:    logger,
-		tierCache: tierCache,
-		allowlist: allowlist,
+		logger:             logger,
+		tierCache:          tierCache,
+		allowlist:          allowlist,
+		maxSignedBodyBytes: maxSignedBodyBytes,
 		replayCache: ttlcache.New[string, struct{}](
 			ttlcache.WithTTL[string, struct{}](replayCacheTTL),
 			ttlcache.WithCapacity[string, struct{}](replayCacheCapacity),
@@ -234,8 +274,8 @@ const (
 )
 
 // errSignedBodyTooLarge is returned by digestRequestBody when a signed request
-// declares or streams more than maxSignedBodyBytes.
-var errSignedBodyTooLarge = errors.NewInvalidArgumentError("signed request body exceeds %d bytes", maxSignedBodyBytes)
+// declares or streams more than the verifier's resolved signed-body cap.
+var errSignedBodyTooLarge = errors.NewInvalidArgumentError("signed request body exceeds configured limit")
 
 // recordAuthResult increments the auth-result counter, tolerating an uninitialised
 // metric (some tests skip metrics setup).
@@ -388,7 +428,7 @@ func (v *peerAuthVerifier) verifySignedRequest(c echo.Context) (peer.ID, string,
 		return "", peerAuthResultBadSig, true
 	}
 
-	actualDigest, err := digestRequestBody(req)
+	actualDigest, err := v.digestRequestBody(req)
 	if err != nil {
 		if errors.Is(err, errSignedBodyTooLarge) {
 			return peerID, peerAuthResultBodyTooLarge, true
@@ -445,25 +485,25 @@ func replayCacheKey(pubKeyRaw, sigBytes []byte) string {
 // digestRequestBody computes the lowercase hex SHA-256 of the request body and
 // replaces req.Body so handlers downstream still see it. For requests with no
 // body (GET/HEAD typically) it returns util.EmptyBodySHA256Hex without reading.
-// Bodies over maxSignedBodyBytes are refused on the declared length where one
+// Bodies over v.maxSignedBodyBytes are refused on the declared length where one
 // is available, and otherwise as soon as the cap is crossed.
-func digestRequestBody(req *http.Request) (string, error) {
+func (v *peerAuthVerifier) digestRequestBody(req *http.Request) (string, error) {
 	if req.Body == nil || req.Body == http.NoBody {
 		return util.EmptyBodySHA256Hex, nil
 	}
 
-	if req.ContentLength > maxSignedBodyBytes {
+	if req.ContentLength > v.maxSignedBodyBytes {
 		return "", errSignedBodyTooLarge
 	}
 
-	buf, err := io.ReadAll(io.LimitReader(req.Body, maxSignedBodyBytes+1))
+	buf, err := io.ReadAll(io.LimitReader(req.Body, v.maxSignedBodyBytes+1))
 	_ = req.Body.Close()
 
 	if err != nil {
 		return "", err
 	}
 
-	if len(buf) > maxSignedBodyBytes {
+	if int64(len(buf)) > v.maxSignedBodyBytes {
 		return "", errSignedBodyTooLarge
 	}
 
