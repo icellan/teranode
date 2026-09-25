@@ -679,11 +679,18 @@ func (c *Centrifuge) registerHTTPHandlers(srv httpHandlerRegistrar) {
 // websocketHTTPHandler builds the handler mounted at /connection/websocket: the readiness
 // gate plus the asset_centrifugeAllowOrigins origin check.
 func (c *Centrifuge) websocketHTTPHandler() http.Handler {
+	var clientIP func(*http.Request) string
+	if c.httpServer != nil {
+		clientIP = c.httpServer.ClientIP
+	}
+
 	return c.readinessMiddleware(NewWebsocketHandler(c.centrifugeNode, WebsocketConfig{
-		ReadBufferSize:     1024,
-		UseWriteBufferPool: true,
-		MaxConnections:     c.settings.Asset.MaxWebsocketConnections,
-		CheckOrigin:        c.checkWebsocketOrigin,
+		ReadBufferSize:      1024,
+		UseWriteBufferPool:  true,
+		MaxConnections:      c.settings.Asset.MaxWebsocketConnections,
+		MaxConnectionsPerIP: c.settings.Asset.MaxWebsocketConnectionsPerIP,
+		ClientIP:            clientIP,
+		CheckOrigin:         c.checkWebsocketOrigin,
 	}))
 }
 
