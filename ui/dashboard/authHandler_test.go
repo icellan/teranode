@@ -349,25 +349,38 @@ func TestWebSocketConfigHandler_ProtocolDetection(t *testing.T) {
 	}
 }
 
-// captureLogger records every formatted log line so tests can assert on their content.
+// captureLogger records every formatted log line so tests can assert on their content,
+// keeping per-level buckets so tests can also assert on the level a line was logged at.
 type captureLogger struct {
 	ulogger.TestLogger
 
-	mu    sync.Mutex
-	lines []string
+	mu         sync.Mutex
+	lines      []string
+	debugLines []string
+	warnLines  []string
 }
 
-func (l *captureLogger) record(format string, args ...interface{}) {
+func (l *captureLogger) record(bucket *[]string, format string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+	line := fmt.Sprintf(format, args...)
+	l.lines = append(l.lines, line)
+	*bucket = append(*bucket, line)
 }
 
-func (l *captureLogger) Debugf(format string, args ...interface{}) { l.record(format, args...) }
-func (l *captureLogger) Infof(format string, args ...interface{})  { l.record(format, args...) }
-func (l *captureLogger) Warnf(format string, args ...interface{})  { l.record(format, args...) }
-func (l *captureLogger) Errorf(format string, args ...interface{}) { l.record(format, args...) }
+func (l *captureLogger) Debugf(format string, args ...interface{}) {
+	l.record(&l.debugLines, format, args...)
+}
+func (l *captureLogger) Infof(format string, args ...interface{}) {
+	l.record(&l.lines, format, args...)
+}
+func (l *captureLogger) Warnf(format string, args ...interface{}) {
+	l.record(&l.warnLines, format, args...)
+}
+func (l *captureLogger) Errorf(format string, args ...interface{}) {
+	l.record(&l.lines, format, args...)
+}
 
 func (l *captureLogger) output() string {
 	l.mu.Lock()
@@ -488,6 +501,38 @@ func TestCheckAuthHandler_DoesNotLogCredentialMaterial(t *testing.T) {
 	require.NotContains(t, logged, encoded)
 	// Not even a prefix of the encoded credential may be logged.
 	require.NotContains(t, logged, encoded[:4])
+}
+
+func TestCheckAuth_PerRequestFailOpenLogsAtDebugNotWarn(t *testing.T) {
+	logger := &captureLogger{}
+	h := newCredentialAuthHandler(logger, "", "", false, false)
+
+	// NewAuthHandler already logged a startup Warnf for the fail-open configuration;
+	// only per-request logging is under test here.
+	startupWarnCount := len(logger.warnLines)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/some/unmatched/path", nil)
+	require.True(t, h.CheckAuth(req))
+
+	require.Len(t, logger.warnLines, startupWarnCount,
+		"per-request fail-open logging must stay at Debug: it also fires on unmatched /api/v1/* paths and doubles WARN volume on scanner traffic")
+	require.NotEmpty(t, logger.debugLines)
+}
+
+func TestCheckAuth_PerRequestFailClosedLogsAtDebugNotWarn(t *testing.T) {
+	logger := &captureLogger{}
+	h := newCredentialAuthHandler(logger, "", "", true, false)
+
+	// NewAuthHandler already logged a startup Warnf for the fail-closed configuration;
+	// only per-request logging is under test here.
+	startupWarnCount := len(logger.warnLines)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/some/unmatched/path", nil)
+	require.False(t, h.CheckAuth(req))
+
+	require.Len(t, logger.warnLines, startupWarnCount,
+		"per-request rejection logging must stay at Debug: it also fires on unmatched /api/v1/* paths and doubles WARN volume on scanner traffic")
+	require.NotEmpty(t, logger.debugLines)
 }
 
 func TestLoginHandler_SecureCookie(t *testing.T) {

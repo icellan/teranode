@@ -112,11 +112,11 @@ func (h *AuthHandler) CheckAuth(r *http.Request) bool {
 	// keep the historic fail-open behaviour (the startup warning names the risk).
 	if h.settings.RPC.RPCUser == "" || h.settings.RPC.RPCPass == "" {
 		if h.settings.Asset.RequireAuthCredentials {
-			h.logger.Warnf("Rejecting admin request: rpc_user/rpc_pass are not both set")
+			h.logger.Debugf("Rejecting admin request: rpc_user/rpc_pass are not both set")
 			return false
 		}
 
-		h.logger.Warnf("SECURITY: allowing an unauthenticated admin request because rpc_user/rpc_pass are unset and asset_requireAuthCredentials is false")
+		h.logger.Debugf("SECURITY: allowing an unauthenticated admin request because rpc_user/rpc_pass are unset and asset_requireAuthCredentials is false")
 
 		return true
 	}
