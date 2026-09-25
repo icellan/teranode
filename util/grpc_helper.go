@@ -81,7 +81,17 @@ type ConnectionOptions struct {
 	Credentials      PasswordCredentials // Credentials to pass to downstream middleware (optional)
 	MaxConnectionAge time.Duration       // The maximum amount of time a connection may exist before it will be closed by sending a GoAway
 	APIKey           string              // API key for authentication
-	CallerName       string              // Name of the calling service for retry metrics (e.g. "validator", "propagation")
+	// APIKeyMethods, when non-nil, restricts the APIKey header to calls whose
+	// full gRPC method (e.g. "/blockchain_api.BlockchainAPI/InvalidateBlock")
+	// is a key in this map, instead of attaching it to every call on the
+	// connection. nil (the default) preserves the previous, unconditional
+	// behaviour for callers that do not set it. Use this when the same
+	// connection also carries calls the server does not protect (e.g. a
+	// server-streaming Subscribe RPC), so the admin secret is not sent in
+	// cleartext over every unprotected call it happens to share a connection
+	// with.
+	APIKeyMethods map[string]bool
+	CallerName    string // Name of the calling service for retry metrics (e.g. "validator", "propagation")
 }
 
 // grpcClientRetriesTotal tracks gRPC client retry attempts by caller service and status code.
@@ -165,17 +175,23 @@ func GetGRPCClient(_ context.Context, address string, connectionOptions *Connect
 	streamClientInterceptors := make([]grpc.StreamClientInterceptor, 0, 3)
 
 	if connectionOptions.APIKey != "" {
+		apiKeyMethods := connectionOptions.APIKeyMethods
+
 		unaryClientInterceptors = append(unaryClientInterceptors,
 			func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn,
 				invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
-				ctx = metadata.AppendToOutgoingContext(ctx, apiKeyHeader, connectionOptions.APIKey)
+				if apiKeyMethods == nil || apiKeyMethods[method] {
+					ctx = metadata.AppendToOutgoingContext(ctx, apiKeyHeader, connectionOptions.APIKey)
+				}
 				return invoker(ctx, method, req, reply, cc, opts...)
 			})
 
 		streamClientInterceptors = append(streamClientInterceptors,
 			func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn,
 				method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
-				ctx = metadata.AppendToOutgoingContext(ctx, apiKeyHeader, connectionOptions.APIKey)
+				if apiKeyMethods == nil || apiKeyMethods[method] {
+					ctx = metadata.AppendToOutgoingContext(ctx, apiKeyHeader, connectionOptions.APIKey)
+				}
 				return streamer(ctx, desc, cc, method, opts...)
 			})
 	}

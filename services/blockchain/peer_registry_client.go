@@ -141,9 +141,11 @@ func (c *PeerRegistryClient) log() ulogger.Logger {
 func NewPeerRegistryClient(ctx context.Context, address string, tSettings *settings.Settings) (PeerRegistryClientI, error) {
 	// Include the admin API key so the admin-protected PeerRegistryService
 	// RPCs (see protectedMethods in Server.go) accept calls made through
-	// this client.
+	// this client. APIKeyMethods restricts the header to those RPCs
+	// specifically rather than every call sharing this connection.
 	conn, err := util.GetGRPCClient(ctx, address, &util.ConnectionOptions{
-		APIKey: tSettings.GRPCAdminAPIKey,
+		APIKey:        tSettings.GRPCAdminAPIKey,
+		APIKeyMethods: protectedMethods,
 	}, tSettings)
 	if err != nil {
 		return nil, err

@@ -144,14 +144,13 @@ func TestAuthInterceptorProtectsSendNotification(t *testing.T) {
 	require.True(t, handlerCalled, "unrelated RPC handler must run")
 }
 
-// TestAuthInterceptorProtectsReportPeerFailureAndSetBlockSubtreesSet exercises
-// the two RPCs that, unprotected, let an attacker reach the same
-// b.notifications flood vector as SendNotification without ever calling
-// SendNotification directly (see [Blockchain][ReportPeerFailure] and
-// [Blockchain][SetBlockSubtreesSet], both of which call b.SendNotification as
-// a plain Go method call that bypasses the gRPC interceptor boundary of
+// TestAuthInterceptorProtectsReportPeerFailure exercises ReportPeerFailure,
+// which, unprotected, would let an attacker reach the same b.notifications
+// flood vector as SendNotification without ever calling SendNotification
+// directly (see [Blockchain][ReportPeerFailure], which calls b.SendNotification
+// as a plain Go method call that bypasses the gRPC interceptor boundary of
 // SendNotification itself).
-func TestAuthInterceptorProtectsReportPeerFailureAndSetBlockSubtreesSet(t *testing.T) {
+func TestAuthInterceptorProtectsReportPeerFailure(t *testing.T) {
 	const apiKey = "test-admin-key"
 
 	interceptor := util.CreateAuthInterceptor(apiKey, protectedMethods)
@@ -162,20 +161,38 @@ func TestAuthInterceptorProtectsReportPeerFailureAndSetBlockSubtreesSet(t *testi
 		return "ok", nil
 	}
 
-	for _, method := range []string{
-		"/blockchain_api.BlockchainAPI/ReportPeerFailure",
-		"/blockchain_api.BlockchainAPI/SetBlockSubtreesSet",
-	} {
-		handlerCalled = false
-		_, err := interceptor(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: method}, handler)
-		require.Equal(t, codes.Unauthenticated, status.Code(err), "%s without metadata must be rejected", method)
-		require.False(t, handlerCalled, "%s handler must not run without a key", method)
+	const method = "/blockchain_api.BlockchainAPI/ReportPeerFailure"
 
-		handlerCalled = false
-		ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", apiKey))
-		_, err = interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: method}, handler)
-		require.NoError(t, err, "%s with the correct key must succeed", method)
-		require.True(t, handlerCalled, "%s handler must run with the correct key", method)
+	handlerCalled = false
+	_, err := interceptor(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: method}, handler)
+	require.Equal(t, codes.Unauthenticated, status.Code(err), "%s without metadata must be rejected", method)
+	require.False(t, handlerCalled, "%s handler must not run without a key", method)
+
+	handlerCalled = false
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-api-key", apiKey))
+	_, err = interceptor(ctx, nil, &grpc.UnaryServerInfo{FullMethod: method}, handler)
+	require.NoError(t, err, "%s with the correct key must succeed", method)
+	require.True(t, handlerCalled, "%s handler must run with the correct key", method)
+}
+
+// TestAuthInterceptorLeavesPipelineRPCsPublic pins the deliberate split from
+// Fix 1: RPCs Teranode's own services call in the normal course of following
+// the chain (see the classification comment on protectedMethods) must stay
+// reachable without an API key, even though they mutate state - otherwise a
+// default (grpc_admin_api_key unset) deployment cannot add blocks, change FSM
+// state, or leave IDLE.
+func TestAuthInterceptorLeavesPipelineRPCsPublic(t *testing.T) {
+	const apiKey = "test-admin-key"
+
+	interceptor := util.CreateAuthInterceptor(apiKey, protectedMethods)
+
+	handler := func(ctx context.Context, req any) (any, error) {
+		return "ok", nil
+	}
+
+	for method := range pipelinePublicBlockchainAPIMethods {
+		_, err := interceptor(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: method}, handler)
+		require.NoError(t, err, "%s must be reachable without an API key (pipeline RPC)", method)
 	}
 }
 
@@ -354,16 +371,19 @@ func TestGRPCAuthIsWiredIntoStart(t *testing.T) {
 // The gRPC auth interceptor never runs on that path, so the routes carry their
 // own check. They are also POST-only, so a bare <img src="..."> on a page an
 // operator visits cannot fire them.
+//
+// newServer sets b.adminAPIKey directly - the resolved key requireAdminAPIKey
+// now compares against (see Fix 2) - rather than going through
+// resolveAdminAPIKey/settings, since these subtests exercise the middleware's
+// own comparison logic, not key resolution (covered separately by
+// TestResolveAdminAPIKey_* and TestHTTPAdminRoutesRejectPlaceholderKey below).
 func TestHTTPAdminRoutesRequireAPIKey(t *testing.T) {
 	const apiKey = "http-admin-key"
 
-	newServer := func(t *testing.T, key string) (*Blockchain, *echo.Echo) {
+	newServer := func(t *testing.T, resolvedKey string) (*Blockchain, *echo.Echo) {
 		t.Helper()
 
-		tSettings := test.CreateBaseTestSettings(t)
-		tSettings.GRPCAdminAPIKey = key
-
-		b := &Blockchain{logger: ulogger.TestLogger{}, settings: tSettings}
+		b := &Blockchain{logger: ulogger.TestLogger{}, settings: test.CreateBaseTestSettings(t), adminAPIKey: resolvedKey}
 
 		e := echo.New()
 		e.POST("/invalidate/:hash", func(c echo.Context) error {
@@ -431,4 +451,37 @@ func TestHTTPAdminRoutesRequireAPIKey(t *testing.T) {
 			require.Equal(t, http.StatusMethodNotAllowed, rec.Code, "%s must not be reachable by GET", path)
 		}
 	})
+}
+
+// TestHTTPAdminRoutesRejectPlaceholderKey is the regression test for the auth
+// bypass fixed here: requireAdminAPIKey used to compare against the raw
+// b.settings.GRPCAdminAPIKey rather than the resolved key, so a well-known
+// placeholder like "testkey" - which resolveAdminAPIKey ignores in favour of a
+// random key - was accepted verbatim over HTTP even though the gRPC
+// interceptor (which uses the resolved key) rejects it. Both doors now share
+// b.adminAPIKey, set once in Start() from resolveAdminAPIKey().
+func TestHTTPAdminRoutesRejectPlaceholderKey(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.GRPCAdminAPIKey = "testkey" // well-known placeholder
+
+	b := &Blockchain{logger: mocklogger.NewTestLogger(), settings: tSettings}
+
+	resolvedKey, err := b.resolveAdminAPIKey()
+	require.NoError(t, err)
+	require.NotEqual(t, "testkey", resolvedKey, "resolveAdminAPIKey must not return the placeholder verbatim")
+
+	b.adminAPIKey = resolvedKey
+
+	e := echo.New()
+	e.POST("/invalidate/:hash", func(c echo.Context) error {
+		return c.String(http.StatusOK, "reached handler")
+	}, b.requireAdminAPIKey)
+
+	req := httptest.NewRequest(http.MethodPost, "/invalidate/"+chainhash.Hash{}.String(), nil)
+	req.Header.Set("x-api-key", "testkey")
+
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusUnauthorized, rec.Code,
+		"the raw placeholder must be rejected now that the HTTP route compares against the resolved key, not the raw setting")
 }

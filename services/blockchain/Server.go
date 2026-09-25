@@ -127,6 +127,7 @@ type Blockchain struct {
 	AppCtx                        context.Context                      // Application context
 	localTestStartState           string                               // Initial state for testing
 	subscriptionManagerReady      atomic.Bool                          // Flag indicating subscription manager is ready
+	adminAPIKey                   string                               // Resolved admin API key (see resolveAdminAPIKey), set once in Start() before startHTTP; shared by the gRPC auth interceptor and requireAdminAPIKey so both doors use the same credential
 
 	// Peer registry for tracking peers across all transport types
 	peerRegistry *CentralizedPeerRegistry
@@ -534,51 +535,49 @@ func (b *Blockchain) resolveAdminAPIKey() (string, error) {
 	return apiKey, nil
 }
 
-// protectedMethods is the full gRPC method paths of every state-mutating RPC
-// on BlockchainAPI and PeerRegistryService (both served on the same listener,
+// protectedMethods is the full gRPC method paths of every admin-only RPC on
+// BlockchainAPI and PeerRegistryService (both served on the same listener,
 // see [Blockchain][Start]); the auth interceptor requires the admin API key
 // for these. A package-level var rather than a function: the map never
-// changes after init, and constructing a fresh ~60-entry map on every call
-// (including once per NewClientWithAddress) is wasted work.
+// changes after init, and constructing a fresh map on every call (including
+// once per NewClientWithAddress) is wasted work.
 //
-// The criterion is what the handler's underlying store call actually does, not
-// what its name suggests: GetNextBlockID reads like a query but allocates from
-// a database sequence, so it is protected. Queries that genuinely only read
-// stay unauthenticated because other services call them without admin
-// credentials.
+// The criterion is who calls the RPC, not whether it mutates state:
+//   - admin: a human operator or an external party invokes it, out-of-band
+//     from Teranode's own services, to change node policy or state
+//     (InvalidateBlock, RevalidateBlock, SendNotification, ReportPeerFailure,
+//     the PeerRegistryService mutations).
+//   - pipeline: one of Teranode's own services calls it in the normal course
+//     of following the chain (AddBlock, SetState, AssignBlockID,
+//     GetNextBlockID, SetBlockMinedSet/ClearBlockMinedSet,
+//     SetBlockSubtreesSet, SetBlockPersistedAt, SetBlockProcessedAt,
+//     SendFSMEvent, Run, Idle, CatchUpBlocks, and the blob-deletion RPCs
+//     driven by the blob store and pruner services).
 //
-// SendNotification, ReportPeerFailure and SetBlockSubtreesSet are protected
-// together: the latter two call b.SendNotification as a plain Go method,
-// bypassing SendNotification's own gRPC boundary, so leaving them public would
-// let an attacker reach the same b.notifications flood vector without ever
-// calling SendNotification. Any new mutating RPC must be added here; the
-// classification is enforced by TestProtectedMethodsCoverAllRPCs.
+// Pipeline RPCs are deliberately public (see publicBlockchainAPIMethods):
+// with grpc_admin_api_key unset (the documented default), the server
+// resolves a random key that internal callers never see, so protecting a
+// pipeline RPC makes the service unable to add blocks, change FSM state, or
+// leave IDLE out of the box. Being public here is exactly as reachable as it
+// already is on main, which has no auth on this service at all - this PR
+// does not extend auth to the data path, only to genuine admin/operator
+// actions.
+//
+// SendNotification and ReportPeerFailure are protected: ReportPeerFailure
+// calls b.SendNotification as a plain Go method, bypassing SendNotification's
+// own gRPC boundary, so leaving it public would let an attacker reach the
+// same b.notifications flood vector without ever calling SendNotification.
+// SetBlockSubtreesSet also calls b.SendNotification this way but is pipeline
+// (see above) and is public regardless - the same flood vector is reachable
+// through it as on main today. Any new mutating RPC must be added here or to
+// the public list; the classification is enforced by
+// TestProtectedMethodsCoverAllRPCs.
 var protectedMethods = map[string]bool{
-	// BlockchainAPI - state mutation.
-	"/blockchain_api.BlockchainAPI/AddBlock":                   true,
-	"/blockchain_api.BlockchainAPI/InvalidateBlock":            true,
-	"/blockchain_api.BlockchainAPI/RevalidateBlock":            true,
-	"/blockchain_api.BlockchainAPI/SendNotification":           true,
-	"/blockchain_api.BlockchainAPI/SetState":                   true,
-	"/blockchain_api.BlockchainAPI/AssignBlockID":              true,
-	"/blockchain_api.BlockchainAPI/GetNextBlockID":             true,
-	"/blockchain_api.BlockchainAPI/SetBlockMinedSet":           true,
-	"/blockchain_api.BlockchainAPI/ClearBlockMinedSet":         true,
-	"/blockchain_api.BlockchainAPI/SetBlockSubtreesSet":        true,
-	"/blockchain_api.BlockchainAPI/SetBlockPersistedAt":        true,
-	"/blockchain_api.BlockchainAPI/SetBlockProcessedAt":        true,
-	"/blockchain_api.BlockchainAPI/SendFSMEvent":               true,
-	"/blockchain_api.BlockchainAPI/Run":                        true,
-	"/blockchain_api.BlockchainAPI/CatchUpBlocks":              true,
-	"/blockchain_api.BlockchainAPI/Idle":                       true,
-	"/blockchain_api.BlockchainAPI/ReportPeerFailure":          true,
-	"/blockchain_api.BlockchainAPI/ScheduleBlobDeletion":       true,
-	"/blockchain_api.BlockchainAPI/CancelBlobDeletion":         true,
-	"/blockchain_api.BlockchainAPI/RemoveBlobDeletion":         true,
-	"/blockchain_api.BlockchainAPI/IncrementBlobDeletionRetry": true,
-	"/blockchain_api.BlockchainAPI/CompleteBlobDeletions":      true,
-	"/blockchain_api.BlockchainAPI/AcquireBlobDeletionBatch":   true,
-	"/blockchain_api.BlockchainAPI/CompleteBlobDeletionBatch":  true,
+	// BlockchainAPI - admin/operator actions.
+	"/blockchain_api.BlockchainAPI/InvalidateBlock":   true,
+	"/blockchain_api.BlockchainAPI/RevalidateBlock":   true,
+	"/blockchain_api.BlockchainAPI/SendNotification":  true,
+	"/blockchain_api.BlockchainAPI/ReportPeerFailure": true,
 
 	// PeerRegistryService - state mutation.
 	"/blockchain_api.PeerRegistryService/RegisterPeer":                true,
@@ -609,12 +608,41 @@ var protectedMethods = map[string]bool{
 // which RPCs an operator is choosing to leave open, and the classification
 // test asserts against it rather than owning it.
 //
-// The criterion is "the handler and its store call only read", verified
-// against the store call rather than the method name. Being public is a
-// decision about access, not about cost - each of these must independently
-// bound whatever allocation a caller can drive.
+// Most of these are read-only queries: "the handler and its store call only
+// read", verified against the store call rather than the method name. Being
+// public is a decision about access, not about cost - each of these must
+// independently bound whatever allocation a caller can drive.
+//
+// The rest are pipeline RPCs (see the classification comment on
+// protectedMethods): AddBlock, SetState, AssignBlockID, GetNextBlockID,
+// SetBlockMinedSet, ClearBlockMinedSet, SetBlockSubtreesSet,
+// SetBlockPersistedAt, SetBlockProcessedAt, SendFSMEvent, Run, Idle,
+// CatchUpBlocks, and the blob-deletion RPCs. These mutate state, but Teranode's
+// own services call them in the normal course of following the chain and
+// managing blob lifecycles, so protecting them would brick a default
+// (grpc_admin_api_key unset) deployment.
 var publicBlockchainAPIMethods = map[string]bool{
 	"/blockchain_api.BlockchainAPI/HealthGRPC":                           true,
+	"/blockchain_api.BlockchainAPI/AddBlock":                             true,
+	"/blockchain_api.BlockchainAPI/SetState":                             true,
+	"/blockchain_api.BlockchainAPI/AssignBlockID":                        true,
+	"/blockchain_api.BlockchainAPI/GetNextBlockID":                       true,
+	"/blockchain_api.BlockchainAPI/SetBlockMinedSet":                     true,
+	"/blockchain_api.BlockchainAPI/ClearBlockMinedSet":                   true,
+	"/blockchain_api.BlockchainAPI/SetBlockSubtreesSet":                  true,
+	"/blockchain_api.BlockchainAPI/SetBlockPersistedAt":                  true,
+	"/blockchain_api.BlockchainAPI/SetBlockProcessedAt":                  true,
+	"/blockchain_api.BlockchainAPI/SendFSMEvent":                         true,
+	"/blockchain_api.BlockchainAPI/Run":                                  true,
+	"/blockchain_api.BlockchainAPI/Idle":                                 true,
+	"/blockchain_api.BlockchainAPI/CatchUpBlocks":                        true,
+	"/blockchain_api.BlockchainAPI/ScheduleBlobDeletion":                 true,
+	"/blockchain_api.BlockchainAPI/CancelBlobDeletion":                   true,
+	"/blockchain_api.BlockchainAPI/RemoveBlobDeletion":                   true,
+	"/blockchain_api.BlockchainAPI/IncrementBlobDeletionRetry":           true,
+	"/blockchain_api.BlockchainAPI/CompleteBlobDeletions":                true,
+	"/blockchain_api.BlockchainAPI/AcquireBlobDeletionBatch":             true,
+	"/blockchain_api.BlockchainAPI/CompleteBlobDeletionBatch":            true,
 	"/blockchain_api.BlockchainAPI/GetBlock":                             true,
 	"/blockchain_api.BlockchainAPI/GetBlocks":                            true,
 	"/blockchain_api.BlockchainAPI/GetBlockByHeight":                     true,
@@ -747,6 +775,13 @@ func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		return err
 	}
 
+	// Store the resolved key so requireAdminAPIKey (the HTTP admin routes)
+	// compares against the same credential as the gRPC auth interceptor
+	// below, rather than the raw, unresolved settings value: resolution
+	// discards well-known placeholders and substitutes a random key, and the
+	// HTTP path must honour that or it becomes a bypass of the gRPC check.
+	b.adminAPIKey = apiKey
+
 	if err := b.startHTTP(ctx); err != nil {
 		return errors.WrapGRPC(err)
 	}
@@ -855,14 +890,22 @@ func (b *Blockchain) startHTTP(ctx context.Context) error {
 // gRPC auth interceptor never runs on the HTTP path, so without this the
 // routes are a complete bypass of it.
 //
-// Unlike the gRPC surface, an unset key closes these routes rather than
-// opening them: they have no service-to-service caller (the asset service
-// exposes an authenticated equivalent, and cmd tooling goes through gRPC), so
-// there is nothing to keep working, and invalidating the tip is the single
-// most damaging thing a reachable port can be asked to do.
+// It compares against b.adminAPIKey, the value resolveAdminAPIKey() computed
+// in Start() - not b.settings.GRPCAdminAPIKey directly - because resolution
+// discards well-known placeholders and substitutes a random key; comparing
+// against the raw setting would accept a placeholder here that the gRPC
+// interceptor rejects, a bypass of the gRPC check via this second door.
+//
+// b.adminAPIKey is empty until Start() runs (or in tests that construct a
+// Blockchain directly without resolving a key), and empty closes the route
+// rather than opening it: there is no service-to-service caller of these
+// routes (the asset service exposes an authenticated equivalent, and cmd
+// tooling goes through gRPC), so there is nothing to keep working, and
+// invalidating the tip is the single most damaging thing a reachable port can
+// be asked to do.
 func (b *Blockchain) requireAdminAPIKey(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		apiKey := b.settings.GRPCAdminAPIKey
+		apiKey := b.adminAPIKey
 		if apiKey == "" {
 			return c.String(http.StatusForbidden, "blockchain admin HTTP endpoints are disabled: grpc_admin_api_key is not configured")
 		}
@@ -1784,8 +1827,19 @@ func (b *Blockchain) GetHashOfAncestorBlock(ctx context.Context, request *blockc
 	}, nil
 }
 
-func (b *Blockchain) GetLatestBlockHeaderFromBlockLocatorRequest(ctx context.Context, request *blockchain_api.GetLatestBlockHeaderFromBlockLocatorRequest) (*blockchain_api.GetBlockHeaderResponse, error) {
-	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetLatestBlockHeaderFromBlockLocatorRequest",
+// GetLatestBlockHeaderFromBlockLocator implements the BlockchainAPIServer
+// interface method of the same name (see blockchain_api_grpc.pb.go). This was
+// previously misnamed with a "Request" suffix, which does not satisfy the
+// generated interface: real gRPC calls fell through to
+// UnimplementedBlockchainAPIServer and returned Unimplemented, while the
+// direct-call unit tests (which invoke the Go method by name, bypassing gRPC
+// entirely) stayed green throughout. Found while adding
+// TestPublicBlockchainAPIMethodsAreReadOnly, which requires a handler to
+// exist under the RPC's real name; fixed here as it blocks that new
+// regression test, independent of the audit-33 findings this branch
+// otherwise addresses.
+func (b *Blockchain) GetLatestBlockHeaderFromBlockLocator(ctx context.Context, request *blockchain_api.GetLatestBlockHeaderFromBlockLocatorRequest) (*blockchain_api.GetBlockHeaderResponse, error) {
+	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetLatestBlockHeaderFromBlockLocator",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainGetLatestBlockHeaderFromBlockLocator),
 	)
@@ -1824,8 +1878,11 @@ func (b *Blockchain) GetLatestBlockHeaderFromBlockLocatorRequest(ctx context.Con
 	}, nil
 }
 
-func (b *Blockchain) GetBlockHeadersFromOldestRequest(ctx context.Context, request *blockchain_api.GetBlockHeadersFromOldestRequest) (*blockchain_api.GetBlockHeadersResponse, error) {
-	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBlockHeadersFromOldestRequest",
+// GetBlockHeadersFromOldest implements the BlockchainAPIServer interface
+// method of the same name (see blockchain_api_grpc.pb.go). Same "Request"
+// suffix bug as GetLatestBlockHeaderFromBlockLocator above; see that comment.
+func (b *Blockchain) GetBlockHeadersFromOldest(ctx context.Context, request *blockchain_api.GetBlockHeadersFromOldestRequest) (*blockchain_api.GetBlockHeadersResponse, error) {
+	ctx, _, deferFn := tracing.Tracer("blockchain").Start(ctx, "GetBlockHeadersFromOldest",
 		tracing.WithParentStat(b.stats),
 		tracing.WithHistogram(prometheusBlockchainGetBlockHeadersFromOldest),
 	)
