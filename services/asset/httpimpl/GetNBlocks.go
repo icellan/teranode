@@ -129,18 +129,18 @@ func (h *HTTP) GetNBlocks(mode ReadMode) func(c echo.Context) error {
 			if err != nil {
 				return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("invalid number of blocks", err).Error())
 			}
+		}
 
-			if numberOfBlocks == 0 {
-				numberOfBlocks = 100
-			}
+		if numberOfBlocks == 0 {
+			numberOfBlocks = 100
+		}
 
-			if numberOfBlocks > 1000 {
-				numberOfBlocks = 1000
-			}
+		if numberOfBlocks > 1000 {
+			numberOfBlocks = 1000
+		}
 
-			if maxBlocks := h.settings.Asset.MaxNBlocks; maxBlocks > 0 && numberOfBlocks > maxBlocks {
-				numberOfBlocks = maxBlocks
-			}
+		if maxBlocks := h.settings.Asset.MaxNBlocks; maxBlocks > 0 && numberOfBlocks > maxBlocks {
+			numberOfBlocks = maxBlocks
 		}
 
 		if len(hashStr) != 64 {
