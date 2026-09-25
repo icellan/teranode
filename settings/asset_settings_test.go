@@ -115,6 +115,7 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 		require.Equal(t, "", s.Asset.CORSAllowedOrigins)
 		require.False(t, s.Asset.EnforcePostAuth)
 		require.Equal(t, 0, s.Asset.MaxWebsocketConnections)
+		require.Equal(t, 0, s.Asset.MaxWebsocketConnectionsPerIP)
 		require.Equal(t, int64(0), s.Asset.WebsocketReadLimit)
 		require.Equal(t, 0, s.Asset.SubtreeStreamConcurrency)
 		require.True(t, s.Asset.PublicErrorDetail)
@@ -165,6 +166,9 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 		}},
 		{"asset_maxWebsocketConnections", "250", func(t *testing.T, s *Settings) {
 			require.Equal(t, 250, s.Asset.MaxWebsocketConnections)
+		}},
+		{"asset_maxWebsocketConnectionsPerIP", "4", func(t *testing.T, s *Settings) {
+			require.Equal(t, 4, s.Asset.MaxWebsocketConnectionsPerIP)
 		}},
 		{"asset_websocketReadLimit", "1048576", func(t *testing.T, s *Settings) {
 			require.Equal(t, int64(1048576), s.Asset.WebsocketReadLimit)

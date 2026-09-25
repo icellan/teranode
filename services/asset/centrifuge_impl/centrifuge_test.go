@@ -2733,6 +2733,95 @@ func TestWebsocketHandler_MaxConnections(t *testing.T) {
 	})
 }
 
+// TestWebsocketHandler_MaxConnectionsPerIP covers the per-IP share of the admission
+// budget: zero keeps today's unlimited behaviour, a positive cap refuses the N+1th
+// connection from one IP while another IP is unaffected, and a slot is released on
+// close so the same IP can reconnect.
+func TestWebsocketHandler_MaxConnectionsPerIP(t *testing.T) {
+	const testIPHeader = "X-Test-Client-IP"
+
+	newHandlerServer := func(t *testing.T, maxPerIP int) *httptest.Server {
+		t.Helper()
+
+		node, err := centrifuge.New(centrifuge.Config{LogLevel: centrifuge.LogLevelError})
+		require.NoError(t, err)
+		require.NoError(t, node.Run())
+
+		t.Cleanup(func() { _ = node.Shutdown(context.Background()) })
+
+		server := httptest.NewServer(NewWebsocketHandler(node, WebsocketConfig{
+			MaxConnectionsPerIP: maxPerIP,
+			ClientIP:            func(r *http.Request) string { return r.Header.Get(testIPHeader) },
+			CheckOrigin:         func(_ *http.Request) bool { return true },
+		}))
+		t.Cleanup(server.Close)
+
+		return server
+	}
+
+	dial := func(server *httptest.Server, ip string) (*websocket.Conn, *http.Response, error) {
+		header := http.Header{}
+		header.Set(testIPHeader, ip)
+
+		return websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), header)
+	}
+
+	t.Run("zero means unlimited", func(t *testing.T) {
+		server := newHandlerServer(t, 0)
+
+		for i := 0; i < 4; i++ {
+			conn, _, err := dial(server, "10.0.0.1")
+			require.NoError(t, err)
+
+			defer func() { _ = conn.Close() }()
+		}
+	})
+
+	t.Run("the N+1th connection from one IP is refused while another IP still connects", func(t *testing.T) {
+		server := newHandlerServer(t, 2)
+
+		conn1, _, err := dial(server, "10.0.0.1")
+		require.NoError(t, err)
+		defer func() { _ = conn1.Close() }()
+
+		conn2, _, err := dial(server, "10.0.0.1")
+		require.NoError(t, err)
+		defer func() { _ = conn2.Close() }()
+
+		refused, resp, err := dial(server, "10.0.0.1")
+		if refused != nil {
+			_ = refused.Close()
+		}
+
+		require.Error(t, err)
+		require.NotNil(t, resp)
+		require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+
+		otherIP, _, err := dial(server, "10.0.0.2")
+		require.NoError(t, err)
+		_ = otherIP.Close()
+	})
+
+	t.Run("a closed connection releases its per-IP slot", func(t *testing.T) {
+		server := newHandlerServer(t, 1)
+
+		conn, _, err := dial(server, "10.0.0.3")
+		require.NoError(t, err)
+		require.NoError(t, conn.Close())
+
+		require.Eventually(t, func() bool {
+			next, _, dialErr := dial(server, "10.0.0.3")
+			if dialErr != nil {
+				return false
+			}
+
+			_ = next.Close()
+
+			return true
+		}, 5*time.Second, 50*time.Millisecond, "the per-IP slot held by a closed connection must be released")
+	})
+}
+
 // TestCentrifuge_HandleP2PFrame covers frame validation on the inbound p2p relay:
 // only the types the relay actually serves are republished, and a node_status that
 // does not identify its peer must not flip the readiness gate.
