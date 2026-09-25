@@ -113,6 +113,57 @@ func TestGetLegacyBlockReaderHoldsPermitForStreamLifetime(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond, "permit must be released once the stream is drained")
 }
 
+// TestGetLegacyBlockReaderPeerPoolIsSeparateFromAnonymousPool proves the internal
+// legacy peer server's wire-format requests (wireBlock=true, ?wire=1 in the HTTP
+// route) draw from their own semaphore: with the anonymous pool fully held by a
+// live, undrained stream, a wire-format request must still be admitted.
+func TestGetLegacyBlockReaderPeerPoolIsSeparateFromAnonymousPool(t *testing.T) {
+	tracing.SetupMockTracer()
+
+	tc := setupWithSettings(t, func(s *settings.Settings) {
+		s.Asset.ConcurrencyGetLegacyBlockReader = 1
+		s.Asset.ConcurrencyGetLegacyBlockReaderPeer = 1
+	})
+
+	block, st := newBlock(tc, t, params)
+
+	blockchainClientMock := tc.repo.BlockchainClient.(*blockchain.Mock)
+	blockchainClientMock.On("GetBlock", mock.Anything, mock.Anything).Return(block, nil)
+
+	subtreeData := subtreepkg.NewSubtreeData(st)
+	for i, tx := range params.txs {
+		if i != 0 {
+			require.NoError(t, subtreeData.AddTx(tx, i))
+		}
+	}
+
+	subtreeDataBytes, err := subtreeData.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, tc.repo.SubtreeStore.Set(t.Context(), st.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeDataBytes))
+
+	// Hold the anonymous (non-wire) pool with a live, undrained stream.
+	anon, err := tc.repo.GetLegacyBlockReader(t.Context(), &chainhash.Hash{})
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_, _ = io.Copy(io.Discard, anon)
+		_ = anon.Close()
+	})
+
+	// A second anonymous request is refused: the anonymous pool is exhausted.
+	_, err = tc.repo.GetLegacyBlockReader(shortCtx(t), &chainhash.Hash{})
+	require.Error(t, err, "second anonymous legacy block stream must not be admitted while the first is live")
+
+	// The wire-format (internal legacy peer server) request still succeeds: it draws
+	// from the separate peer pool, which the anonymous stream above never touched.
+	peer, err := tc.repo.GetLegacyBlockReader(shortCtx(t), &chainhash.Hash{}, true)
+	require.NoError(t, err, "the internal legacy peer server path must still acquire a permit while the anonymous pool is exhausted")
+
+	_, err = io.Copy(io.Discard, peer)
+	require.NoError(t, err)
+	require.NoError(t, peer.Close())
+}
+
 // TestSubtreeNodeHashesStreamConcurrencyCap proves the new subtree stream cap is
 // held for the lifetime of the returned reader.
 func TestSubtreeNodeHashesStreamConcurrencyCap(t *testing.T) {
