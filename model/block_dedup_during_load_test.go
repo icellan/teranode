@@ -185,3 +185,21 @@ func TestBlock_Valid_DuplicateAcrossLoadedSubtrees(t *testing.T) {
 		})
 	}
 }
+
+// TestPutSubtreeInTxMap_NilTxMapIsTransient pins that a missing txMap fails the
+// insert instead of panicking. The load-time dedup only allocates the map in
+// onFirst, which runs because getAndValidateSubtrees reloads every subtree; if
+// that ever changed and subtree 0 were skipped, onLoaded would reach the insert
+// with no map. That is a node-side fault, so it must be retryable, never a
+// verdict on the block.
+func TestPutSubtreeInTxMap_NilTxMapIsTransient(t *testing.T) {
+	b, _, st1, _ := dedupLoadFixture(t, nil)
+	require.Nil(t, b.txMap)
+
+	var err error
+
+	require.NotPanics(t, func() {
+		err = b.putSubtreeInTxMap(b.Hash().String(), st1, 1, st1.Size())
+	})
+	requireTransientError(t, err)
+}

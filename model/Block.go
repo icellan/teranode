@@ -1545,6 +1545,14 @@ func (b *Block) putSubtreeInTxMap(blockLabel string, subtree *subtreepkg.Subtree
 		return errors.NewProcessingError("[checkDuplicateTransactionsInSubtree][%s] subtree %d was released during validation", blockLabel, subIdx)
 	}
 
+	// The load-time dedup allocates the map in onFirst, which only runs because
+	// getAndValidateSubtrees reloads every subtree including subtree 0. Guard the
+	// dependency rather than nil-deref inside an errgroup goroutine if that ever
+	// changes: a missing map is a node fault, so fail transient, never the block.
+	if b.txMap == nil {
+		return errors.NewProcessingError("[checkDuplicateTransactionsInSubtree][%s] subtree %d reached the duplicate check with no txMap", blockLabel, subIdx)
+	}
+
 	var idx64 uint64
 
 	// All subtrees before subIdx are full-size (the per-block invariant enforced by
