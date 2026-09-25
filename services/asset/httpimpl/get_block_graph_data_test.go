@@ -305,6 +305,56 @@ func TestGetBlockGraphData(t *testing.T) {
 	})
 }
 
+// TestGetBlockGraphData_StoreBucketedSeriesIsNotReRedGridded guards the boundary
+// hole where the handler re-derives a bucket rung from an already-bucketed
+// series' own endpoints. 30d buckets (2592000s) are not a multiple of 1w
+// buckets (604800s), so a series the store bucketed at 30d, whose *bucketed*
+// endpoint range happens to fall at or under the 5y threshold, must not be
+// silently re-gridded onto 1w buckets by the handler.
+func TestGetBlockGraphData_StoreBucketedSeriesIsNotReRedGridded(t *testing.T) {
+	initPrometheusMetrics()
+
+	const numPoints = 61
+
+	points := make([]*model.DataPoint, 0, numPoints)
+	for i := 0; i < numPoints; i++ {
+		points = append(points, &model.DataPoint{Timestamp: uint32(i) * uint32(bucket30d), TxCount: 1}) // nolint:gosec
+	}
+
+	// The bucketed endpoint range (60 * 2592000 = 155,520,000s) is under the 5y
+	// (157,680,000s) threshold, so re-deriving a rung from these endpoints would
+	// pick bucket1w, not bucket30d.
+	require.Less(t, int64(points[numPoints-1].Timestamp-points[0].Timestamp), int64(157680000))
+
+	httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
+
+	mockRepo.On("GetBlockGraphData", mock.Anything, mock.Anything).Return(&model.BlockDataPoints{
+		DataPoints:    points,
+		BucketSeconds: bucket30d,
+	}, nil)
+
+	echoContext.SetPath("/blocks/graph/:period")
+	echoContext.SetParamNames("period")
+	echoContext.SetParamValues("all")
+
+	require.NoError(t, httpServer.GetBlockGraphData(echoContext))
+	require.Equal(t, http.StatusOK, responseRecorder.Code)
+
+	var response struct {
+		DataPoints []struct {
+			Timestamp uint32 `json:"timestamp"`
+			TxCount   uint64 `json:"tx_count"`
+		} `json:"data_points"`
+	}
+
+	require.NoError(t, json.Unmarshal(responseRecorder.Body.Bytes(), &response))
+	require.Len(t, response.DataPoints, numPoints, "a bucketed series must pass through unchanged, not be re-gridded")
+
+	for i, dp := range response.DataPoints {
+		require.Equal(t, points[i].Timestamp, dp.Timestamp, "point %d must keep its store-assigned 30d-bucket timestamp", i)
+	}
+}
+
 func TestGetBlockGraphData_MaxBlockGraphPoints(t *testing.T) {
 	initPrometheusMetrics()
 

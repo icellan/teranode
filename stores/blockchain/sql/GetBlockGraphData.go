@@ -24,11 +24,11 @@ import (
 
 // graphBucketSeconds returns the bucket size in seconds used to aggregate the
 // block graph series for a given total timestamp range, or 0 for per-block
-// resolution. The asset HTTP handler holds the same ladder and re-applies it to
-// whatever this store returns; because the ladder is idempotent over
-// already-bucketed points, aggregating here produces the same response the
-// handler produced when it aggregated the full raw series itself. Keep the two
-// ladders in step.
+// resolution. The asset HTTP handler holds the same ladder, but re-deriving a
+// rung from an already-bucketed series is not always idempotent (30d buckets
+// are not a multiple of 1w buckets), so this store reports the rung it used
+// via BlockDataPoints.BucketSeconds and the handler must not re-aggregate when
+// that is non-zero. Keep the two ladders in step regardless.
 func graphBucketSeconds(rangeSeconds int64) int64 {
 	switch {
 	case rangeSeconds <= 86400: // <= 24h: per-block resolution
@@ -166,7 +166,7 @@ func (s *SQL) GetBlockGraphData(ctx context.Context, periodMillis uint64) (*mode
 			`GROUP BY ` + bucketExpr + ` ORDER BY 1 ASC`
 	}
 
-	blockDataPoints := &model.BlockDataPoints{}
+	blockDataPoints := &model.BlockDataPoints{BucketSeconds: bucketSeconds}
 
 	rows, err := s.db.QueryContext(ctx, q, periodSeconds)
 	if err != nil {
