@@ -93,6 +93,24 @@ func TestParseNumberOfHeaders(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 10_000, n, "catchup sends n=10000 and must not be tightened by default")
 	})
+
+	t.Run("absent n is still clamped when Asset.MaxBlockHeaders is below the default", func(t *testing.T) {
+		httpServer, _, _, _ := GetMockHTTP(t, nil)
+		httpServer.settings.Asset.MaxBlockHeaders = 50
+
+		n, err := httpServer.parseNumberOfHeaders("")
+		require.NoError(t, err)
+		assert.Equal(t, 50, n, "the default must go through the cap, not bypass it")
+	})
+
+	t.Run("n=0 is still clamped when Asset.MaxBlockHeaders is below the default", func(t *testing.T) {
+		httpServer, _, _, _ := GetMockHTTP(t, nil)
+		httpServer.settings.Asset.MaxBlockHeaders = 50
+
+		n, err := httpServer.parseNumberOfHeaders("0")
+		require.NoError(t, err)
+		assert.Equal(t, 50, n, "the default must go through the cap, not bypass it")
+	})
 }
 
 func TestGetBlockHeadersToCommonAncestor(t *testing.T) {
