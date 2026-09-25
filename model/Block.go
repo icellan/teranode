@@ -109,9 +109,11 @@ type Block struct {
 	subtreeSlicesMu sync.RWMutex
 	txMap           txmap.TxMap
 	// txMapCount is the entry count txMap was sized from, and the pool key it
-	// must be returned with. Derived from the loaded block body by
-	// txMapEntryCount, not from the peer-supplied TransactionCount. Stashed so
-	// the release key cannot drift from the one used at GetTxMap time.
+	// must be returned with. Never the peer-supplied TransactionCount: the
+	// separate pass derives it from the loaded body by txMapEntryCount, and the
+	// in-memory load path from len(Subtrees) x subtree 0 once the subtree list
+	// is bound to the header (getAndValidateSubtreesWithDedup). Stashed so the
+	// release key cannot drift from the one used at GetTxMap time.
 	txMapCount      uint64
 	medianTimestamp uint32
 	// nodeAllocator, if non-nil, supplies pooled backing slices for the
@@ -899,9 +901,10 @@ func (b *Block) ValidWithBinding(ctx context.Context, logger ulogger.Logger, sub
 	}
 
 	// 11. Check that there are no duplicate transactions in the block.
-	// CVE-2012-2459 guard — runs unconditionally so future callers passing nil subtreeStore
-	// don't silently skip dedup. checkDuplicateTransactions iterates SubtreeSlices in memory
-	// and does not need the subtree store directly. Deliberately ordered BEFORE the coinbase
+	// CVE-2012-2459 guard — runs on every path so future callers passing nil subtreeStore
+	// don't silently skip dedup: during the subtree load above on the in-memory path
+	// (dedupedDuringLoad), otherwise as the separate checkDuplicateTransactions pass below,
+	// which iterates SubtreeSlices in memory and does not need the subtree store directly. Deliberately ordered BEFORE the coinbase
 	// and fee checks below (bitcoin-sv/teranode#4692): svnode runs the
 	// mutation check in CheckBlock, ahead of the coinbase checks and ahead of
 	// ContextualCheckBlock's height and fee arithmetic. A body that is both mutated and
@@ -1227,11 +1230,12 @@ func (b *Block) releaseTxMap() {
 		ClearTxMapStats()
 	} else if poolable, ok := b.txMap.(*txmap.SplitSwissMapUint64); ok {
 		// Return the pooled in-memory map for reuse on the next block. The
-		// invariant this relies on is narrow and local: checkDuplicateTransactions
-		// assigns b.txMapCount immediately before GetTxMap and nothing between
+		// invariant this relies on is narrow and local: both allocation sites
+		// (checkDuplicateTransactions, and onFirst in getAndValidateSubtreesWithDedup)
+		// assign b.txMapCount immediately before GetTxMap and nothing between
 		// there and here writes it, so the Put key equals the Get key and the map
-		// lands in the pool it came from (counts above every size class are
-		// dropped by PutTxMap). Deliberately not stated in terms of
+		// lands in the pool it came from (counts above every size class, and maps
+		// whose fill falls outside their class, are dropped by PutTxMap). Deliberately not stated in terms of
 		// b.TransactionCount, which GetAndValidateSubtrees only recomputes when
 		// Valid took the `subtreeStore != nil && len(b.Subtrees) > 0` branch.
 		PutTxMap(poolable, b.txMapCount)
@@ -2476,8 +2480,9 @@ func (b *Block) getAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 			//
 			// A processing error, NOT a corrupt-body verdict: a nil survivor here can never be
 			// peer data. SubtreeSlices is reallocated all-nil above, so every index gets a
-			// goroutine; each goroutine either assigns its slice or returns an error, and the
-			// errgroup Wait above returns before this loop on any error. subtreeSlicesMu is held
+			// loader: the boundary subtrees run inline when onFirst is set, the rest in
+			// goroutines. Each loader either assigns its slice or returns an error, and every
+			// error returns before this loop. subtreeSlicesMu is held
 			// for the whole function, so nothing can nil an entry mid-flight either. A nil left
 			// here is therefore a local invariant break, and classifying it corrupt would strike
 			// the serving peer for our own bug. Matches how Valid and CheckMerkleRoot classify the
