@@ -18,7 +18,10 @@ package blockchain
 import (
 	"container/ring"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
@@ -500,6 +503,171 @@ func (b *Blockchain) fsmBootState() (string, error) {
 	}
 }
 
+// resolveAdminAPIKey returns the effective admin API key for the blockchain
+// gRPC server (which also serves PeerRegistryService on the same listener),
+// generating a random key when none is configured or the configured value is
+// a well-known placeholder. This mirrors services/legacy/Server.go's and
+// services/p2p/Server.go's handling of util.ValidateAdminAPIKey: admin
+// auth fails closed rather than open, so an unconfigured or placeholder key
+// leaves the protected RPCs unreachable instead of unauthenticated.
+func (b *Blockchain) resolveAdminAPIKey() (string, error) {
+	apiKey := b.settings.GRPCAdminAPIKey
+	if util.ValidateAdminAPIKey(b.logger, "Blockchain", apiKey, b.settings.BlockChain.GRPCListenAddress, b.settings.SecurityLevelGRPC) {
+		// Configured key is a well-known placeholder; ignore it and fall back to
+		// the random-key path below rather than trusting a world-readable value.
+		apiKey = ""
+	}
+
+	if apiKey == "" {
+		// Generate a random API key if not provided
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			return "", errors.WrapGRPC(errors.NewServiceNotStartedError("[Blockchain] failed to generate API key", err))
+		}
+
+		apiKey = hex.EncodeToString(key)
+		// Never log the key itself; a random key means admin-protected RPCs are
+		// intentionally unreachable until an operator configures one.
+		b.logger.Warnf("[Blockchain] grpc_admin_api_key is not set; a random key was generated so admin-protected RPCs (SendNotification, ReportPeerFailure, SetBlockSubtreesSet, AddBlock, InvalidateBlock, and other state-mutating RPCs) are unreachable until a key is configured")
+	}
+
+	return apiKey, nil
+}
+
+// protectedMethods is the full gRPC method paths of every state-mutating RPC
+// on BlockchainAPI and PeerRegistryService (both served on the same listener,
+// see [Blockchain][Start]); the auth interceptor requires the admin API key
+// for these. A package-level var rather than a function: the map never
+// changes after init, and constructing a fresh ~60-entry map on every call
+// (including once per NewClientWithAddress) is wasted work.
+//
+// The criterion is what the handler's underlying store call actually does, not
+// what its name suggests: GetNextBlockID reads like a query but allocates from
+// a database sequence, so it is protected. Queries that genuinely only read
+// stay unauthenticated because other services call them without admin
+// credentials.
+//
+// SendNotification, ReportPeerFailure and SetBlockSubtreesSet are protected
+// together: the latter two call b.SendNotification as a plain Go method,
+// bypassing SendNotification's own gRPC boundary, so leaving them public would
+// let an attacker reach the same b.notifications flood vector without ever
+// calling SendNotification. Any new mutating RPC must be added here; the
+// classification is enforced by TestProtectedMethodsCoverAllRPCs.
+var protectedMethods = map[string]bool{
+	// BlockchainAPI - state mutation.
+	"/blockchain_api.BlockchainAPI/AddBlock":                   true,
+	"/blockchain_api.BlockchainAPI/InvalidateBlock":            true,
+	"/blockchain_api.BlockchainAPI/RevalidateBlock":            true,
+	"/blockchain_api.BlockchainAPI/SendNotification":           true,
+	"/blockchain_api.BlockchainAPI/SetState":                   true,
+	"/blockchain_api.BlockchainAPI/AssignBlockID":              true,
+	"/blockchain_api.BlockchainAPI/GetNextBlockID":             true,
+	"/blockchain_api.BlockchainAPI/SetBlockMinedSet":           true,
+	"/blockchain_api.BlockchainAPI/ClearBlockMinedSet":         true,
+	"/blockchain_api.BlockchainAPI/SetBlockSubtreesSet":        true,
+	"/blockchain_api.BlockchainAPI/SetBlockPersistedAt":        true,
+	"/blockchain_api.BlockchainAPI/SetBlockProcessedAt":        true,
+	"/blockchain_api.BlockchainAPI/SendFSMEvent":               true,
+	"/blockchain_api.BlockchainAPI/Run":                        true,
+	"/blockchain_api.BlockchainAPI/CatchUpBlocks":              true,
+	"/blockchain_api.BlockchainAPI/Idle":                       true,
+	"/blockchain_api.BlockchainAPI/ReportPeerFailure":          true,
+	"/blockchain_api.BlockchainAPI/ScheduleBlobDeletion":       true,
+	"/blockchain_api.BlockchainAPI/CancelBlobDeletion":         true,
+	"/blockchain_api.BlockchainAPI/RemoveBlobDeletion":         true,
+	"/blockchain_api.BlockchainAPI/IncrementBlobDeletionRetry": true,
+	"/blockchain_api.BlockchainAPI/CompleteBlobDeletions":      true,
+	"/blockchain_api.BlockchainAPI/AcquireBlobDeletionBatch":   true,
+	"/blockchain_api.BlockchainAPI/CompleteBlobDeletionBatch":  true,
+
+	// PeerRegistryService - state mutation.
+	"/blockchain_api.PeerRegistryService/RegisterPeer":                true,
+	"/blockchain_api.PeerRegistryService/UpdatePeerMetrics":           true,
+	"/blockchain_api.PeerRegistryService/RemovePeer":                  true,
+	"/blockchain_api.PeerRegistryService/AddBanScore":                 true,
+	"/blockchain_api.PeerRegistryService/ClearBannedPeers":            true,
+	"/blockchain_api.PeerRegistryService/UpdateConnectionState":       true,
+	"/blockchain_api.PeerRegistryService/UpdateLastMessageTime":       true,
+	"/blockchain_api.PeerRegistryService/UpdateStorage":               true,
+	"/blockchain_api.PeerRegistryService/RecordSyncAttempt":           true,
+	"/blockchain_api.PeerRegistryService/ClearAllSyncAttempts":        true,
+	"/blockchain_api.PeerRegistryService/RecordBlockReceived":         true,
+	"/blockchain_api.PeerRegistryService/RecordSubtreeReceived":       true,
+	"/blockchain_api.PeerRegistryService/RecordTransactionReceived":   true,
+	"/blockchain_api.PeerRegistryService/RecordCatchupError":          true,
+	"/blockchain_api.PeerRegistryService/RecordCatchupAttempt":        true,
+	"/blockchain_api.PeerRegistryService/RecordCatchupSuccess":        true,
+	"/blockchain_api.PeerRegistryService/RecordCatchupFailure":        true,
+	"/blockchain_api.PeerRegistryService/ResetReputation":             true,
+	"/blockchain_api.PeerRegistryService/ReconsiderBadPeers":          true,
+	"/blockchain_api.PeerRegistryService/RecordValidatedPeerProgress": true,
+}
+
+// publicBlockchainAPIMethods are the BlockchainAPI RPCs deliberately reachable
+// without the admin API key. This lives here, next to protectedMethods,
+// rather than in a test file: it is a production statement of intent about
+// which RPCs an operator is choosing to leave open, and the classification
+// test asserts against it rather than owning it.
+//
+// The criterion is "the handler and its store call only read", verified
+// against the store call rather than the method name. Being public is a
+// decision about access, not about cost - each of these must independently
+// bound whatever allocation a caller can drive.
+var publicBlockchainAPIMethods = map[string]bool{
+	"/blockchain_api.BlockchainAPI/HealthGRPC":                           true,
+	"/blockchain_api.BlockchainAPI/GetBlock":                             true,
+	"/blockchain_api.BlockchainAPI/GetBlocks":                            true,
+	"/blockchain_api.BlockchainAPI/GetBlockByHeight":                     true,
+	"/blockchain_api.BlockchainAPI/GetBlockByID":                         true,
+	"/blockchain_api.BlockchainAPI/GetBlockStats":                        true,
+	"/blockchain_api.BlockchainAPI/GetBlockGraphData":                    true,
+	"/blockchain_api.BlockchainAPI/GetLastNBlocks":                       true,
+	"/blockchain_api.BlockchainAPI/GetLastNInvalidBlocks":                true,
+	"/blockchain_api.BlockchainAPI/GetSuitableBlock":                     true,
+	"/blockchain_api.BlockchainAPI/GetHashOfAncestorBlock":               true,
+	"/blockchain_api.BlockchainAPI/GetLatestBlockHeaderFromBlockLocator": true,
+	"/blockchain_api.BlockchainAPI/GetBlockHeadersFromOldest":            true,
+	"/blockchain_api.BlockchainAPI/GetNextWorkRequired":                  true,
+	"/blockchain_api.BlockchainAPI/GetBlockExists":                       true,
+	"/blockchain_api.BlockchainAPI/GetBlockHeaders":                      true,
+	"/blockchain_api.BlockchainAPI/GetBlockHeadersToCommonAncestor":      true,
+	"/blockchain_api.BlockchainAPI/GetBlockHeadersFromCommonAncestor":    true,
+	"/blockchain_api.BlockchainAPI/GetBlockHeadersFromTill":              true,
+	"/blockchain_api.BlockchainAPI/GetBlockHeadersFromHeight":            true,
+	"/blockchain_api.BlockchainAPI/GetBlockHeadersByHeight":              true,
+	"/blockchain_api.BlockchainAPI/GetMedianTimePastByHeights":           true,
+	"/blockchain_api.BlockchainAPI/GetBlocksByHeight":                    true,
+	"/blockchain_api.BlockchainAPI/FindBlocksContainingSubtree":          true,
+	"/blockchain_api.BlockchainAPI/GetBlockHeaderIDs":                    true,
+	"/blockchain_api.BlockchainAPI/GetBestBlockHeader":                   true,
+	"/blockchain_api.BlockchainAPI/CheckBlockIsInCurrentChain":           true,
+	"/blockchain_api.BlockchainAPI/CheckBlockIsAncestorOfBlock":          true,
+	"/blockchain_api.BlockchainAPI/GetChainTips":                         true,
+	"/blockchain_api.BlockchainAPI/GetBlockHeader":                       true,
+	"/blockchain_api.BlockchainAPI/GetSubscribers":                       true,
+	"/blockchain_api.BlockchainAPI/GetState":                             true,
+	"/blockchain_api.BlockchainAPI/GetBlockIsMined":                      true,
+	"/blockchain_api.BlockchainAPI/GetBlocksMinedNotSet":                 true,
+	"/blockchain_api.BlockchainAPI/GetBlocksNotPersisted":                true,
+	"/blockchain_api.BlockchainAPI/GetBlocksSubtreesNotSet":              true,
+	"/blockchain_api.BlockchainAPI/GetFSMCurrentState":                   true,
+	"/blockchain_api.BlockchainAPI/WaitUntilFSMTransitionFromIdleState":  true,
+	"/blockchain_api.BlockchainAPI/GetBlockLocator":                      true,
+	"/blockchain_api.BlockchainAPI/LocateBlockHeaders":                   true,
+	"/blockchain_api.BlockchainAPI/GetBestHeightAndTime":                 true,
+	"/blockchain_api.BlockchainAPI/ListScheduledDeletions":               true,
+	"/blockchain_api.BlockchainAPI/GetPendingBlobDeletions":              true,
+}
+
+// publicPeerRegistryServiceMethods are the PeerRegistryService RPCs
+// deliberately reachable without the admin API key: read-only queries.
+var publicPeerRegistryServiceMethods = map[string]bool{
+	"/blockchain_api.PeerRegistryService/GetPeer":         true,
+	"/blockchain_api.PeerRegistryService/ListPeers":       true,
+	"/blockchain_api.PeerRegistryService/IsPeerBanned":    true,
+	"/blockchain_api.PeerRegistryService/ListBannedPeers": true,
+}
+
 // Start begins the blockchain service operations.
 //
 // This method initializes and launches all the core components of the blockchain service:
@@ -572,8 +740,20 @@ func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	// Start batch token cleanup
 	go b.cleanupExpiredBatchTokens()
 
+	// Resolve (and validate) the admin key before starting the HTTP admin
+	// routes: they share the same credential, gated by requireAdminAPIKey.
+	apiKey, err := b.resolveAdminAPIKey()
+	if err != nil {
+		return err
+	}
+
 	if err := b.startHTTP(ctx); err != nil {
 		return errors.WrapGRPC(err)
+	}
+
+	authOptions := &util.AuthOptions{
+		APIKey:           apiKey,
+		ProtectedMethods: protectedMethods,
 	}
 
 	// this will block
@@ -581,7 +761,7 @@ func (b *Blockchain) Start(ctx context.Context, readyCh chan<- struct{}) error {
 		blockchain_api.RegisterBlockchainAPIServer(server, b)
 		blockchain_api.RegisterPeerRegistryServiceServer(server, b)
 		closeOnce.Do(func() { close(readyCh) })
-	}, nil); err != nil {
+	}, authOptions); err != nil {
 		return errors.WrapGRPC(errors.NewServiceNotStartedError("[Blockchain][Start] can't start GRPC server", err))
 	}
 
@@ -636,8 +816,13 @@ func (b *Blockchain) startHTTP(ctx context.Context) error {
 		return c.String(http.StatusOK, "OK")
 	})
 
-	e.GET("/invalidate/:hash", b.invalidateHandler)
-	e.GET("/revalidate/:hash", b.revalidateHandler)
+	// Block (re)validation mutates consensus state, so it gets the same
+	// credential as the equivalent gRPC RPCs rather than being a second, open
+	// door onto them. POST rather than GET so a bare <img src="..."> on a page
+	// an operator visits cannot fire it; the CORS policy above only allows
+	// cross-origin GET, so a browser has to preflight and will be refused.
+	e.POST("/invalidate/:hash", b.invalidateHandler, b.requireAdminAPIKey)
+	e.POST("/revalidate/:hash", b.revalidateHandler, b.requireAdminAPIKey)
 
 	go func() {
 		<-ctx.Done()
@@ -663,6 +848,31 @@ func (b *Blockchain) startHTTP(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+// requireAdminAPIKey gates the blockchain service's state-mutating HTTP admin
+// routes behind the same x-api-key credential as the protected gRPC RPCs. The
+// gRPC auth interceptor never runs on the HTTP path, so without this the
+// routes are a complete bypass of it.
+//
+// Unlike the gRPC surface, an unset key closes these routes rather than
+// opening them: they have no service-to-service caller (the asset service
+// exposes an authenticated equivalent, and cmd tooling goes through gRPC), so
+// there is nothing to keep working, and invalidating the tip is the single
+// most damaging thing a reachable port can be asked to do.
+func (b *Blockchain) requireAdminAPIKey(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		apiKey := b.settings.GRPCAdminAPIKey
+		if apiKey == "" {
+			return c.String(http.StatusForbidden, "blockchain admin HTTP endpoints are disabled: grpc_admin_api_key is not configured")
+		}
+
+		if subtle.ConstantTimeCompare([]byte(c.Request().Header.Get("x-api-key")), []byte(apiKey)) != 1 {
+			return c.String(http.StatusUnauthorized, "missing or invalid x-api-key header")
+		}
+
+		return next(c)
+	}
 }
 
 // invalidateHandler handles HTTP requests to invalidate a block.

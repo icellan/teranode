@@ -120,10 +120,21 @@ func NewClientWithAddress(ctx context.Context, logger ulogger.Logger, tSettings 
 
 	retries := 0
 
+	// Include the admin API key so the admin-protected RPCs (see
+	// protectedMethods in Server.go) accept calls made through this client.
+	apiKey := tSettings.GRPCAdminAPIKey
+	if apiKey == "" || util.IsPlaceholderAdminAPIKey(apiKey) {
+		// A placeholder is ignored by the server (which uses a random key), so a
+		// client that sent it would still be rejected; warn instead of logging a
+		// reassuring "using API key" line that contradicts the server.
+		logger.Warnf("[Blockchain Client] grpc_admin_api_key is unset or a well-known placeholder; admin-protected RPCs (SendNotification, AddBlock, InvalidateBlock, and other state-mutating RPCs) will fail with Unauthenticated because the server ignores placeholders and uses a random key")
+	}
+
 	for {
 		baConn, err = util.GetGRPCClient(ctx, address, &util.ConnectionOptions{
 			MaxRetries:   tSettings.GRPCMaxRetries,
 			RetryBackoff: tSettings.GRPCRetryBackoff,
+			APIKey:       apiKey,
 			CallerName:   "blockchain",
 		}, tSettings)
 		if err != nil {
