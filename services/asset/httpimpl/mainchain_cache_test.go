@@ -129,6 +129,26 @@ func TestMainChainCache_BelowWindowRPCErrorNotCached(t *testing.T) {
 	bcMock.AssertExpectations(t)
 }
 
+// TestMainChainCache_BelowWindowFillPanicReturnsErrorToWaiters pins that a panic in
+// the shared singleflight fill is recovered and turned into an error for every
+// waiter, rather than taking the process down. DoChan re-panics in a fresh
+// goroutine for any caller beyond the first when the fill is not guarded, which
+// bypasses echo's request-goroutine Recover entirely.
+func TestMainChainCache_BelowWindowFillPanicReturnsErrorToWaiters(t *testing.T) {
+	bcMock := &blockchain.Mock{}
+	c := populatedCache(t, bcMock)
+
+	bcMock.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{7}).
+		Panic("boom").Once()
+
+	require.NotPanics(t, func() {
+		_, err := c.IsOnMainChain(context.Background(), 7, 50)
+		require.Error(t, err)
+	})
+
+	bcMock.AssertExpectations(t)
+}
+
 func TestMainChainCache_AboveWindowFallbackUncached(t *testing.T) {
 	bcMock := &blockchain.Mock{}
 	c := populatedCache(t, bcMock)
