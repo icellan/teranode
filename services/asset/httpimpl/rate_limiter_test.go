@@ -363,22 +363,26 @@ func TestResolveHeavyBurst(t *testing.T) {
 		name       string
 		configured int
 		floor      int
+		rate       int
 		want       int
 		wantWarn   bool
 	}{
-		{name: "unset takes the floor silently", configured: 0, floor: 32, want: 32, wantWarn: false},
-		{name: "configured below the floor is raised and warns", configured: 8, floor: 32, want: 32, wantWarn: true},
-		{name: "configured above the floor is kept", configured: 64, floor: 32, want: 64, wantWarn: false},
-		{name: "configured equal to the floor is kept", configured: 32, floor: 32, want: 32, wantWarn: false},
-		{name: "no floor keeps the configured value", configured: 8, floor: 0, want: 8, wantWarn: false},
+		{name: "unset takes the floor silently", configured: 0, floor: 32, rate: 10, want: 32, wantWarn: false},
+		{name: "configured below the floor is respected, not raised, but warns", configured: 8, floor: 32, rate: 10, want: 8, wantWarn: true},
+		{name: "configured above the floor is kept", configured: 64, floor: 32, rate: 10, want: 64, wantWarn: false},
+		{name: "configured equal to the floor is kept", configured: 32, floor: 32, rate: 10, want: 32, wantWarn: false},
+		{name: "no floor keeps the configured value", configured: 8, floor: 0, rate: 10, want: 8, wantWarn: false},
+		{name: "floor above 4x rate is clamped before being applied", configured: 0, floor: 100, rate: 10, want: 40, wantWarn: false},
+		{name: "configured above the clamped floor is kept, no warn", configured: 50, floor: 100, rate: 10, want: 50, wantWarn: false},
+		{name: "configured below the clamped floor is respected and warns against the clamped value", configured: 20, floor: 100, rate: 10, want: 20, wantWarn: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			logger := ulogger.NewVerboseTestLogger(t)
-			got, raised := resolveHeavyBurst(logger, tt.configured, tt.floor)
+			got, warned := resolveHeavyBurst(logger, tt.configured, tt.floor, tt.rate)
 			require.Equal(t, tt.want, got)
-			require.Equal(t, tt.wantWarn, raised)
+			require.Equal(t, tt.wantWarn, warned)
 		})
 	}
 }

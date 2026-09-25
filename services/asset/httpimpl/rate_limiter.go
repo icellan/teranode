@@ -202,24 +202,39 @@ func (rl *tieredRateLimiter) burstFor(ratePerSec int) int {
 	return max(ratePerSec, rl.minBurst)
 }
 
-// resolveHeavyBurst returns the burst the heavy-endpoint limiter should use,
-// and whether an operator-configured value had to be raised.
+// maxHeavyBurstRateMultiple bounds the derived catchup-route floor (see
+// resolveHeavyBurst) at a multiple of the sustained heavy rate. Without a
+// cap, raising subtreevalidation_getMissingTransactions silently raises the
+// anonymous per-IP burst on the Asset listener with no ceiling.
+const maxHeavyBurstRateMultiple = 4
+
+// resolveHeavyBurst returns the burst the catchup-route heavy limiter should
+// use, and whether it warned about the configured value.
 //
 // floor is the concurrent fan-out a catching-up peer performs
-// (subtreevalidation_getMissingTransactions). A burst below it makes honest
-// catchup traffic collide with the limiter: the resulting 429 is never
-// retried and subtree validation reports the serving peer as invalid.
-func resolveHeavyBurst(logger ulogger.Logger, configured, floor int) (int, bool) {
-	if configured >= floor {
+// (subtreevalidation_getMissingTransactions), clamped to at most
+// maxHeavyBurstRateMultiple times rate. A burst below the (clamped) floor
+// makes honest catchup traffic collide with the limiter: the resulting 429 is
+// never retried and subtree validation reports the serving peer as invalid.
+//
+// An explicit, non-zero asset_httpHeavyRateBurst is always respected, even
+// when it is below the floor: an operator's configured value is never
+// overridden. A single-line warning is logged instead, naming the risk.
+func resolveHeavyBurst(logger ulogger.Logger, configured, floor, rate int) (int, bool) {
+	clampedFloor := floor
+	if maxFloor := rate * maxHeavyBurstRateMultiple; rate > 0 && clampedFloor > maxFloor {
+		clampedFloor = maxFloor
+	}
+
+	if configured > 0 {
+		if configured < clampedFloor {
+			logger.Warnf("[Asset] asset_httpHeavyRateBurst %d is below the catchup fan-out floor %d (subtreevalidation_getMissingTransactions, clamped to %dx the heavy rate); keeping the configured value because it was set explicitly - honest peer catchup may be rejected with 429", configured, clampedFloor, maxHeavyBurstRateMultiple)
+			return configured, true
+		}
 		return configured, false
 	}
 
-	raised := configured > 0
-	if raised {
-		logger.Warnf("[Asset] asset_httpHeavyRateBurst %d is below the catchup fan-out of %d (subtreevalidation_getMissingTransactions); raising it to %d so honest peer catchup is not rejected with 429", configured, floor, floor)
-	}
-
-	return floor, raised
+	return clampedFloor, false
 }
 
 // unverifiedKey normalises the source identifier for unverified buckets. For
