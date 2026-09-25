@@ -113,11 +113,14 @@ func TestGetLegacyBlockReaderHoldsPermitForStreamLifetime(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond, "permit must be released once the stream is drained")
 }
 
-// TestGetLegacyBlockReaderPeerPoolIsSeparateFromAnonymousPool proves the internal
-// legacy peer server's wire-format requests (wireBlock=true, ?wire=1 in the HTTP
-// route) draw from their own semaphore: with the anonymous pool fully held by a
-// live, undrained stream, a wire-format request must still be admitted.
-func TestGetLegacyBlockReaderPeerPoolIsSeparateFromAnonymousPool(t *testing.T) {
+// setupLegacyBlockReaderPoolTest builds a repository with both legacy-block-reader
+// pools capped at 1 and a legacy block ready to serve, and holds the anonymous
+// (non-marked) pool open with a live, undrained stream. Every
+// TestGetLegacyBlockReader*Pool* test shares this setup: only the ctx a second
+// call is made with differs.
+func setupLegacyBlockReaderPoolTest(t *testing.T) *testContext {
+	t.Helper()
+
 	tracing.SetupMockTracer()
 
 	tc := setupWithSettings(t, func(s *settings.Settings) {
@@ -141,7 +144,7 @@ func TestGetLegacyBlockReaderPeerPoolIsSeparateFromAnonymousPool(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, tc.repo.SubtreeStore.Set(t.Context(), st.RootHash()[:], fileformat.FileTypeSubtreeData, subtreeDataBytes))
 
-	// Hold the anonymous (non-wire) pool with a live, undrained stream.
+	// Hold the anonymous (unmarked-ctx) pool with a live, undrained stream.
 	anon, err := tc.repo.GetLegacyBlockReader(t.Context(), &chainhash.Hash{})
 	require.NoError(t, err)
 
@@ -150,18 +153,43 @@ func TestGetLegacyBlockReaderPeerPoolIsSeparateFromAnonymousPool(t *testing.T) {
 		_ = anon.Close()
 	})
 
-	// A second anonymous request is refused: the anonymous pool is exhausted.
+	// A second, unmarked request is refused: the anonymous pool is exhausted. This
+	// pins the precondition every test below depends on.
 	_, err = tc.repo.GetLegacyBlockReader(shortCtx(t), &chainhash.Hash{})
 	require.Error(t, err, "second anonymous legacy block stream must not be admitted while the first is live")
 
-	// The wire-format (internal legacy peer server) request still succeeds: it draws
-	// from the separate peer pool, which the anonymous stream above never touched.
-	peer, err := tc.repo.GetLegacyBlockReader(shortCtx(t), &chainhash.Hash{}, true)
-	require.NoError(t, err, "the internal legacy peer server path must still acquire a permit while the anonymous pool is exhausted")
+	return tc
+}
+
+// TestGetLegacyBlockReaderPeerPoolIsSeparateFromAnonymousPool proves a ctx marked
+// by WithLegacyBlockReaderPeerPool draws from the separate peer semaphore: with
+// the anonymous pool fully held by a live, undrained stream, a marked request
+// must still be admitted.
+func TestGetLegacyBlockReaderPeerPoolIsSeparateFromAnonymousPool(t *testing.T) {
+	tc := setupLegacyBlockReaderPoolTest(t)
+
+	peerCtx := WithLegacyBlockReaderPeerPool(shortCtx(t), true)
+
+	peer, err := tc.repo.GetLegacyBlockReader(peerCtx, &chainhash.Hash{}, true)
+	require.NoError(t, err, "a ctx marked for the peer pool must still acquire a permit while the anonymous pool is exhausted")
 
 	_, err = io.Copy(io.Discard, peer)
 	require.NoError(t, err)
 	require.NoError(t, peer.Close())
+}
+
+// TestGetLegacyBlockReaderWireBlockAloneDoesNotClaimThePeerPool is the exact
+// vulnerability the peer-pool separation must not reintroduce: wireBlock=true
+// (?wire=1 on the HTTP route) is client-controlled and, on its own, must not
+// grant the peer pool. Only httpimpl.GetLegacyBlock's loopback check does that,
+// by marking ctx. A caller that passes wireBlock=true without marking ctx — as
+// any anonymous HTTP client requesting ?wire=1 does — must still be refused
+// while the anonymous pool is exhausted.
+func TestGetLegacyBlockReaderWireBlockAloneDoesNotClaimThePeerPool(t *testing.T) {
+	tc := setupLegacyBlockReaderPoolTest(t)
+
+	_, err := tc.repo.GetLegacyBlockReader(shortCtx(t), &chainhash.Hash{}, true)
+	require.Error(t, err, "wireBlock=true without a ctx marked for the peer pool must not bypass the exhausted anonymous pool")
 }
 
 // TestSubtreeNodeHashesStreamConcurrencyCap proves the new subtree stream cap is

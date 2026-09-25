@@ -3,6 +3,7 @@ package httpimpl
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/bsv-blockchain/teranode/errors"
@@ -253,5 +254,51 @@ func TestGetRestLegacyBlock(t *testing.T) {
 		// Check response status code
 		assert.Equal(t, http.StatusInternalServerError, echoErr.Code)
 		assert.Equal(t, "PROCESSING (4): error getting block -> PROCESSING (4): error getting block", echoErr.Message)
+	})
+}
+
+// TestIsLoopbackDirectPeer pins the security-critical decision that gates the
+// internal legacy-peer-server pool (asset_concurrency_get_legacy_block_reader_peer):
+// it must key off the request's actual TCP peer (http.Request.RemoteAddr), never
+// a client-supplied header, so an anonymous off-box caller cannot claim the pool
+// by forging one.
+func TestIsLoopbackDirectPeer(t *testing.T) {
+	newContext := func(remoteAddr string, headers map[string]string) echo.Context {
+		req := httptest.NewRequest(http.MethodGet, "/block_legacy/deadbeef", nil)
+		req.RemoteAddr = remoteAddr
+
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+
+		return echo.New().NewContext(req, httptest.NewRecorder())
+	}
+
+	t.Run("loopback IPv4 RemoteAddr", func(t *testing.T) {
+		require.True(t, isLoopbackDirectPeer(newContext("127.0.0.1:54321", nil)))
+	})
+
+	t.Run("loopback IPv6 RemoteAddr", func(t *testing.T) {
+		require.True(t, isLoopbackDirectPeer(newContext("[::1]:54321", nil)))
+	})
+
+	t.Run("non-loopback RemoteAddr", func(t *testing.T) {
+		require.False(t, isLoopbackDirectPeer(newContext("203.0.113.5:54321", nil)))
+	})
+
+	t.Run("non-loopback RemoteAddr with a spoofed X-Forwarded-For does not count as loopback", func(t *testing.T) {
+		require.False(t, isLoopbackDirectPeer(newContext("203.0.113.5:54321", map[string]string{
+			"X-Forwarded-For": "127.0.0.1",
+		})))
+	})
+
+	t.Run("non-loopback RemoteAddr with a spoofed X-Real-IP does not count as loopback", func(t *testing.T) {
+		require.False(t, isLoopbackDirectPeer(newContext("203.0.113.5:54321", map[string]string{
+			"X-Real-IP": "127.0.0.1",
+		})))
+	})
+
+	t.Run("RemoteAddr without a port is never loopback", func(t *testing.T) {
+		require.False(t, isLoopbackDirectPeer(newContext("not-a-host-port", nil)))
 	})
 }
