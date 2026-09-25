@@ -205,3 +205,26 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 		})
 	}
 }
+
+// TestAssetSettings_ConcurrencyGetLegacyBlockReaderPeer covers the peer-pool
+// counterpart to asset_concurrency_get_legacy_block_reader: same default (-1 =
+// NumCPU) and independently settable, so the anonymous and internal legacy-peer
+// pools can be sized separately.
+func TestAssetSettings_ConcurrencyGetLegacyBlockReaderPeer(t *testing.T) {
+	t.Run("defaults to -1 (NumCPU), same as the anonymous pool", func(t *testing.T) {
+		s := NewSettings()
+
+		require.Equal(t, -1, s.Asset.ConcurrencyGetLegacyBlockReader)
+		require.Equal(t, -1, s.Asset.ConcurrencyGetLegacyBlockReaderPeer)
+	})
+
+	t.Run("is settable independently of the anonymous pool", func(t *testing.T) {
+		gocore.Config().Set("asset_concurrency_get_legacy_block_reader_peer", "8")
+		t.Cleanup(func() { gocore.Config().Set("asset_concurrency_get_legacy_block_reader_peer", "") })
+
+		s := NewSettings()
+
+		require.Equal(t, 8, s.Asset.ConcurrencyGetLegacyBlockReaderPeer)
+		require.Equal(t, -1, s.Asset.ConcurrencyGetLegacyBlockReader)
+	})
+}
