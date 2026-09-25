@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -343,6 +344,134 @@ func TestGetTransactionsResponseByteBudget(t *testing.T) {
 	echoErr := &echo.HTTPError{}
 	require.True(t, errors.As(err, &echoErr))
 	require.Equal(t, http.StatusRequestEntityTooLarge, echoErr.Code)
+}
+
+// TestGetTransactionsResponseByteBudgetFloor checks that
+// asset_maxBatchResponseBytes, like asset_maxBatchRecords, is never enforced
+// below the response size a maximal catchup batch can produce: a value set well
+// under subtreevalidation_missingTransactionsBatchSize * catchupResponseBytesPerTx
+// must not reject a batch that fits under the floor.
+func TestGetTransactionsResponseByteBudgetFloor(t *testing.T) {
+	initPrometheusMetrics()
+
+	httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
+	httpServer.settings.Asset.MaxBatchResponseBytes = 1
+	httpServer.settings.SubtreeValidation.MissingTransactionsBatchSize = 16384
+
+	mockRepo.On("GetTransaction", mock.Anything, mock.Anything).Return(testTX1RawBytes, nil)
+
+	echoContext.Request().Body = io.NopCloser(bytes.NewReader(bytes.Repeat(testTX1Hash.CloneBytes(), 4)))
+
+	require.NoError(t, httpServer.GetTransactions()(echoContext))
+	require.Equal(t, http.StatusOK, responseRecorder.Code)
+}
+
+// TestGetTransactionsPreservesResponseOrder pins the response order to the
+// request order, not to whichever concurrent lookup finishes first.
+func TestGetTransactionsPreservesResponseOrder(t *testing.T) {
+	initPrometheusMetrics()
+
+	httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
+
+	mockRepo.On("GetTransaction", mock.MatchedBy(func(h *chainhash.Hash) bool {
+		return h.IsEqual(testTX1Hash)
+	})).Return(testTX1RawBytes, nil)
+	mockRepo.On("GetTransaction", mock.MatchedBy(func(h *chainhash.Hash) bool {
+		return h.IsEqual(testTX2Hash)
+	})).Return(testTX2RawBytes, nil)
+
+	// Request tx2 before tx1: the response must still come back tx2, then tx1.
+	body := append(testTX2Hash.CloneBytes(), testTX1Hash.CloneBytes()...)
+	echoContext.Request().Body = io.NopCloser(bytes.NewReader(body))
+
+	require.NoError(t, httpServer.GetTransactions()(echoContext))
+	require.Equal(t, http.StatusOK, responseRecorder.Code)
+
+	expected := append(append([]byte{}, testTX2RawBytes...), testTX1RawBytes...)
+	require.Equal(t, expected, responseRecorder.Body.Bytes())
+}
+
+// TestGetTransactionsDispatchesBeforeBodyFullyRead is the memory/shape regression:
+// the handler must dispatch each hash's lookup as it is read, not read the whole
+// body into a slice before any lookup starts. A blocking body reader proves it:
+// the first hash's lookup must run while the second hash has not been supplied
+// yet.
+func TestGetTransactionsDispatchesBeforeBodyFullyRead(t *testing.T) {
+	initPrometheusMetrics()
+
+	pr, pw := io.Pipe()
+	httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, pr)
+
+	firstLookupStarted := make(chan struct{})
+
+	mockRepo.On("GetTransaction", mock.MatchedBy(func(h *chainhash.Hash) bool {
+		return h.IsEqual(testTX1Hash)
+	})).Run(func(mock.Arguments) {
+		close(firstLookupStarted)
+	}).Return(testTX1RawBytes, nil).Once()
+	mockRepo.On("GetTransaction", mock.MatchedBy(func(h *chainhash.Hash) bool {
+		return h.IsEqual(testTX2Hash)
+	})).Return(testTX2RawBytes, nil).Once()
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- httpServer.GetTransactions()(echoContext)
+	}()
+
+	_, err := pw.Write(testTX1Hash.CloneBytes())
+	require.NoError(t, err)
+
+	select {
+	case <-firstLookupStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected the first hash's lookup to start before the rest of the body was read")
+	}
+
+	_, err = pw.Write(testTX2Hash.CloneBytes())
+	require.NoError(t, err)
+	require.NoError(t, pw.Close())
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after the body was fully supplied")
+	}
+
+	require.Equal(t, http.StatusOK, responseRecorder.Code)
+}
+
+// TestGetTransactionsStopsDispatchingAfterAFailure covers both the early-stop-on-
+// cancellation and reserve-before-serialize fixes: once a dispatched lookup has
+// failed, the handler must not keep dispatching (and therefore serializing) every
+// remaining hash in a large batch. On the previous implementation nothing checked
+// the shared context before dispatching or serializing, so every hash in the batch
+// was always looked up regardless of an earlier failure.
+func TestGetTransactionsStopsDispatchingAfterAFailure(t *testing.T) {
+	initPrometheusMetrics()
+
+	const requestedHashes = 5000
+
+	httpServer, mockRepo, echoContext, _ := GetMockHTTP(t, nil)
+
+	var calls atomic.Int64
+
+	mockRepo.On("GetTransaction", mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) { calls.Add(1) }).
+		Return(nil, errors.NewNotFoundError("transaction not found"))
+
+	body := bytes.Repeat(testTX1Hash.CloneBytes(), requestedHashes)
+	echoContext.Request().Body = io.NopCloser(bytes.NewReader(body))
+
+	err := httpServer.GetTransactions()(echoContext)
+
+	echoErr := &echo.HTTPError{}
+	require.True(t, errors.As(err, &echoErr))
+	require.Equal(t, http.StatusNotFound, echoErr.Code)
+
+	require.Less(t, calls.Load(), int64(requestedHashes),
+		"the handler must stop reading and dispatching more hashes once a lookup has already failed")
 }
 
 // TestConcatTransactionBytesAllocatesExactly guards against a speculative
