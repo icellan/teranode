@@ -255,7 +255,8 @@ func (c *LocalClient) GetBlockHeadersFromCommonAncestor(ctx context.Context, cha
 
 // GetLatestBlockHeaderFromBlockLocator retrieves the latest block header from a block locator.
 func (c *LocalClient) GetLatestBlockHeaderFromBlockLocator(ctx context.Context, bestBlockHash *chainhash.Hash, blockLocator []chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
-	return c.store.GetLatestBlockHeaderFromBlockLocator(ctx, bestBlockHash, blockLocator)
+	header, meta, _, err := c.store.GetLatestBlockHeaderFromBlockLocator(ctx, bestBlockHash, blockLocator)
+	return header, meta, err
 }
 
 // GetBlockHeadersFromOldest retrieves block headers starting from the oldest block.

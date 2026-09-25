@@ -1596,7 +1596,7 @@ func (b *Blockchain) GetLatestBlockHeaderFromBlockLocatorRequest(ctx context.Con
 		locatorHashes[i] = *hash
 	}
 
-	blockHeader, meta, err := b.store.GetLatestBlockHeaderFromBlockLocator(ctx, bestBlockHash, locatorHashes)
+	blockHeader, meta, _, err := b.store.GetLatestBlockHeaderFromBlockLocator(ctx, bestBlockHash, locatorHashes)
 	if err != nil {
 		return nil, errors.WrapGRPC(err)
 	}
@@ -3390,10 +3390,31 @@ func getBlockHeadersToCommonAncestor(ctx context.Context, store blockchain_store
 	// chain with the same not-found error - after paging through the whole
 	// chain to get there. Answer it now instead. A store error here is not
 	// fatal: fall through to the walk, which stays authoritative.
-	if _, _, err := store.GetLatestBlockHeaderFromBlockLocator(ctx, hashTarget, locatorValues); err != nil {
-		if errors.Is(err, errors.ErrNotFound) {
+	_, ancestorMeta, hashTargetOnMainChain, preflightErr := store.GetLatestBlockHeaderFromBlockLocator(ctx, hashTarget, locatorValues)
+	if preflightErr != nil {
+		if errors.Is(preflightErr, errors.ErrNotFound) {
 			return nil, nil, errors.NewNotFoundError("common ancestor hash not found for any block locator hash")
 		}
+	}
+
+	// The pre-flight already resolved the ancestor's height. When hashTarget is
+	// itself on the main chain (not a stale/fork tip) and the walk is not
+	// depth-limited, the same result can be read with one bounded, indexed
+	// range read instead of paging backward from hashTarget in search of it -
+	// which, for a locator that resolves deep in the chain, would otherwise
+	// page through the whole distance to get there.
+	if preflightErr == nil && hashTargetOnMainChain && maxWalkDepth <= 0 {
+		headerHistory, headerMetaHistory, ok, err := getCommonAncestorHeadersByRange(ctx, store, hashTarget, ancestorMeta, int(maxHeaders))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if ok {
+			return headerHistory, headerMetaHistory, nil
+		}
+		// ok is false only when the target's own height could not be resolved
+		// (e.g. hashTarget not found); fall through to the walk, which stays
+		// authoritative.
 	}
 
 	max := int(maxHeaders)
@@ -3449,6 +3470,59 @@ out:
 	return headerHistory, headerMetaHistory, nil
 }
 
+// getCommonAncestorHeadersByRange answers getBlockHeadersToCommonAncestor with a
+// single bounded height-range read instead of walking backward from hashTarget in
+// numberOfHeaders-sized batches. It is only safe to call when hashTarget is on the
+// main chain: the range read is filtered by on_main_chain rather than following
+// hashTarget's own ancestry, so a stale/fork target must keep using the walk.
+//
+// ok is false when hashTarget's own height could not be resolved; the caller must
+// fall back to the walk in that case.
+func getCommonAncestorHeadersByRange(ctx context.Context, store blockchain_store.Store, hashTarget *chainhash.Hash, ancestorMeta *model.BlockHeaderMeta, maxHeaders int) ([]*model.BlockHeader, []*model.BlockHeaderMeta, bool, error) {
+	if maxHeaders <= 0 {
+		return nil, nil, false, nil
+	}
+
+	_, targetMeta, err := store.GetBlockHeader(ctx, hashTarget)
+	if err != nil || targetMeta.Height < ancestorMeta.Height {
+		// Not found, or the ancestor is somehow above hashTarget (should not
+		// happen: GetLatestBlockHeaderFromBlockLocator only returns ancestors
+		// at or below hashTarget's height) - fall back to the walk.
+		return nil, nil, false, nil
+	}
+
+	startHeight := ancestorMeta.Height
+	endHeight := targetMeta.Height
+
+	// Mirrors the ring buffer in the walk: when the ancestor is further back
+	// than maxHeaders, only the maxHeaders headers nearest to the ancestor are
+	// kept (the walk breaks the instant it finds the ancestor), not the ones
+	// nearest to hashTarget.
+	if int64(endHeight)-int64(startHeight)+1 > int64(maxHeaders) {
+		endHeight = startHeight + uint32(maxHeaders) - 1
+	}
+
+	headers, metas, err := store.GetBlockHeadersByHeight(ctx, startHeight, endHeight)
+	if err != nil {
+		return nil, nil, false, errors.NewStorageError("failed to get block headers by height", err)
+	}
+
+	// GetBlockHeadersByHeight returns ascending height order; the walk returns
+	// descending (hashTarget-side first), so reverse to match it exactly. The
+	// returned slices are shared with the store's response cache, so this must
+	// build new slices rather than reversing in place - mutating the cached
+	// slice would corrupt every future cache hit for the same height range.
+	reversedHeaders := make([]*model.BlockHeader, len(headers))
+	reversedMetas := make([]*model.BlockHeaderMeta, len(metas))
+
+	for i, header := range headers {
+		reversedHeaders[len(headers)-1-i] = header
+		reversedMetas[len(metas)-1-i] = metas[i]
+	}
+
+	return reversedHeaders, reversedMetas, true, nil
+}
+
 // GetBlockHeadersFromCommonAncestor retrieves block headers from a common ancestor.
 func (b *Blockchain) GetBlockHeadersFromCommonAncestor(ctx context.Context, request *blockchain_api.GetBlockHeadersFromCommonAncestorRequest) (*blockchain_api.GetBlockHeadersResponse, error) {
 	targetHash, err := chainhash.NewHash(request.TargetHash)
@@ -3489,7 +3563,7 @@ func (b *Blockchain) GetBlockHeadersFromCommonAncestor(ctx context.Context, requ
 
 func getBlockHeadersFromCommonAncestor(ctx context.Context, store blockchain_store.Store, chainTipHash *chainhash.Hash, blockLocatorHashes []chainhash.Hash, maxHeaders uint32) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
 	// first we need to get the common ancestor of the target hash and the block locator hashes
-	commonBlockHeader, _, err := store.GetLatestBlockHeaderFromBlockLocator(ctx, chainTipHash, blockLocatorHashes)
+	commonBlockHeader, _, _, err := store.GetLatestBlockHeaderFromBlockLocator(ctx, chainTipHash, blockLocatorHashes)
 	if err != nil {
 		return nil, nil, errors.NewProcessingError("failed to get latest block header from block locator", err)
 	}

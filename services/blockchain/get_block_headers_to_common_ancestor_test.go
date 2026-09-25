@@ -190,3 +190,107 @@ func TestGetBlockHeadersToCommonAncestorWalkDepthBudget(t *testing.T) {
 	require.LessOrEqual(t, store.getBlockHeadersCalls.Load()-before, int64(2),
 		"the budget must cap the number of header pages read")
 }
+
+// TestGetBlockHeadersToCommonAncestorMainChainDeepLocatorSkipsTheWalk is the
+// perf regression: on default settings (asset_maxLocatorWalkDepth=0), a locator
+// that resolves deep in the chain must be answered with a single bounded range
+// read, not by paging backward from the tip one numberOfHeaders batch at a
+// time. It must still return exactly what the walk returns.
+func TestGetBlockHeadersToCommonAncestorMainChainDeepLocatorSkipsTheWalk(t *testing.T) {
+	const numBlocks = 2_500
+
+	store, hashes := buildCommonAncestorTestChain(t, numBlocks)
+	ctx := context.Background()
+
+	tipHash := hashes[numBlocks]
+	// Ancestor is deep: height 5, far below the default page size (1,000) and
+	// the requested maxHeaders (100).
+	locator := []*chainhash.Hash{hashes[5]}
+
+	headers, metas, err := getBlockHeadersToCommonAncestor(ctx, store, tipHash, locator, 100, 0)
+	require.NoError(t, err)
+
+	require.Equal(t, int64(0), store.getBlockHeadersCalls.Load(),
+		"a main-chain target must be answered by a range read, not the paging walk")
+
+	// Same result the walk produces: 100 headers, ending at the ancestor
+	// (height 5, since 5+100-1=104 < tip), descending.
+	require.Len(t, headers, 100)
+	require.Len(t, metas, 100)
+	require.Equal(t, hashes[104].String(), headers[0].Hash().String())
+	require.Equal(t, hashes[5].String(), headers[len(headers)-1].Hash().String())
+	require.Equal(t, uint32(104), metas[0].Height)
+	require.Equal(t, uint32(5), metas[len(metas)-1].Height)
+}
+
+// TestGetBlockHeadersToCommonAncestorForkTargetUsesTheWalk asserts that a
+// stale/fork tip target is never answered by the on_main_chain range read: the
+// range read would silently substitute whichever main-chain block sits at the
+// same heights, not the fork's own ancestors. It must fall back to the
+// (correct) walk and return the fork's own headers.
+func TestGetBlockHeadersToCommonAncestorForkTargetUsesTheWalk(t *testing.T) {
+	store, hashes := buildCommonAncestorTestChain(t, 5)
+	ctx := context.Background()
+
+	// hashes[3] is the shared ancestor; fork off from there with two blocks
+	// that never become the main chain (equal work, stored second).
+	coinbase, err := bt.NewTxFromString(model.CoinbaseHex)
+	require.NoError(t, err)
+
+	bits, err := model.NewNBitFromString("1d00ffff")
+	require.NoError(t, err)
+
+	now := uint32(time.Now().Unix()) // nolint:gosec
+
+	forkBlock4 := &model.Block{
+		Header: &model.BlockHeader{
+			Version:        1,
+			Timestamp:      now + 1_000,
+			Nonce:          9001,
+			Bits:           *bits,
+			HashPrevBlock:  hashes[3],
+			HashMerkleRoot: &chainhash.Hash{1},
+		},
+		CoinbaseTx:       coinbase,
+		TransactionCount: 1,
+		SizeInBytes:      80,
+	}
+	_, _, err = store.StoreBlock(ctx, forkBlock4, "")
+	require.NoError(t, err)
+
+	forkBlock5 := &model.Block{
+		Header: &model.BlockHeader{
+			Version:        1,
+			Timestamp:      now + 1_001,
+			Nonce:          9002,
+			Bits:           *bits,
+			HashPrevBlock:  forkBlock4.Hash(),
+			HashMerkleRoot: &chainhash.Hash{2},
+		},
+		CoinbaseTx:       coinbase,
+		TransactionCount: 1,
+		SizeInBytes:      80,
+	}
+	_, _, err = store.StoreBlock(ctx, forkBlock5, "")
+	require.NoError(t, err)
+
+	// hashes[5] (the real main chain tip) has strictly more work stored first,
+	// so the fork stays a fork; forkBlock5 is a stale tip, not on_main_chain.
+	locator := []*chainhash.Hash{hashes[3]}
+
+	headers, metas, err := getBlockHeadersToCommonAncestor(ctx, store, forkBlock5.Hash(), locator, 100, 0)
+	require.NoError(t, err)
+	require.NotEmpty(t, store.getBlockHeadersCalls.Load(),
+		"a fork target must fall back to the walk, not the main-chain range read")
+
+	require.Len(t, headers, 3)
+	require.Len(t, metas, 3)
+	// Descending: forkBlock5 (tip) first, then forkBlock4, then the ancestor
+	// itself (hashes[3], shared with the main chain) - the fork's own headers,
+	// not whatever sits on the main chain at heights 4 and 5.
+	require.Equal(t, forkBlock5.Hash().String(), headers[0].Hash().String())
+	require.Equal(t, forkBlock4.Hash().String(), headers[1].Hash().String())
+	require.Equal(t, hashes[3].String(), headers[2].Hash().String())
+	require.NotEqual(t, hashes[5].String(), headers[0].Hash().String())
+	require.NotEqual(t, hashes[4].String(), headers[1].Hash().String())
+}
