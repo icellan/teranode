@@ -134,10 +134,6 @@ func (h *HTTP) GetBlockHeadersToCommonAncestor(mode ReadMode) func(c echo.Contex
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
-		if numberOfHeaders > 10_000 {
-			numberOfHeaders = 10_000
-		}
-
 		var (
 			headers     []*model.BlockHeader
 			headerMetas []*model.BlockHeaderMeta
@@ -194,23 +190,28 @@ func (h *HTTP) parseBlockLocatorHashes(hashesStr string) ([]*chainhash.Hash, err
 	return hashes, nil
 }
 
-// parseNumberOfHeaders parses and validates the 'n' parameter for number of headers
+// parseNumberOfHeaders parses and validates the 'n' parameter for number of headers.
+// The default (an absent or zero 'n') is subject to the same cap as an explicit
+// value: it is never returned before Asset.MaxBlockHeaders has had a chance to
+// tighten it.
 func (h *HTTP) parseNumberOfHeaders(nStr string) (int, error) {
-	if nStr == "" {
-		return 100, nil
-	}
+	n := 100
 
-	n, err := strconv.Atoi(nStr)
-	if err != nil {
-		return 0, errors.NewInvalidArgumentError("invalid number of headers")
-	}
+	if nStr != "" {
+		var err error
 
-	if n < 0 {
-		return 0, errors.NewInvalidArgumentError("number of headers must not be negative")
+		n, err = strconv.Atoi(nStr)
+		if err != nil {
+			return 0, errors.NewInvalidArgumentError("invalid number of headers")
+		}
+
+		if n < 0 {
+			return 0, errors.NewInvalidArgumentError("number of headers must not be negative")
+		}
 	}
 
 	if n == 0 {
-		return 100, nil
+		n = 100
 	}
 
 	if n > 10_000 {
