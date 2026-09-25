@@ -114,7 +114,15 @@ type Block struct {
 	// in-memory load path from len(Subtrees) x subtree 0 once the subtree list
 	// is bound to the header (getAndValidateSubtreesWithDedup). Stashed so the
 	// release key cannot drift from the one used at GetTxMap time.
-	txMapCount      uint64
+	txMapCount uint64
+	// txMapFresh records whether txMap was allocated for this block rather than
+	// reused from the pool, which decides whether an underfilled map is kept on
+	// release (txMapPoolable).
+	txMapFresh bool
+	// firstRootMemo caches subtree 0's coinbase-substituted root from the early
+	// binding check, so CheckMerkleRoot does not recompute it for the same
+	// subtree (a full merkle store over up to 1M leaves).
+	firstRootMemo   atomic.Pointer[firstRootMemo]
 	medianTimestamp uint32
 	// nodeAllocator, if non-nil, supplies pooled backing slices for the
 	// per-subtree Node arrays during GetAndValidateSubtrees. Only the
@@ -836,8 +844,9 @@ func (b *Block) ValidWithBinding(ctx context.Context, logger ulogger.Logger, sub
 		// 6. Get and validate any missing subtrees. With the in-memory txMap the
 		// duplicate check runs on each subtree as it loads rather than as a second
 		// pass afterwards; any txMap it allocates is released by the defer below.
-		// Its only verdict is BlockCorrupt, the same class as the merkle checks it
-		// now runs ahead of.
+		// Both paths bind the subtree list to the header's merkle root once the
+		// first and last subtrees are loaded, before fetching the rest; the dedup's
+		// only verdict is BlockCorrupt, the same class as the merkle checks.
 		defer b.releaseTxMap()
 
 		if len(settings.Block.DiskMapDirs) == 0 {
@@ -1238,7 +1247,7 @@ func (b *Block) releaseTxMap() {
 		// whose fill falls outside their class, are dropped by PutTxMap). Deliberately not stated in terms of
 		// b.TransactionCount, which GetAndValidateSubtrees only recomputes when
 		// Valid took the `subtreeStore != nil && len(b.Subtrees) > 0` branch.
-		PutTxMap(poolable, b.txMapCount)
+		putTxMap(poolable, b.txMapCount, b.txMapFresh)
 	} else if closer, ok := b.txMap.(io.Closer); ok {
 		_ = closer.Close()
 	}
@@ -1473,7 +1482,7 @@ func (b *Block) checkDuplicateTransactions(ctx context.Context, logger ulogger.L
 		// release time below, keyed by the same 64-bit count held in
 		// b.txMapCount — counts above every size class allocate fresh with a
 		// bounded preallocation hint instead of failing the block (issue 1428).
-		b.txMap = GetTxMap(b.txMapCount)
+		b.txMap, b.txMapFresh = getTxMap(b.txMapCount)
 	}
 	for subIdx := 0; subIdx < len(b.SubtreeSlices); subIdx++ {
 		subIdx := subIdx
@@ -2141,7 +2150,9 @@ func (b *Block) checkBodyBoundToHeader(blockLabel string, first, last *subtreepk
 	slices[0] = first
 	slices[len(slices)-1] = last
 
-	calculated, err := blockMerkleRoot(blockLabel, hashes, slices, false)
+	b.firstRootMemo.Store(&firstRootMemo{subtree: first, coinbase: *b.CoinbaseTx.TxIDChainHash(), root: *rootHash})
+
+	calculated, err := blockMerkleRoot(func() string { return blockLabel }, hashes, slices, false)
 	if err != nil {
 		return err
 	}
@@ -2179,7 +2190,7 @@ func (b *Block) getAndValidateSubtreesWithDedup(ctx context.Context, logger ulog
 		}
 
 		b.txMapCount = uint64(len(b.Subtrees)) * uint64(first.Length()) // nolint: gosec
-		b.txMap = GetTxMap(b.txMapCount)
+		b.txMap, b.txMapFresh = getTxMap(b.txMapCount)
 		subtreeSize = first.Size()
 		deduped = true
 
@@ -2197,20 +2208,23 @@ func (b *Block) getAndValidateSubtreesWithDedup(ctx context.Context, logger ulog
 	return deduped, nil
 }
 
-// loadBoundarySubtrees loads the first and last subtrees, then runs onFirst on
-// them and onLoaded on each, in that order. A single-subtree body loads it once.
+// loadBoundarySubtrees loads the first and last subtrees in parallel, then runs
+// onFirst on them and onLoaded on each, in that order. A single-subtree body
+// loads it once.
 func loadBoundarySubtrees(loaders []func() error, onFirst func(first, last *subtreepkg.Subtree) error,
 	onLoaded func(sIdx int, subtree *subtreepkg.Subtree) error, slices []*subtreepkg.Subtree) error {
 	lastIdx := len(loaders) - 1
 
-	if err := loaders[0](); err != nil {
-		return err
-	}
+	var boundary errgroup.Group
+
+	boundary.Go(loaders[0])
 
 	if lastIdx > 0 {
-		if err := loaders[lastIdx](); err != nil {
-			return err
-		}
+		boundary.Go(loaders[lastIdx])
+	}
+
+	if err := boundary.Wait(); err != nil {
+		return err
 	}
 
 	if err := onFirst(slices[0], slices[lastIdx]); err != nil {
@@ -2711,6 +2725,14 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 		}
 
 		if sIdx == 0 {
+			// Reuse the early binding check's result when it was computed for this
+			// same subtree and coinbase. Swap consumes it, so the memo never keeps a
+			// released subtree alive.
+			if memo := b.firstRootMemo.Swap(nil); memo != nil && memo.subtree == subtree && memo.coinbase.IsEqual(b.CoinbaseTx.TxIDChainHash()) {
+				hashes[sIdx] = memo.root
+				continue
+			}
+
 			// We need to inject the coinbase tx id into the first position of the first subtree
 			rootHash, err := subtree.RootHashWithReplaceRootNode(b.CoinbaseTx.TxIDChainHash(), 0, uint64(b.CoinbaseTx.Size())) // nolint: gosec
 			if err != nil {
@@ -2731,7 +2753,7 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 	var calculatedMerkleRootHash *chainhash.Hash
 
 	if len(hashes) > 0 {
-		calculatedMerkleRootHash, err = blockMerkleRoot(b.String(), hashes, b.SubtreeSlices, true)
+		calculatedMerkleRootHash, err = blockMerkleRoot(b.String, hashes, b.SubtreeSlices, true)
 		if err != nil {
 			return err
 		}
@@ -2749,6 +2771,14 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 	return nil
 }
 
+// firstRootMemo is subtree 0's coinbase-substituted root, keyed by the subtree
+// and coinbase it was computed from.
+type firstRootMemo struct {
+	subtree  *subtreepkg.Subtree
+	coinbase chainhash.Hash
+	root     chainhash.Hash
+}
+
 // blockMerkleRoot computes the header merkle root of a subtree-backed body from
 // its top-level subtree roots. hashes[0] must already carry the coinbase
 // substitution. slices supplies the subtrees whose shape the top tree depends
@@ -2756,7 +2786,10 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 // With allLoaded every entry must be present, as CheckMerkleRoot needs; the
 // early binding check passes only the first and last, and the middle lengths
 // are checked once the rest are loaded.
-func blockMerkleRoot(label string, hashes []chainhash.Hash, slices []*subtreepkg.Subtree, allLoaded bool) (*chainhash.Hash, error) {
+//
+// label is only called to build an error: CheckMerkleRoot passes b.String, which
+// takes subtreeSlicesMu.
+func blockMerkleRoot(label func() string, hashes []chainhash.Hash, slices []*subtreepkg.Subtree, allLoaded bool) (*chainhash.Hash, error) {
 	if len(hashes) == 1 {
 		return &hashes[0], nil
 	}
@@ -2772,7 +2805,7 @@ func blockMerkleRoot(label string, hashes []chainhash.Hash, slices []*subtreepkg
 	// concurrent release can nil an entry between the two passes.
 	firstSubtree := slices[0]
 	if firstSubtree == nil {
-		return nil, errors.NewProcessingError("[BLOCK][%s] first subtree was released during validation", label)
+		return nil, errors.NewProcessingError("[BLOCK][%s] first subtree was released during validation", label())
 	}
 
 	targetLength := firstSubtree.Length()
@@ -2786,7 +2819,7 @@ func blockMerkleRoot(label string, hashes []chainhash.Hash, slices []*subtreepkg
 	if !subtreepkg.IsPowerOfTwo(targetLength) {
 		return nil, errors.NewBlockCorruptError(
 			"[BLOCK][%s] first subtree leaf count is not a power of two: %d",
-			label, targetLength,
+			label(), targetLength,
 		)
 	}
 
@@ -2800,20 +2833,20 @@ func blockMerkleRoot(label string, hashes []chainhash.Hash, slices []*subtreepkg
 				continue
 			}
 
-			return nil, errors.NewProcessingError("[BLOCK][%s] subtree %d of %d was released during validation", label, i, len(slices))
+			return nil, errors.NewProcessingError("[BLOCK][%s] subtree %d of %d was released during validation", label(), i, len(slices))
 		}
 
 		if !isLast && sub.Length() != targetLength {
 			return nil, errors.NewBlockCorruptError(
 				"[BLOCK][%s] only the final subtree may be incomplete (index %d, length %d, targetLength %d)",
-				label, i, sub.Length(), targetLength,
+				label(), i, sub.Length(), targetLength,
 			)
 		}
 
 		if isLast && sub.Length() > targetLength {
 			return nil, errors.NewBlockCorruptError(
 				"[BLOCK][%s] final subtree exceeds first subtree size (length %d, targetLength %d)",
-				label, sub.Length(), targetLength,
+				label(), sub.Length(), targetLength,
 			)
 		}
 	}
@@ -2830,13 +2863,13 @@ func blockMerkleRoot(label string, hashes []chainhash.Hash, slices []*subtreepkg
 	// for adversarial transaction counts — see issue #901.
 	last := slices[len(slices)-1]
 	if last == nil {
-		return nil, errors.NewProcessingError("[BLOCK][%s] final subtree was released during validation", label)
+		return nil, errors.NewProcessingError("[BLOCK][%s] final subtree was released during validation", label())
 	}
 
 	if last.Length() < targetLength {
 		liftedRoot, err := last.RootHashPadded(targetHeight)
 		if err != nil {
-			return nil, errors.NewProcessingError("[BLOCK][%s] failed lifting final subtree", label, err)
+			return nil, errors.NewProcessingError("[BLOCK][%s] failed lifting final subtree", label(), err)
 		}
 
 		hashes[len(hashes)-1] = *liftedRoot
@@ -2844,21 +2877,21 @@ func blockMerkleRoot(label string, hashes []chainhash.Hash, slices []*subtreepkg
 
 	st, err := subtreepkg.NewIncompleteTreeByLeafCount(len(hashes))
 	if err != nil {
-		return nil, errors.NewProcessingError("[BLOCK][%s] error creating new root tree", label, err)
+		return nil, errors.NewProcessingError("[BLOCK][%s] error creating new root tree", label(), err)
 	}
 
 	seen := make(map[chainhash.Hash]struct{}, len(hashes))
 
 	for _, hash := range hashes {
 		if _, dup := seen[hash]; dup {
-			return nil, errors.NewBlockCorruptError("[BLOCK][%s] duplicate subtree root hash in top-level merkle tree: %s", label, hash.String())
+			return nil, errors.NewBlockCorruptError("[BLOCK][%s] duplicate subtree root hash in top-level merkle tree: %s", label(), hash.String())
 		}
 
 		seen[hash] = struct{}{}
 
 		err = st.AddNode(hash, 1, 0)
 		if err != nil {
-			return nil, errors.NewProcessingError("[BLOCK][%s] error adding node to root tree", label, err)
+			return nil, errors.NewProcessingError("[BLOCK][%s] error adding node to root tree", label(), err)
 		}
 	}
 
@@ -2866,7 +2899,7 @@ func blockMerkleRoot(label string, hashes []chainhash.Hash, slices []*subtreepkg
 
 	calculatedMerkleRootHash, err := chainhash.NewHash(calculatedMerkleRoot[:])
 	if err != nil {
-		return nil, errors.NewProcessingError("[BLOCK][%s] error creating calculated merkle root hash", label, err)
+		return nil, errors.NewProcessingError("[BLOCK][%s] error creating calculated merkle root hash", label(), err)
 	}
 
 	return calculatedMerkleRootHash, nil
