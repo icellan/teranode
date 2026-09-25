@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -337,7 +338,14 @@ func (c *mainChainCache) IsOnMainChain(ctx context.Context, blockID, blockHeight
 	}
 	c.mu.RUnlock()
 
-	ch := c.sf.DoChan(strconv.FormatUint(uint64(blockID), 10), func() (interface{}, error) {
+	ch := c.sf.DoChan(strconv.FormatUint(uint64(blockID), 10), func() (val interface{}, err error) {
+		// DoChan always runs the fill in its own goroutine, and a panic there
+		// re-panics past this goroutine unconditionally (singleflight cannot
+		// tell "one waiter" from "many", so it never recovers) — bypassing
+		// echo's Recover middleware and taking the process down. Recover here
+		// and surface it as an error to every waiter instead.
+		defer util.RecoverToError(c.logger, &err, nil, "mainchain below-window fill for block %d", blockID)()
+
 		// Re-check under the singleflight: a caller that lost the oldCache race
 		// to a just-completed leader becomes the new leader here and must not
 		// re-issue the RPC.
