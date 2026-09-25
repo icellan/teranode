@@ -11,24 +11,25 @@ import (
 )
 
 func TestGetTxMap_ReusesPooledInstance(t *testing.T) {
-	// First Get + Put returns instance to pool.
-	m1 := GetTxMap(100_000)
+	// First Get + Put returns instance to pool. Class 0, so a one-entry fill
+	// belongs to the class and the map is kept (see txMapPoolable).
+	m1 := GetTxMap(1 << 12)
 	require.NotNil(t, m1)
 	var h chainhash.Hash
 	h[0] = 0x42
 	require.NoError(t, m1.Put(h, 1))
 	require.Equal(t, 1, m1.Length())
-	PutTxMap(m1, 100_000)
+	PutTxMap(m1, 1<<12)
 	waitForRecycles()
 
 	// Second Get for the same size class should yield a cleared map.
 	// We can't guarantee it's the same instance because sync.Pool is
 	// allowed to drop entries, but if we do get a pooled instance the
 	// length must be zero.
-	m2 := GetTxMap(100_000)
+	m2 := GetTxMap(1 << 12)
 	require.NotNil(t, m2)
 	require.Equal(t, 0, m2.Length(), "pooled map must be cleared before reuse")
-	PutTxMap(m2, 100_000)
+	PutTxMap(m2, 1<<12)
 }
 
 func TestGetTxMap_OversizedAllocatesFresh(t *testing.T) {
@@ -119,13 +120,13 @@ func TestTxMapPool_ConcurrentReuse(t *testing.T) {
 		go func(g int) {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
-				m := GetTxMap(10_000)
+				m := GetTxMap(1 << 12)
 				require.Equal(t, 0, m.Length())
 				var h chainhash.Hash
 				h[0] = byte(g)
 				h[1] = byte(i)
 				require.NoError(t, m.Put(h, uint64(g*iters+i)))
-				PutTxMap(m, 10_000)
+				PutTxMap(m, 1<<12)
 			}
 		}(g)
 	}
@@ -155,7 +156,7 @@ func TestRecycleInBackground(t *testing.T) {
 	idle := make(chan struct{})
 
 	go func() {
-		tracker.waitIdle()
+		tracker.waitRecycled()
 		close(idle)
 	}()
 
@@ -219,7 +220,7 @@ func TestRecycleTracker_IdleMapVisibleToAnyGoroutine(t *testing.T) {
 	m := &struct{ id int }{2}
 
 	recycleInBackground(tracker, pool, m, func() {})
-	tracker.waitIdle()
+	tracker.waitRecycled()
 
 	got := make(chan interface{})
 
@@ -237,7 +238,7 @@ func TestRecycleTracker_IdleMapExpiresIntoPool(t *testing.T) {
 	pool := &sync.Pool{}
 
 	recycleInBackground(tracker, pool, &struct{ id int }{3}, func() {})
-	tracker.waitIdle()
+	tracker.waitRecycled()
 
 	require.Eventually(t, func() bool {
 		tracker.mu.Lock()
@@ -257,7 +258,7 @@ func TestRecycleTracker_StaleExpiryKeepsNewerMap(t *testing.T) {
 	second := &struct{ id int }{5}
 
 	recycleInBackground(tracker, pool, first, func() {})
-	tracker.waitIdle()
+	tracker.waitRecycled()
 
 	tracker.mu.Lock()
 	firstGen := tracker.idleGen
@@ -266,25 +267,53 @@ func TestRecycleTracker_StaleExpiryKeepsNewerMap(t *testing.T) {
 	require.Same(t, first, tracker.take(pool))
 
 	recycleInBackground(tracker, pool, second, func() {})
-	tracker.waitIdle()
+	tracker.waitRecycled()
 
 	tracker.expireIdle(pool, firstGen)
 
 	require.Same(t, second, tracker.take(pool), "a stale expiry must not evict the newer map")
 }
 
-// TestTxMapFitsClass pins which released maps are pooled: only one whose fill
-// belongs to the class it was drawn from. Filled past the class, pooling
-// retains an oversized backing; filled far below it, the background Clear would
-// write every slot of a mostly empty eager allocation and make it resident.
-func TestTxMapFitsClass(t *testing.T) {
+// TestTxMapPoolable pins which released maps are pooled. Filled past its class,
+// a map would retain an oversized backing, so it is always dropped. Filled far
+// below its class, only a map allocated fresh for this block is dropped: the
+// background Clear would make its mostly untouched eager backing resident. A map
+// drawn from the pool is resident already, and dropping it would make the next
+// block (a retry after an error, typically) allocate a second one.
+func TestTxMapPoolable(t *testing.T) {
 	idx := txMapClassIdxFor(1 << 20) // the 1M class
 	below := int(txMapSizeClasses[idx-1])
 	class := int(txMapSizeClasses[idx])
 
-	require.True(t, txMapFitsClass(class, idx), "a full class is pooled")
-	require.True(t, txMapFitsClass(below+1, idx), "just above the class below is pooled")
-	require.False(t, txMapFitsClass(class+1, idx), "past the class is dropped")
-	require.False(t, txMapFitsClass(below, idx), "a fill the class below would hold is dropped")
-	require.True(t, txMapFitsClass(0, 0), "the smallest class keeps any fill")
+	require.True(t, txMapPoolable(class, idx, true), "a full class is pooled")
+	require.True(t, txMapPoolable(below+1, idx, true), "just above the class below is pooled")
+	require.False(t, txMapPoolable(class+1, idx, false), "past the class is dropped")
+	require.False(t, txMapPoolable(class+1, idx, true), "past the class is dropped")
+	require.False(t, txMapPoolable(below, idx, true), "a fresh map the class below would hold is dropped")
+	require.True(t, txMapPoolable(0, idx, false), "a pooled map is kept however little it holds")
+	require.True(t, txMapPoolable(0, 0, true), "the smallest class keeps any fill")
+}
+
+// TestEvictIdleExcept pins that a class which had to allocate releases the
+// maps parked in the other classes: a parked map cannot be collected, so after
+// block sizes move to a new class the old class's map would otherwise stay
+// pinned beside the new one until its timer fires.
+func TestEvictIdleExcept(t *testing.T) {
+	trackers := []*recycleTracker{newRecycleTracker(time.Hour), newRecycleTracker(time.Hour), newRecycleTracker(time.Hour)}
+	pools := []*sync.Pool{{}, {}, {}}
+
+	for i := range trackers {
+		recycleInBackground(trackers[i], pools[i], &struct{ id int }{i}, func() {})
+		trackers[i].waitRecycled()
+	}
+
+	evictIdleExcept(trackers, pools, 1)
+
+	for i, tr := range trackers {
+		tr.mu.Lock()
+		parked := tr.idle != nil
+		tr.mu.Unlock()
+
+		require.Equal(t, i == 1, parked, "class %d", i)
+	}
 }

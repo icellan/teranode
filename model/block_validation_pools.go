@@ -17,9 +17,11 @@ import (
 //
 // Pools are keyed by approximate size class (ceiling-power-of-two of the
 // expected entry count) so a 1024-tx block does not retain a 1M-tx
-// backing and vice-versa. sync.Pool's natural per-GC drainage handles
-// network-load shifts: when subtree size drops from 1M back to 1K the
-// large-class pool simply ages out.
+// backing and vice-versa. Load shifts are handled in two steps: the last
+// cleared map of a class is parked for up to idleMapMaxAge (or until another
+// class has to allocate, see evictIdleExcept) and then left to sync.Pool, whose
+// per-GC drainage lets the class age out when subtree size drops from 1M back
+// to 1K.
 //
 // Callers pass the same `n` to Put as they used at Get so the map returns
 // to the correct class.
@@ -144,29 +146,53 @@ func parentSpendsAllocHint(expectedInpoints uint64) uint64 {
 // the map still holds n entries, growing on insert. Pass the same n to
 // PutTxMap.
 func GetTxMap(n uint64) *txmap.SplitSwissMapUint64 {
-	idx := txMapClassIdxFor(n)
-	if idx < 0 {
-		return txmap.NewSplitSwissMapUint64(txMapAllocHint(n), txMapBuckets)
-	}
-	if m := txMapRecycles[idx].take(txMapPools[idx]); m != nil {
-		return m.(*txmap.SplitSwissMapUint64)
-	}
-	return txmap.NewSplitSwissMapUint64(txMapSizeClasses[idx], txMapBuckets)
+	m, _ := getTxMap(n)
+	return m
 }
 
-// txMapFitsClass reports whether a released map filled with length entries
-// belongs in class idx: more than the class below would hold, and no more than
-// this one. Filled past the class, pooling it would retain an oversized backing
-// for every later block that draws the class (the same reason over-max maps are
-// dropped). Filled far below it, the background Clear would write every slot of
-// a mostly empty eager allocation and make the whole backing resident. Either
-// way the map is dropped and the class allocates fresh when next drawn.
-func txMapFitsClass(length int, idx int) bool {
+// getTxMap is GetTxMap that also reports whether the map was allocated fresh
+// rather than reused, which putTxMap needs to decide whether to keep it.
+func getTxMap(n uint64) (m *txmap.SplitSwissMapUint64, fresh bool) {
+	idx := txMapClassIdxFor(n)
+	if idx < 0 {
+		evictIdleExcept(txMapRecycles, txMapPools, -1)
+		return txmap.NewSplitSwissMapUint64(txMapAllocHint(n), txMapBuckets), true
+	}
+	if pooled := txMapRecycles[idx].take(txMapPools[idx]); pooled != nil {
+		return pooled.(*txmap.SplitSwissMapUint64), false
+	}
+	evictIdleExcept(txMapRecycles, txMapPools, idx)
+	return txmap.NewSplitSwissMapUint64(txMapSizeClasses[idx], txMapBuckets), true
+}
+
+// txMapPoolable reports whether a released map filled with length entries goes
+// back to class idx. Filled past the class, never: pooling it would retain an
+// oversized backing for every later block that draws the class (the same
+// reason over-max maps are dropped). Filled no more than the class below would
+// hold, only if it came from the pool: the background Clear writes every slot,
+// which for a freshly allocated, mostly untouched map makes the whole eager
+// backing resident for nothing. A map drawn from the pool is resident already,
+// and dropping it would just make the next Get of the class (a retry after an
+// error, typically, since an honest block fills its class) allocate a second.
+func txMapPoolable(length int, idx int, fresh bool) bool {
 	if uint64(length) > uint64(txMapSizeClasses[idx]) { // nolint: gosec
 		return false
 	}
 
-	return idx == 0 || uint64(length) > uint64(txMapSizeClasses[idx-1]) // nolint: gosec
+	return !fresh || idx == 0 || uint64(length) > uint64(txMapSizeClasses[idx-1]) // nolint: gosec
+}
+
+// evictIdleExcept moves the parked maps of every class but keep to their
+// pools, where the GC can drain them. Called when a class has to allocate: a
+// parked map cannot be collected, so after block sizes move to a new class the
+// old class's map would otherwise stay resident beside the new one until its
+// idle timer fires. keep < 0 evicts every class.
+func evictIdleExcept(trackers []*recycleTracker, pools []*sync.Pool, keep int) {
+	for i, t := range trackers {
+		if i != keep {
+			t.evictIdle(pools[i])
+		}
+	}
 }
 
 // PutTxMap clears m and returns it to the size-class pool keyed by n.
@@ -180,6 +206,12 @@ func txMapFitsClass(length int, idx int) bool {
 // later block that draws the largest class. The cost is that consecutive
 // over-max blocks each allocate fresh.
 func PutTxMap(m *txmap.SplitSwissMapUint64, n uint64) {
+	putTxMap(m, n, false)
+}
+
+// putTxMap is PutTxMap for a map whose origin is known; fresh must be what
+// getTxMap reported for it.
+func putTxMap(m *txmap.SplitSwissMapUint64, n uint64, fresh bool) {
 	if m == nil {
 		return
 	}
@@ -187,7 +219,7 @@ func PutTxMap(m *txmap.SplitSwissMapUint64, n uint64) {
 	if idx < 0 {
 		return
 	}
-	if !txMapFitsClass(m.Length(), idx) {
+	if !txMapPoolable(m.Length(), idx, fresh) {
 		return
 	}
 	recycleInBackground(txMapRecycles[idx], txMapPools[idx], m, m.Clear)
@@ -243,11 +275,13 @@ func parentSpendsClassIdxFor(n uint64) int {
 func GetParentSpendsMap(expectedInpoints uint64) *SplitSyncedParentMap {
 	idx := parentSpendsClassIdxFor(expectedInpoints)
 	if idx < 0 {
+		evictIdleExcept(parentSpendsRecycles, parentSpendsPools, -1)
 		return NewSplitSyncedParentMap(parentSpendsBuckets, parentSpendsAllocHint(expectedInpoints))
 	}
 	if m := parentSpendsRecycles[idx].take(parentSpendsPools[idx]); m != nil {
 		return m.(*SplitSyncedParentMap)
 	}
+	evictIdleExcept(parentSpendsRecycles, parentSpendsPools, idx)
 	return NewSplitSyncedParentMap(parentSpendsBuckets, parentSpendsSizeClasses[idx])
 }
 
@@ -359,6 +393,18 @@ func (t *recycleTracker) finish(pool *sync.Pool, m interface{}) {
 	t.cond.Broadcast()
 }
 
+// evictIdle moves whatever map is parked to pool.
+func (t *recycleTracker) evictIdle(pool *sync.Pool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.idle != nil {
+		pool.Put(t.idle)
+		t.idle = nil
+		t.idleGen++
+	}
+}
+
 // expireIdle moves the parked map to pool if it is still the one parked at gen.
 func (t *recycleTracker) expireIdle(pool *sync.Pool, gen uint64) {
 	t.mu.Lock()
@@ -408,8 +454,9 @@ func (t *recycleTracker) take(pool *sync.Pool) interface{} {
 	}
 }
 
-// waitIdle blocks until no recycle of this class is in flight.
-func (t *recycleTracker) waitIdle() {
+// waitRecycled blocks until no recycle of this class is in flight. It does
+// not wait for the idle slot, which holds finished recycles.
+func (t *recycleTracker) waitRecycled() {
 	t.mu.Lock()
 	for t.pending > 0 {
 		t.cond.Wait()
@@ -420,10 +467,10 @@ func (t *recycleTracker) waitIdle() {
 // waitForRecycles blocks until every in-flight recycle has handed on its map.
 func waitForRecycles() {
 	for _, t := range txMapRecycles {
-		t.waitIdle()
+		t.waitRecycled()
 	}
 
 	for _, t := range parentSpendsRecycles {
-		t.waitIdle()
+		t.waitRecycled()
 	}
 }
