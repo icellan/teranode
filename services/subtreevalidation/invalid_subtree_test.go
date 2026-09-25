@@ -118,6 +118,61 @@ func TestInvalidSubtreeReporting_MalformedTransactionData(t *testing.T) {
 	assert.Equal(t, "malformed_transaction_data", msg.Reason)
 }
 
+// TestGetMissingTransactionsBatch_OverallDeadlineBoundsRetries pins the bound on the
+// getMissingTransactionsBatch fetch. The caller's ctx (the announcement path) has no
+// deadline of its own, so without one set here the retry helper's ctx.Done() abort can
+// never fire, and the retry loop always runs to its attempt limit - a peer that stalls
+// and then answers 429/503 could hold a single batch for attempts x streaming-timeout.
+//
+// The bound is asserted through the attempt count rather than wall-clock alone: a
+// timing-only assertion would still pass if the loop happened to run to completion
+// quickly.
+func TestGetMissingTransactionsBatch_OverallDeadlineBoundsRetries(t *testing.T) {
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	// Short enough that the retry backoff (250ms, then doubling) crosses it well before
+	// the default 6-attempt ladder completes, instead of waiting on the production
+	// default of 5m.
+	tSettings.SubtreeValidation.MissingTransactionsFetchTimeout = 300 * time.Millisecond
+
+	subtreeHash := chainhash.HashH([]byte("test-subtree"))
+	baseURL := testPeerURL
+
+	server := &Server{
+		logger:                       ulogger.TestLogger{},
+		settings:                     tSettings,
+		subtreeStore:                 memory.New(),
+		invalidSubtreeKafkaProducer:  &mockKafkaProducer{},
+		invalidSubtreeDeDuplicateMap: expiringmap.New[string, struct{}](time.Minute * 1),
+	}
+	defer server.invalidSubtreeDeDuplicateMap.Stop()
+
+	// 503 is the only status the retry loop iterates on, so this is the shape that
+	// reaches all six attempts if left unbounded.
+	url := fmt.Sprintf("%s/subtree/%s/txs", baseURL, subtreeHash.String())
+	httpmock.RegisterResponder("POST", url, httpmock.NewStringResponder(503, "unavailable"))
+
+	missingTxHashes := []utxo.UnresolvedMetaData{
+		{Hash: chainhash.HashH([]byte("tx1")), Idx: 0},
+	}
+
+	start := time.Now()
+	_, err := server.getMissingTransactionsBatch(context.Background(), subtreeHash, missingTxHashes, baseURL, "")
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+
+	calls := httpmock.GetCallCountInfo()["POST "+url]
+	require.GreaterOrEqual(t, calls, 1, "the fetch should have been attempted at least once")
+	require.Less(t, calls, 6, "the retry loop must abort on the deadline rather than running every attempt")
+
+	// The full backoff chain is 250ms+500ms+1s+2s+4s = 7.75s of sleeping alone, so an
+	// unbounded run cannot finish anywhere near this.
+	require.Less(t, elapsed, 5*time.Second, "the whole fetch must be bounded by one deadline, not one per attempt")
+}
+
 // TestInvalidSubtreeReporting_TransactionCountMismatch tests that invalid subtree messages ARE sent
 // when the peer returns a different number of transactions than requested
 func TestInvalidSubtreeReporting_TransactionCountMismatch(t *testing.T) {

@@ -51,6 +51,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
@@ -254,6 +255,18 @@ func (u *Server) DelTxMetaCacheMulti(ctx context.Context, hash *chainhash.Hash) 
 	return nil
 }
 
+// missingTransactionsFetchTimeout resolves the bound on one getMissingTransactionsBatch
+// call. A non-positive configured value (unset, or explicitly zero/negative) falls back
+// to the default rather than being treated as unbounded, and a nil settings object is
+// tolerated the same way.
+func missingTransactionsFetchTimeout(tSettings *settings.Settings) time.Duration {
+	if tSettings == nil || tSettings.SubtreeValidation.MissingTransactionsFetchTimeout <= 0 {
+		return 5 * time.Minute
+	}
+
+	return tSettings.SubtreeValidation.MissingTransactionsFetchTimeout
+}
+
 // getMissingTransactionsBatch retrieves a batch of transactions from the network.
 // Note: The returned transactions may not be in the same order as the input hashes.
 //
@@ -306,7 +319,17 @@ func (u *Server) getMissingTransactionsBatch(ctx context.Context, subtreeHash ch
 	// reputation of a peer that was behaving correctly. Re-sending the body on each
 	// attempt is safe here — the request is a list of txids and the endpoint is a
 	// pure read, so every attempt asks for exactly the same transactions.
-	body, err := util.DoHTTPRequestBodyReaderWithRetry(ctx, txsURL, txIDBytes)
+	//
+	// One deadline is set around the whole call rather than left to the caller's ctx:
+	// without it, the retry helper's ctx.Done() abort can never fire (this ctx has no
+	// deadline of its own), so the retry loop always runs to its attempt limit, and
+	// each attempt sees no deadline and installs a fresh HTTP streaming timeout of its
+	// own — a peer that stalls and then answers 429/503 can hold a single batch for
+	// attempts x streaming-timeout instead of one bounded window.
+	fetchCtx, cancel := context.WithTimeout(ctx, missingTransactionsFetchTimeout(u.settings))
+	defer cancel()
+
+	body, err := util.DoHTTPRequestBodyReaderWithRetry(fetchCtx, txsURL, txIDBytes)
 	if err != nil {
 		// Peer cannot provide requested transactions - report as invalid subtree
 		u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, peerID, "peer_cannot_provide_transactions")
