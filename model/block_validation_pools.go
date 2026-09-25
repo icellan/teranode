@@ -2,6 +2,7 @@ package model
 
 import (
 	"sync"
+	"time"
 
 	txmap "github.com/bsv-blockchain/go-tx-map"
 )
@@ -54,7 +55,7 @@ var txMapPools = func() []*sync.Pool {
 	return pools
 }()
 
-var txMapRecycles = newRecycleTrackers(len(txMapSizeClasses))
+var txMapRecycles = newRecycleTrackers(len(txMapSizeClasses), idleMapMaxAge)
 
 // txMapClassIdxFor returns the smallest size-class index that holds n
 // entries, or -1 if n exceeds every class (caller allocates fresh + skips
@@ -99,10 +100,12 @@ const txMapConstructorWrapThreshold uint64 = 3579139413
 // wrap threshold previously got an exact preallocation and now gets the
 // largest-class hint, so filling it rehashes mid-fill across all buckets with a
 // transient peak around 1.5x the final size. That is the intended trade — an
-// unvalidated number should not drive an exact multi-GB allocation — and since
-// the count is now derived from the loaded block body (see txMapEntryCount) the
-// band is only reachable by a block that genuinely carries that many
-// transactions.
+// unvalidated number should not drive an exact multi-GB allocation. The count
+// is never the peer-supplied TransactionCount: the separate pass derives it from
+// the loaded body (txMapEntryCount), and the in-memory load path from
+// len(Subtrees) x subtree 0 only after the subtree list is bound to the header's
+// merkle root (getAndValidateSubtreesWithDedup). So the band is only reachable
+// by a body committed to under a valid-PoW header.
 //
 // The function is deliberately total (a min, not an assertion) so it stays
 // correct for any input, although its only current call site reaches it just
@@ -151,6 +154,21 @@ func GetTxMap(n uint64) *txmap.SplitSwissMapUint64 {
 	return txmap.NewSplitSwissMapUint64(txMapSizeClasses[idx], txMapBuckets)
 }
 
+// txMapFitsClass reports whether a released map filled with length entries
+// belongs in class idx: more than the class below would hold, and no more than
+// this one. Filled past the class, pooling it would retain an oversized backing
+// for every later block that draws the class (the same reason over-max maps are
+// dropped). Filled far below it, the background Clear would write every slot of
+// a mostly empty eager allocation and make the whole backing resident. Either
+// way the map is dropped and the class allocates fresh when next drawn.
+func txMapFitsClass(length int, idx int) bool {
+	if uint64(length) > uint64(txMapSizeClasses[idx]) { // nolint: gosec
+		return false
+	}
+
+	return idx == 0 || uint64(length) > uint64(txMapSizeClasses[idx-1]) // nolint: gosec
+}
+
 // PutTxMap clears m and returns it to the size-class pool keyed by n.
 // n must match the value passed to GetTxMap. Maps that did not come from
 // the pool (n above max class) are dropped.
@@ -169,10 +187,7 @@ func PutTxMap(m *txmap.SplitSwissMapUint64, n uint64) {
 	if idx < 0 {
 		return
 	}
-	// Same reasoning as the over-max drop above, for a map that was drawn for a
-	// class but filled past it: the load-time dedup sizes from len(Subtrees) x
-	// subtree 0, which a longer final subtree can exceed.
-	if uint64(m.Length()) > uint64(txMapSizeClasses[idx]) { // nolint: gosec
+	if !txMapFitsClass(m.Length(), idx) {
 		return
 	}
 	recycleInBackground(txMapRecycles[idx], txMapPools[idx], m, m.Clear)
@@ -207,7 +222,7 @@ var parentSpendsPools = func() []*sync.Pool {
 	return pools
 }()
 
-var parentSpendsRecycles = newRecycleTrackers(len(parentSpendsSizeClasses))
+var parentSpendsRecycles = newRecycleTrackers(len(parentSpendsSizeClasses), idleMapMaxAge)
 
 func parentSpendsClassIdxFor(n uint64) int {
 	for i, class := range parentSpendsSizeClasses {
@@ -264,32 +279,50 @@ func recycleInBackground(t *recycleTracker, pool *sync.Pool, m interface{}, clea
 	}()
 }
 
-// recycleTracker coordinates the in-flight recycles of one size class with the
-// Gets for it. The next block's Get can land while the previous block's map is
-// still clearing; allocating fresh there would hold two largest-class maps at
-// once, so a Get that finds the pool empty waits for the recycle instead and
-// receives the map directly. The handoff cannot go through the sync.Pool: a Put
-// lands in the recycling goroutine's per-P slot, which a Get on another P does
-// not see, and the race detector drops pooled items at random.
+// idleMapMaxAge is how long a cleared map stays parked in its class's idle
+// slot before it moves to the sync.Pool, whose per-GC drain then releases it if
+// nothing draws the class again. Two target block intervals: long enough that
+// consecutive blocks of a class reuse one map instead of allocating a second,
+// short enough that a class nobody draws any more is let go.
+const idleMapMaxAge = 20 * time.Minute
+
+// recycleTracker coordinates the recycles of one size class with the Gets for
+// it, so a Get finds a cleared map whenever one exists instead of allocating a
+// second map of the class, which for the largest class is tens of GB.
+//
+// Two gaps need covering, and sync.Pool covers neither: a Put lands in the
+// putting goroutine's per-P slot, which a Get on another P does not see, and the
+// race detector drops pooled items at random.
+//   - A Get during the clear waits for the recycle and receives the map directly
+//     (handoff). The next block's Get lands milliseconds into its validation,
+//     inside the previous block's multi-second clear.
+//   - A clear that finishes with nobody waiting parks the map in the idle slot,
+//     which any goroutine can take from, for up to maxIdle. Only then, or when
+//     the slot is already taken, does it go to the sync.Pool.
 type recycleTracker struct {
 	mu      sync.Mutex
 	cond    *sync.Cond
+	maxIdle time.Duration
 	pending int
 	waiters int
 	handoff interface{}
+	idle    interface{}
+	// idleGen changes whenever the idle slot is filled or emptied, so an expiry
+	// timer only evicts the map it was armed for.
+	idleGen uint64
 }
 
-func newRecycleTracker() *recycleTracker {
-	t := &recycleTracker{}
+func newRecycleTracker(maxIdle time.Duration) *recycleTracker {
+	t := &recycleTracker{maxIdle: maxIdle}
 	t.cond = sync.NewCond(&t.mu)
 
 	return t
 }
 
-func newRecycleTrackers(n int) []*recycleTracker {
+func newRecycleTrackers(n int, maxIdle time.Duration) []*recycleTracker {
 	trackers := make([]*recycleTracker, n)
 	for i := range trackers {
-		trackers[i] = newRecycleTracker()
+		trackers[i] = newRecycleTracker(maxIdle)
 	}
 
 	return trackers
@@ -301,16 +334,24 @@ func (t *recycleTracker) start() {
 	t.mu.Unlock()
 }
 
-// finish passes a cleared map to a waiting Get if there is one, and pools it
-// otherwise. The pool Put happens under the lock so a Get never observes the
-// recycle as done before the map is reachable.
+// finish passes a cleared map to a waiting Get if there is one, parks it in the
+// idle slot if that is free, and pools it otherwise. Everything happens under
+// the lock so a Get never observes the recycle as done before the map is
+// reachable.
 func (t *recycleTracker) finish(pool *sync.Pool, m interface{}) {
 	t.mu.Lock()
 	t.pending--
 
-	if t.waiters > 0 && t.handoff == nil {
+	switch {
+	case t.waiters > 0 && t.handoff == nil:
 		t.handoff = m
-	} else {
+	case t.idle == nil:
+		t.idle = m
+		t.idleGen++
+		gen := t.idleGen
+
+		time.AfterFunc(t.maxIdle, func() { t.expireIdle(pool, gen) })
+	default:
 		pool.Put(m)
 	}
 
@@ -318,14 +359,22 @@ func (t *recycleTracker) finish(pool *sync.Pool, m interface{}) {
 	t.cond.Broadcast()
 }
 
-// take returns a map from pool, waiting out any in-flight recycle of its class
-// when the pool is empty. nil means there is nothing to reuse and the caller
-// allocates.
-func (t *recycleTracker) take(pool *sync.Pool) interface{} {
-	if m := pool.Get(); m != nil {
-		return m
-	}
+// expireIdle moves the parked map to pool if it is still the one parked at gen.
+func (t *recycleTracker) expireIdle(pool *sync.Pool, gen uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 
+	if t.idle != nil && t.idleGen == gen {
+		pool.Put(t.idle)
+		t.idle = nil
+		t.idleGen++
+	}
+}
+
+// take returns a cleared map of this class if one exists, waiting out any
+// in-flight recycle rather than returning empty-handed. nil means there is
+// nothing to reuse and the caller allocates.
+func (t *recycleTracker) take(pool *sync.Pool) interface{} {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -337,8 +386,20 @@ func (t *recycleTracker) take(pool *sync.Pool) interface{} {
 			return m
 		}
 
+		if t.idle != nil {
+			m := t.idle
+			t.idle = nil
+			t.idleGen++
+
+			return m
+		}
+
+		if m := pool.Get(); m != nil {
+			return m
+		}
+
 		if t.pending == 0 {
-			return pool.Get()
+			return nil
 		}
 
 		t.waiters++
