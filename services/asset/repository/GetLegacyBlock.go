@@ -24,6 +24,33 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// legacyBlockReaderPeerPoolCtxKey is the context key WithLegacyBlockReaderPeerPool
+// and legacyBlockReaderUsesPeerPool use to pass the HTTP boundary's pool decision
+// into GetLegacyBlockReader without changing its signature.
+type legacyBlockReaderPeerPoolCtxKey struct{}
+
+// WithLegacyBlockReaderPeerPool marks ctx so a subsequent GetLegacyBlockReader call
+// draws from semGetLegacyBlockReaderPeer (the internal legacy-peer-server budget)
+// instead of semGetLegacyBlockReader (the anonymous-HTTP budget).
+//
+// Callers must only pass usePeerPool=true once they have verified the request
+// truly originates from this node's own legacy peer server. The wire-format query
+// parameter alone (?wire=1) is not sufficient: any anonymous caller can set it.
+// httpimpl.GetLegacyBlock verifies the request's direct TCP peer (RemoteAddr, not
+// a header an anonymous caller can forge) is loopback before setting this to true.
+func WithLegacyBlockReaderPeerPool(ctx context.Context, usePeerPool bool) context.Context {
+	return context.WithValue(ctx, legacyBlockReaderPeerPoolCtxKey{}, usePeerPool)
+}
+
+// legacyBlockReaderUsesPeerPool reports whether ctx was marked by
+// WithLegacyBlockReaderPeerPool. An unmarked ctx (the common case: anonymous HTTP
+// clients, and any test that does not opt in) defaults to false, i.e. the
+// anonymous-HTTP pool.
+func legacyBlockReaderUsesPeerPool(ctx context.Context) bool {
+	usePeerPool, _ := ctx.Value(legacyBlockReaderPeerPoolCtxKey{}).(bool)
+	return usePeerPool
+}
+
 // chunkResult holds the result of fetching a chunk of transactions from the UTXO store.
 // Used for ordered fan-in: chunks are fetched in parallel but written in order.
 type chunkResult struct {
@@ -47,14 +74,16 @@ type chunkResult struct {
 func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhash.Hash, wireBlock ...bool) (*io.PipeReader, error) {
 	returnWireBlock := len(wireBlock) > 0 && wireBlock[0]
 
-	// The wire-format request (?wire=1) is only ever set by this node's own legacy peer
-	// server (pushBlockMsg), which serves SV peers over the p2p wire protocol. Anonymous
-	// HTTP clients share semGetLegacyBlockReader instead, so a burst of slow anonymous
-	// reads cannot exhaust the budget SV peer serving depends on.
+	// Which pool this call draws from is decided at the HTTP boundary (see
+	// httpimpl.GetLegacyBlock), not here: ?wire=1 alone is not a trust signal, since
+	// any anonymous caller can set it. The boundary verifies the request's direct TCP
+	// peer is loopback before marking ctx, so a request that merely asks for wire
+	// format without actually originating from this node's own legacy peer server
+	// still draws from the anonymous pool.
 	sem := repo.semGetLegacyBlockReader
 	semName := "GetLegacyBlockReader"
 
-	if returnWireBlock {
+	if legacyBlockReaderUsesPeerPool(ctx) {
 		sem = repo.semGetLegacyBlockReaderPeer
 		semName = "GetLegacyBlockReaderPeer"
 	}

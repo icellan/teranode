@@ -1,11 +1,13 @@
 package httpimpl
 
 import (
+	"net"
 	"net/http"
 	"strings"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/asset/repository"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/labstack/echo/v4"
 )
@@ -72,6 +74,15 @@ func (h *HTTP) GetLegacyBlock() func(c echo.Context) error {
 		}
 
 		wireBlock := c.QueryParam("wire") != ""
+
+		// The internal legacy-peer-server pool is only for this node's own legacy
+		// peer server (pushBlockMsg), which reaches this route over loopback. wire=1
+		// alone proves nothing: any anonymous caller can set it. isLoopbackDirectPeer
+		// checks the request's actual TCP peer (RemoteAddr), never a header, so a
+		// spoofed X-Forwarded-For cannot claim the internal pool from off-box.
+		if wireBlock && isLoopbackDirectPeer(c) {
+			ctx = repository.WithLegacyBlockReaderPeerPool(ctx, true)
+		}
 
 		r, err := h.repository.GetLegacyBlockReader(ctx, hash, wireBlock)
 		if err != nil {
@@ -171,4 +182,29 @@ func (h *HTTP) GetRestLegacyBlock() func(c echo.Context) error {
 
 		return nil
 	}
+}
+
+// isLoopbackDirectPeer reports whether c's request arrived directly from a
+// loopback address, using the connection's actual remote address
+// (http.Request.RemoteAddr) rather than c.RealIP() or any client-supplied header
+// (X-Forwarded-For, X-Real-IP): those are exactly what an anonymous caller
+// controls, and the internal legacy-peer-server pool must not be claimable from
+// off-box by setting one.
+//
+// This holds only when the legacy peer server reaches Asset HTTP over an actual
+// loopback connection. Behind a same-pod sidecar proxy (or any proxy terminating
+// the TCP connection locally and forwarding on), every request's direct peer is
+// the proxy itself — typically also loopback — so the separation does not
+// distinguish the legacy peer server from other proxied traffic in that topology.
+func isLoopbackDirectPeer(c echo.Context) bool {
+	host, _, err := net.SplitHostPort(c.Request().RemoteAddr)
+	if err != nil {
+		// RemoteAddr without a port (e.g. a unix socket, or a malformed test
+		// request) is never a loopback TCP peer.
+		return false
+	}
+
+	ip := net.ParseIP(host)
+
+	return ip != nil && ip.IsLoopback()
 }
