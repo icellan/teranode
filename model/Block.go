@@ -841,7 +841,7 @@ func (b *Block) ValidWithBinding(ctx context.Context, logger ulogger.Logger, sub
 		if len(settings.Block.DiskMapDirs) == 0 {
 			dedupedDuringLoad, err = b.getAndValidateSubtreesWithDedup(ctx, logger, subtreeStore, settings.Block.GetAndValidateSubtreesConcurrency)
 		} else {
-			err = b.GetAndValidateSubtrees(ctx, logger, subtreeStore, settings.Block.GetAndValidateSubtreesConcurrency)
+			err = b.getAndValidateSubtreesBound(ctx, logger, subtreeStore, settings.Block.GetAndValidateSubtreesConcurrency)
 		}
 
 		if err != nil {
@@ -2085,13 +2085,77 @@ func (b *Block) GetAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 	return b.getAndValidateSubtrees(ctx, logger, subtreeStore, getAndValidateSubtreesConcurrency, nil, nil)
 }
 
+// getAndValidateSubtreesBound is GetAndValidateSubtrees that checks the subtree
+// list against the header's merkle root as soon as the first and last subtrees
+// are loaded, before fetching the rest. Block.Valid uses it when the duplicate
+// check is not done during the load, so an unbound body fails after two
+// fetches instead of after all of them. CheckMerkleRoot still runs afterwards.
+func (b *Block) getAndValidateSubtreesBound(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, getAndValidateSubtreesConcurrency int) error {
+	// b.Hash(), not b.String(): the hook runs under subtreeSlicesMu.
+	blockLabel := b.Hash().String()
+
+	return b.getAndValidateSubtrees(ctx, logger, subtreeStore, getAndValidateSubtreesConcurrency,
+		func(first, last *subtreepkg.Subtree) error { return b.checkBodyBoundToHeader(blockLabel, first, last) }, nil)
+}
+
+// checkBodyBoundToHeader is CheckMerkleRoot for a body of which only the first
+// and last subtrees are loaded. The middle entries contribute their keys, which
+// every loaded subtree is later bound to, and their lengths are checked by
+// CheckMerkleRoot once they are loaded. Same verdicts and error classes: an
+// unbound or repeated subtree list is BlockCorrupt.
+func (b *Block) checkBodyBoundToHeader(blockLabel string, first, last *subtreepkg.Subtree) error {
+	// The same guards Block.Valid runs on the first subtree before its own
+	// CheckMerkleRoot, in the same order and classes. In particular an emptied
+	// first subtree is a transient local condition: computing a root over it
+	// would report a corrupt body and strike an innocent peer.
+	if first == nil {
+		return errors.NewProcessingError("[BLOCK][%s] first subtree was released during validation", blockLabel)
+	}
+
+	if len(first.Nodes) == 0 {
+		return errors.NewProcessingError("[BLOCK][%s] first subtree emptied (released) during validation", blockLabel)
+	}
+
+	if !first.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholder) {
+		return errors.NewBlockCorruptError("[BLOCK][%s] first transaction in first subtree is not a coinbase placeholder: %s", blockLabel, first.Nodes[0].Hash.String())
+	}
+
+	hashes := make([]chainhash.Hash, len(b.Subtrees))
+	slices := make([]*subtreepkg.Subtree, len(b.Subtrees))
+
+	rootHash, err := first.RootHashWithReplaceRootNode(b.CoinbaseTx.TxIDChainHash(), 0, uint64(b.CoinbaseTx.Size())) // nolint: gosec
+	if err != nil {
+		return errors.NewProcessingError("[BLOCK][%s] error replacing root node in subtree", blockLabel, err)
+	}
+
+	hashes[0] = *rootHash
+
+	for i := 1; i < len(b.Subtrees); i++ {
+		hashes[i] = *b.Subtrees[i]
+	}
+
+	slices[0] = first
+	slices[len(slices)-1] = last
+
+	calculated, err := blockMerkleRoot(blockLabel, hashes, slices, false)
+	if err != nil {
+		return err
+	}
+
+	if !b.Header.HashMerkleRoot.IsEqual(calculated) {
+		return errors.NewBlockCorruptError("[BLOCK][%s] merkle root does not match", blockLabel)
+	}
+
+	return nil
+}
+
 // getAndValidateSubtreesWithDedup loads the subtrees and runs the duplicate
 // check on each one as it lands, instead of in a second pass over the whole
-// block afterwards. Subtree 0 is loaded first to size the txMap from the body
-// as len(Subtrees) x its length, and the index scheme is
-// checkDuplicateTransactions' own. That size is only a hint: the final subtree
-// may differ from the first in either direction, and a map filled past its
-// class is dropped rather than pooled on release (PutTxMap).
+// block afterwards. The first and last subtrees are loaded first; once the
+// subtree list is bound to the header's merkle root, the txMap is sized from
+// the body as len(Subtrees) x subtree 0's length, and the index scheme is
+// checkDuplicateTransactions' own. A map that ends up far from its size class
+// is dropped rather than pooled on release (PutTxMap).
 //
 // deduped reports whether the check ran. It is false when the subtrees were
 // already loaded (nothing is fetched) or the block has none; the caller then
@@ -2102,7 +2166,14 @@ func (b *Block) getAndValidateSubtreesWithDedup(ctx context.Context, logger ulog
 	// b.Hash(), not b.String(): the hooks run under subtreeSlicesMu.
 	blockLabel := b.Hash().String()
 
-	onFirst := func(first *subtreepkg.Subtree) error {
+	onFirst := func(first, last *subtreepkg.Subtree) error {
+		// Bind the subtree list to the header before it sizes anything: until
+		// then len(Subtrees) is a peer claim, and the product below could draw
+		// the largest size class for a body that is about to fail CheckMerkleRoot.
+		if err := b.checkBodyBoundToHeader(blockLabel, first, last); err != nil {
+			return err
+		}
+
 		b.txMapCount = uint64(len(b.Subtrees)) * uint64(first.Length()) // nolint: gosec
 		b.txMap = GetTxMap(b.txMapCount)
 		subtreeSize = first.Size()
@@ -2122,31 +2193,48 @@ func (b *Block) getAndValidateSubtreesWithDedup(ctx context.Context, logger ulog
 	return deduped, nil
 }
 
-// loadFirstSubtree loads subtree 0 and runs the hooks on it, in order.
-func loadFirstSubtree(loadSubtree func() error, onFirst func(first *subtreepkg.Subtree) error,
+// loadBoundarySubtrees loads the first and last subtrees, then runs onFirst on
+// them and onLoaded on each, in that order. A single-subtree body loads it once.
+func loadBoundarySubtrees(loaders []func() error, onFirst func(first, last *subtreepkg.Subtree) error,
 	onLoaded func(sIdx int, subtree *subtreepkg.Subtree) error, slices []*subtreepkg.Subtree) error {
-	if err := loadSubtree(); err != nil {
+	lastIdx := len(loaders) - 1
+
+	if err := loaders[0](); err != nil {
 		return err
 	}
 
-	if err := onFirst(slices[0]); err != nil {
+	if lastIdx > 0 {
+		if err := loaders[lastIdx](); err != nil {
+			return err
+		}
+	}
+
+	if err := onFirst(slices[0], slices[lastIdx]); err != nil {
 		return err
 	}
 
-	if onLoaded != nil {
-		return onLoaded(0, slices[0])
+	if onLoaded == nil {
+		return nil
+	}
+
+	if err := onLoaded(0, slices[0]); err != nil {
+		return err
+	}
+
+	if lastIdx > 0 {
+		return onLoaded(lastIdx, slices[lastIdx])
 	}
 
 	return nil
 }
 
 // getAndValidateSubtrees is GetAndValidateSubtrees with optional load hooks.
-// When onFirst is set, subtree 0 is loaded before the rest start and onFirst
-// runs on it; onLoaded then runs on every subtree (0 included, after onFirst)
-// straight after it is loaded and bound to its key. Both run while
-// subtreeSlicesMu is held.
+// When onFirst is set, the first and last subtrees are loaded before the rest
+// start and onFirst runs on them; onLoaded then runs on every subtree (those two
+// included, after onFirst) straight after it is loaded and bound to its key.
+// Both run while subtreeSlicesMu is held.
 func (b *Block) getAndValidateSubtrees(ctx context.Context, logger ulogger.Logger, subtreeStore SubtreeStore, getAndValidateSubtreesConcurrency int,
-	onFirst func(first *subtreepkg.Subtree) error, onLoaded func(sIdx int, subtree *subtreepkg.Subtree) error) error {
+	onFirst func(first, last *subtreepkg.Subtree) error, onLoaded func(sIdx int, subtree *subtreepkg.Subtree) error) error {
 	ctx, _, deferFn := tracing.Tracer("block").Start(ctx, "GetAndValidateSubtrees",
 		tracing.WithHistogram(prometheusBlockGetAndValidateSubtrees),
 		tracing.WithLogMessage(logger, "[GetAndValidateSubtrees][%s] fetching and validating subtrees", b.String()),
@@ -2233,6 +2321,9 @@ func (b *Block) getAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(logger, g, concurrency)
+
+	loaders := make([]func() error, len(b.Subtrees))
+
 	// we have the hashes. Get the actual subtrees from the subtree store
 	for i, subtreeHash := range b.Subtrees {
 		i := i
@@ -2329,31 +2420,41 @@ func (b *Block) getAndValidateSubtrees(ctx context.Context, logger ulogger.Logge
 				return nil
 			}
 
-			if i == 0 && onFirst != nil {
-				// Nothing else is in flight yet, so run it here and let onFirst see
-				// subtree 0 before any other subtree can reach onLoaded. Wait is still
-				// called on failure: only Wait cancels gCtx, which otherwise stays
-				// registered on ctx.
-				if err := loadFirstSubtree(loadSubtree, onFirst, onLoaded, b.SubtreeSlices); err != nil {
-					_ = g.Wait()
-					return err
-				}
+			loaders[i] = loadSubtree
+		}
+	}
 
-				continue
+	lastIdx := len(loaders) - 1
+
+	if onFirst != nil && lastIdx >= 0 {
+		// Nothing else is in flight yet, so load the boundary subtrees here and let
+		// onFirst see them before any other subtree is fetched or reaches
+		// onLoaded. Wait is still called on failure: only Wait cancels gCtx, which
+		// otherwise stays registered on ctx.
+		if err := loadBoundarySubtrees(loaders, onFirst, onLoaded, b.SubtreeSlices); err != nil {
+			_ = g.Wait()
+			return err
+		}
+	}
+
+	for i, load := range loaders {
+		if load == nil || (onFirst != nil && (i == 0 || i == lastIdx)) {
+			continue
+		}
+
+		i, load := i, load
+
+		g.Go(func() error {
+			if err := load(); err != nil {
+				return err
 			}
 
-			g.Go(func() error {
-				if err := loadSubtree(); err != nil {
-					return err
-				}
+			if onLoaded != nil {
+				return onLoaded(i, b.SubtreeSlices[i])
+			}
 
-				if onLoaded != nil {
-					return onLoaded(i, b.SubtreeSlices[i])
-				}
-
-				return nil
-			})
-		}
+			return nil
+		})
 	}
 
 	if err := g.Wait(); err != nil {
@@ -2624,112 +2725,12 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 
 	var calculatedMerkleRootHash *chainhash.Hash
 
-	switch {
-	case len(hashes) == 1:
-		calculatedMerkleRootHash = &hashes[0]
-	case len(hashes) > 0:
-		// The first subtree must be complete (production invariant under Strategy A).
-		// Its Length() therefore equals its serialized leaf count both in-memory and
-		// after a disk round-trip, making it a stable signal for the block's
-		// intended subtree capacity. Subtree.Height is correct for the lift step
-		// because for a complete subtree Height = Ceil(Log2(Length)) and that
-		// relationship is preserved by deserialization (which re-derives Height
-		// from numLeaves).
-		// Re-read rather than reuse the loop above: without subtreeSlicesMu a
-		// concurrent release can nil an entry between the two passes.
-		firstSubtree := b.SubtreeSlices[0]
-		if firstSubtree == nil {
-			return errors.NewProcessingError("[BLOCK][%s] first subtree was released during validation", b.String())
-		}
-
-		targetLength := firstSubtree.Length()
-		targetHeight := firstSubtree.Height
-
-		// Lift correctness depends on the first subtree's leaf count being a power
-		// of two — that's what makes the partitioned top-tree composition match
-		// the canonical flat merkle root. Without this guard a peer can craft a
-		// non-power-of-two first subtree (e.g. lengths [3, 2]) and produce a
-		// merkle root that a canonical SV Node validator would not agree with.
-		if !subtreepkg.IsPowerOfTwo(targetLength) {
-			return errors.NewBlockCorruptError(
-				"[BLOCK][%s] first subtree leaf count is not a power of two: %d",
-				b.String(), targetLength,
-			)
-		}
-
-		for i, sub := range b.SubtreeSlices {
-			isLast := i == len(b.SubtreeSlices)-1
-
-			if sub == nil {
-				return errors.NewProcessingError("[BLOCK][%s] subtree %d of %d was released during validation", b.String(), i, len(b.SubtreeSlices))
-			}
-
-			if !isLast && sub.Length() != targetLength {
-				return errors.NewBlockCorruptError(
-					"[BLOCK][%s] only the final subtree may be incomplete (index %d, length %d, targetLength %d)",
-					b.String(), i, sub.Length(), targetLength,
-				)
-			}
-
-			if isLast && sub.Length() > targetLength {
-				return errors.NewBlockCorruptError(
-					"[BLOCK][%s] final subtree exceeds first subtree size (length %d, targetLength %d)",
-					b.String(), sub.Length(), targetLength,
-				)
-			}
-		}
-
-		// If the final subtree is shorter than the target length, lift its root
-		// to the target height so it occupies the slot of a same-capacity subtree
-		// in the top-level merkle tree. The final subtree's leaf count does NOT
-		// need to be a power of two: BuildMerkleTreeStoreFromBytes already applies
-		// the duplicate-when-odd rule at every internal level, so the subtree's
-		// own RootHash() naturally lives at height ceil(log2(Length)) and matches
-		// what the canonical flat tree produces for that segment. Allowing
-		// non-power-of-two final subtrees is what lets the legacy-block
-		// partitioner stay at maxItems instead of degenerating to tiny subtrees
-		// for adversarial transaction counts — see issue #901.
-		last := b.SubtreeSlices[len(b.SubtreeSlices)-1]
-		if last == nil {
-			return errors.NewProcessingError("[BLOCK][%s] final subtree was released during validation", b.String())
-		}
-
-		if last.Length() < targetLength {
-			liftedRoot, err := last.RootHashPadded(targetHeight)
-			if err != nil {
-				return errors.NewProcessingError("[BLOCK][%s] failed lifting final subtree", b.String(), err)
-			}
-
-			hashes[len(hashes)-1] = *liftedRoot
-		}
-
-		st, err := subtreepkg.NewIncompleteTreeByLeafCount(len(b.Subtrees))
+	if len(hashes) > 0 {
+		calculatedMerkleRootHash, err = blockMerkleRoot(b.String(), hashes, b.SubtreeSlices, true)
 		if err != nil {
-			return errors.NewProcessingError("[BLOCK][%s] error creating new root tree", b.String(), err)
+			return err
 		}
-
-		seen := make(map[chainhash.Hash]struct{}, len(hashes))
-
-		for _, hash := range hashes {
-			if _, dup := seen[hash]; dup {
-				return errors.NewBlockCorruptError("[BLOCK][%s] duplicate subtree root hash in top-level merkle tree: %s", b.String(), hash.String())
-			}
-
-			seen[hash] = struct{}{}
-
-			err = st.AddNode(hash, 1, 0)
-			if err != nil {
-				return errors.NewProcessingError("[BLOCK][%s] error adding node to root tree", b.String(), err)
-			}
-		}
-
-		calculatedMerkleRoot := st.RootHash()
-
-		calculatedMerkleRootHash, err = chainhash.NewHash(calculatedMerkleRoot[:])
-		if err != nil {
-			return errors.NewProcessingError("[BLOCK][%s] error creating calculated merkle root hash", b.String(), err)
-		}
-	default:
+	} else {
 		calculatedMerkleRootHash = b.CoinbaseTx.TxIDChainHash()
 	}
 
@@ -2741,6 +2742,129 @@ func (b *Block) CheckMerkleRoot(ctx context.Context) (err error) {
 	}
 
 	return nil
+}
+
+// blockMerkleRoot computes the header merkle root of a subtree-backed body from
+// its top-level subtree roots. hashes[0] must already carry the coinbase
+// substitution. slices supplies the subtrees whose shape the top tree depends
+// on: the first (target length and height) and the last (lifted when short).
+// With allLoaded every entry must be present, as CheckMerkleRoot needs; the
+// early binding check passes only the first and last, and the middle lengths
+// are checked once the rest are loaded.
+func blockMerkleRoot(label string, hashes []chainhash.Hash, slices []*subtreepkg.Subtree, allLoaded bool) (*chainhash.Hash, error) {
+	if len(hashes) == 1 {
+		return &hashes[0], nil
+	}
+
+	// The first subtree must be complete (production invariant under Strategy A).
+	// Its Length() therefore equals its serialized leaf count both in-memory and
+	// after a disk round-trip, making it a stable signal for the block's
+	// intended subtree capacity. Subtree.Height is correct for the lift step
+	// because for a complete subtree Height = Ceil(Log2(Length)) and that
+	// relationship is preserved by deserialization (which re-derives Height
+	// from numLeaves).
+	// Re-read rather than reuse the loop above: without subtreeSlicesMu a
+	// concurrent release can nil an entry between the two passes.
+	firstSubtree := slices[0]
+	if firstSubtree == nil {
+		return nil, errors.NewProcessingError("[BLOCK][%s] first subtree was released during validation", label)
+	}
+
+	targetLength := firstSubtree.Length()
+	targetHeight := firstSubtree.Height
+
+	// Lift correctness depends on the first subtree's leaf count being a power
+	// of two — that's what makes the partitioned top-tree composition match
+	// the canonical flat merkle root. Without this guard a peer can craft a
+	// non-power-of-two first subtree (e.g. lengths [3, 2]) and produce a
+	// merkle root that a canonical SV Node validator would not agree with.
+	if !subtreepkg.IsPowerOfTwo(targetLength) {
+		return nil, errors.NewBlockCorruptError(
+			"[BLOCK][%s] first subtree leaf count is not a power of two: %d",
+			label, targetLength,
+		)
+	}
+
+	for i, sub := range slices {
+		isLast := i == len(slices)-1
+
+		if sub == nil {
+			if !allLoaded && !isLast {
+				// The early binding check has only the first and last subtree
+				// loaded; the middle lengths are checked once the rest are.
+				continue
+			}
+
+			return nil, errors.NewProcessingError("[BLOCK][%s] subtree %d of %d was released during validation", label, i, len(slices))
+		}
+
+		if !isLast && sub.Length() != targetLength {
+			return nil, errors.NewBlockCorruptError(
+				"[BLOCK][%s] only the final subtree may be incomplete (index %d, length %d, targetLength %d)",
+				label, i, sub.Length(), targetLength,
+			)
+		}
+
+		if isLast && sub.Length() > targetLength {
+			return nil, errors.NewBlockCorruptError(
+				"[BLOCK][%s] final subtree exceeds first subtree size (length %d, targetLength %d)",
+				label, sub.Length(), targetLength,
+			)
+		}
+	}
+
+	// If the final subtree is shorter than the target length, lift its root
+	// to the target height so it occupies the slot of a same-capacity subtree
+	// in the top-level merkle tree. The final subtree's leaf count does NOT
+	// need to be a power of two: BuildMerkleTreeStoreFromBytes already applies
+	// the duplicate-when-odd rule at every internal level, so the subtree's
+	// own RootHash() naturally lives at height ceil(log2(Length)) and matches
+	// what the canonical flat tree produces for that segment. Allowing
+	// non-power-of-two final subtrees is what lets the legacy-block
+	// partitioner stay at maxItems instead of degenerating to tiny subtrees
+	// for adversarial transaction counts — see issue #901.
+	last := slices[len(slices)-1]
+	if last == nil {
+		return nil, errors.NewProcessingError("[BLOCK][%s] final subtree was released during validation", label)
+	}
+
+	if last.Length() < targetLength {
+		liftedRoot, err := last.RootHashPadded(targetHeight)
+		if err != nil {
+			return nil, errors.NewProcessingError("[BLOCK][%s] failed lifting final subtree", label, err)
+		}
+
+		hashes[len(hashes)-1] = *liftedRoot
+	}
+
+	st, err := subtreepkg.NewIncompleteTreeByLeafCount(len(hashes))
+	if err != nil {
+		return nil, errors.NewProcessingError("[BLOCK][%s] error creating new root tree", label, err)
+	}
+
+	seen := make(map[chainhash.Hash]struct{}, len(hashes))
+
+	for _, hash := range hashes {
+		if _, dup := seen[hash]; dup {
+			return nil, errors.NewBlockCorruptError("[BLOCK][%s] duplicate subtree root hash in top-level merkle tree: %s", label, hash.String())
+		}
+
+		seen[hash] = struct{}{}
+
+		err = st.AddNode(hash, 1, 0)
+		if err != nil {
+			return nil, errors.NewProcessingError("[BLOCK][%s] error adding node to root tree", label, err)
+		}
+	}
+
+	calculatedMerkleRoot := st.RootHash()
+
+	calculatedMerkleRootHash, err := chainhash.NewHash(calculatedMerkleRoot[:])
+	if err != nil {
+		return nil, errors.NewProcessingError("[BLOCK][%s] error creating calculated merkle root hash", label, err)
+	}
+
+	return calculatedMerkleRootHash, nil
 }
 
 // ExtractCoinbaseHeight attempts to extract the height of the block from the
