@@ -501,7 +501,10 @@ var localServiceHTTPClient = &http.Client{
 // such as the legacy service reading blocks from the local asset service. The URL must come
 // from this node's settings, never from a peer: unlike DoHTTPRequestBodyReader it does not
 // refuse loopback or private addresses. The default timeout matches DoHTTPRequestBodyReader.
-func DoLocalServiceHTTPRequestBodyReader(ctx context.Context, url string) (io.ReadCloser, error) {
+//
+// headers is optional (existing callers pass none) and, when given, is set on the outgoing
+// request as-is - e.g. the legacy peer server's internal pool token header.
+func DoLocalServiceHTTPRequestBodyReader(ctx context.Context, url string, headers ...map[string]string) (io.ReadCloser, error) {
 	cancelFn := func() {
 		// noop
 	}
@@ -510,7 +513,12 @@ func DoLocalServiceHTTPRequestBodyReader(ctx context.Context, url string) (io.Re
 		ctx, cancelFn = context.WithTimeout(ctx, time.Duration(httpStreamingTimeout)*time.Millisecond)
 	}
 
-	bodyReaderCloser, cancelFn, err := executeHTTPRequestWithClient(ctx, cancelFn, localServiceHTTPClient, url)
+	var reqHeaders map[string]string
+	if len(headers) > 0 {
+		reqHeaders = headers[0]
+	}
+
+	bodyReaderCloser, cancelFn, err := executeHTTPRequestWithClient(ctx, cancelFn, localServiceHTTPClient, url, reqHeaders)
 	if err != nil {
 		cancelFn()
 		return nil, err
@@ -787,7 +795,7 @@ func executeHTTPRequest(ctx context.Context, cancelFn context.CancelFunc, rawURL
 		return nil, cancelFn, err
 	}
 
-	return executeHTTPRequestWithClient(ctx, cancelFn, httpClient, rawURL, requestBody...)
+	return executeHTTPRequestWithClient(ctx, cancelFn, httpClient, rawURL, nil, requestBody...)
 }
 
 // buildOutboundRequest constructs the http.Request shared by every path that talks to a
@@ -804,7 +812,10 @@ func executeHTTPRequest(ctx context.Context, cancelFn context.CancelFunc, rawURL
 // way it once did: the retry path used to build its own request and sent unsigned
 // application/json bodies, undoing both the WAF fix and peer-request signing on every
 // retried attempt.
-func buildOutboundRequest(ctx context.Context, rawURL string, requestBody ...[]byte) (*http.Request, error) {
+//
+// headers, when non-nil, are set after Content-Type (so a caller can override it) and
+// before signing (so a signer that covers headers sees them).
+func buildOutboundRequest(ctx context.Context, rawURL string, headers map[string]string, requestBody ...[]byte) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, errors.NewServiceError("failed to create http request", err)
@@ -825,6 +836,10 @@ func buildOutboundRequest(ctx context.Context, rawURL string, requestBody ...[]b
 		}
 		req.Method = http.MethodPost
 		req.Header.Set("Content-Type", "application/octet-stream")
+	}
+
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 
 	// Sign the request if a signer is configured (silently skip on error)
@@ -877,8 +892,8 @@ const maxRetrySecondWait = 2 * time.Second
 
 // executeHTTPRequestWithClient performs the request through client, which decides what
 // addresses may be reached.
-func executeHTTPRequestWithClient(ctx context.Context, cancelFn context.CancelFunc, client *http.Client, rawURL string, requestBody ...[]byte) (io.ReadCloser, context.CancelFunc, error) {
-	req, err := buildOutboundRequest(ctx, rawURL, requestBody...)
+func executeHTTPRequestWithClient(ctx context.Context, cancelFn context.CancelFunc, client *http.Client, rawURL string, headers map[string]string, requestBody ...[]byte) (io.ReadCloser, context.CancelFunc, error) {
+	req, err := buildOutboundRequest(ctx, rawURL, headers, requestBody...)
 	if err != nil {
 		return nil, cancelFn, err
 	}
@@ -1255,7 +1270,7 @@ func doHTTPRequestWithRetryAfter(ctx context.Context, timeoutMs int, rawURL stri
 		return nil, 0, err
 	}
 
-	req, err := buildOutboundRequest(ctx, rawURL, requestBody...)
+	req, err := buildOutboundRequest(ctx, rawURL, nil, requestBody...)
 	if err != nil {
 		cancelFn()
 		return nil, 0, err

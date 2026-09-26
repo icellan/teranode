@@ -1,7 +1,7 @@
 package httpimpl
 
 import (
-	"net"
+	"crypto/subtle"
 	"net/http"
 	"strings"
 
@@ -11,6 +11,12 @@ import (
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"github.com/labstack/echo/v4"
 )
+
+// legacyInternalTokenHeader carries the shared secret (asset_legacyPeerPoolToken)
+// the legacy peer server presents on its internal ?wire=1 request to
+// GET /block_legacy/:hash, so Asset can tell that call apart from an anonymous
+// caller who also sets ?wire=1.
+const legacyInternalTokenHeader = "X-Teranode-Internal-Token"
 
 // GetLegacyBlock creates an HTTP handler that streams a block in the legacy Bitcoin protocol format.
 //
@@ -76,11 +82,13 @@ func (h *HTTP) GetLegacyBlock() func(c echo.Context) error {
 		wireBlock := c.QueryParam("wire") != ""
 
 		// The internal legacy-peer-server pool is only for this node's own legacy
-		// peer server (pushBlockMsg), which reaches this route over loopback. wire=1
-		// alone proves nothing: any anonymous caller can set it. isLoopbackDirectPeer
-		// checks the request's actual TCP peer (RemoteAddr), never a header, so a
-		// spoofed X-Forwarded-For cannot claim the internal pool from off-box.
-		if wireBlock && isLoopbackDirectPeer(c) {
+		// peer server (pushBlockMsg). wire=1 alone proves nothing: any anonymous
+		// caller can set it. asset_legacyPeerPoolToken is a shared secret configured
+		// identically on the legacy and Asset services; only a request that presents
+		// it, in addition to wire=1, is trusted with the peer pool. An unset
+		// (empty) token makes the pool unreachable by anyone, preserving today's
+		// single-pool behaviour.
+		if wireBlock && h.usesLegacyPeerPool(c) {
 			ctx = repository.WithLegacyBlockReaderPeerPool(ctx, true)
 		}
 
@@ -184,27 +192,28 @@ func (h *HTTP) GetRestLegacyBlock() func(c echo.Context) error {
 	}
 }
 
-// isLoopbackDirectPeer reports whether c's request arrived directly from a
-// loopback address, using the connection's actual remote address
-// (http.Request.RemoteAddr) rather than c.RealIP() or any client-supplied header
-// (X-Forwarded-For, X-Real-IP): those are exactly what an anonymous caller
-// controls, and the internal legacy-peer-server pool must not be claimable from
-// off-box by setting one.
+// usesLegacyPeerPool reports whether c's request is trusted to draw from the
+// internal legacy-peer-server GetLegacyBlockReader pool, based on
+// asset_legacyPeerPoolToken: a shared secret, never on network origin (RemoteAddr,
+// X-Forwarded-For, etc. are all caller-controlled or topology-dependent, neither
+// of which anonymous-vs-internal separation can safely rest on across every
+// deployment shape, e.g. a multi-container asset_httpAddress).
 //
-// This holds only when the legacy peer server reaches Asset HTTP over an actual
-// loopback connection. Behind a same-pod sidecar proxy (or any proxy terminating
-// the TCP connection locally and forwarding on), every request's direct peer is
-// the proxy itself — typically also loopback — so the separation does not
-// distinguish the legacy peer server from other proxied traffic in that topology.
-func isLoopbackDirectPeer(c echo.Context) bool {
-	host, _, err := net.SplitHostPort(c.Request().RemoteAddr)
-	if err != nil {
-		// RemoteAddr without a port (e.g. a unix socket, or a malformed test
-		// request) is never a loopback TCP peer.
+// An empty configured token means the pool is unreachable: the zero value, and
+// the shipped default, is today's single-pool behaviour. Otherwise the caller
+// must present the same value in the X-Teranode-Internal-Token header, compared
+// with a constant-time comparison so response timing cannot be used to guess it
+// byte-by-byte.
+func (h *HTTP) usesLegacyPeerPool(c echo.Context) bool {
+	configured := h.settings.Asset.LegacyPeerPoolToken
+	if configured == "" {
 		return false
 	}
 
-	ip := net.ParseIP(host)
+	presented := c.Request().Header.Get(legacyInternalTokenHeader)
+	if presented == "" {
+		return false
+	}
 
-	return ip != nil && ip.IsLoopback()
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(configured)) == 1
 }
