@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -216,6 +217,93 @@ func TestGetMissingTransactionsBatch_CancelledCtxDoesNotPublishInvalidSubtree(t 
 
 	kafkaProducer := server.invalidSubtreeKafkaProducer.(*mockKafkaProducer)
 	require.Empty(t, kafkaProducer.messages, "a peer must not be penalised for this node's own cancellation")
+}
+
+// cancelOnReadBody cancels a context on the first Read, simulating this node's own
+// cancellation arriving while a peer's response body is being consumed.
+type cancelOnReadBody struct {
+	cancel context.CancelFunc
+	r      io.Reader
+	once   sync.Once
+}
+
+func (b *cancelOnReadBody) Read(p []byte) (int, error) {
+	b.once.Do(b.cancel)
+	return b.r.Read(p)
+}
+
+func (b *cancelOnReadBody) Close() error { return nil }
+
+// TestGetMissingTransactionsBatch_CtxCancelledMidFlightDoesNotPublish covers the two
+// cancellation windows after the pre-fetch check: our ctx cancelled while the request is
+// in flight (the fetch itself fails), and cancelled while the response body is being
+// read (the body read fails). Neither is the peer's fault, so neither may reach
+// publishInvalidSubtree - blockchain.Client.GetFSMCurrentState returns a cached state
+// without looking at ctx, so nothing downstream suppresses the report.
+func TestGetMissingTransactionsBatch_CtxCancelledMidFlightDoesNotPublish(t *testing.T) {
+	tests := []struct {
+		name      string
+		responder func(cancel context.CancelFunc) httpmock.Responder
+	}{
+		{
+			name: "cancelled during the fetch",
+			responder: func(cancel context.CancelFunc) httpmock.Responder {
+				return func(req *http.Request) (*http.Response, error) {
+					cancel()
+					return nil, context.Canceled
+				}
+			},
+		},
+		{
+			name: "cancelled while the body is read",
+			responder: func(cancel context.CancelFunc) httpmock.Responder {
+				return func(req *http.Request) (*http.Response, error) {
+					// The response arrives intact; our ctx is cancelled on the first
+					// body read, after the fetch has returned. The bytes are not a
+					// parseable transaction, so the read fails - which must not be
+					// blamed on the peer.
+					body := &cancelOnReadBody{cancel: cancel, r: bytes.NewReader([]byte{0xff, 0xff, 0xff})}
+					return &http.Response{StatusCode: http.StatusOK, Body: body, Header: http.Header{}}, nil
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			httpmock.ActivateNonDefault(util.HTTPClient())
+			defer httpmock.DeactivateAndReset()
+
+			tSettings := test.CreateBaseTestSettings(t)
+			subtreeHash := chainhash.HashH([]byte("test-subtree"))
+			baseURL := testPeerURL
+
+			server := &Server{
+				logger:                       ulogger.TestLogger{},
+				settings:                     tSettings,
+				subtreeStore:                 memory.New(),
+				invalidSubtreeKafkaProducer:  &mockKafkaProducer{},
+				invalidSubtreeDeDuplicateMap: expiringmap.New[string, struct{}](time.Minute * 1),
+			}
+			defer server.invalidSubtreeDeDuplicateMap.Stop()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			url := fmt.Sprintf("%s/subtree/%s/txs", baseURL, subtreeHash.String())
+			httpmock.RegisterResponder("POST", url, tt.responder(cancel))
+
+			missingTxHashes := []utxo.UnresolvedMetaData{
+				{Hash: chainhash.HashH([]byte("tx1")), Idx: 0},
+			}
+
+			_, err := server.getMissingTransactionsBatch(ctx, subtreeHash, missingTxHashes, baseURL, "")
+			require.Error(t, err)
+
+			kafkaProducer := server.invalidSubtreeKafkaProducer.(*mockKafkaProducer)
+			require.Empty(t, kafkaProducer.messages, "a peer must not be penalised for this node's own cancellation")
+		})
+	}
 }
 
 // TestInvalidSubtreeReporting_TransactionCountMismatch tests that invalid subtree messages ARE sent
