@@ -56,7 +56,8 @@ func TestAssetCORSConfig_EmptyAllowlistNeverAllowsCredentials(t *testing.T) {
 // TestAssetCORSConfig_ExplicitAllowlistIsStrict — a configured allowlist is
 // matched exactly, and only then are credentials permitted.
 func TestAssetCORSConfig_ExplicitAllowlistIsStrict(t *testing.T) {
-	origins := parseCORSAllowedOrigins(" https://ops.example.com | https://admin.example.com ")
+	origins, err := parseCORSAllowedOrigins(" https://ops.example.com | https://admin.example.com ")
+	require.NoError(t, err)
 	require.Equal(t, []string{"https://ops.example.com", "https://admin.example.com"}, origins)
 
 	cfg := assetCORSConfig(origins)
@@ -108,6 +109,38 @@ func TestAssetCORSConfig_AllowlistIsExactMatchOnly(t *testing.T) {
 		require.Empty(t, rec.Header().Get(echo.HeaderAccessControlAllowOrigin))
 		require.Empty(t, rec.Header().Get(echo.HeaderAccessControlAllowCredentials))
 	})
+}
+
+// TestParseCORSAllowedOrigins_NormalisesCaseAndTrailingSlash — an operator
+// typo in scheme/host case, or a trailing slash, must still match the
+// canonical origin a browser sends.
+func TestParseCORSAllowedOrigins_NormalisesCaseAndTrailingSlash(t *testing.T) {
+	origins, err := parseCORSAllowedOrigins("HTTPS://Ops.Example.COM/")
+	require.NoError(t, err)
+	require.Equal(t, []string{"https://ops.example.com"}, origins)
+
+	cfg := assetCORSConfig(origins)
+	rec := corsProbe(t, cfg, "https://ops.example.com")
+	require.Equal(t, "https://ops.example.com", rec.Header().Get(echo.HeaderAccessControlAllowOrigin),
+		"a normalised configured entry must match the canonical origin a browser sends")
+}
+
+// TestParseCORSAllowedOrigins_RejectsNullOrigin — "null" can never be a
+// legitimate operator origin (it's the Origin header a sandboxed/opaque
+// request sends), so it must fail loudly at startup rather than being
+// silently accepted or dropped.
+func TestParseCORSAllowedOrigins_RejectsNullOrigin(t *testing.T) {
+	_, err := parseCORSAllowedOrigins("null")
+	require.Error(t, err)
+}
+
+// TestParseCORSAllowedOrigins_RejectsEntryWithPath — an origin is
+// scheme+host+port only; a configured entry with a path is an operator
+// mistake that should fail startup with a clear error, not be silently
+// truncated or accepted as a no-op path segment.
+func TestParseCORSAllowedOrigins_RejectsEntryWithPath(t *testing.T) {
+	_, err := parseCORSAllowedOrigins("https://ops.example.com/dashboard")
+	require.Error(t, err)
 }
 
 // newTestServer builds a real HTTP server over a minimal repository so route

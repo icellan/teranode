@@ -199,7 +199,10 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	// registration would be unreachable for OPTIONS; the single config
 	// therefore carries the union of the headers, including the dashboard's
 	// X-CSRF-Token.
-	corsAllowedOrigins := parseCORSAllowedOrigins(tSettings.Asset.CORSAllowedOrigins)
+	corsAllowedOrigins, err := parseCORSAllowedOrigins(tSettings.Asset.CORSAllowedOrigins)
+	if err != nil {
+		return nil, err
+	}
 	if len(corsAllowedOrigins) == 0 {
 		logger.Warnf("[Asset] asset_corsAllowedOrigins is empty: every browser origin is reflected and credentialed cross-origin responses are refused; list the operator origins that need cookie or Authorization access")
 	}
@@ -725,17 +728,64 @@ func (h *HTTP) Sign(resp *echo.Response, hash []byte) error {
 }
 
 // parseCORSAllowedOrigins splits the pipe-separated asset_corsAllowedOrigins
-// list, using the same convention as asset_trustedProxyCIDRs.
-func parseCORSAllowedOrigins(raw string) []string {
-	var origins []string
+// list, using the same convention as asset_trustedProxyCIDRs. Each entry is
+// normalised (see normalizeCORSOrigin) and validated; a malformed entry fails
+// loudly at startup rather than being silently accepted or dropped, matching
+// how asset_trustedProxyCIDRs already treats an unparseable CIDR.
+func parseCORSAllowedOrigins(raw string) ([]string, error) {
+	var (
+		origins     []string
+		invalidErrs []string
+	)
 
 	for _, origin := range strings.Split(raw, "|") {
-		if origin = strings.TrimSpace(origin); origin != "" {
-			origins = append(origins, origin)
+		if origin = strings.TrimSpace(origin); origin == "" {
+			continue
 		}
+
+		normalized, err := normalizeCORSOrigin(origin)
+		if err != nil {
+			invalidErrs = append(invalidErrs, fmt.Sprintf("%q (%v)", origin, err))
+			continue
+		}
+
+		origins = append(origins, normalized)
 	}
 
-	return origins
+	if len(invalidErrs) > 0 {
+		return nil, errors.NewConfigurationError(
+			"[Asset] asset_corsAllowedOrigins has invalid entries: %s",
+			strings.Join(invalidErrs, ", "),
+		)
+	}
+
+	return origins, nil
+}
+
+// normalizeCORSOrigin lower-cases the scheme and host and trims a trailing
+// slash, so an operator typo like "HTTPS://Ops.Example.com/" still matches
+// the canonical "https://ops.example.com" a browser sends. It rejects the
+// literal "null" origin (never a legitimate operator origin) and any entry
+// carrying a path, query or fragment: an origin is scheme+host[+port] only.
+func normalizeCORSOrigin(origin string) (string, error) {
+	if strings.EqualFold(origin, "null") {
+		return "", errors.NewConfigurationError("the null origin can never be a legitimate operator origin")
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil {
+		return "", err
+	}
+
+	if u.Scheme == "" || u.Host == "" {
+		return "", errors.NewConfigurationError("must be an absolute origin (scheme://host[:port])")
+	}
+
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", errors.NewConfigurationError("must not include a path, query or fragment")
+	}
+
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host), nil
 }
 
 // assetCORSConfig builds the single CORS policy for the Asset listener.
