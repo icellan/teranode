@@ -552,3 +552,69 @@ func TestGetTransactionsReleasesSubtreePermitBeforeResponseWrite(t *testing.T) {
 	require.True(t, probe.releasedAtWrite.Load(),
 		"subtree map permit must be released once the fan-out is done, not held across the client-paced response write")
 }
+
+// TestGetTransactionsFromSubtreeReadsBodyBeforeTakingThePermit is the regression
+// test for the slowloris fix: on the subtree path, GetSubtreeTransactions — which
+// takes the node-wide asset_concurrency_get_subtree_transactions permit — must not
+// be called until the request body has been read to completion. Dispatching while
+// reading (as the plain POST /transactions path does) would hold that shared,
+// low-default (2) permit for the whole client-paced upload, letting a couple of
+// slow anonymous uploads pin both permits and starve every other caller of this
+// route, including honest peer catchup.
+//
+// A blocking body (io.Pipe) proves it: GetSubtreeTransactions must not be called
+// while the body is still open, and must be called once EOF is supplied.
+func TestGetTransactionsFromSubtreeReadsBodyBeforeTakingThePermit(t *testing.T) {
+	initPrometheusMetrics()
+
+	pr, pw := io.Pipe()
+	httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, pr)
+
+	subtreeHash := chainhash.HashH([]byte("slowloris-subtree"))
+
+	subtreeTransactionsCalled := make(chan struct{})
+
+	mockRepo.On("GetSubtreeExists", mock.Anything, mock.Anything).Return(true, nil).Once()
+	mockRepo.On("GetSubtreeTransactions", mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) { close(subtreeTransactionsCalled) }).
+		Return(map[chainhash.Hash]*bt.Tx{*testTX1Hash: testTx1}, func() {}, nil).Once()
+
+	echoContext.SetPath("/subtree/:hash/txs")
+	echoContext.SetParamNames("hash")
+	echoContext.SetParamValues(subtreeHash.String())
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- httpServer.GetTransactions()(echoContext)
+	}()
+
+	// Write one full hash, then hold the pipe open (no EOF yet): the body is
+	// still being uploaded.
+	_, err := pw.Write(testTX1Hash.CloneBytes())
+	require.NoError(t, err)
+
+	select {
+	case <-subtreeTransactionsCalled:
+		t.Fatal("GetSubtreeTransactions (and therefore the node-wide permit) must not be taken while the body is still open")
+	case <-time.After(200 * time.Millisecond):
+		// expected: nothing has happened yet, the handler is still reading the body
+	}
+
+	require.NoError(t, pw.Close())
+
+	select {
+	case <-subtreeTransactionsCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GetSubtreeTransactions must be called once the body reaches EOF")
+	}
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not return after the body reached EOF")
+	}
+
+	require.Equal(t, http.StatusOK, responseRecorder.Code)
+}
