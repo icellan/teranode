@@ -618,3 +618,37 @@ func TestGetTransactionsFromSubtreeReadsBodyBeforeTakingThePermit(t *testing.T) 
 
 	require.Equal(t, http.StatusOK, responseRecorder.Code)
 }
+
+// TestReadSubtreeBatchHashesInitialCapacityIsCapped pins that nothing a client
+// controls sizes the up-front allocation beyond subtreeBatchHashHintCap: not a
+// forged Content-Length, and not an operator maxRecords reached through a
+// request that sends no Content-Length at all. The slice still grows to hold a
+// genuinely large body.
+func TestReadSubtreeBatchHashesInitialCapacityIsCapped(t *testing.T) {
+	tests := []struct {
+		name          string
+		contentLength int64
+		maxRecords    int
+	}{
+		{"forged content-length, no record cap", 1 << 30, 0},
+		{"no content-length, large record cap", 0, 1_000_000},
+		{"forged content-length, large record cap", 1 << 30, 1_000_000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hashes, err := readSubtreeBatchHashes(bytes.NewReader(nil), tt.contentLength, tt.maxRecords)
+			require.NoError(t, err)
+			require.LessOrEqual(t, cap(hashes), subtreeBatchHashHintCap)
+		})
+	}
+
+	t.Run("a body larger than the hint still reads in full", func(t *testing.T) {
+		n := subtreeBatchHashHintCap + 10
+		body := bytes.Repeat([]byte{0x01}, n*chainhash.HashSize)
+
+		hashes, err := readSubtreeBatchHashes(bytes.NewReader(body), 0, 0)
+		require.NoError(t, err)
+		require.Len(t, hashes, n)
+	})
+}
