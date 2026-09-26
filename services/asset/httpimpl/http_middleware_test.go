@@ -143,6 +143,17 @@ func TestParseCORSAllowedOrigins_RejectsUserinfo(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestParseCORSAllowedOrigins_RejectsWildcardHost — matching is exact, so a
+// scheme-qualified wildcard such as https://*.example.com could only ever match
+// itself literally, which no browser sends. It must fail startup rather than be
+// accepted as an entry that silently matches nothing.
+func TestParseCORSAllowedOrigins_RejectsWildcardHost(t *testing.T) {
+	for _, entry := range []string{"https://*.example.com", "https://ops.*.com", "*"} {
+		_, err := parseCORSAllowedOrigins(entry)
+		require.Error(t, err, entry)
+	}
+}
+
 // TestParseCORSAllowedOrigins_RejectsNullOrigin — "null" can never be a
 // legitimate operator origin (it's the Origin header a sandboxed/opaque
 // request sends), so it must fail loudly at startup rather than being

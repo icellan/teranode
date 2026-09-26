@@ -789,6 +789,13 @@ func normalizeCORSOrigin(origin string) (string, error) {
 		return "", errors.NewConfigurationError("must not include userinfo")
 	}
 
+	// Matching is exact, so a wildcard host could only match itself literally,
+	// which no browser sends: refuse it rather than accept an entry that
+	// silently matches nothing.
+	if strings.Contains(u.Host, "*") {
+		return "", errors.NewConfigurationError("must not contain a wildcard; list each origin exactly")
+	}
+
 	scheme := strings.ToLower(u.Scheme)
 	host := strings.ToLower(u.Hostname())
 	port := u.Port()
