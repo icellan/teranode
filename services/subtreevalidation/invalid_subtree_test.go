@@ -307,6 +307,64 @@ func TestGetMissingTransactionsBatch_CtxCancelledMidFlightDoesNotPublish(t *test
 	}
 }
 
+// TestGetMissingTransactionsBatch_FetchDeadlineMidBodyIsNotMalformedData pins that
+// when this node's own overall fetch deadline expires while the peer's body is
+// still being read (the caller's ctx still live), the peer is reported as unable
+// to provide the transactions, not as having served malformed data.
+func TestGetMissingTransactionsBatch_FetchDeadlineMidBodyIsNotMalformedData(t *testing.T) {
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.SubtreeValidation.MissingTransactionsFetchTimeout = 50 * time.Millisecond
+
+	subtreeHash := chainhash.HashH([]byte("test-subtree"))
+	baseURL := testPeerURL
+
+	server := &Server{
+		logger:                       ulogger.TestLogger{},
+		settings:                     tSettings,
+		subtreeStore:                 memory.New(),
+		invalidSubtreeKafkaProducer:  &mockKafkaProducer{},
+		invalidSubtreeDeDuplicateMap: expiringmap.New[string, struct{}](time.Minute * 1),
+	}
+	defer server.invalidSubtreeDeDuplicateMap.Stop()
+
+	url := fmt.Sprintf("%s/subtree/%s/txs", baseURL, subtreeHash.String())
+	httpmock.RegisterResponder("POST", url, func(req *http.Request) (*http.Response, error) {
+		// The body stalls until the request's own (fetch-deadline) ctx expires, then
+		// fails with that ctx's error.
+		body := &ctxBoundBody{ctx: req.Context()}
+		return &http.Response{StatusCode: http.StatusOK, Body: body, Header: http.Header{}}, nil
+	})
+
+	missingTxHashes := []utxo.UnresolvedMetaData{
+		{Hash: chainhash.HashH([]byte("tx1")), Idx: 0},
+	}
+
+	_, err := server.getMissingTransactionsBatch(context.Background(), subtreeHash, missingTxHashes, baseURL, "")
+	require.Error(t, err)
+
+	kafkaProducer := server.invalidSubtreeKafkaProducer.(*mockKafkaProducer)
+	require.Len(t, kafkaProducer.messages, 1)
+
+	var msg kafkamessage.KafkaInvalidSubtreeTopicMessage
+	require.NoError(t, proto.Unmarshal(kafkaProducer.messages[0].Value, &msg))
+	require.Equal(t, "peer_cannot_provide_transactions", msg.Reason)
+}
+
+// ctxBoundBody blocks each Read until ctx is done, then returns ctx's error.
+type ctxBoundBody struct {
+	ctx context.Context
+}
+
+func (b *ctxBoundBody) Read(_ []byte) (int, error) {
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (b *ctxBoundBody) Close() error { return nil }
+
 // TestInvalidSubtreeReporting_TransactionCountMismatch tests that invalid subtree messages ARE sent
 // when the peer returns a different number of transactions than requested
 func TestInvalidSubtreeReporting_TransactionCountMismatch(t *testing.T) {
