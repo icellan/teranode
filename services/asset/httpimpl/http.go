@@ -266,6 +266,12 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	// other heavy route keeps burst == rate, so a bulk caller on an unrelated
 	// heavy route (e.g. POST /utxos, up to 1024-way Aerospike fan-out) can't
 	// spend the floor a catching-up peer needs.
+	//
+	// The two limiters are independent per-IP buckets, not a shared budget:
+	// one unverified IP can draw asset_httpHeavyRateLimit sustained on the
+	// catchup routes AND the same rate again, separately, on the other heavy
+	// routes - double the pre-split sustained budget for that IP across the
+	// whole heavy surface. See asset_httpHeavyRateLimit's longdesc.
 	var heavyRateLimiter, catchupRateLimiter echo.MiddlewareFunc
 	if tSettings.Asset.HTTPHeavyRateLimit > 0 {
 		heavyRL := newTieredRateLimiter(
@@ -282,18 +288,23 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 		// concurrent unsigned (and so tier-unverified) requests at once, so the
 		// catchup-route burst floors at that value.
 		heavyBurst, _ := resolveHeavyBurst(logger, tSettings.Asset.HTTPHeavyRateBurst, tSettings.SubtreeValidation.GetMissingTransactions, tSettings.Asset.HTTPHeavyRateLimit)
-		logger.Infof("[Asset] heavy-endpoint rate limit: %d req/s, burst %d (catchup routes), burst %d (other heavy routes)",
-			tSettings.Asset.HTTPHeavyRateLimit, heavyBurst, tSettings.Asset.HTTPHeavyRateLimit)
 
+		// heavy_catchup is a distinct metric label from heavy so the two
+		// independent buckets are distinguishable on teranode_asset_http_rate_limited_total.
 		catchupRL := newTieredRateLimiter(
 			tSettings.Asset.HTTPHeavyRateLimit,
 			tSettings.Asset.HTTPPeerRateMultiplier,
 			tSettings.Asset.HTTPMinerRateLimit,
 			heavyBurst,
-			"heavy",
+			"heavy_catchup",
 		)
 		catchupRateLimiter = catchupRL.Middleware()
 		rateLimiters = append(rateLimiters, catchupRL)
+
+		logger.Infof("[Asset] heavy-endpoint rate limits: catchup routes %d req/s burst %d, other heavy routes %d req/s burst %d (independent per-IP buckets: an unverified IP's sustained budget across the whole heavy surface is up to %d req/s)",
+			tSettings.Asset.HTTPHeavyRateLimit, heavyBurst,
+			tSettings.Asset.HTTPHeavyRateLimit, tSettings.Asset.HTTPHeavyRateLimit,
+			2*tSettings.Asset.HTTPHeavyRateLimit)
 	}
 	heavyMW := func() []echo.MiddlewareFunc {
 		if heavyRateLimiter != nil {
