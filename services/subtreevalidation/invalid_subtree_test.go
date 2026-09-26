@@ -149,8 +149,8 @@ func TestGetMissingTransactionsBatch_OverallDeadlineBoundsRetries(t *testing.T) 
 	}
 	defer server.invalidSubtreeDeDuplicateMap.Stop()
 
-	// 503 is the only status the retry loop iterates on, so this is the shape that
-	// reaches all six attempts if left unbounded.
+	// 503 (like 429) is retried by the retry loop, so this is the shape that reaches
+	// all six attempts if left unbounded.
 	url := fmt.Sprintf("%s/subtree/%s/txs", baseURL, subtreeHash.String())
 	httpmock.RegisterResponder("POST", url, httpmock.NewStringResponder(503, "unavailable"))
 
@@ -171,6 +171,51 @@ func TestGetMissingTransactionsBatch_OverallDeadlineBoundsRetries(t *testing.T) 
 	// The full backoff chain is 250ms+500ms+1s+2s+4s = 7.75s of sleeping alone, so an
 	// unbounded run cannot finish anywhere near this.
 	require.Less(t, elapsed, 5*time.Second, "the whole fetch must be bounded by one deadline, not one per attempt")
+}
+
+// TestGetMissingTransactionsBatch_CancelledCtxDoesNotPublishInvalidSubtree pins that an
+// HTTP failure caused by OUR OWN cancelled context - a sibling batch failing in the same
+// errgroup, or service shutdown - must not be reported as the peer's fault.
+//
+// Before this fix, that suppression depended entirely on publishInvalidSubtree's
+// GetFSMCurrentState(ctx) call happening to fail on the same cancelled ctx and returning
+// early. That is fragile: a nil blockchainClient (GetFSMCurrentState is skipped
+// entirely, see publishInvalidSubtree) or a blockchain client that tolerates a cancelled
+// ctx would fall through and publish anyway. The check must be explicit and not
+// depend on an unrelated downstream RPC failing the same way.
+func TestGetMissingTransactionsBatch_CancelledCtxDoesNotPublishInvalidSubtree(t *testing.T) {
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	subtreeHash := chainhash.HashH([]byte("test-subtree"))
+	baseURL := testPeerURL
+
+	server := &Server{
+		logger:                       ulogger.TestLogger{},
+		settings:                     tSettings,
+		subtreeStore:                 memory.New(),
+		invalidSubtreeKafkaProducer:  &mockKafkaProducer{},
+		invalidSubtreeDeDuplicateMap: expiringmap.New[string, struct{}](time.Minute * 1),
+	}
+	defer server.invalidSubtreeDeDuplicateMap.Stop()
+
+	// Never actually reached: a cancelled ctx must short-circuit before the HTTP call.
+	url := fmt.Sprintf("%s/subtree/%s/txs", baseURL, subtreeHash.String())
+	httpmock.RegisterResponder("POST", url, httpmock.NewStringResponder(200, ""))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	missingTxHashes := []utxo.UnresolvedMetaData{
+		{Hash: chainhash.HashH([]byte("tx1")), Idx: 0},
+	}
+
+	_, err := server.getMissingTransactionsBatch(ctx, subtreeHash, missingTxHashes, baseURL, "")
+	require.Error(t, err)
+
+	kafkaProducer := server.invalidSubtreeKafkaProducer.(*mockKafkaProducer)
+	require.Empty(t, kafkaProducer.messages, "a peer must not be penalised for this node's own cancellation")
 }
 
 // TestInvalidSubtreeReporting_TransactionCountMismatch tests that invalid subtree messages ARE sent
