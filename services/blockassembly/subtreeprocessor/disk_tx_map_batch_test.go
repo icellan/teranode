@@ -94,8 +94,9 @@ func TestDiskTxMap_UpdateSubtreeIndexBatchMatchesSingle(t *testing.T) {
 	}
 }
 
-// A batch in which no node has an entry writes nothing and must still leave the
-// map fully usable (it releases its Badger batch rather than abandoning it).
+// A batch in which no node has an entry writes nothing and leaves the map fully
+// usable. (The abandoned-batch leak this path once had is not observable here;
+// it was measured separately.)
 func TestDiskTxMap_UpdateSubtreeIndexBatchAllMissing(t *testing.T) {
 	m, err := NewDiskTxMap(DiskTxMapOptions{BasePaths: []string{t.TempDir(), t.TempDir()}})
 	require.NoError(t, err)

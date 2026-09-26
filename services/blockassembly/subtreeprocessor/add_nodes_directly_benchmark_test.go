@@ -70,6 +70,13 @@ func BenchmarkAddNodesDirectly(b *testing.B) {
 						}
 					}
 
+					// Count the disk writes still queued in the DiskTxMap writers.
+					if dm, ok := stp.currentTxMap.(*DiskTxMap); ok {
+						if err := dm.Flush(); err != nil {
+							b.Fatal(err)
+						}
+					}
+
 					b.StopTimer()
 					cleanup()
 					b.StartTimer()

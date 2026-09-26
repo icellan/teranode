@@ -139,6 +139,11 @@ func (s *BadgerTempStore) GetEach(n int, key func(i int) []byte, fn func(i int, 
 }
 
 // WriteBatch provides efficient batch write operations.
+//
+// Every WriteBatch, including the fresh one Flush installs after writing,
+// holds a Badger read mark until it is flushed or cancelled. Call Cancel when
+// done with a batch (also after a successful Flush): an abandoned batch pins
+// Badger's read watermark for the life of the store.
 type WriteBatch struct {
 	wb    *badger.WriteBatch
 	store *BadgerTempStore
