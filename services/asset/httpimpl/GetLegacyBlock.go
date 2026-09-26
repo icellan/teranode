@@ -1,6 +1,7 @@
 package httpimpl
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"net/http"
 	"strings"
@@ -215,5 +216,10 @@ func (h *HTTP) usesLegacyPeerPool(c echo.Context) bool {
 		return false
 	}
 
-	return subtle.ConstantTimeCompare([]byte(presented), []byte(configured)) == 1
+	// Compare fixed-length digests: ConstantTimeCompare returns early on a length
+	// mismatch, which would leak the token's length.
+	presentedSum := sha256.Sum256([]byte(presented))
+	configuredSum := sha256.Sum256([]byte(configured))
+
+	return subtle.ConstantTimeCompare(presentedSum[:], configuredSum[:]) == 1
 }
