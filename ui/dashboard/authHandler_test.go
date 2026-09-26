@@ -355,38 +355,61 @@ type captureLogger struct {
 	ulogger.TestLogger
 
 	mu         sync.Mutex
-	lines      []string
 	debugLines []string
+	infoLines  []string
 	warnLines  []string
+	errorLines []string
 }
 
 func (l *captureLogger) record(bucket *[]string, format string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	line := fmt.Sprintf(format, args...)
-	l.lines = append(l.lines, line)
-	*bucket = append(*bucket, line)
+	*bucket = append(*bucket, fmt.Sprintf(format, args...))
 }
 
 func (l *captureLogger) Debugf(format string, args ...interface{}) {
 	l.record(&l.debugLines, format, args...)
 }
 func (l *captureLogger) Infof(format string, args ...interface{}) {
-	l.record(&l.lines, format, args...)
+	l.record(&l.infoLines, format, args...)
 }
 func (l *captureLogger) Warnf(format string, args ...interface{}) {
 	l.record(&l.warnLines, format, args...)
 }
 func (l *captureLogger) Errorf(format string, args ...interface{}) {
-	l.record(&l.lines, format, args...)
+	l.record(&l.errorLines, format, args...)
 }
 
+// output returns every recorded line, in the order each level was appended:
+// debug, info, warn, error. Recording order within a level is preserved;
+// order across levels is not, since only per-level buckets are timestamped.
 func (l *captureLogger) output() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	return strings.Join(l.lines, "\n")
+	all := make([]string, 0, len(l.debugLines)+len(l.infoLines)+len(l.warnLines)+len(l.errorLines))
+	all = append(all, l.debugLines...)
+	all = append(all, l.infoLines...)
+	all = append(all, l.warnLines...)
+	all = append(all, l.errorLines...)
+
+	return strings.Join(all, "\n")
+}
+
+// TestCaptureLogger_DoesNotDoubleRecordInfoAndError — Infof and Errorf must
+// each record a line exactly once. record() already appends to the aggregate
+// l.lines; passing &l.lines as the bucket too (as Infof/Errorf previously did)
+// appends the same line to l.lines twice.
+func TestCaptureLogger_DoesNotDoubleRecordInfoAndError(t *testing.T) {
+	logger := &captureLogger{}
+
+	logger.Infof("info line")
+	logger.Errorf("error line")
+
+	require.Equal(t, []string{"info line"}, logger.infoLines)
+	require.Equal(t, []string{"error line"}, logger.errorLines)
+	require.Equal(t, "info line\nerror line", logger.output())
 }
 
 func newCredentialAuthHandler(logger ulogger.Logger, user, pass string, requireCredentials, secureCookies bool) *AuthHandler {
