@@ -371,6 +371,13 @@ func (u *Server) getMissingTransactionsBatch(ctx context.Context, subtreeHash ch
 				return nil, errors.NewContextCanceledError("[getMissingTransactionsBatch][%s] aborted", subtreeHash.String(), ctx.Err())
 			}
 
+			// Our own fetch deadline expiring mid-body means the peer was too slow to
+			// serve the batch, not that it served bad data.
+			if fetchCtx.Err() != nil {
+				u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, peerID, "peer_cannot_provide_transactions")
+				return nil, errors.NewExternalError("[getMissingTransactionsBatch][%s] fetch deadline exceeded reading the response", subtreeHash.String(), err)
+			}
+
 			// Malformed transaction data from peer - report as invalid subtree
 			u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, peerID, "malformed_transaction_data")
 			// Not recoverable, returning processing error
