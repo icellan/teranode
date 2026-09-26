@@ -217,6 +217,7 @@ func TestGetMissingTransactionsBatch_CancelledCtxDoesNotPublishInvalidSubtree(t 
 
 	kafkaProducer := server.invalidSubtreeKafkaProducer.(*mockKafkaProducer)
 	require.Empty(t, kafkaProducer.messages, "a peer must not be penalised for this node's own cancellation")
+	require.Zero(t, httpmock.GetTotalCallCount(), "an already-cancelled ctx must not reach the peer at all")
 }
 
 // cancelOnReadBody cancels a context on the first Read, simulating this node's own
