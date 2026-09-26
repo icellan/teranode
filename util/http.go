@@ -502,9 +502,17 @@ func DoLocalServiceHTTPRequestBodyReader(ctx context.Context, url string, header
 		ctx, cancelFn = context.WithTimeout(ctx, time.Duration(httpStreamingTimeout)*time.Millisecond)
 	}
 
+	// Merge every map passed; a later map wins on a duplicate key.
 	var reqHeaders map[string]string
-	if len(headers) > 0 {
-		reqHeaders = headers[0]
+
+	for _, h := range headers {
+		for k, v := range h {
+			if reqHeaders == nil {
+				reqHeaders = make(map[string]string, len(h))
+			}
+
+			reqHeaders[k] = v
+		}
 	}
 
 	bodyReaderCloser, cancelFn, err := executeHTTPRequestWithClient(ctx, cancelFn, localServiceHTTPClient, url, reqHeaders)

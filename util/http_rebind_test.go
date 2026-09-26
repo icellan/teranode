@@ -397,3 +397,26 @@ func TestDoLocalServiceHTTPRequestBodyReader_CarriesHeaders(t *testing.T) {
 	_ = reader.Close()
 	require.Empty(t, gotHeader, "omitting headers must not send the header at all")
 }
+
+// TestDoLocalServiceHTTPRequestBodyReader_MergesEveryHeadersMap pins that
+// headers from every map passed reach the request, rather than every map after
+// the first being silently ignored. A later map wins on a duplicate key.
+func TestDoLocalServiceHTTPRequestBodyReader_MergesEveryHeadersMap(t *testing.T) {
+	var got http.Header
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	reader, err := DoLocalServiceHTTPRequestBodyReader(context.Background(), server.URL,
+		map[string]string{"X-First": "1", "X-Shared": "first"},
+		map[string]string{"X-Second": "2", "X-Shared": "second"})
+	require.NoError(t, err)
+	_ = reader.Close()
+
+	require.Equal(t, "1", got.Get("X-First"))
+	require.Equal(t, "2", got.Get("X-Second"))
+	require.Equal(t, "second", got.Get("X-Shared"))
+}
