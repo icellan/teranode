@@ -652,3 +652,14 @@ func TestReadSubtreeBatchHashesInitialCapacityIsCapped(t *testing.T) {
 		require.Len(t, hashes, n)
 	})
 }
+
+// TestTxSizeMatchesResponseBytes pins the assumption the subtree-map branch of
+// the response-byte budget relies on: it reserves tx.Size() before serializing,
+// so that must equal the length of the non-extended bytes it then writes.
+func TestTxSizeMatchesResponseBytes(t *testing.T) {
+	tx := bt.NewTx()
+	require.NoError(t, tx.From("a9b84a7e4b1c2f1d3a5e6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f80910", 0, "76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac", 1000))
+	require.NoError(t, tx.PayToAddress("1AdZmoAQUw4XCsCihukoHMvNWXcsd8jDN6", 900))
+
+	require.Equal(t, len(tx.Bytes()), tx.Size())
+}
