@@ -329,8 +329,23 @@ func (u *Server) getMissingTransactionsBatch(ctx context.Context, subtreeHash ch
 	fetchCtx, cancel := context.WithTimeout(ctx, missingTransactionsFetchTimeout(u.settings))
 	defer cancel()
 
+	// A failure caused by OUR OWN cancellation - a sibling batch failing in the same
+	// errgroup, or service shutdown - is not the peer's fault and must not be reported
+	// as one. Checked explicitly against the caller's ctx, both before the fetch (an
+	// already-cancelled ctx must not even reach the peer) and after a failed one
+	// (cancellation mid-flight): relying on publishInvalidSubtree's GetFSMCurrentState
+	// call to fail on the same cancelled ctx to suppress the report would be implicit,
+	// and is skipped entirely when blockchainClient is nil.
+	if ctx.Err() != nil {
+		return nil, errors.NewContextCanceledError("[getMissingTransactionsBatch][%s] aborted", subtreeHash.String(), ctx.Err())
+	}
+
 	body, err := util.DoHTTPRequestBodyReaderWithRetry(fetchCtx, txsURL, txIDBytes)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, errors.NewContextCanceledError("[getMissingTransactionsBatch][%s] aborted", subtreeHash.String(), ctx.Err())
+		}
+
 		// Peer cannot provide requested transactions - report as invalid subtree
 		u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, peerID, "peer_cannot_provide_transactions")
 		return nil, errors.NewExternalError("[getMissingTransactionsBatch][%s] failed to do http request", subtreeHash.String(), err)
