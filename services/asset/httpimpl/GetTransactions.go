@@ -1,6 +1,7 @@
 package httpimpl
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"strings"
@@ -57,10 +58,15 @@ import (
 //   - Concurrent transaction retrieval (up to 1024 goroutines)
 //   - The response buffer is sized from the serialized transactions, not from
 //     the requested record count
-//   - Each hash is dispatched to a lookup as it is read from the request body,
-//     rather than reading the whole body before any lookup starts
-//   - Results are written into per-record slots (a mutex-guarded slice that
-//     grows one slot per hash read, not presized from a request-supplied count)
+//   - POST /transactions (no subtree hash) dispatches each hash to a lookup as
+//     it is read from the request body, rather than reading the whole body
+//     before any lookup starts, and the per-record result slice grows one slot
+//     per hash read, not presized from a request-supplied count
+//   - POST /subtree/:hash/txs reads the whole (bounded) body before dispatching
+//     any lookup, because GetSubtreeTransactions takes a node-wide permit
+//     (asset_concurrency_get_subtree_transactions): dispatching while reading
+//     would hold that shared permit for the client-paced upload, not just the
+//     lookup fan-out
 //
 // Monitoring:
 //   - Execution time recorded in "GetTransactions_http" statistic
@@ -127,188 +133,340 @@ func (h *HTTP) GetTransactions() func(c echo.Context) error {
 			_ = body.Close()
 		}()
 
-		// Read the first hash before deciding whether to load the subtree
-		// transaction map: an empty body must not pay for a full subtree-data
-		// deserialization the request never needed.
+		if subtreeHash != nil {
+			return h.getTransactionsFromSubtree(ctx, c, subtreeHash, body)
+		}
+
+		return h.getTransactionsStreaming(ctx, c, body)
+	}
+}
+
+// lookupAndStoreTransaction resolves hash — via transactionFromSubtreeData when
+// present, otherwise the UTXO store — reserves the response-byte budget, and
+// stores the serialized result in (*parts)[idx]. Shared by both GetTransactions
+// code paths below.
+//
+// parts is a pointer, not a slice, and every access to *parts here happens under
+// partsMu: on the streaming path the caller keeps growing the underlying slice
+// with append after some lookups are already dispatched, so reading the slice
+// header itself (not just indexing into it) must be synchronised, or a goroutine
+// here can race the caller's append.
+func (h *HTTP) lookupAndStoreTransaction(gCtx context.Context, hash chainhash.Hash, idx int,
+	transactionFromSubtreeData map[chainhash.Hash]*bt.Tx, parts *[][]byte, partsMu *sync.Mutex,
+	responseSize *atomic.Int64, maxBytes int64) (retErr error) {
+	// Echo's middleware.Recover only protects the request goroutine — not the
+	// ones errgroup spawns. The hashes come straight from the request body, so
+	// without this defer a single caller-chosen txid that panics on
+	// serialization (e.g. a tx reconstructed from an .outputs-only external
+	// blob, which carries nil *bt.Output holes) would crash the asset process.
+	defer func() {
+		if r := recover(); r != nil {
+			h.logger.Errorf("[Asset_http:GetTransactions] recovered panic on %s: %v", hash.String(), r)
+			retErr = echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("internal error getting transaction %s", hash.String()).Error())
+		}
+	}()
+
+	// A sibling lookup has already failed, or the client went away: skip the
+	// work rather than serializing a transaction nobody will read.
+	if gCtx.Err() != nil {
+		return gCtx.Err()
+	}
+
+	var b []byte
+
+	if tx, ok := transactionFromSubtreeData[hash]; ok {
+		// always write the non-extended normal bytes as a response !
+		// our peer node should extend the transactions if needed
+		b = tx.Bytes()
+	} else {
+		var err error
+
+		b, err = h.repository.GetTransaction(gCtx, &hash)
+		if err != nil {
+			if errors.Is(err, errors.ErrNotFound) || strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "no such file") {
+				return echo.NewHTTPError(http.StatusNotFound, errors.NewNotFoundError("transaction not found", err).Error())
+			}
+
+			return echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error getting transaction", err).Error())
+		}
+	}
+
+	// Reserve the response-byte budget before storing the result: a batch that
+	// trips the budget on this record must not retain its bytes in parts.
+	if err := h.enforceBatchResponseBytes("GetTransactions", responseSize.Add(int64(len(b))), maxBytes); err != nil {
+		return err
+	}
+
+	partsMu.Lock()
+	(*parts)[idx] = b
+	partsMu.Unlock()
+
+	return nil
+}
+
+// subtreeBatchHashHintCap bounds the initial capacity readSubtreeBatchHashes takes
+// from a request's Content-Length. Content-Length is client-supplied, so it is
+// only ever a capped hint for the initial slice capacity, never a size the
+// request is trusted to dictate outright: an attacker-set Content-Length far
+// larger than the body actually sent (or than the operator's budget allows) must
+// not itself trigger a large allocation. 65536 is 4x the default subtreevalidation
+// catchup batch size (16384), matching the recommended asset_maxBatchRecords
+// starting value.
+const subtreeBatchHashHintCap = 65536
+
+// readSubtreeBatchHashes reads every 32-byte txid from body into a hash slice,
+// growing it as it reads rather than presizing it from a value the request
+// supplies: the slice's initial capacity is derived only from contentLength
+// (itself just a hint, capped by subtreeBatchHashHintCap) and maxRecords when
+// set, never from anything that determines its final size. maxRecords is
+// enforced as hashes are read, exactly as the dispatch-while-reading path
+// enforces it: an over-budget request is rejected here, before
+// GetSubtreeTransactions (and the permit it takes) is ever reached.
+func readSubtreeBatchHashes(body io.Reader, contentLength int64, maxRecords int) ([]chainhash.Hash, error) {
+	hint := 0
+
+	if contentLength > 0 {
+		hint = int(contentLength / chainhash.HashSize)
+		if hint > subtreeBatchHashHintCap {
+			hint = subtreeBatchHashHintCap
+		}
+	}
+
+	if maxRecords > 0 && (hint == 0 || hint > maxRecords) {
+		hint = maxRecords
+	}
+
+	hashes := make([]chainhash.Hash, 0, hint)
+
+	for {
 		var hash chainhash.Hash
 
 		if _, err := io.ReadFull(body, hash[:]); err != nil {
 			if errors.Is(err, io.EOF) {
-				return c.Blob(http.StatusOK, echo.MIMEOctetStream, nil)
+				break
 			}
 
-			return echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error reading request body", err).Error())
+			return nil, echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error reading request body", err).Error())
 		}
 
-		transactionFromSubtreeData := make(map[chainhash.Hash]*bt.Tx)
+		if maxRecords > 0 && len(hashes) >= maxRecords {
+			return nil, errBatchRecords(maxRecords)
+		}
 
-		// The permit covers the map, so it is held for as long as the map is read -
-		// which ends with the fan-out below, not with the response. Holding it across
-		// the write would pace a node-wide semaphore off the client's read speed.
-		releaseSubtreeMap := func() {}
-		defer func() { releaseSubtreeMap() }()
+		hashes = append(hashes, hash)
+	}
 
-		if subtreeHash != nil {
-			// read the data from the subtreeData file and create a map of transaction hashes to transactions
-			txMap, release, err := h.repository.GetSubtreeTransactions(ctx, subtreeHash)
+	return hashes, nil
+}
 
-			releaseSubtreeMap = release
+// getTransactionsFromSubtree serves POST /subtree/:hash/txs.
+// GetSubtreeTransactions takes a node-wide permit
+// (asset_concurrency_get_subtree_transactions, default 2) to bound the
+// underlying subtree-data deserialization. Dispatching lookups while reading the
+// request body — as the plain POST /transactions path does — would hold that
+// permit for the whole client-paced upload: a couple of slow anonymous uploads
+// can then pin both permits for up to the HTTP read timeout, starving every
+// other caller of this route, including honest peer catchup. So on this path the
+// body is read to completion, entirely off that permit, before the permit is
+// ever taken: its lifetime is bounded to the lookup fan-out below, never the
+// upload.
+func (h *HTTP) getTransactionsFromSubtree(ctx context.Context, c echo.Context, subtreeHash *chainhash.Hash, body io.Reader) error {
+	maxRecords := h.maxBatchRecords()
 
-			if err != nil {
-				// this should not be an ERROR, but a warning, because it is not critical if the subtree data is not available
-				// it just means that the transactions will be fetched from the utxo store
-				h.logger.Debugf("[Asset_http:GetTransactions][%s] error getting transactions from subtree data: %s", subtreeHash.String(), err.Error())
-			} else {
-				transactionFromSubtreeData = txMap
+	hashes, err := readSubtreeBatchHashes(body, c.Request().ContentLength, maxRecords)
+	if err != nil {
+		return err
+	}
+
+	h.observeBatchRecords("GetTransactions", len(hashes))
+
+	if len(hashes) == 0 {
+		return c.Blob(http.StatusOK, echo.MIMEOctetStream, nil)
+	}
+
+	transactionFromSubtreeData := make(map[chainhash.Hash]*bt.Tx)
+
+	// The permit covers the map, so it is held for as long as the map is read -
+	// which ends with the fan-out below, not with the response. Holding it across
+	// the write would pace a node-wide semaphore off the client's read speed.
+	releaseSubtreeMap := func() {}
+	defer func() { releaseSubtreeMap() }()
+
+	// read the data from the subtreeData file and create a map of transaction hashes to transactions
+	txMap, release, err := h.repository.GetSubtreeTransactions(ctx, subtreeHash)
+
+	releaseSubtreeMap = release
+
+	if err != nil {
+		// this should not be an ERROR, but a warning, because it is not critical if the subtree data is not available
+		// it just means that the transactions will be fetched from the utxo store
+		h.logger.Debugf("[Asset_http:GetTransactions][%s] error getting transactions from subtree data: %s", subtreeHash.String(), err.Error())
+	} else {
+		transactionFromSubtreeData = txMap
+	}
+
+	maxBytes := h.maxBatchResponseBytes()
+
+	parts := make([][]byte, len(hashes))
+
+	var (
+		partsMu      sync.Mutex
+		responseSize atomic.Int64
+	)
+
+	g, gCtx := errgroup.WithContext(ctx)
+	util.SafeSetLimit(h.logger, g, 1024)
+
+	for idx, hash := range hashes {
+		idx, hash := idx, hash
+
+		g.Go(func() error {
+			return h.lookupAndStoreTransaction(gCtx, hash, idx, transactionFromSubtreeData, &parts, &partsMu, &responseSize, maxBytes)
+		})
+	}
+
+	waitErr := g.Wait()
+
+	// The map is no longer read past this point, so drop the permit before the
+	// client-paced response write. release is sync.Once-guarded, so the deferred
+	// call above stays safe.
+	releaseSubtreeMap()
+
+	if waitErr != nil {
+		h.logger.Errorf("failed to get txs from repository: %s", waitErr.Error())
+		return waitErr
+	}
+
+	responseBytes := concatTransactionBytes(parts)
+
+	prometheusAssetHTTPGetTransactions.WithLabelValues("OK", "200").Add(float64(len(hashes)))
+
+	h.logger.Debugf("[Asset_http:GetTransactions] sending %d txs to client (%d bytes)", len(hashes), len(responseBytes))
+
+	return c.Blob(http.StatusOK, echo.MIMEOctetStream, responseBytes)
+}
+
+// getTransactionsStreaming serves POST /transactions (no subtree hash): each hash
+// is dispatched to a lookup as it is read from body, and the read loop stops
+// once a dispatched lookup has failed or the client's context is cancelled. This
+// path takes no node-wide permit, so pacing dispatch to the client's upload
+// speed does not pin a shared budget the way the subtree path's
+// GetSubtreeTransactions permit would.
+func (h *HTTP) getTransactionsStreaming(ctx context.Context, c echo.Context, body io.Reader) error {
+	maxRecords := h.maxBatchRecords()
+	maxBytes := h.maxBatchResponseBytes()
+
+	var (
+		partsMu      sync.Mutex
+		parts        [][]byte
+		responseSize atomic.Int64
+		recordsRead  int
+	)
+
+	// A derived, explicitly cancellable context: once the read loop stops on a
+	// read/budget error (firstErr below), cancel cuts short any lookup already
+	// dispatched but not yet observing the errgroup's own cancellation (which
+	// only fires once a goroutine itself returns an error), instead of letting
+	// up to 1024 of them run to completion after the request is already known
+	// to fail.
+	cancelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	g, gCtx := errgroup.WithContext(cancelCtx)
+	util.SafeSetLimit(h.logger, g, 1024)
+
+	// dispatch budgets and launches the lookup for a single hash, appending it
+	// its own slot in parts. parts grows one slot per hash actually read, so
+	// it is never presized from a request-supplied count; the mutex guards
+	// both the append and every goroutine's indexed write, since a later
+	// append can reallocate the backing array while an earlier goroutine is
+	// still writing to its slot.
+	dispatch := func(hash chainhash.Hash) error {
+		if maxRecords > 0 && recordsRead >= maxRecords {
+			return errBatchRecords(maxRecords)
+		}
+
+		recordsRead++
+
+		partsMu.Lock()
+		idx := len(parts)
+		parts = append(parts, nil)
+		partsMu.Unlock()
+
+		g.Go(func() error {
+			return h.lookupAndStoreTransaction(gCtx, hash, idx, nil, &parts, &partsMu, &responseSize, maxBytes)
+		})
+
+		return nil
+	}
+
+	var hash chainhash.Hash
+
+	if _, err := io.ReadFull(body, hash[:]); err != nil {
+		if errors.Is(err, io.EOF) {
+			return c.Blob(http.StatusOK, echo.MIMEOctetStream, nil)
+		}
+
+		return echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error reading request body", err).Error())
+	}
+
+	// firstErr is the read/budget error that stopped the read loop, if any.
+	// It takes priority over waitErr: it is the reason no more hashes were
+	// read, whereas waitErr is whatever a dispatched lookup returned.
+	var firstErr error
+
+	if err := dispatch(hash); err != nil {
+		firstErr = err
+	}
+
+	for firstErr == nil {
+		if gCtx.Err() != nil {
+			// A dispatched lookup already failed, or the client's context was
+			// cancelled: stop reading more hashes from a body that can no
+			// longer produce a successful response.
+			break
+		}
+
+		if _, err := io.ReadFull(body, hash[:]); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
 			}
+
+			firstErr = echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error reading request body", err).Error())
+
+			break
 		}
-
-		maxRecords := h.maxBatchRecords()
-
-		var (
-			partsMu      sync.Mutex
-			parts        [][]byte
-			responseSize atomic.Int64
-			recordsRead  int
-		)
-
-		g, gCtx := errgroup.WithContext(ctx)
-		util.SafeSetLimit(h.logger, g, 1024)
-
-		// dispatch budgets and launches the lookup for a single hash, appending it
-		// its own slot in parts. parts grows one slot per hash actually read, so
-		// it is never presized from a request-supplied count; the mutex guards
-		// both the append and every goroutine's indexed write, since a later
-		// append can reallocate the backing array while an earlier goroutine is
-		// still writing to its slot.
-		dispatch := func(hash chainhash.Hash) error {
-			if maxRecords > 0 && recordsRead >= maxRecords {
-				return errBatchRecords(maxRecords)
-			}
-
-			recordsRead++
-
-			partsMu.Lock()
-			idx := len(parts)
-			parts = append(parts, nil)
-			partsMu.Unlock()
-
-			g.Go(func() (retErr error) {
-				// Echo's middleware.Recover only protects the request goroutine —
-				// not the ones errgroup spawns. The hashes come straight from the
-				// request body, so without this defer a single caller-chosen txid
-				// that panics on serialization (e.g. a tx reconstructed from an
-				// .outputs-only external blob, which carries nil *bt.Output holes)
-				// would crash the asset process.
-				defer func() {
-					if r := recover(); r != nil {
-						h.logger.Errorf("[Asset_http:GetTransactions] recovered panic on %s: %v", hash.String(), r)
-						retErr = echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("internal error getting transaction %s", hash.String()).Error())
-					}
-				}()
-
-				// A sibling lookup has already failed, or the client went away:
-				// skip the work rather than serializing a transaction nobody will
-				// read.
-				if gCtx.Err() != nil {
-					return gCtx.Err()
-				}
-
-				var b []byte
-
-				if tx, ok := transactionFromSubtreeData[hash]; ok {
-					// always write the non-extended normal bytes as a response !
-					// our peer node should extend the transactions if needed
-					b = tx.Bytes()
-				} else {
-					var err error
-
-					b, err = h.repository.GetTransaction(gCtx, &hash)
-					if err != nil {
-						if errors.Is(err, errors.ErrNotFound) || strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "no such file") {
-							return echo.NewHTTPError(http.StatusNotFound, errors.NewNotFoundError("transaction not found", err).Error())
-						} else {
-							return echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error getting transaction", err).Error())
-						}
-					}
-				}
-
-				// Reserve the response-byte budget before storing the result: a
-				// batch that trips the budget on this record must not retain its
-				// bytes in parts.
-				if err := h.enforceBatchResponseBytes("GetTransactions", responseSize.Add(int64(len(b))), h.maxBatchResponseBytes()); err != nil {
-					return err
-				}
-
-				partsMu.Lock()
-				parts[idx] = b
-				partsMu.Unlock()
-
-				return nil
-			})
-
-			return nil
-		}
-
-		// firstErr is the read/budget error that stopped the read loop, if any.
-		// It takes priority over waitErr: it is the reason no more hashes were
-		// read, whereas waitErr is whatever a dispatched lookup returned.
-		var firstErr error
 
 		if err := dispatch(hash); err != nil {
 			firstErr = err
+			break
 		}
-
-		for firstErr == nil {
-			if gCtx.Err() != nil {
-				// A dispatched lookup already failed, or the client's context was
-				// cancelled: stop reading more hashes from a body that can no
-				// longer produce a successful response.
-				break
-			}
-
-			if _, err := io.ReadFull(body, hash[:]); err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				}
-
-				firstErr = echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error reading request body", err).Error())
-
-				break
-			}
-
-			if err := dispatch(hash); err != nil {
-				firstErr = err
-				break
-			}
-		}
-
-		h.observeBatchRecords("GetTransactions", recordsRead)
-
-		waitErr := g.Wait()
-
-		// The map is no longer read past this point, so drop the permit before the
-		// client-paced response write. release is sync.Once-guarded, so the deferred
-		// call above stays safe.
-		releaseSubtreeMap()
-
-		if firstErr != nil {
-			return firstErr
-		}
-
-		if waitErr != nil {
-			h.logger.Errorf("failed to get txs from repository: %s", waitErr.Error())
-			return waitErr
-		}
-
-		responseBytes := concatTransactionBytes(parts)
-
-		prometheusAssetHTTPGetTransactions.WithLabelValues("OK", "200").Add(float64(recordsRead))
-
-		h.logger.Debugf("[Asset_http:GetTransactions] sending %d txs to client (%d bytes)", recordsRead, len(responseBytes))
-
-		return c.Blob(http.StatusOK, echo.MIMEOctetStream, responseBytes)
 	}
+
+	if firstErr != nil {
+		cancel()
+	}
+
+	h.observeBatchRecords("GetTransactions", recordsRead)
+
+	waitErr := g.Wait()
+
+	if firstErr != nil {
+		return firstErr
+	}
+
+	if waitErr != nil {
+		h.logger.Errorf("failed to get txs from repository: %s", waitErr.Error())
+		return waitErr
+	}
+
+	responseBytes := concatTransactionBytes(parts)
+
+	prometheusAssetHTTPGetTransactions.WithLabelValues("OK", "200").Add(float64(recordsRead))
+
+	h.logger.Debugf("[Asset_http:GetTransactions] sending %d txs to client (%d bytes)", recordsRead, len(responseBytes))
+
+	return c.Blob(http.StatusOK, echo.MIMEOctetStream, responseBytes)
 }
 
 // concatTransactionBytes joins the per-record serialized transactions into a
@@ -411,10 +569,15 @@ func (h *HTTP) observeBatchRecords(route string, records int) {
 	}
 }
 
-// catchupResponseBytesPerTx is the conservative per-transaction size used to floor
-// asset_maxBatchResponseBytes at a legitimate maximal catchup batch. It matches the
-// ratio batchResponseWarnBytes already assumes for the default batch size (32MiB /
-// 16384 = 2KiB/tx).
+// catchupResponseBytesPerTx is the per-transaction size used to floor
+// asset_maxBatchResponseBytes at a legitimate catchup batch. It matches the ratio
+// batchResponseWarnBytes already assumes for the default batch size (32MiB / 16384
+// = 2KiB/tx) — an average for small transactions, NOT a conservative (i.e.
+// worst-case) figure. A subtree whose transactions run well above 2KiB (e.g. a
+// chain carrying large data-carrier transactions) can still produce a batch larger
+// than this floor. The floor only guarantees a configured value can't be set below
+// small-transaction traffic; it does not guarantee a configured value is safe for
+// this node's actual transaction sizes. See asset_maxBatchResponseBytes's longdesc.
 const catchupResponseBytesPerTx = 2048
 
 // maxBatchResponseBytes returns the response-byte cap enforced on POST
@@ -424,8 +587,10 @@ const catchupResponseBytesPerTx = 2048
 // peer-catchup path: subtree validation posts subtreevalidation_missingTransactionsBatchSize
 // txids (16384 by default) in one request, each resolving to a full transaction. A
 // 413 there is not retried — it feeds publishInvalidSubtree and demotes an honest
-// peer. The cap is therefore never enforced below the response size a maximal
-// catchup batch can reasonably produce.
+// peer. The cap is therefore never enforced below catchupResponseBytesPerTx's
+// small-transaction estimate; see that constant's doc for why this floor is not a
+// substitute for sizing the setting itself against this chain's actual transaction
+// sizes.
 //
 // POST /utxos is not on the peer-catchup path (see GetUTXOs.go), so it enforces
 // the operator's configured value directly, unfloored, the same as its record
