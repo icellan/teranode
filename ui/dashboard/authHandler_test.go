@@ -383,7 +383,7 @@ func (l *captureLogger) Errorf(format string, args ...interface{}) {
 
 // output returns every recorded line, in the order each level was appended:
 // debug, info, warn, error. Recording order within a level is preserved;
-// order across levels is not, since only per-level buckets are timestamped.
+// order across levels is lost, since each level has its own bucket.
 func (l *captureLogger) output() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -398,9 +398,9 @@ func (l *captureLogger) output() string {
 }
 
 // TestCaptureLogger_DoesNotDoubleRecordInfoAndError — Infof and Errorf must
-// each record a line exactly once. record() already appends to the aggregate
-// l.lines; passing &l.lines as the bucket too (as Infof/Errorf previously did)
-// appends the same line to l.lines twice.
+// each record a line exactly once. They previously appended to a shared
+// aggregate slice both directly and through record(), so every Info/Error line
+// was recorded twice; each level now has its own bucket.
 func TestCaptureLogger_DoesNotDoubleRecordInfoAndError(t *testing.T) {
 	logger := &captureLogger{}
 
