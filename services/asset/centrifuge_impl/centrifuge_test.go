@@ -3135,3 +3135,60 @@ func TestCentrifuge_LogWebsocketMount(t *testing.T) {
 		require.Len(t, logger.messages("Infof"), 1)
 	})
 }
+
+// TestWebsocketHandler_RefusalLogNamesTheCapThatFired pins that a refusal caused
+// by the per-IP cap is logged against asset_maxWebsocketConnectionsPerIP and its
+// limit, not against the global cap, which may be unset or still have room.
+func TestWebsocketHandler_RefusalLogNamesTheCapThatFired(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		messages []string
+		limits   []any
+	)
+
+	node, err := centrifuge.New(centrifuge.Config{
+		LogLevel: centrifuge.LogLevelDebug,
+		LogHandler: func(e centrifuge.LogEntry) {
+			if !strings.Contains(e.Message, "websocket upgrade refused") {
+				return
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			messages = append(messages, e.Message)
+			limits = append(limits, e.Fields["limit"])
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, node.Run())
+
+	t.Cleanup(func() { _ = node.Shutdown(context.Background()) })
+
+	handler := NewWebsocketHandler(node, WebsocketConfig{
+		MaxConnectionsPerIP: 1,
+		ClientIP:            func(_ *http.Request) string { return "203.0.113.7" },
+		CheckOrigin:         func(_ *http.Request) bool { return true },
+	})
+
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	first, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+
+	t.Cleanup(func() { _ = first.Close() })
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.Error(t, err)
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	require.Len(t, messages, 1)
+	require.Contains(t, messages[0], "asset_maxWebsocketConnectionsPerIP")
+	require.Equal(t, 1, limits[0])
+}
