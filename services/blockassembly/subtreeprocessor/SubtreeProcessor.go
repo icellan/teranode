@@ -5933,10 +5933,7 @@ func (stp *SubtreeProcessor) parallelBuildRemainderSubtrees(ctx context.Context,
 		stp.chainedSubtreesTotalSize.Add(oldSubtree.SizeInBytes)
 
 		if stp.diskTxMap != nil {
-			idx := int16(chainedIdx + 1)
-			for _, node := range oldSubtree.Nodes {
-				_ = stp.diskTxMap.UpdateSubtreeIndex(node.Hash, idx)
-			}
+			_ = stp.diskTxMap.UpdateSubtreeIndexBatch(oldSubtree.Nodes, int16(chainedIdx+1))
 		}
 
 		stp.subtreesInBlock++

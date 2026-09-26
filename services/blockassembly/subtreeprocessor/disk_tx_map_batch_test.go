@@ -93,3 +93,28 @@ func TestDiskTxMap_UpdateSubtreeIndexBatchMatchesSingle(t *testing.T) {
 		require.Equal(t, a.SubtreeIndex, b.SubtreeIndex)
 	}
 }
+
+// A batch in which no node has an entry writes nothing and must still leave the
+// map fully usable (it releases its Badger batch rather than abandoning it).
+func TestDiskTxMap_UpdateSubtreeIndexBatchAllMissing(t *testing.T) {
+	m, err := NewDiskTxMap(DiskTxMapOptions{BasePaths: []string{t.TempDir(), t.TempDir()}})
+	require.NoError(t, err)
+
+	defer m.Close()
+
+	missing := []subtreepkg.Node{{Hash: batchTestHash(1)}, {Hash: batchTestHash(2)}}
+	require.NoError(t, m.UpdateSubtreeIndexBatch(missing, 3))
+
+	for _, node := range missing {
+		_, ok := m.Get(node.Hash)
+		require.False(t, ok)
+	}
+
+	inp := subtreepkg.TxInpoints{}
+	m.Set(batchTestHash(1), &inp)
+	require.NoError(t, m.UpdateSubtreeIndexBatch(missing, 3))
+
+	got, ok := m.Get(batchTestHash(1))
+	require.True(t, ok)
+	require.Equal(t, int16(3), got.SubtreeIndex)
+}

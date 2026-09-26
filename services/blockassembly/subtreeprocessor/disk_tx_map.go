@@ -419,6 +419,10 @@ func (m *DiskTxMap) UpdateSubtreeIndex(hash chainhash.Hash, subtreeIndex int16) 
 // UpdateSubtreeIndexBatch sets the SubtreeIndex of every node's entry, like one
 // UpdateSubtreeIndex call per node, but with a single flush and, per disk, one
 // read transaction and one write batch. Nodes without an entry are skipped.
+//
+// Like UpdateSubtreeIndex, it rewrites each value it read, so the caller must
+// not write these entries concurrently (the subtree processor goroutine owns
+// the map).
 func (m *DiskTxMap) UpdateSubtreeIndexBatch(nodes []subtreepkg.Node, subtreeIndex int16) error {
 	if len(nodes) == 0 {
 		return nil
@@ -451,6 +455,11 @@ func (m *DiskTxMap) updateSubtreeIndexOnDisk(diskIdx int, nodes []subtreepkg.Nod
 	store := m.disks[diskIdx].store
 	wb := store.NewWriteBatch()
 
+	// Always release the batch: tempstore's Flush opens a fresh Badger batch,
+	// and an abandoned one pins Badger's read watermark for the life of the
+	// store, retaining every later commit's conflict keys.
+	defer wb.Cancel()
+
 	err := store.GetEach(len(idxs), func(i int) []byte {
 		return nodes[idxs[i]].Hash[:]
 	}, func(i int, val []byte) error {
@@ -466,7 +475,6 @@ func (m *DiskTxMap) updateSubtreeIndexOnDisk(diskIdx int, nodes []subtreepkg.Nod
 		return wb.Set(nodes[idxs[i]].Hash[:], updated)
 	})
 	if err != nil {
-		wb.Cancel()
 		return errors.NewStorageError("updating subtree index on disk %d", diskIdx, err)
 	}
 
