@@ -372,7 +372,7 @@ func TestResolveHeavyBurst(t *testing.T) {
 		{name: "configured above the floor is kept", configured: 64, floor: 32, rate: 10, want: 64, wantWarn: false},
 		{name: "configured equal to the floor is kept", configured: 32, floor: 32, rate: 10, want: 32, wantWarn: false},
 		{name: "no floor keeps the configured value", configured: 8, floor: 0, rate: 10, want: 8, wantWarn: false},
-		{name: "floor above 4x rate is clamped before being applied", configured: 0, floor: 100, rate: 10, want: 40, wantWarn: false},
+		{name: "floor above 4x rate is clamped, and warns because the burst no longer covers the fan-out", configured: 0, floor: 100, rate: 10, want: 40, wantWarn: true},
 		{name: "configured above the clamped floor is kept, no warn", configured: 50, floor: 100, rate: 10, want: 50, wantWarn: false},
 		{name: "configured below the clamped floor is respected and warns against the clamped value", configured: 20, floor: 100, rate: 10, want: 20, wantWarn: true},
 	}
