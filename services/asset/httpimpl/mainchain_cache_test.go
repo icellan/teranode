@@ -149,6 +149,34 @@ func TestMainChainCache_BelowWindowFillPanicReturnsErrorToWaiters(t *testing.T) 
 	bcMock.AssertExpectations(t)
 }
 
+// TestMainChainCache_WriteBackPanicDoesNotLeaveMutexLocked pins a defect in the panic
+// recovery itself: the below-window write-back took c.mu.Lock() and released it with a
+// plain statement, not a defer. Now that a panic in the fill is recovered instead of
+// crashing the process, a panic between Lock and that plain Unlock would leave mu locked
+// forever, deadlocking every subsequent lookup instead of taking the process down.
+func TestMainChainCache_WriteBackPanicDoesNotLeaveMutexLocked(t *testing.T) {
+	bcMock := &blockchain.Mock{}
+	c := populatedCache(t, bcMock)
+
+	bcMock.On("CheckBlockIsInCurrentChain", mock.Anything, []uint32{7}).Return(true, nil).Once()
+
+	// Force the write-back's map assignment to panic (assignment to a nil map) while
+	// the generation guard would otherwise let it through.
+	c.mu.Lock()
+	c.oldCache = nil
+	c.mu.Unlock()
+
+	_, err := c.IsOnMainChain(context.Background(), 7, 50)
+	require.Error(t, err)
+
+	locked := c.mu.TryLock()
+	require.True(t, locked, "mu must not stay locked after a panic during the write-back")
+
+	if locked {
+		c.mu.Unlock()
+	}
+}
+
 func TestMainChainCache_AboveWindowFallbackUncached(t *testing.T) {
 	bcMock := &blockchain.Mock{}
 	c := populatedCache(t, bcMock)

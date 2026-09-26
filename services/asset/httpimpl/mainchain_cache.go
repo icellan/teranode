@@ -293,6 +293,23 @@ func (c *mainChainCache) invalidate() {
 	c.mu.Unlock()
 }
 
+// cacheOldEntry writes onChain into oldCache under the generation guard, using a
+// deferred unlock so a panic during the write — the fill closure recovers panics and
+// turns them into an error rather than crashing the process — cannot leave mu locked
+// forever and deadlock every subsequent lookup.
+func (c *mainChainCache) cacheOldEntry(blockID uint32, gen uint64, onChain bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Generation guard: only cache if no invalidation/rebuild happened while the RPC
+	// was in flight; the result may describe the pre-reorg chain. Size cap: skip
+	// caching when full rather than evicting — overflow IDs just pay the RPC each
+	// time.
+	if c.generation == gen && c.windowHealthy && len(c.oldCache) < maxOldCacheEntries {
+		c.oldCache[blockID] = onChain
+	}
+}
+
 // blockRootsCache returns the per-block merkle-proof root cache, tolerating a
 // nil receiver so callers need no wiring check.
 func (c *mainChainCache) blockRootsCache() *blockRootsCache {
@@ -368,15 +385,7 @@ func (c *mainChainCache) IsOnMainChain(ctx context.Context, blockID, blockHeight
 			return false, err
 		}
 
-		c.mu.Lock()
-		// Generation guard: only cache if no invalidation/rebuild happened while
-		// the RPC was in flight; the result may describe the pre-reorg chain.
-		// Size cap: skip caching when full rather than evicting — overflow IDs
-		// just pay the RPC each time.
-		if c.generation == gen && c.windowHealthy && len(c.oldCache) < maxOldCacheEntries {
-			c.oldCache[blockID] = onChain
-		}
-		c.mu.Unlock()
+		c.cacheOldEntry(blockID, gen, onChain)
 		return onChain, nil
 	})
 
