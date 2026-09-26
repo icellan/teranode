@@ -634,16 +634,28 @@ func (c *Centrifuge) logWebsocketMount(addr string) {
 // is actually served on does not, which is exactly the misleading case.
 func namesNarrowerInterface(addr, servedOn string) bool {
 	addrHost, _, err := net.SplitHostPort(addr)
-	if err != nil || addrHost == "" {
+	if err != nil || isWildcardHost(addrHost) {
 		return false
 	}
 
 	servedHost, _, err := net.SplitHostPort(servedOn)
-	if err != nil {
+	if err != nil || isWildcardHost(servedHost) {
 		servedHost = ""
 	}
 
 	return !strings.EqualFold(addrHost, servedHost)
+}
+
+// isWildcardHost reports whether host is any spelling of the all-interfaces
+// address: empty, 0.0.0.0 or ::.
+func isWildcardHost(host string) bool {
+	if host == "" {
+		return true
+	}
+
+	ip := net.ParseIP(host)
+
+	return ip != nil && ip.IsUnspecified()
 }
 
 // Stop gracefully shuts down the Centrifuge server.

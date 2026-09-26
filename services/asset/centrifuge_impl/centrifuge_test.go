@@ -3192,3 +3192,26 @@ func TestWebsocketHandler_RefusalLogNamesTheCapThatFired(t *testing.T) {
 	require.Contains(t, messages[0], "asset_maxWebsocketConnectionsPerIP")
 	require.Equal(t, 1, limits[0])
 }
+
+// TestNamesNarrowerInterface pins that every spelling of the wildcard address
+// (empty host, 0.0.0.0, ::) counts as the wildcard, so it is not reported as
+// narrowing the interface, while a specific host that differs from what the
+// socket serves on is.
+func TestNamesNarrowerInterface(t *testing.T) {
+	tests := []struct {
+		addr, servedOn string
+		want           bool
+	}{
+		{":8892", ":8090", false},
+		{"0.0.0.0:8892", ":8090", false},
+		{"[::]:8892", ":8090", false},
+		{"0.0.0.0:8892", "127.0.0.1:8090", false},
+		{"127.0.0.1:8892", "127.0.0.1:8090", false},
+		{"localhost:8892", ":8090", true},
+		{"127.0.0.1:8892", "0.0.0.0:8090", true},
+	}
+
+	for _, tt := range tests {
+		require.Equal(t, tt.want, namesNarrowerInterface(tt.addr, tt.servedOn), "%s served on %s", tt.addr, tt.servedOn)
+	}
+}
