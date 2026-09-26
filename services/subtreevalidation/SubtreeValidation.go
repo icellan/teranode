@@ -333,9 +333,9 @@ func (u *Server) getMissingTransactionsBatch(ctx context.Context, subtreeHash ch
 	// errgroup, or service shutdown - is not the peer's fault and must not be reported
 	// as one. Checked explicitly against the caller's ctx, both before the fetch (an
 	// already-cancelled ctx must not even reach the peer) and after a failed one
-	// (cancellation mid-flight): relying on publishInvalidSubtree's GetFSMCurrentState
-	// call to fail on the same cancelled ctx to suppress the report would be implicit,
-	// and is skipped entirely when blockchainClient is nil.
+	// (cancellation mid-flight), and again on a failed body read below. Nothing
+	// downstream suppresses the report: blockchain.Client.GetFSMCurrentState returns a
+	// cached state without looking at ctx.
 	if ctx.Err() != nil {
 		return nil, errors.NewContextCanceledError("[getMissingTransactionsBatch][%s] aborted", subtreeHash.String(), ctx.Err())
 	}
@@ -364,6 +364,13 @@ func (u *Server) getMissingTransactionsBatch(ctx context.Context, subtreeHash ch
 			if errors.Is(err, io.EOF) {
 				break
 			}
+
+			// Our own cancellation can also surface here, mid-body-read; that is not
+			// the peer serving bad data.
+			if ctx.Err() != nil {
+				return nil, errors.NewContextCanceledError("[getMissingTransactionsBatch][%s] aborted", subtreeHash.String(), ctx.Err())
+			}
+
 			// Malformed transaction data from peer - report as invalid subtree
 			u.publishInvalidSubtree(ctx, subtreeHash.String(), baseURL, peerID, "malformed_transaction_data")
 			// Not recoverable, returning processing error
