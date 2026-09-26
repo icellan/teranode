@@ -77,7 +77,8 @@ func TestGetTxMetaByTxID(t *testing.T) {
 		require.True(t, errors.As(err, &echoErr))
 
 		assert.Equal(t, http.StatusNotFound, echoErr.Code)
-		assert.Contains(t, echoErr.Message, "txmeta_raw is disabled")
+		// Indistinguishable from an unregistered route: echo's own not-found error.
+		require.Equal(t, echo.ErrNotFound.Message, echoErr.Message)
 	})
 
 	t.Run("invalid utxostore URL - GetAerospikeClient error", func(t *testing.T) {

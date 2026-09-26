@@ -162,9 +162,11 @@ func (h *HTTP) GetTxMetaByTxID(mode ReadMode) func(c echo.Context) error {
 		defer deferFn()
 
 		// This route serves the raw store record. An operator who does not need
-		// it can take it off the public surface without a redeploy.
+		// it can take it off the public surface without a redeploy. Answer with
+		// echo's own not-found error so a disabled route can't be told apart
+		// from an unregistered one.
 		if !h.settings.Asset.TxMetaRawEnabled {
-			return echo.NewHTTPError(http.StatusNotFound, "txmeta_raw is disabled")
+			return echo.ErrNotFound
 		}
 
 		// get
