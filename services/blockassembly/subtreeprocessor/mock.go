@@ -212,8 +212,30 @@ func (m *MockSubtreeProcessor) AddDirectly(node *subtree.Node, txInpoints *subtr
 	return args.Error(0)
 }
 
+// AddDirectlyReportOnly implements Interface.AddDirectlyReportOnly
+func (m *MockSubtreeProcessor) AddDirectlyReportOnly(node *subtree.Node, txInpoints *subtree.TxInpoints, skipNotification bool) error {
+	args := m.Called(node, txInpoints, skipNotification)
+
+	if args.Get(0) == nil {
+		return nil
+	}
+
+	return args.Error(0)
+}
+
 // AddNodesDirectly implements Interface.AddNodesDirectly
 func (m *MockSubtreeProcessor) AddNodesDirectly(txs []*utxostore.UnminedTransaction, skipNotification bool) error {
+	args := m.Called(txs, skipNotification)
+
+	if args.Get(0) == nil {
+		return nil
+	}
+
+	return args.Error(0)
+}
+
+// AddNodesDirectlyReportOnly implements Interface.AddNodesDirectlyReportOnly
+func (m *MockSubtreeProcessor) AddNodesDirectlyReportOnly(txs []*utxostore.UnminedTransaction, skipNotification bool) error {
 	args := m.Called(txs, skipNotification)
 
 	if args.Get(0) == nil {

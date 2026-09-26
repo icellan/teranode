@@ -915,9 +915,33 @@ func (ba *BlockAssembly) storeSubtreeData(ctx context.Context, subtreeRequest su
 			defer close(metaDoneCh)
 			subtreeMeta := subtreepkg.NewSubtreeMeta(subtreeRequest.Subtree)
 
+			// DiskTxMap satisfies this so a read error here is returned to us
+			// instead of being recorded on the map, where it would be
+			// misattributed to whichever subtree processor operation happens to
+			// check the map's pending error next (this runs in a background
+			// goroutine, concurrently with the processor).
+			parentTxMapWithErr, parentTxMapSupportsErr := subtreeRequest.ParentTxMap.(interface {
+				GetWithErr(hash chainhash.Hash) (*subtreepkg.TxInpoints, bool, error)
+			})
+
 			for idx, node := range subtreeRequest.Subtree.Nodes {
 				if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-					txInpoints, found := subtreeRequest.ParentTxMap.Get(node.Hash)
+					var (
+						txInpoints *subtreepkg.TxInpoints
+						found      bool
+					)
+
+					if parentTxMapSupportsErr {
+						var getErr error
+
+						txInpoints, found, getErr = parentTxMapWithErr.GetWithErr(node.Hash)
+						if getErr != nil {
+							ba.logger.Errorf("[BlockAssembly:storeSubtreeData][%s] error reading parent tx hashes for node %s: %s", subtreeRequest.Subtree.RootHash().String(), node.Hash.String(), getErr)
+						}
+					} else {
+						txInpoints, found = subtreeRequest.ParentTxMap.Get(node.Hash)
+					}
+
 					if !found && subtreeRequest.DeletedTxs != nil {
 						// Fallback: check if transaction was deleted during async storage
 						var deletedTxInpoints subtreepkg.TxInpoints

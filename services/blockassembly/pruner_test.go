@@ -66,7 +66,7 @@ func TestCleanupDuringStartup(t *testing.T) {
 		ba.setBestBlockHeader(nil, 100)
 
 		// Call loadUnminedTransactions which includes cleanup
-		err := ba.loadUnminedTransactions(ctx)
+		err := ba.loadUnminedTransactions(ctx, false)
 
 		require.NoError(t, err)
 		assert.True(t, iteratorCalled)
@@ -142,7 +142,7 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 		ba.setBestBlockHeader(nil, 100)
 
 		// Call loadUnminedTransactions
-		err := ba.loadUnminedTransactions(ctx)
+		err := ba.loadUnminedTransactions(ctx, false)
 
 		require.NoError(t, err)
 		mockStore.AssertExpectations(t)

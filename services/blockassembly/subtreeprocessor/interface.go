@@ -85,6 +85,14 @@ type Interface interface {
 	// Note: This method bypasses the normal queue processing and should be used
 	AddDirectly(node *subtreepkg.Node, txInpoints *subtreepkg.TxInpoints, skipNotification bool) error
 
+	// AddDirectlyReportOnly behaves like AddDirectly, except a disk tx map
+	// error pending after the node has otherwise been placed successfully is
+	// logged and counted rather than failing the call. Use this instead of
+	// AddDirectly when the caller runs after a commit that cannot be rolled
+	// back (e.g. reset's postProcess reload), where failing on a pending map
+	// error would incorrectly report an already-committed operation as failed.
+	AddDirectlyReportOnly(node *subtreepkg.Node, txInpoints *subtreepkg.TxInpoints, skipNotification bool) error
+
 	// AddNodesDirectly adds a batch of unmined transactions directly to the processor without going through the queue.
 	// It performs parallel filtering/insertion into currentTxMap and sequential insertion into subtrees.
 	// This bypasses the queue and is useful for bulk loading transactions at startup.
@@ -96,6 +104,11 @@ type Interface interface {
 	// Returns:
 	//   - error: Any error encountered during addition
 	AddNodesDirectly(txs []*utxostore.UnminedTransaction, skipNotification bool) error
+
+	// AddNodesDirectlyReportOnly is the batch counterpart of
+	// AddDirectlyReportOnly: same load, but a pending disk tx map error is
+	// logged and counted instead of failing the call.
+	AddNodesDirectlyReportOnly(txs []*utxostore.UnminedTransaction, skipNotification bool) error
 
 	// GetCurrentRunningState returns the current operational state of the processor.
 	// This provides visibility into whether the processor is running, stopped,

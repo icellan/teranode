@@ -40,11 +40,20 @@ type writeEntry struct {
 	batch     *[]writeEntry // non-nil = several writes in one message (pointer keeps the channel element small)
 }
 
+// shardBatch is the writer's pending Badger batch; tempstore.WriteBatch
+// implements it.
+type shardBatch interface {
+	Set(key, value []byte) error
+	Flush() error
+	Cancel()
+}
+
 // diskShard is one Badger instance on a single disk, with its own writer goroutine.
 // Multiple disk shards across physical disks give linear I/O scaling.
 type diskShard struct {
 	store        *tempstore.BadgerTempStore
-	batch        *tempstore.WriteBatch
+	batch        shardBatch
+	newBatch     func() shardBatch // creates a fresh batch against the current store; recreated by Clear
 	writeCh      chan writeEntry
 	done         chan struct{}
 	path         string
@@ -75,6 +84,75 @@ type DiskTxMap struct {
 	prefix         string
 	capacity       uint
 	filterMemBytes int64 // total cuckoo filter memory, computed once at construction
+
+	// errMu guards err, the first storage error since the last TakeErr. Map
+	// operations have no error return and writes are asynchronous, so failures
+	// are recorded here and surfaced by the subtree processor.
+	errMu sync.Mutex
+	err   error
+
+	// closeWarnMu guards closeWarn: a benign cleanup failure closing a
+	// generation Clear has already successfully rotated away from. The
+	// rotation and the data are both fine - only the discarded generation's
+	// directory is left behind - so this is kept separate from err/recordErr,
+	// which would fail the caller's operation. See TakeCloseWarn.
+	closeWarnMu sync.Mutex
+	closeWarn   error
+}
+
+// recordCloseWarn keeps closeWarn if no earlier warning is pending, the same
+// take-once contract as recordErr/TakeErr but for a warning that must never
+// fail an operation.
+func (m *DiskTxMap) recordCloseWarn(err error) {
+	if err == nil {
+		return
+	}
+
+	m.closeWarnMu.Lock()
+	if m.closeWarn == nil {
+		m.closeWarn = err
+	}
+	m.closeWarnMu.Unlock()
+}
+
+// TakeCloseWarn returns, and clears, the first Close warning recorded since
+// the last call. Callers that rotate this map (Clear) should check this
+// afterward and log/count it - never fail on it, since by the time Clear
+// records one, the rotation itself has already succeeded.
+func (m *DiskTxMap) TakeCloseWarn() error {
+	m.closeWarnMu.Lock()
+	defer m.closeWarnMu.Unlock()
+
+	err := m.closeWarn
+	m.closeWarn = nil
+
+	return err
+}
+
+// recordErr keeps err if no earlier error is pending.
+func (m *DiskTxMap) recordErr(err error) {
+	if err == nil {
+		return
+	}
+
+	m.errMu.Lock()
+	if m.err == nil {
+		m.err = err
+	}
+	m.errMu.Unlock()
+}
+
+// TakeErr returns the first storage error recorded since the last call, and
+// clears it. A non-nil error means earlier writes, reads or deletes did not
+// reach disk; writes in a failed flush are lost.
+func (m *DiskTxMap) TakeErr() error {
+	m.errMu.Lock()
+	defer m.errMu.Unlock()
+
+	err := m.err
+	m.err = nil
+
+	return err
 }
 
 // DiskTxMapOptions configures the DiskTxMap.
@@ -146,12 +224,13 @@ func NewDiskTxMap(opts DiskTxMapOptions) (*DiskTxMap, error) {
 		}
 
 		m.disks[i] = diskShard{
-			store:   store,
-			batch:   store.NewWriteBatch(),
-			writeCh: make(chan writeEntry, writeChBuffer/len(paths)),
-			done:    make(chan struct{}),
-			path:    path,
-			prefix:  fmt.Sprintf("%s-disk%d", prefix, i),
+			store:    store,
+			batch:    store.NewWriteBatch(),
+			newBatch: func() shardBatch { return store.NewWriteBatch() },
+			writeCh:  make(chan writeEntry, writeChBuffer/len(paths)),
+			done:     make(chan struct{}),
+			path:     path,
+			prefix:   fmt.Sprintf("%s-disk%d", prefix, i),
 
 			pending:    semaphore.NewWeighted(pendingPerDisk),
 			pendingCap: pendingPerDisk,
@@ -185,7 +264,7 @@ func (m *DiskTxMap) writerLoop(diskIdx int) {
 	for entry := range d.writeCh {
 		if entry.flushDone != nil {
 			if pending > 0 {
-				_ = d.batch.Flush()
+				m.flushBatch(diskIdx)
 				m.clearRecentMapsForDisk(diskIdx)
 				pending = 0
 			}
@@ -197,7 +276,7 @@ func (m *DiskTxMap) writerLoop(diskIdx int) {
 			entries := *entry.batch
 			for i := range entries {
 				value := serializeTxMapValue(entries[i].inpoints)
-				_ = d.batch.Set(entries[i].key[:], value)
+				m.recordSetErr(diskIdx, d.batch.Set(entries[i].key[:], value))
 				atomic.AddInt64(&d.bytesWritten, int64(chainhash.HashSize+len(value)))
 			}
 
@@ -205,23 +284,53 @@ func (m *DiskTxMap) writerLoop(diskIdx int) {
 			d.pending.Release(int64(len(entries)))
 		} else {
 			value := serializeTxMapValue(entry.inpoints)
-			_ = d.batch.Set(entry.key[:], value)
+			m.recordSetErr(diskIdx, d.batch.Set(entry.key[:], value))
 			atomic.AddInt64(&d.bytesWritten, int64(chainhash.HashSize+len(value)))
 			pending++
 		}
 
 		if pending >= writerFlushThreshold {
-			_ = d.batch.Flush()
+			m.flushBatch(diskIdx)
 			m.clearRecentMapsForDisk(diskIdx)
 			pending = 0
 		}
 	}
 
 	if pending > 0 {
-		_ = d.batch.Flush()
+		m.flushBatch(diskIdx)
 		m.clearRecentMapsForDisk(diskIdx)
 	}
 	close(d.done)
+}
+
+// flushBatch flushes the disk's pending batch and records any error. A failed
+// Badger batch stays failed - Badger keeps the commit error and marks the
+// batch finished, so every subsequent Set/Flush on it fails too - so on error
+// this cancels it and installs a fresh one from newBatch, recovering the shard
+// for later writes instead of failing every write until the next Clear
+// rotation happens to succeed.
+func (m *DiskTxMap) flushBatch(diskIdx int) {
+	d := &m.disks[diskIdx]
+
+	err := d.batch.Flush()
+	m.recordFlushErr(diskIdx, err)
+
+	if err != nil {
+		d.batch.Cancel()
+		d.batch = d.newBatch()
+	}
+}
+
+func (m *DiskTxMap) recordSetErr(diskIdx int, err error) {
+	if err != nil {
+		m.recordErr(errors.NewStorageError("disk tx map: queueing write on disk %d", diskIdx, err))
+	}
+}
+
+func (m *DiskTxMap) recordFlushErr(diskIdx int, err error) {
+	if err != nil {
+		m.recordErr(errors.NewStorageError("disk tx map: writing batch on disk %d", diskIdx, err))
+	}
 }
 
 // diskOf returns the disk shard index for a hash.
@@ -327,7 +436,11 @@ func (m *DiskTxMap) Delete(hash chainhash.Hash) bool {
 
 	diskIdx := m.diskOf(hash)
 	m.flushDisk(diskIdx)
-	_ = m.disks[diskIdx].store.Delete(hash[:])
+
+	if err := m.disks[diskIdx].store.Delete(hash[:]); err != nil {
+		m.recordErr(errors.NewStorageError("disk tx map: deleting %s on disk %d", hash, diskIdx, err))
+	}
+
 	m.count.Add(-1)
 	return true
 }
@@ -426,6 +539,8 @@ func (m *DiskTxMap) Clear() {
 				_ = created.Close()
 			}
 
+			m.recordErr(errors.NewStorageError("disk tx map: rotating store on disk %d", i, err))
+
 			return
 		}
 
@@ -447,9 +562,19 @@ func (m *DiskTxMap) Clear() {
 	for i := range m.disks {
 		d := &m.disks[i]
 		d.batch.Cancel()
-		_ = d.store.Close()
-		d.store = replacements[i]
-		d.batch = replacements[i].NewWriteBatch()
+
+		if err := d.store.Close(); err != nil {
+			// Rotation for every disk already succeeded by this point (the
+			// replacement loop above returns early on any failure) - this is
+			// a leaked directory from the discarded generation, not a data
+			// problem, so it must not fail the caller. See TakeCloseWarn.
+			m.recordCloseWarn(errors.NewStorageError("disk tx map: closing previous generation on disk %d", i, err))
+		}
+
+		store := replacements[i]
+		d.store = store
+		d.batch = store.NewWriteBatch()
+		d.newBatch = func() shardBatch { return store.NewWriteBatch() }
 	}
 
 	m.count.Store(0)
@@ -484,7 +609,11 @@ func (m *DiskTxMap) UpdateSubtreeIndex(hash chainhash.Hash, subtreeIndex int16) 
 
 	d := &m.disks[m.diskOf(hash)]
 	val, err := d.store.Get(hash[:])
-	if err != nil || val == nil {
+	if err != nil {
+		return errors.NewStorageError("disk tx map: reading %s for subtree index update", hash.String(), err)
+	}
+
+	if val == nil {
 		return errors.NewNotFoundError("entry not found for hash %s", hash.String())
 	}
 
@@ -601,17 +730,55 @@ func (m *DiskTxMap) clearRecentMapsForDisk(diskIdx int) {
 	}
 }
 
-// getFromStore retrieves and deserializes TxInpoints from the correct disk shard.
+// getFromStore retrieves and deserializes TxInpoints from the correct disk
+// shard, recording any read error on the map for a later operation boundary
+// to report.
 func (m *DiskTxMap) getFromStore(hash chainhash.Hash) *subtreepkg.TxInpoints {
+	inpoints, err := m.getFromStoreOrErr(hash)
+	if err != nil {
+		m.recordErr(err)
+		return nil
+	}
+
+	return inpoints
+}
+
+// getFromStoreOrErr is getFromStore without the side effect of recording the
+// error on the map. Used by GetWithErr, whose callers run concurrently with
+// processor operations (e.g. the async subtree storer) and must handle their
+// own read errors rather than have them land on whichever operation happens
+// to check the map's pending error next.
+func (m *DiskTxMap) getFromStoreOrErr(hash chainhash.Hash) (*subtreepkg.TxInpoints, error) {
 	diskIdx := m.diskOf(hash)
 	m.flushDisk(diskIdx)
 
 	val, err := m.disks[diskIdx].store.Get(hash[:])
-	if err != nil || val == nil {
-		return nil
+	if err != nil {
+		return nil, errors.NewStorageError("disk tx map: reading %s on disk %d", hash, diskIdx, err)
 	}
 
-	return deserializeTxMapValue(val)
+	if val == nil {
+		return nil, nil
+	}
+
+	return deserializeTxMapValue(val), nil
+}
+
+// GetWithErr behaves like Get but returns the read error to the caller instead
+// of recording it on the map. Callers that run concurrently with processor
+// operations must use this so a read error they cause is not misattributed to
+// whichever operation next checks the map's pending error.
+func (m *DiskTxMap) GetWithErr(hash chainhash.Hash) (*subtreepkg.TxInpoints, bool, error) {
+	inpoints, err := m.getFromStoreOrErr(hash)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if inpoints == nil {
+		return nil, false, nil
+	}
+
+	return inpoints, true, nil
 }
 
 // shardOf returns the filter shard index for a hash.

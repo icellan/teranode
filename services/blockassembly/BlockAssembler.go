@@ -775,7 +775,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 	// in the for/select in the subtreeprocessor
 	postProcessFn := func() error {
 		// reload the unmined transactions
-		if err = b.loadUnminedTransactions(ctx, shouldValidateInputs); err != nil {
+		if err = b.loadUnminedTransactions(ctx, true, shouldValidateInputs); err != nil {
 			return errors.NewProcessingError("[Reset] error loading unmined transactions", err)
 		}
 
@@ -1230,7 +1230,7 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 	b.replayPendingConflictIntents(ctx)
 
 	// Load unmined transactions (this includes cleanup of old unmined transactions first)
-	if err = b.loadUnminedTransactions(ctx); err != nil {
+	if err = b.loadUnminedTransactions(ctx, false); err != nil {
 		// we cannot start block assembly if we have not loaded unmined transactions successfully
 		return errors.NewStorageError("[BlockAssembler] failed to load un-mined transactions: %v", err)
 	}
@@ -2975,7 +2975,17 @@ func (b *BlockAssembler) fixUnminedSinceInconsistencies(ctx context.Context) err
 // Called from:
 //   - reset() as postProcessFn (after reorg processing)
 //   - Startup initialization
-func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateInputs ...bool) (err error) {
+//
+// isReload distinguishes the two: true when called from reset's postProcess,
+// false for the startup load. reset has already committed its state change
+// (maps cleared, header at the target tip) by the time postProcess runs, so a
+// disk tx map error surfacing during this reload cannot be rolled back - it
+// is logged and counted (via AddDirectlyReportOnly/AddNodesDirectlyReportOnly)
+// rather than failing the reload, matching reset's own commit-point handling.
+// The startup load has no such commit to protect, so it keeps failing on a
+// pending map error (AddDirectly/AddNodesDirectly): the map may be partially
+// populated, and a restart reloads it.
+func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload bool, validateInputs ...bool) (err error) {
 	shouldValidateInputs := len(validateInputs) > 0 && validateInputs[0]
 
 	_, _, deferFn := tracing.Tracer("blockassembly").Start(ctx, "loadUnminedTransactions",
@@ -3005,7 +3015,7 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 	// 2. OnRestartValidateParentChain is false (parent validation requires in-memory for small datasets)
 	if b.settings.BlockAssembly.UnminedTxDiskSortEnabled && !b.settings.BlockAssembly.OnRestartValidateParentChain {
 		b.logger.Infof("[loadUnminedTransactions] using disk-based sorting to reduce RAM usage")
-		return b.loadUnminedTransactionsWithDiskSort(ctx)
+		return b.loadUnminedTransactionsWithDiskSort(ctx, isReload)
 	}
 
 	// Wait for the unmined_since index to be ready before attempting to get the iterator
@@ -3308,7 +3318,12 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 
 			// Pass slice segment directly - no copy needed
 			batch := unminedTransactions[start:end]
-			if err = b.subtreeProcessor.AddNodesDirectly(batch, true); err != nil {
+			if isReload {
+				err = b.subtreeProcessor.AddNodesDirectlyReportOnly(batch, true)
+			} else {
+				err = b.subtreeProcessor.AddNodesDirectly(batch, true)
+			}
+			if err != nil {
 				return errors.NewProcessingError("error adding unmined transactions batch to subtree processor", err)
 			}
 
@@ -3328,7 +3343,12 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, validateIn
 	} else {
 		// Sequential mode: use AddDirectly for each transaction
 		for idx, unminedTransaction := range unminedTransactions {
-			if err = b.subtreeProcessor.AddDirectly(unminedTransaction.Node, unminedTransaction.TxInpoints, true); err != nil {
+			if isReload {
+				err = b.subtreeProcessor.AddDirectlyReportOnly(unminedTransaction.Node, unminedTransaction.TxInpoints, true)
+			} else {
+				err = b.subtreeProcessor.AddDirectly(unminedTransaction.Node, unminedTransaction.TxInpoints, true)
+			}
+			if err != nil {
 				return errors.NewProcessingError("error adding unmined transaction to subtree processor", err)
 			}
 
@@ -3576,7 +3596,11 @@ func (b *BlockAssembler) CheckInputValidation(ctx context.Context) (int, error) 
 // 2. Keeps only minimal sort entries (12 bytes each) in memory
 // 3. Sorts in memory by CreatedAt
 // 4. Reads back from disk in sorted order
-func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context) error {
+//
+// isReload has the same meaning as in loadUnminedTransactions: true when this
+// is reset's postProcess reload (report-only on a disk tx map error), false
+// for the startup load (fail on one).
+func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context, isReload bool) error {
 	scanHeaders := uint64(1000)
 
 	// Wait for the unmined_since index to be ready
@@ -3815,7 +3839,12 @@ func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context
 			return errors.NewProcessingError("error deserializing unmined transaction", deserErr)
 		}
 
-		if err = b.subtreeProcessor.AddDirectly(unminedTx.Node, unminedTx.TxInpoints, true); err != nil {
+		if isReload {
+			err = b.subtreeProcessor.AddDirectlyReportOnly(unminedTx.Node, unminedTx.TxInpoints, true)
+		} else {
+			err = b.subtreeProcessor.AddDirectly(unminedTx.Node, unminedTx.TxInpoints, true)
+		}
+		if err != nil {
 			return errors.NewProcessingError("error adding unmined transaction to subtree processor", err)
 		}
 
