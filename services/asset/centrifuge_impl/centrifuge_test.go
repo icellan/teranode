@@ -656,6 +656,131 @@ func TestCentrifuge_WebsocketOriginEnforced(t *testing.T) {
 	}
 }
 
+// TestCentrifuge_WebsocketPerIPCapUsesHTTPServerClientIP drives real upgrades
+// through the handler Start mounts (registerHTTPHandlers) and proves
+// websocketHTTPHandler wires WebsocketConfig.ClientIP to the real
+// httpimpl.HTTP.ClientIP (via c.httpServer.ClientIP), which is echo's RealIP:
+// XFF-aware behind a trusted proxy, and not just the raw RemoteAddr. If the
+// wiring regressed to a RemoteAddr-only fallback (or to no ClientIP func at
+// all), every client in this test shares the same loopback RemoteAddr and
+// would collapse onto one per-IP key.
+func TestCentrifuge_WebsocketPerIPCapUsesHTTPServerClientIP(t *testing.T) {
+	newServer := func(t *testing.T, trustedProxyCIDRs string) *httptest.Server {
+		t.Helper()
+
+		logger := ulogger.TestLogger{}
+		tSettings := &settings.Settings{
+			Asset: settings.AssetSettings{
+				HTTPAddress:                  "http://localhost:8080",
+				TrustedProxyCIDRs:            trustedProxyCIDRs,
+				MaxWebsocketConnectionsPerIP: 1,
+			},
+		}
+
+		mockHTTP, err := httpimpl.New(logger, tSettings, &repository.Repository{}, nil)
+		require.NoError(t, err)
+
+		c, err := New(logger, tSettings, nil, mockHTTP)
+		require.NoError(t, err)
+		require.NoError(t, c.Init(context.Background()))
+		t.Cleanup(func() { _ = c.centrifugeNode.Shutdown(context.Background()) })
+
+		c.statusMutex.Lock()
+		c.cachedCurrentNodeStatus = &notificationMsg{Type: "node_status", PeerID: "test"}
+		c.currentNodePeerID = "test"
+		c.statusMutex.Unlock()
+
+		reg := &recordingRegistrar{}
+		c.registerHTTPHandlers(reg)
+		require.Contains(t, reg.handlers, "/connection/websocket")
+
+		server := httptest.NewServer(reg.handlers["/connection/websocket"])
+		t.Cleanup(server.Close)
+
+		return server
+	}
+
+	dial := func(server *httptest.Server, xForwardedFor string) (*websocket.Conn, *http.Response, error) {
+		header := http.Header{}
+		if xForwardedFor != "" {
+			header.Set("X-Forwarded-For", xForwardedFor)
+		}
+
+		return websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), header)
+	}
+
+	t.Run("a trusted proxy's X-Forwarded-For separates two clients into their own per-IP slot", func(t *testing.T) {
+		// Default (empty) asset_trustedProxyCIDRs still trusts loopback, which is
+		// where httptest.Server's RemoteAddr always is - matching echo's own
+		// documented RealIP default.
+		server := newServer(t, "")
+
+		first, _, err := dial(server, "203.0.113.1")
+		require.NoError(t, err)
+		defer func() { _ = first.Close() }()
+
+		second, _, err := dial(server, "203.0.113.2")
+		require.NoError(t, err, "a different X-Forwarded-For client IP must get its own per-IP slot, not share the RemoteAddr-based one")
+		defer func() { _ = second.Close() }()
+	})
+
+	t.Run("the same client IP twice still hits its own per-IP cap", func(t *testing.T) {
+		server := newServer(t, "")
+
+		first, _, err := dial(server, "203.0.113.1")
+		require.NoError(t, err)
+		defer func() { _ = first.Close() }()
+
+		refused, resp, err := dial(server, "203.0.113.1")
+		if refused != nil {
+			_ = refused.Close()
+		}
+
+		require.Error(t, err)
+		require.NotNil(t, resp)
+		require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	})
+
+	// The next two subtests use a two-hop X-Forwarded-For chain
+	// "<client>, <proxy>", where both hops are public (non-private, non-loopback)
+	// addresses. Without asset_trustedProxyCIDRs, echo's default extractor has no
+	// reason to trust the proxy hop and stops there, returning the proxy's own IP
+	// - so two different clients behind the same untrusted proxy collapse onto
+	// one per-IP key. Configuring asset_trustedProxyCIDRs to cover the proxy hop
+	// makes the extractor skip past it to the real client IP, exactly as it does
+	// for every other Asset HTTP route via c.RealIP().
+	const untrustedProxyHop = "203.0.113.9"
+
+	t.Run("without asset_trustedProxyCIDRs, an untrusted proxy hop is not skipped, collapsing two different clients", func(t *testing.T) {
+		server := newServer(t, "")
+
+		first, _, err := dial(server, "198.51.100.7, "+untrustedProxyHop)
+		require.NoError(t, err)
+		defer func() { _ = first.Close() }()
+
+		refused, resp, err := dial(server, "198.51.100.8, "+untrustedProxyHop)
+		if refused != nil {
+			_ = refused.Close()
+		}
+
+		require.Error(t, err, "with the proxy hop untrusted, both requests must resolve to the proxy's own IP and share one per-IP slot")
+		require.NotNil(t, resp)
+		require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	})
+
+	t.Run("asset_trustedProxyCIDRs covering the proxy hop reaches the real per-client IP", func(t *testing.T) {
+		server := newServer(t, untrustedProxyHop+"/32")
+
+		first, _, err := dial(server, "198.51.100.7, "+untrustedProxyHop)
+		require.NoError(t, err)
+		defer func() { _ = first.Close() }()
+
+		second, _, err := dial(server, "198.51.100.8, "+untrustedProxyHop)
+		require.NoError(t, err, "with the proxy hop trusted, each distinct client IP behind it must get its own per-IP slot")
+		defer func() { _ = second.Close() }()
+	})
+}
+
 func TestWebsocketTransport_Methods(t *testing.T) {
 	t.Run("transport basic properties", func(t *testing.T) {
 		// Create mock connection
