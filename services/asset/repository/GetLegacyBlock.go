@@ -25,7 +25,7 @@ import (
 )
 
 // legacyBlockReaderPeerPoolCtxKey is the context key WithLegacyBlockReaderPeerPool
-// and legacyBlockReaderUsesPeerPool use to pass the HTTP boundary's pool decision
+// and LegacyBlockReaderUsesPeerPool use to pass the HTTP boundary's pool decision
 // into GetLegacyBlockReader without changing its signature.
 type legacyBlockReaderPeerPoolCtxKey struct{}
 
@@ -36,17 +36,20 @@ type legacyBlockReaderPeerPoolCtxKey struct{}
 // Callers must only pass usePeerPool=true once they have verified the request
 // truly originates from this node's own legacy peer server. The wire-format query
 // parameter alone (?wire=1) is not sufficient: any anonymous caller can set it.
-// httpimpl.GetLegacyBlock verifies the request's direct TCP peer (RemoteAddr, not
-// a header an anonymous caller can forge) is loopback before setting this to true.
+// httpimpl.GetLegacyBlock only sets this after checking asset_legacyPeerPoolToken:
+// a shared secret the request must present in the X-Teranode-Internal-Token
+// header, compared with a constant-time comparison. An empty (default) token
+// makes the pool unreachable regardless of what any caller presents.
 func WithLegacyBlockReaderPeerPool(ctx context.Context, usePeerPool bool) context.Context {
 	return context.WithValue(ctx, legacyBlockReaderPeerPoolCtxKey{}, usePeerPool)
 }
 
-// legacyBlockReaderUsesPeerPool reports whether ctx was marked by
+// LegacyBlockReaderUsesPeerPool reports whether ctx was marked by
 // WithLegacyBlockReaderPeerPool. An unmarked ctx (the common case: anonymous HTTP
 // clients, and any test that does not opt in) defaults to false, i.e. the
-// anonymous-HTTP pool.
-func legacyBlockReaderUsesPeerPool(ctx context.Context) bool {
+// anonymous-HTTP pool. Exported so callers (and tests, including outside this
+// package) can observe the same decision GetLegacyBlockReader acts on.
+func LegacyBlockReaderUsesPeerPool(ctx context.Context) bool {
 	usePeerPool, _ := ctx.Value(legacyBlockReaderPeerPoolCtxKey{}).(bool)
 	return usePeerPool
 }
@@ -83,7 +86,7 @@ func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhas
 	sem := repo.semGetLegacyBlockReader
 	semName := "GetLegacyBlockReader"
 
-	if legacyBlockReaderUsesPeerPool(ctx) {
+	if LegacyBlockReaderUsesPeerPool(ctx) {
 		sem = repo.semGetLegacyBlockReaderPeer
 		semName = "GetLegacyBlockReaderPeer"
 	}
