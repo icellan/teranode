@@ -14,6 +14,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -217,6 +218,20 @@ func TestNew_DashboardCORSUsesTheSameAllowlist(t *testing.T) {
 		"the dashboard CORS config must not reflect an unlisted origin either")
 }
 
+// fireRequests serves n requests for method/path against srv and returns how
+// many got a 429.
+func fireRequests(srv *HTTP, method, path string, n int) (tooMany int) {
+	for i := 0; i < n; i++ {
+		req := httptest.NewRequest(method, path, nil)
+		rec := httptest.NewRecorder()
+		srv.e.ServeHTTP(rec, req)
+		if rec.Code == http.StatusTooManyRequests {
+			tooMany++
+		}
+	}
+	return tooMany
+}
+
 // TestNew_HeavyRateLimiterSplitsBurstByCatchupRoute — only the five routes
 // peer catchup depends on get the raised burst. Every other heavy route
 // (including POST /utxos, up to 1024-way Aerospike fan-out) must keep
@@ -226,35 +241,80 @@ func TestNew_HeavyRateLimiterSplitsBurstByCatchupRoute(t *testing.T) {
 	tSettings.Asset.HTTPHeavyRateLimit = 2
 	tSettings.SubtreeValidation.GetMissingTransactions = 6
 
-	srv := newTestServer(t, tSettings)
-
-	fire := func(method, path string, n int) (tooMany int) {
-		for i := 0; i < n; i++ {
-			req := httptest.NewRequest(method, path, nil)
-			rec := httptest.NewRecorder()
-			srv.e.ServeHTTP(rec, req)
-			if rec.Code == http.StatusTooManyRequests {
-				tooMany++
-			}
-		}
-		return tooMany
+	catchupRoutes := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"GET /subtree/:hash", http.MethodGet, fmt.Sprintf("/api/v1/subtree/%s", testHashHex)},
+		{"GET /subtree_data/:hash", http.MethodGet, fmt.Sprintf("/api/v1/subtree_data/%s", testHashHex)},
+		{"POST /subtree/:hash/txs", http.MethodPost, fmt.Sprintf("/api/v1/subtree/%s/txs", testHashHex)},
+		{"GET /blocks/:hash", http.MethodGet, fmt.Sprintf("/api/v1/blocks/%s", testHashHex)},
+		{"GET /block/:hash", http.MethodGet, fmt.Sprintf("/api/v1/block/%s", testHashHex)},
 	}
 
-	t.Run("catchup route gets the raised burst", func(t *testing.T) {
-		path := fmt.Sprintf("/api/v1/subtree/%s", testHashHex)
+	for _, rt := range catchupRoutes {
+		t.Run(rt.name+" gets the raised burst", func(t *testing.T) {
+			srv := newTestServer(t, tSettings)
 
-		require.Zero(t, fire(http.MethodGet, path, 6),
-			"burst should admit the full catchup fan-out of 6 before any 429")
-		require.Equal(t, 1, fire(http.MethodGet, path, 1),
-			"the request past the floor must be rejected")
+			require.Zero(t, fireRequests(srv, rt.method, rt.path, 6),
+				"burst should admit the full catchup fan-out of 6 before any 429")
+			require.Equal(t, 1, fireRequests(srv, rt.method, rt.path, 1),
+				"the request past the floor must be rejected")
+		})
+	}
+
+	t.Run("a non-catchup heavy route keeps burst == rate", func(t *testing.T) {
+		srv := newTestServer(t, tSettings)
+		path := fmt.Sprintf("/api/v1/subtree/%s/hex", testHashHex)
+
+		require.Zero(t, fireRequests(srv, http.MethodGet, path, 2),
+			"burst should equal the sustained rate of 2")
+		require.Equal(t, 1, fireRequests(srv, http.MethodGet, path, 1),
+			"the third request must be rejected: this route must not get the catchup floor")
 	})
 
 	t.Run("POST /utxos keeps burst == rate, not the catchup floor", func(t *testing.T) {
-		require.Zero(t, fire(http.MethodPost, "/api/v1/utxos", 2),
+		srv := newTestServer(t, tSettings)
+
+		require.Zero(t, fireRequests(srv, http.MethodPost, "/api/v1/utxos", 2),
 			"burst should equal the sustained rate of 2")
-		require.Equal(t, 1, fire(http.MethodPost, "/api/v1/utxos", 1),
+		require.Equal(t, 1, fireRequests(srv, http.MethodPost, "/api/v1/utxos", 1),
 			"the third request must be rejected: this route must not get the catchup floor")
 	})
+}
+
+// TestNew_HeavyRateLimiterUsesDistinctMetricLabelForCatchupRoutes — the two
+// heavy limiters are independent per-IP buckets, so a 429 on a catchup route
+// must be counted under its own "heavy_catchup" label, distinct from "heavy"
+// for the non-catchup heavy routes; otherwise the two independent budgets are
+// indistinguishable on teranode_asset_http_rate_limited_total.
+func TestNew_HeavyRateLimiterUsesDistinctMetricLabelForCatchupRoutes(t *testing.T) {
+	tSettings := baseTestSettings()
+	tSettings.Asset.HTTPHeavyRateLimit = 1
+	tSettings.SubtreeValidation.GetMissingTransactions = 1
+
+	srv := newTestServer(t, tSettings)
+
+	catchupPath := fmt.Sprintf("/api/v1/subtree/%s", testHashHex)
+	otherHeavyPath := fmt.Sprintf("/api/v1/subtree/%s/hex", testHashHex)
+
+	beforeCatchup := testutil.ToFloat64(prometheusAssetHTTPRateLimited.WithLabelValues("heavy_catchup"))
+	beforeHeavy := testutil.ToFloat64(prometheusAssetHTTPRateLimited.WithLabelValues("heavy"))
+
+	require.Equal(t, 1, fireRequests(srv, http.MethodGet, catchupPath, 2),
+		"burst 1: the second request on the catchup route must be rejected")
+
+	require.Equal(t, beforeCatchup+1, testutil.ToFloat64(prometheusAssetHTTPRateLimited.WithLabelValues("heavy_catchup")),
+		"the catchup-route rejection must be counted under heavy_catchup")
+	require.Equal(t, beforeHeavy, testutil.ToFloat64(prometheusAssetHTTPRateLimited.WithLabelValues("heavy")),
+		"a catchup-route rejection must not be counted under heavy")
+
+	require.Equal(t, 1, fireRequests(srv, http.MethodGet, otherHeavyPath, 2),
+		"burst 1: the second request on the non-catchup heavy route must be rejected")
+
+	require.Equal(t, beforeHeavy+1, testutil.ToFloat64(prometheusAssetHTTPRateLimited.WithLabelValues("heavy")),
+		"the non-catchup heavy-route rejection must be counted under heavy")
 }
 
 // TestNew_TrustedProxyCIDRsReplaceEchoDefaults — echo.TrustIPRange is additive:
