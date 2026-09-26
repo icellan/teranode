@@ -175,6 +175,13 @@ func (h *HTTP) lookupAndStoreTransaction(gCtx context.Context, hash chainhash.Ha
 	var b []byte
 
 	if tx, ok := transactionFromSubtreeData[hash]; ok {
+		// Reserve the response-byte budget from the computed size before
+		// serializing, so a batch that trips the budget never allocates this
+		// record's bytes. tx.Size() is the non-extended size tx.Bytes() writes.
+		if err := h.enforceBatchResponseBytes("GetTransactions", responseSize.Add(int64(tx.Size())), maxBytes); err != nil {
+			return err
+		}
+
 		// always write the non-extended normal bytes as a response !
 		// our peer node should extend the transactions if needed
 		b = tx.Bytes()
@@ -189,12 +196,13 @@ func (h *HTTP) lookupAndStoreTransaction(gCtx context.Context, hash chainhash.Ha
 
 			return echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error getting transaction", err).Error())
 		}
-	}
 
-	// Reserve the response-byte budget before storing the result: a batch that
-	// trips the budget on this record must not retain its bytes in parts.
-	if err := h.enforceBatchResponseBytes("GetTransactions", responseSize.Add(int64(len(b))), maxBytes); err != nil {
-		return err
+		// The store hands back already-allocated bytes, so the budget can only be
+		// checked after the fetch; a batch that trips it on this record still
+		// doesn't retain the bytes in parts.
+		if err := h.enforceBatchResponseBytes("GetTransactions", responseSize.Add(int64(len(b))), maxBytes); err != nil {
+			return err
+		}
 	}
 
 	partsMu.Lock()
