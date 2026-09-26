@@ -205,20 +205,18 @@ func (h *HTTP) lookupAndStoreTransaction(gCtx context.Context, hash chainhash.Ha
 }
 
 // subtreeBatchHashHintCap bounds the initial capacity readSubtreeBatchHashes takes
-// from a request's Content-Length. Content-Length is client-supplied, so it is
-// only ever a capped hint for the initial slice capacity, never a size the
-// request is trusted to dictate outright: an attacker-set Content-Length far
-// larger than the body actually sent (or than the operator's budget allows) must
-// not itself trigger a large allocation. 65536 is 4x the default subtreevalidation
-// catchup batch size (16384), matching the recommended asset_maxBatchRecords
-// starting value.
-const subtreeBatchHashHintCap = 65536
+// up front, whatever the hint came from: Content-Length is client-supplied, and
+// asset_maxBatchRecords can be large while the request sends no Content-Length at
+// all. Either way a slow client could otherwise make every connection hold a large
+// allocation before sending a single hash. 1024 hashes is 32 KiB; a larger body
+// grows the slice as it is actually read.
+const subtreeBatchHashHintCap = 1024
 
 // readSubtreeBatchHashes reads every 32-byte txid from body into a hash slice,
 // growing it as it reads rather than presizing it from a value the request
-// supplies: the slice's initial capacity is derived only from contentLength
-// (itself just a hint, capped by subtreeBatchHashHintCap) and maxRecords when
-// set, never from anything that determines its final size. maxRecords is
+// supplies: the slice's initial capacity is a hint taken from contentLength and
+// maxRecords, always capped by subtreeBatchHashHintCap, and never determines its
+// final size. maxRecords is
 // enforced as hashes are read, exactly as the dispatch-while-reading path
 // enforces it: an over-budget request is rejected here, before
 // GetSubtreeTransactions (and the permit it takes) is ever reached.
@@ -227,13 +225,17 @@ func readSubtreeBatchHashes(body io.Reader, contentLength int64, maxRecords int)
 
 	if contentLength > 0 {
 		hint = int(contentLength / chainhash.HashSize)
-		if hint > subtreeBatchHashHintCap {
-			hint = subtreeBatchHashHintCap
-		}
 	}
 
 	if maxRecords > 0 && (hint == 0 || hint > maxRecords) {
 		hint = maxRecords
+	}
+
+	// Cap last, so neither a forged Content-Length nor a large operator
+	// maxRecords reached through a request with no Content-Length can size the
+	// up-front allocation.
+	if hint > subtreeBatchHashHintCap {
+		hint = subtreeBatchHashHintCap
 	}
 
 	hashes := make([]chainhash.Hash, 0, hint)
