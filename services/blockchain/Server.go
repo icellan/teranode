@@ -3403,6 +3403,13 @@ func getBlockHeadersToCommonAncestor(ctx context.Context, store blockchain_store
 	// range read instead of paging backward from hashTarget in search of it -
 	// which, for a locator that resolves deep in the chain, would otherwise
 	// page through the whole distance to get there.
+	//
+	// Known divergence from the walk below: the walk's `len(headers) <= 1`
+	// short-circuit (a few lines down) can return before checking the last
+	// header in a batch against the locator, so a locator whose only match is
+	// genesis gets a spurious not-found from the walk. The pre-flight has no
+	// such quirk, so this range read still finds genesis and returns it - the
+	// more correct answer of the two, not a regression.
 	if preflightErr == nil && hashTargetOnMainChain && maxWalkDepth <= 0 {
 		headerHistory, headerMetaHistory, ok, err := getCommonAncestorHeadersByRange(ctx, store, hashTarget, ancestorMeta, int(maxHeaders))
 		if err != nil {
