@@ -219,7 +219,9 @@ const maxHeavyBurstRateMultiple = 4
 //
 // An explicit, non-zero asset_httpHeavyRateBurst is always respected, even
 // when it is below the floor: an operator's configured value is never
-// overridden. A single-line warning is logged instead, naming the risk.
+// overridden. A single-line warning is logged instead, naming the risk. The
+// same warning is logged when the clamp itself lowers the burst below the
+// fan-out, which happens on auto-configured hosts with many cores.
 func resolveHeavyBurst(logger ulogger.Logger, configured, floor, rate int) (int, bool) {
 	clampedFloor := floor
 	if maxFloor := rate * maxHeavyBurstRateMultiple; rate > 0 && clampedFloor > maxFloor {
@@ -232,6 +234,11 @@ func resolveHeavyBurst(logger ulogger.Logger, configured, floor, rate int) (int,
 			return configured, true
 		}
 		return configured, false
+	}
+
+	if clampedFloor < floor {
+		logger.Warnf("[Asset] catchup-route heavy burst clamped to %d (%dx asset_httpHeavyRateLimit), below the catchup fan-out of %d (subtreevalidation_getMissingTransactions) - honest peer catchup may be rejected with 429; raise asset_httpHeavyRateLimit or set asset_httpHeavyRateBurst explicitly", clampedFloor, maxHeavyBurstRateMultiple, floor)
+		return clampedFloor, true
 	}
 
 	return clampedFloor, false
