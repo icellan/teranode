@@ -239,6 +239,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ConcurrencyGetLegacyBlockReaderPeer: getInt("asset_concurrency_get_legacy_block_reader_peer", -1, alternativeContext...), // -1 = NumCPU()
 
 			// Streaming configuration
+			LegacyPeerPoolToken:             getString("asset_legacyPeerPoolToken", "", alternativeContext...),
 			SubtreeDataStreamingChunkSize:   getInt("asset_subtreeDataStreamingChunkSize", 10000, alternativeContext...),
 			SubtreeDataStreamingConcurrency: getInt("asset_subtreeDataStreamingConcurrency", 2, alternativeContext...),
 

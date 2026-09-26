@@ -370,3 +370,30 @@ func TestDoLocalServiceHTTPRequestBodyReader_ReachesLoopback(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "block", string(body))
 }
+
+// TestDoLocalServiceHTTPRequestBodyReader_CarriesHeaders covers the legacy peer
+// server's internal-pool token: DoLocalServiceHTTPRequestBodyReader's optional
+// headers argument must reach the outgoing request, and omitting it (as every
+// other caller does) must not send any extra header.
+func TestDoLocalServiceHTTPRequestBodyReader_CarriesHeaders(t *testing.T) {
+	var gotHeader string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Teranode-Internal-Token")
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	reader, err := DoLocalServiceHTTPRequestBodyReader(context.Background(), server.URL,
+		map[string]string{"X-Teranode-Internal-Token": "a-shared-secret"})
+	require.NoError(t, err)
+	_ = reader.Close()
+	require.Equal(t, "a-shared-secret", gotHeader, "the header passed in must reach the request")
+
+	gotHeader = ""
+
+	reader, err = DoLocalServiceHTTPRequestBodyReader(context.Background(), server.URL)
+	require.NoError(t, err)
+	_ = reader.Close()
+	require.Empty(t, gotHeader, "omitting headers must not send the header at all")
+}
