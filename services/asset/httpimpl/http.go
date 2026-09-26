@@ -785,7 +785,29 @@ func normalizeCORSOrigin(origin string) (string, error) {
 		return "", errors.NewConfigurationError("must not include a path, query or fragment")
 	}
 
-	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host), nil
+	if u.User != nil {
+		return "", errors.NewConfigurationError("must not include userinfo")
+	}
+
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+
+	// Browsers omit the scheme's default port from the Origin header, so keep it
+	// out of the canonical form or the entry could never match.
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+
+	if port != "" {
+		host += ":" + port
+	}
+
+	return scheme + "://" + host, nil
 }
 
 // assetCORSConfig builds the single CORS policy for the Asset listener.

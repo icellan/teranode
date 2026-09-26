@@ -125,6 +125,24 @@ func TestParseCORSAllowedOrigins_NormalisesCaseAndTrailingSlash(t *testing.T) {
 		"a normalised configured entry must match the canonical origin a browser sends")
 }
 
+// TestParseCORSAllowedOrigins_StripsDefaultPorts — browsers omit the scheme's
+// default port from the Origin header, so a configured https://host:443 or
+// http://host:80 would otherwise never match. A non-default port is part of the
+// origin and must be kept.
+func TestParseCORSAllowedOrigins_StripsDefaultPorts(t *testing.T) {
+	origins, err := parseCORSAllowedOrigins("https://ops.example.com:443|http://dev.example.com:80|https://alt.example.com:8443")
+	require.NoError(t, err)
+	require.Equal(t, []string{"https://ops.example.com", "http://dev.example.com", "https://alt.example.com:8443"}, origins)
+}
+
+// TestParseCORSAllowedOrigins_RejectsUserinfo — an origin never carries
+// userinfo. Silently dropping it would hide an operator mistake (and a
+// credential sitting in config), so it must fail startup instead.
+func TestParseCORSAllowedOrigins_RejectsUserinfo(t *testing.T) {
+	_, err := parseCORSAllowedOrigins("https://user@ops.example.com")
+	require.Error(t, err)
+}
+
 // TestParseCORSAllowedOrigins_RejectsNullOrigin — "null" can never be a
 // legitimate operator origin (it's the Origin header a sandboxed/opaque
 // request sends), so it must fail loudly at startup rather than being
