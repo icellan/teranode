@@ -489,18 +489,19 @@ func TestResponseFormatting(t *testing.T) {
 }
 
 // TestApplyReadPolicyTimeout pins the permit-wait fix for the case the bot thread on
-// GetTxMetaByTXID.go flagged: aero.NewPolicy() leaves TotalTimeout at 0, and Asset HTTP
-// requests carry no context deadline by default, so acquirePermit would fall onto its
-// uncancelable blocking-send path. A configured read policy can also leave TotalTimeout at
-// 0 (aerospike_useDefaultBasePolicies, or an explicit TotalTimeout=0), so the fallback must
-// apply regardless of where the zero came from.
+// GetTxMetaByTXID.go flagged. aero.NewPolicy() itself defaults TotalTimeout to 1s, not 0
+// - but util.GetAerospikeReadPolicy can still resolve to a zero TotalTimeout (e.g.
+// aerospike_useDefaultBasePolicies leaves the package-level read-policy fields at their
+// Go zero value, or an explicit TotalTimeout=0 in aerospike_readPolicy), and Asset HTTP
+// requests carry no context deadline by default. Without a bound in that combination,
+// acquirePermit falls onto its uncancelable blocking-send path.
 func TestApplyReadPolicyTimeout(t *testing.T) {
 	t.Run("no ctx deadline and zero TotalTimeout gets the fallback", func(t *testing.T) {
 		policy := &aero.BasePolicy{}
 
 		applyReadPolicyTimeout(context.Background(), policy)
 
-		assert.Greater(t, policy.TotalTimeout, time.Duration(0),
+		require.Greater(t, policy.TotalTimeout, time.Duration(0),
 			"TotalTimeout must be non-zero so acquirePermit cannot block forever")
 	})
 
@@ -509,7 +510,7 @@ func TestApplyReadPolicyTimeout(t *testing.T) {
 
 		applyReadPolicyTimeout(context.Background(), policy)
 
-		assert.Equal(t, 42*time.Second, policy.TotalTimeout)
+		require.Equal(t, 42*time.Second, policy.TotalTimeout)
 	})
 
 	t.Run("ctx deadline bounds TotalTimeout to the remaining time", func(t *testing.T) {
@@ -520,7 +521,7 @@ func TestApplyReadPolicyTimeout(t *testing.T) {
 
 		applyReadPolicyTimeout(ctx, policy)
 
-		assert.Greater(t, policy.TotalTimeout, time.Duration(0))
-		assert.LessOrEqual(t, policy.TotalTimeout, 3*time.Second)
+		require.Greater(t, policy.TotalTimeout, time.Duration(0))
+		require.LessOrEqual(t, policy.TotalTimeout, 3*time.Second)
 	})
 }
