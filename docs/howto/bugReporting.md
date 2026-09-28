@@ -48,12 +48,17 @@ Before submitting a bug report, gather the following information:
 
 ## Severity
 
+> **Security vulnerabilities** (exploitable consensus bugs, funds at risk, remote crashes):
+> do not open a public issue — report privately via
+> <https://github.com/bsv-blockchain/teranode/security/advisories/new>
+
 New bug reports should select a severity using the "Severity" section of the bug report
 template, and the maintainer triaging the issue applies the matching `severity:*` label.
 Choose the level that matches the observed impact:
 
 - `severity:critical` — consensus failure, data loss or corruption, funds at risk, or a
-  node that cannot sync or stay up. No workaround.
+  node that cannot sync or stay up. Impact alone decides this level; an available
+  workaround does not downgrade it.
 - `severity:major` — a core function is broken or badly degraded (e.g. sustained
   throughput loss, a service that needs manual restarts), but a workaround exists.
 - `severity:minor` — cosmetic, documentation, or low-impact issues with an easy
@@ -79,9 +84,13 @@ titles are not being changed retroactively and existing issues are not being rel
 When creating a new issue, GitHub will automatically load a template. The template includes the following sections:
 
 ```markdown
+> **Security vulnerabilities** (exploitable consensus bugs, funds at risk, remote crashes):
+> do not open a public issue — report privately via
+> <https://github.com/bsv-blockchain/teranode/security/advisories/new>
+
 ## Severity
 Project policy is to tick exactly one (see the severity criteria above):
-- [ ] severity:critical — consensus failure, data loss or corruption, funds at risk, or a node that cannot sync or stay up, with no workaround
+- [ ] severity:critical — consensus failure, data loss or corruption, funds at risk, or a node that cannot sync or stay up. Impact alone decides this level; an available workaround does not downgrade it
 - [ ] severity:major — a core function is broken or badly degraded (sustained throughput loss, a service needing manual restarts), but a workaround exists
 - [ ] severity:minor — cosmetic, documentation, or low-impact issues with an easy workaround
 
