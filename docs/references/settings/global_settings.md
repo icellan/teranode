@@ -121,9 +121,13 @@ This hierarchy exists because file-level operations are the foundation of blob s
 #### PostgreSQL Connection Pool
 
 Default connection pool and resilience settings for every service's PostgreSQL store. A service can
-override the first seven with its own `<service>_postgres_*` settings (see e.g. [Blockchain
-Settings](services/blockchain_settings.md) and [UTXO Store Settings](stores/utxo_settings.md)); there is
-no per-service override for the circuit breaker settings.
+override the first six (`MaxOpenConns`, `MaxIdleConns`, `ConnMaxLifetime`, `ConnMaxIdleTime`,
+`RetryMaxAttempts`, `RetryBaseDelay`) with its own `<service>_postgres_*` settings, and setting any one of
+those six also activates a per-service `RetryEnabled` - but `RetryEnabled` has no global fallback of its
+own: it only takes effect alongside one of the six, and once active it replaces the global value outright
+(`false` included), so a service that sets only its own `retryEnabled` is silently ignored (see e.g.
+[Blockchain Settings](services/blockchain_settings.md) and [UTXO Store Settings](stores/utxo_settings.md)
+for the exact mechanics). There is no per-service override for the circuit breaker settings.
 
 | Setting | Type | Default | Environment Variable | Usage |
 |---------|------|---------|---------------------|-------|
