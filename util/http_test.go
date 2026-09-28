@@ -1756,9 +1756,16 @@ func TestDoHTTPRequestBodyReaderWithRetry_SignsEveryAttempt(t *testing.T) {
 	defer SetHTTPRequestSigner(NewEd25519RequestSigner(nil))
 
 	var attempts int32
-	signatures := make(chan string, 4)
+	type attemptAuth struct {
+		signature string
+		timestamp string
+	}
+	signatures := make(chan attemptAuth, 4)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		signatures <- r.Header.Get("X-Peer-Signature")
+		signatures <- attemptAuth{
+			signature: r.Header.Get("X-Peer-Signature"),
+			timestamp: r.Header.Get("X-Peer-Timestamp"),
+		}
 
 		if atomic.AddInt32(&attempts, 1) < 3 {
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -1776,11 +1783,22 @@ func TestDoHTTPRequestBodyReaderWithRetry_SignsEveryAttempt(t *testing.T) {
 
 	close(signatures)
 
+	seenSignatures := make(map[string]struct{})
+	seenTimestamps := make(map[string]struct{})
 	seen := 0
-	for sig := range signatures {
-		require.NotEmpty(t, sig, "every attempt must be signed")
+	for a := range signatures {
+		require.NotEmpty(t, a.signature, "every attempt must be signed")
+		seenSignatures[a.signature] = struct{}{}
+		seenTimestamps[a.timestamp] = struct{}{}
 		seen++
 	}
 
 	require.Equal(t, 3, seen)
+	// A retry sent in the same Unix second as the previous attempt would be
+	// byte-identical (Ed25519 is deterministic, and the signed timestamp has
+	// one-second resolution), so the receiver's replay cache would reject it.
+	// Every retried attempt must therefore carry a distinct signed timestamp
+	// (and therefore a distinct signature).
+	require.Len(t, seenTimestamps, 3, "each retry must be signed with a distinct timestamp")
+	require.Len(t, seenSignatures, 3, "each retry must produce a distinct signature")
 }
