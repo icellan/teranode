@@ -72,15 +72,16 @@ type PeerInfoResponse struct {
 //
 // swagger:model MinimalPeerInfoResponse
 type MinimalPeerInfoResponse struct {
-	ID             string `json:"id"`
-	Transport      string `json:"transport"`
-	ClientName     string `json:"client_name"`
-	Height         uint32 `json:"height"`
-	BlockHash      string `json:"block_hash"`
-	DataHubURL     string `json:"data_hub_url"`
-	NetworkAddress string `json:"network_address,omitempty"`
-	IsConnected    bool   `json:"is_connected"`
-	ConnectedAt    int64  `json:"connected_at"`
+	ID              string `json:"id"`
+	Transport       string `json:"transport"`
+	ClientName      string `json:"client_name"`
+	Height          uint32 `json:"height"`
+	BlockHash       string `json:"block_hash"`
+	DataHubURL      string `json:"data_hub_url"`
+	NetworkAddress  string `json:"network_address,omitempty"`
+	IsConnected     bool   `json:"is_connected"`
+	ConnectedAt     int64  `json:"connected_at"`
+	LastMessageTime int64  `json:"last_message_time"`
 }
 
 // MinimalPeersResponse is the PeersResponse counterpart for the minimal shape.
@@ -184,15 +185,16 @@ func minimalPeerInfoToResponse(peer *blockchain.PeerInfo) MinimalPeerInfoRespons
 	}
 
 	return MinimalPeerInfoResponse{
-		ID:             peer.ID,
-		Transport:      transportLabel(peer.TransportType),
-		ClientName:     peer.ClientName,
-		Height:         peer.Height,
-		BlockHash:      blockHashStr,
-		DataHubURL:     peer.DataHubURL,
-		NetworkAddress: peer.NetworkAddress,
-		IsConnected:    peer.IsConnected,
-		ConnectedAt:    timeToUnix(peer.ConnectedAt),
+		ID:              peer.ID,
+		Transport:       transportLabel(peer.TransportType),
+		ClientName:      peer.ClientName,
+		Height:          peer.Height,
+		BlockHash:       blockHashStr,
+		DataHubURL:      peer.DataHubURL,
+		NetworkAddress:  peer.NetworkAddress,
+		IsConnected:     peer.IsConnected,
+		ConnectedAt:     timeToUnix(peer.ConnectedAt),
+		LastMessageTime: timeToUnix(peer.LastMessageTime),
 	}
 }
 
