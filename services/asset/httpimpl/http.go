@@ -284,10 +284,10 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 		heavyRateLimiter = heavyRL.Middleware()
 		rateLimiters = append(rateLimiters, heavyRL)
 
-		// A catching-up peer fans out subtreevalidation_getMissingTransactions
-		// concurrent unsigned (and so tier-unverified) requests at once, so the
-		// catchup-route burst floors at that value.
-		heavyBurst, _ := resolveHeavyBurst(logger, tSettings.Asset.HTTPHeavyRateBurst, tSettings.SubtreeValidation.GetMissingTransactions, tSettings.Asset.HTTPHeavyRateLimit)
+		// A catching-up peer fans out many concurrent, typically tier-unverified,
+		// requests at once, so the catchup-route burst floors at the larger of its
+		// two catchup fan-outs (see catchupFanOut).
+		heavyBurst, _ := resolveHeavyBurst(logger, tSettings.Asset.HTTPHeavyRateBurst, catchupFanOut(tSettings), tSettings.Asset.HTTPHeavyRateLimit)
 
 		// heavy_catchup is a distinct metric label from heavy so the two
 		// independent buckets are distinguishable on teranode_asset_http_rate_limited_total.
