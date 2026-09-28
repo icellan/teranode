@@ -492,6 +492,18 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 
 			case <-heartbeatTicker.C:
 				// Idle tick: proves the loop is alive without requiring work.
+				// Also the polling point for a disk tx map post-commit storage
+				// error (moveForwardBlock, reorgBlocks, dequeue, removeTx,
+				// Stop, or reset's own reload): none of those call sites can
+				// fail the operation that observed the error - it already
+				// committed - so they request a reset instead, of which this
+				// is the only reader. A reset reloads unmined transactions
+				// from the UTXO store, the source of truth, curing any
+				// phantom the storage error left in the filter.
+				if b.subtreeProcessor.TakeResetRequested() {
+					b.logger.Warnf("[BlockAssembler] disk tx map reported a post-commit storage error; resetting block assembly")
+					b.Reset(false)
+				}
 
 			case resetReq := <-b.resetCh:
 				b.setCurrentRunningState(StateResetting)
@@ -3370,6 +3382,14 @@ func (b *BlockAssembler) loadUnminedTransactions(ctx context.Context, isReload b
 
 	prometheusBlockAssemblerAddDirectlyBatchTime.Observe(time.Since(batchStart).Seconds())
 
+	// The tail of the load leaves writes below the disk tx map's flush
+	// threshold unflushed; AddNodesDirectly/AddDirectly's own per-call check
+	// cannot see a flush failure for those. Flush once here, after the whole
+	// load, and check.
+	if err = b.subtreeProcessor.FlushDiskTxMapForLoad("loadUnminedTransactions", isReload); err != nil {
+		return errors.NewProcessingError("error flushing disk tx map after loading unmined transactions", err)
+	}
+
 	// unlock any locked transactions
 	if len(lockedTransactions) > 0 {
 		if err = b.utxoStore.SetLocked(ctx, lockedTransactions, false); err != nil {
@@ -3859,6 +3879,13 @@ func (b *BlockAssembler) loadUnminedTransactionsWithDiskSort(ctx context.Context
 	}
 
 	prometheusBlockAssemblerAddDirectlyBatchTime.Observe(time.Since(batchStart).Seconds())
+
+	// See the same call in loadUnminedTransactions: the tail of this loop's
+	// AddDirectly calls leaves writes below the disk tx map's flush threshold
+	// unflushed.
+	if err = b.subtreeProcessor.FlushDiskTxMapForLoad("loadUnminedTransactionsWithDiskSort", isReload); err != nil {
+		return errors.NewProcessingError("error flushing disk tx map after loading unmined transactions", err)
+	}
 
 	// Unlock any locked transactions
 	if len(lockedTransactions) > 0 {

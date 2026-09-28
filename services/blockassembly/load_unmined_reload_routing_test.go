@@ -96,6 +96,8 @@ func TestLoadUnminedTransactions_IsReloadSelectsEntryPoint(t *testing.T) {
 					stp.On(method, mock.Anything, mock.Anything, true).Return(nil).Once()
 				}
 
+				stp.On("FlushDiskTxMapForLoad", mock.Anything, isReload).Return(nil).Once()
+
 				blockchainClient := &blockchain.Mock{}
 				blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)
 

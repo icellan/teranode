@@ -110,6 +110,18 @@ type Interface interface {
 	// logged and counted instead of failing the call.
 	AddNodesDirectlyReportOnly(txs []*utxostore.UnminedTransaction, skipNotification bool) error
 
+	// FlushDiskTxMapForLoad flushes the disk tx map writers and reports any
+	// pending storage error. Callers doing a bulk load (loadUnminedTransactions,
+	// loadUnminedTransactionsWithDiskSort) must call this once after the whole
+	// load has finished: AddDirectly/AddNodesDirectly's own per-call boundary
+	// check only sees errors an earlier automatic flush already surfaced, so
+	// writes still below the writer's flush threshold - which every load's
+	// tail leaves unflushed - are otherwise never checked.
+	//
+	// isReload has the same meaning as elsewhere: false fails the call (the
+	// startup load); true only logs and counts (reset's report-only reload).
+	FlushDiskTxMapForLoad(where string, isReload bool) error
+
 	// GetCurrentRunningState returns the current operational state of the processor.
 	// This provides visibility into whether the processor is running, stopped,
 	// resetting, or in another operational state.
@@ -180,6 +192,17 @@ type Interface interface {
 	// Returns:
 	//   - ResetResponse: Response containing reset operation results
 	Reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block, useFastForwardReset bool, postProcess func() error) ResetResponse
+
+	// TakeResetRequested reports, and clears, whether a post-commit disk tx
+	// map storage error requested a reset since the last call. A post-commit
+	// storage error cannot fail the operation that observed it (the write is
+	// already applied), but it may have left the filter claiming an entry
+	// whose data never reached disk (a phantom); a reset reloads from the
+	// UTXO store, the source of truth, curing it. BlockAssembler polls this
+	// once per heartbeat tick of its main loop, rather than after any single
+	// call, since any operation (MoveForwardBlock, Reorg, an async removeTx
+	// or Stop) can be the one that observes the error.
+	TakeResetRequested() bool
 
 	// Remove removes a specific transaction from the processor by its hash.
 	// This is used when transactions become invalid or need to be excluded.

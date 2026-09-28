@@ -3,6 +3,7 @@ package subtreeprocessor
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
@@ -462,6 +463,33 @@ func TestCloseRetiredDiskTxMaps_ReportsRetiredMapError(t *testing.T) {
 
 // Stop's pending-error drain must go through the same counted path as every
 // other boundary, not a bare logger.Errorf call (finding F).
+// A post-commit disk tx map error is not unique to moveForwardBlock: any
+// operation that reports rather than fails (removeTx here; dequeue,
+// reorgBlocks and reset's own reload share the same drainAndLogDiskTxMapErr/
+// reportOrJoinDiskTxMapErr helpers) leaves the same phantom risk and must
+// request a reset too.
+func TestRemoveTx_PostCommitErrorRequestsReset(t *testing.T) {
+	stp, cleanup := newAddNodesBenchProcessor(t, 64, WithTxMapDirs([]string{t.TempDir()}))
+	defer cleanup()
+
+	stp.Start(context.Background())
+
+	require.False(t, stp.TakeResetRequested(), "precondition: no reset pending")
+
+	boom := errors.NewStorageError("badger write failed")
+	stp.diskTxMap.recordErr(boom)
+
+	before := testutil.ToFloat64(prometheusSubtreeProcessorDiskTxMapErrors.WithLabelValues("removeTx"))
+
+	require.NoError(t, stp.Remove(context.Background(), batchTestHash(1)))
+
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(prometheusSubtreeProcessorDiskTxMapErrors.WithLabelValues("removeTx")) == before+1
+	}, time.Second, time.Millisecond, "removeTx must log and count the pending error")
+
+	require.True(t, stp.TakeResetRequested(), "a post-commit storage error observed during removeTx must request a reset")
+}
+
 func TestStop_DrainsPendingDiskTxMapErrThroughCountedPath(t *testing.T) {
 	stp, cleanup := newAddNodesBenchProcessor(t, 64, WithTxMapDirs([]string{t.TempDir()}))
 
@@ -474,6 +502,55 @@ func TestStop_DrainsPendingDiskTxMapErrThroughCountedPath(t *testing.T) {
 
 	after := testutil.ToFloat64(prometheusSubtreeProcessorDiskTxMapErrors.WithLabelValues("stop"))
 	require.Equal(t, before+1, after, "Stop must log and count a pending error, not just log it")
+}
+
+// AddDirectly's own boundary check cannot see a flush failure for a write
+// still sitting below writerFlushThreshold: nothing flushed it yet, so
+// diskTxMapErr() has nothing to observe. FlushDiskTxMapForLoad exists for
+// exactly this - a caller flushes once, after the whole load, and only then
+// checks. Fails a REAL flush via the failingBatch seam, not recordErr, so a
+// regression that goes back to a naked diskTxMapErr() check is caught.
+func TestFlushDiskTxMapForLoad_CatchesTrailingUnflushedWriteFailure(t *testing.T) {
+	stp, cleanup := newAddNodesBenchProcessor(t, 64, WithTxMapDirs([]string{t.TempDir()}))
+	defer cleanup()
+
+	failing := &failingBatch{flushErr: errors.NewStorageError("flush failed")}
+	stp.diskTxMap.disks[0].batch = failing
+
+	node := subtreepkg.Node{Hash: batchTestHash(1), Fee: 1, SizeInBytes: 100}
+	inp := subtreepkg.TxInpoints{}
+
+	// A single write stays well below writerFlushThreshold, so AddDirectly's
+	// own deferred check has nothing to see yet.
+	require.NoError(t, stp.AddDirectly(&node, &inp, true), "the write itself is unflushed, not yet failing")
+	require.NoError(t, stp.diskTxMapErr(), "nothing flushed yet, so nothing pending")
+
+	err := stp.FlushDiskTxMapForLoad("test", false)
+	require.Error(t, err, "the startup load must fail on the trailing flush failure")
+	require.NoError(t, stp.diskTxMapErr(), "drained, not left pending")
+}
+
+// The same trailing flush failure must only be logged and counted for
+// reset's report-only reload.
+func TestFlushDiskTxMapForLoad_ReportsTrailingUnflushedWriteFailureOnReload(t *testing.T) {
+	stp, cleanup := newAddNodesBenchProcessor(t, 64, WithTxMapDirs([]string{t.TempDir()}))
+	defer cleanup()
+
+	failing := &failingBatch{flushErr: errors.NewStorageError("flush failed")}
+	stp.diskTxMap.disks[0].batch = failing
+
+	node := subtreepkg.Node{Hash: batchTestHash(1), Fee: 1, SizeInBytes: 100}
+	inp := subtreepkg.TxInpoints{}
+
+	require.NoError(t, stp.AddDirectlyReportOnly(&node, &inp, true))
+
+	before := testutil.ToFloat64(prometheusSubtreeProcessorDiskTxMapErrors.WithLabelValues("test_reload"))
+
+	err := stp.FlushDiskTxMapForLoad("test_reload", true)
+	require.NoError(t, err, "the reload must not fail on a post-commit flush error")
+
+	after := testutil.ToFloat64(prometheusSubtreeProcessorDiskTxMapErrors.WithLabelValues("test_reload"))
+	require.Equal(t, before+1, after, "the trailing flush failure must still be logged and counted")
 }
 
 // Errors recorded on the inactive half of the double buffer are reported too.

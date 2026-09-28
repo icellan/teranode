@@ -99,7 +99,11 @@ func newMoveForwardCommitBoundaryProcessor(t *testing.T) (*SubtreeProcessor, *mo
 // (clearCurrentTxMapShadow) must fail the call and leave the processor's
 // in-memory state exactly as it was, so a retry of the same block succeeds -
 // per the user's decision, map errors fail the operation only where the
-// existing rollback path can still run.
+// existing rollback path can still run. Goes through the public MoveForwardBlock
+// entry point (started processor, dispatcher goroutine) so this exercises the
+// real production rollback() closure in SubtreeProcessor.go's
+// moveForwardBlockChan handler, not a hand-rolled stand-in for it: a
+// regression that breaks or removes that rollback fails this test.
 func TestMoveForwardBlock_DiskTxMapErrorBeforeCommitFailsAndRollsBack(t *testing.T) {
 	stp, block := newMoveForwardCommitBoundaryProcessor(t)
 
@@ -111,17 +115,10 @@ func TestMoveForwardBlock_DiskTxMapErrorBeforeCommitFailsAndRollsBack(t *testing
 	boom := errors.NewStorageError("badger write failed")
 	stp.diskTxMap.recordErr(boom)
 
-	processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
-	_, _, err := stp.moveForwardBlock(context.Background(), block, false, processedConflictingHashesMap, false, true)
-	require.ErrorIs(t, err, boom, "the pending map error must fail this call")
+	stp.Start(context.Background())
 
-	// Mirror the production rollback (SubtreeProcessor.go's moveForwardBlockChan
-	// handler): on error, restore the four snapshotted fields.
-	stp.chainedSubtrees = originalChainedSubtrees
-	stp.currentSubtree.Store(originalCurrentSubtree)
-	stp.restoreCurrentTxMap(originalCurrentTxMap)
-	stp.currentBlockHeader.Store(originalHeader)
-	stp.setTxCountFromSubtrees()
+	err := stp.MoveForwardBlock(block)
+	require.ErrorIs(t, err, boom, "the pending map error must fail this call")
 
 	require.Same(t, originalCurrentSubtree, stp.currentSubtree.Load(), "currentSubtree must be unchanged")
 	require.Same(t, originalHeader, stp.currentBlockHeader.Load(), "currentBlockHeader must be unchanged")
@@ -131,8 +128,7 @@ func TestMoveForwardBlock_DiskTxMapErrorBeforeCommitFailsAndRollsBack(t *testing
 	require.NoError(t, stp.diskTxMapErr(), "the error was consumed by the failed call, not left pending")
 
 	// Retry: the same block, now with no map error pending, must succeed.
-	processedConflictingHashesMap2 := make(map[chainhash.Hash]struct{})
-	_, _, retryErr := stp.moveForwardBlock(context.Background(), block, false, processedConflictingHashesMap2, false, true)
+	retryErr := stp.MoveForwardBlock(block)
 	require.NoError(t, retryErr, "a retry after the transient error clears must succeed")
 }
 
@@ -170,14 +166,14 @@ func TestMoveForwardBlock_DiskTxMapErrorAfterCommitDoesNotFailTheCall(t *testing
 	require.Error(t, mapErr, "the Clear rotation failure is still pending for the caller to log")
 }
 
-// The pre-commit check must flush the writer first: writes below
-// writerFlushThreshold sit unflushed in the writer's pending batch, so a
-// naked diskTxMapErr() call cannot see a flush failure for entries this block
-// itself just wrote. Without a flush before the check, moveForwardBlock
-// commits with those entries silently missing from disk — the filter still
-// claims they exist, but every later Get for them misses, and the very next
-// moveForward's remainder pass fails "not found in currentTxMap" forever.
-func TestMoveForwardBlock_PreCommitCheckFlushesBeforeFailing(t *testing.T) {
+// dequeueDuringBlockMovement has already drained the queue by the time this
+// final check runs: rollback() does not requeue what it drained (see #852),
+// so a flush failure for that pass's own writes must not fail moveForwardBlock
+// - doing so would lose the drained batches permanently. The dequeue drain is
+// this block's own commit point: the error is logged, counted, and a reset is
+// requested (to reload from the UTXO store and cure the resulting phantom),
+// but the call still succeeds and the double-buffer swap still commits.
+func TestMoveForwardBlock_DequeueOwnWriteFailure_LogsCountsRequestsResetButSucceeds(t *testing.T) {
 	stp, block := newMoveForwardCommitBoundaryProcessor(t)
 
 	// Prime the queue with a tx NOT in the block, so processRemainderTransactionsAndDequeue's
@@ -205,14 +201,19 @@ func TestMoveForwardBlock_PreCommitCheckFlushesBeforeFailing(t *testing.T) {
 
 	originalCurrentTxMap := stp.currentTxMap
 
+	before := testutil.ToFloat64(prometheusSubtreeProcessorDiskTxMapErrors.WithLabelValues("moveForwardBlock_postDequeue"))
+
 	processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 	_, _, err := stp.moveForwardBlock(context.Background(), block, false, processedConflictingHashesMap, false, true)
-	require.Error(t, err, "a flush failure for this block's own writes must fail the call before commit, not be missed by an unflushed check")
-	require.ErrorContains(t, err, "disk tx map storage error before commit", "must be the pre-commit check's own error, not some unrelated failure")
-	require.ErrorContains(t, err, "flush failed", "and must actually be the flush failure, not e.g. a panic turned into an error")
+	require.NoError(t, err, "a flush failure for the dequeue pass's own writes must not fail moveForwardBlock: the queue is already drained and rollback cannot requeue it")
 
-	requireSameMap(t, originalCurrentTxMap, stp.currentTxMap,
-		"a failure here must still be before the commit point: the double-buffer swap is rolled back")
+	require.NotSame(t, originalCurrentTxMap, stp.currentTxMap, "moveForwardBlock must still commit: the double-buffer swap is not rolled back")
+	require.Equal(t, int64(0), stp.queue.length(), "the queue was drained and must not be replayed")
+
+	after := testutil.ToFloat64(prometheusSubtreeProcessorDiskTxMapErrors.WithLabelValues("moveForwardBlock_postDequeue"))
+	require.Equal(t, before+1, after, "the dequeue pass's own flush failure must be logged and counted")
+
+	require.True(t, stp.TakeResetRequested(), "a post-commit storage error from the dequeue pass must request a reset to cure the resulting phantom")
 }
 
 // Pins the actual P0 fix through the public entry point: a started processor

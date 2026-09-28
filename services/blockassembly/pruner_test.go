@@ -51,6 +51,7 @@ func TestCleanupDuringStartup(t *testing.T) {
 
 		subtreeProcessor := &subtreeprocessor.MockSubtreeProcessor{}
 		subtreeProcessor.On("GetCurrentBlockHeader").Return(blockHeader1, nil)
+		subtreeProcessor.On("FlushDiskTxMapForLoad", mock.Anything, false).Return(nil).Once()
 
 		// Create BlockAssembler with mocked dependencies
 		ba := &BlockAssembler{
@@ -125,6 +126,7 @@ func TestLoadUnminedTransactionsExcludesConflicting(t *testing.T) {
 		}), true).Return(nil).Once()
 		// GetCurrentBlockHeader may be called multiple times during loading
 		mockSubtreeProcessor.On("GetCurrentBlockHeader").Return(blockHeader1, nil).Maybe()
+		mockSubtreeProcessor.On("FlushDiskTxMapForLoad", mock.Anything, false).Return(nil).Once()
 
 		blockchainClient := &blockchain.Mock{}
 		blockchainClient.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil)

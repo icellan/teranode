@@ -85,6 +85,8 @@ func TestReset_PostProcessReportOnlyMapErrorDoesNotFailReset(t *testing.T) {
 
 	after := testutil.ToFloat64(prometheusSubtreeProcessorDiskTxMapErrors.WithLabelValues("AddDirectlyReportOnly"))
 	require.Equal(t, before+1, after, "the map error must still be logged and counted")
+
+	require.True(t, stp.TakeResetRequested(), "a post-commit map error surfacing during reset's own reload must request a further reset - reset has no rollback of its own, so this is the only way the phantom it may have left gets cured")
 }
 
 // reset's currentTxMap.Clear() + Length()==0 check runs before

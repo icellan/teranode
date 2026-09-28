@@ -72,6 +72,24 @@ func (m *MockSubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlo
 	return args.Get(0).(ResetResponse)
 }
 
+// TakeResetRequested implements Interface.TakeResetRequested. Defaults to
+// false without requiring an explicit .On(...) expectation: most callers
+// never exercise the post-commit disk tx map error path this reports, and
+// requiring every test that starts the BlockAssembler main loop (which polls
+// this every heartbeat tick) to stub it would be pure noise. Tests pinning
+// the reset-request behaviour itself still set up an explicit expectation,
+// which takes priority.
+func (m *MockSubtreeProcessor) TakeResetRequested() bool {
+	for _, call := range m.ExpectedCalls {
+		if call.Method == "TakeResetRequested" {
+			args := m.Called()
+			return args.Bool(0)
+		}
+	}
+
+	return false
+}
+
 func (m *MockSubtreeProcessor) GetCurrentBlockHeader() *model.BlockHeader {
 	args := m.Called()
 	return args.Get(0).(*model.BlockHeader)
@@ -237,6 +255,17 @@ func (m *MockSubtreeProcessor) AddNodesDirectly(txs []*utxostore.UnminedTransact
 // AddNodesDirectlyReportOnly implements Interface.AddNodesDirectlyReportOnly
 func (m *MockSubtreeProcessor) AddNodesDirectlyReportOnly(txs []*utxostore.UnminedTransaction, skipNotification bool) error {
 	args := m.Called(txs, skipNotification)
+
+	if args.Get(0) == nil {
+		return nil
+	}
+
+	return args.Error(0)
+}
+
+// FlushDiskTxMapForLoad implements Interface.FlushDiskTxMapForLoad
+func (m *MockSubtreeProcessor) FlushDiskTxMapForLoad(where string, isReload bool) error {
+	args := m.Called(where, isReload)
 
 	if args.Get(0) == nil {
 		return nil
