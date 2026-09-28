@@ -180,6 +180,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			StatsRefreshDuration:            getDuration("aerospike_statsRefresh", 5*time.Second, alternativeContext...),
 			EnableSpendFilterExpressions:    getBool("aerospike_enable_spend_filter_expressions", false, alternativeContext...),
 			EnableSetMinedFilterExpressions: getBool("aerospike_enable_setmined_filter_expressions", false, alternativeContext...),
+			EnablePreserveFilterExpressions: getBool("aerospike_enable_preserve_filter_expressions", false, alternativeContext...),
 			UseSeparateUDFMinedModule:       getBool("aerospike_use_separate_udf_mined_module", false, alternativeContext...),
 			SeparateSpendUDFModuleCount:     getInt("aerospike_separate_udf_spend_module_count", 0, alternativeContext...),
 			UseNativeTeranodeOps:            getBool("aerospike_use_native_teranode_ops", false, alternativeContext...),
@@ -603,6 +604,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			WebSocketMaxConnectionsPerSource: getInt("p2p_websocket_max_connections_per_source", 0, alternativeContext...),
 			WebSocketAllowedOrigins:          getMultiString("p2p_websocket_allowed_origins", "|", []string{}, alternativeContext...),
 			WebSocketTrustedSourceCIDRs:      getMultiString("p2p_websocket_trusted_source_cidrs", "|", []string{"127.0.0.1/32", "::1/128"}, alternativeContext...),
+			HTTPRateLimit:                    getInt("p2p_httpRateLimit", 100, alternativeContext...),
 		},
 		Coinbase: CoinbaseSettings{
 			DB:                          getString("coinbaseDB", "", alternativeContext...),
