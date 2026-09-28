@@ -41,9 +41,16 @@ const (
 const freshnessWindowSeconds = 10
 
 // replayCacheTTL is how long a seen (pubkey, signature) pair is remembered.
-// It must exceed freshnessWindowSeconds so that an attacker can't outlast the
-// cache by replaying right at the edge of the window.
-const replayCacheTTL = 15 * time.Second
+// checkFreshness accepts a two-sided span around the server clock,
+// [ts-freshnessWindowSeconds, ts+freshnessWindowSeconds+1) (the +1 covers
+// second truncation), which is 2*freshnessWindowSeconds+1 seconds wide. A
+// claim taken at the earliest accepted instant (t0 = ts-freshnessWindowSeconds)
+// must still be live at the latest accepted instant (ts+freshnessWindowSeconds),
+// so the TTL must cover the full span plus one more second of margin: at least
+// 2*freshnessWindowSeconds+2 seconds. Anything shorter lets a captured
+// signature be replayed after its cache entry expires while its timestamp is
+// still within the freshness window.
+const replayCacheTTL = time.Duration(2*freshnessWindowSeconds+2) * time.Second
 
 // replayCacheCapacity bounds memory usage under a signature-flood attack.
 // At ~70 bytes per entry (key + ttlcache overhead) this is ~7 MB worst case.

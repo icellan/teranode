@@ -337,6 +337,21 @@ func TestPeerAuthMiddleware_ReplayBlocked(t *testing.T) {
 	require.Equal(t, tierUnverified, capturedTier, "second submission of the same signature must be rejected")
 }
 
+// TestReplayCacheTTL_CoversFullFreshnessSpan — checkFreshness accepts a
+// timestamp anywhere in [ts-freshnessWindowSeconds, ts+freshnessWindowSeconds+1),
+// a span of 2*freshnessWindowSeconds+1 seconds (the +1 covers second
+// truncation). A replay claim taken at the earliest accepted instant must
+// still be live at the latest accepted instant, so the cache TTL must be at
+// least that span plus one second of margin. A TTL that only exceeds
+// freshnessWindowSeconds (e.g. 15s against a 10s window) lets an attacker
+// replay a captured signature after the cache entry expires but while the
+// timestamp is still fresh.
+func TestReplayCacheTTL_CoversFullFreshnessSpan(t *testing.T) {
+	minRequiredTTL := time.Duration(2*freshnessWindowSeconds+1) * time.Second
+	require.GreaterOrEqual(t, replayCacheTTL, minRequiredTTL+time.Second,
+		"replayCacheTTL must cover the whole accepted freshness span plus a second of margin")
+}
+
 // TestPeerAuthMiddleware_AllowlistEmpty_NoElevation — a valid, fresh, non-replayed
 // signature whose peer is NOT in the allowlist must drop to tierUnverified.
 func TestPeerAuthMiddleware_AllowlistEmpty_NoElevation(t *testing.T) {
