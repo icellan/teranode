@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/require"
@@ -383,6 +384,34 @@ func TestResolveHeavyBurst(t *testing.T) {
 			got, warned := resolveHeavyBurst(logger, tt.configured, tt.floor, tt.rate)
 			require.Equal(t, tt.want, got)
 			require.Equal(t, tt.wantWarn, warned)
+		})
+	}
+}
+
+// TestCatchupFanOut pins the catchup-route burst floor to the larger of the two
+// catchup fan-outs a peer can aim at this node: the missing-transactions POSTs
+// (subtreevalidation_getMissingTransactions) and block catchup, which runs
+// blockvalidation_subtree_fetch_concurrency goroutines that each send
+// GET /subtree then GET /subtree_data.
+func TestCatchupFanOut(t *testing.T) {
+	tests := []struct {
+		name                   string
+		getMissingTransactions int
+		subtreeFetchConcurrent int
+		want                   int
+	}{
+		{"missing-transactions fan-out is larger", 32, 8, 32},
+		{"block catchup is larger, two requests per goroutine", 32, 32, 64},
+		{"block catchup unset", 6, 0, 6},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &settings.Settings{}
+			s.SubtreeValidation.GetMissingTransactions = tt.getMissingTransactions
+			s.BlockValidation.SubtreeFetchConcurrency = tt.subtreeFetchConcurrent
+
+			require.Equal(t, tt.want, catchupFanOut(s))
 		})
 	}
 }

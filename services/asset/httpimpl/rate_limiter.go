@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/labstack/echo/v4"
@@ -208,11 +209,20 @@ func (rl *tieredRateLimiter) burstFor(ratePerSec int) int {
 // anonymous per-IP burst on the Asset listener with no ceiling.
 const maxHeavyBurstRateMultiple = 4
 
+// catchupFanOut is how many heavy requests one catching-up peer can aim at this
+// node at once: the larger of the missing-transactions POSTs it runs in parallel
+// (subtreevalidation_getMissingTransactions) and block catchup, which runs
+// blockvalidation_subtree_fetch_concurrency goroutines that each send
+// GET /subtree and then GET /subtree_data.
+func catchupFanOut(tSettings *settings.Settings) int {
+	return max(tSettings.SubtreeValidation.GetMissingTransactions, 2*tSettings.BlockValidation.SubtreeFetchConcurrency)
+}
+
 // resolveHeavyBurst returns the burst the catchup-route heavy limiter should
 // use, and whether it warned about the configured value.
 //
-// floor is the concurrent fan-out a catching-up peer performs
-// (subtreevalidation_getMissingTransactions), clamped to at most
+// floor is the concurrent fan-out a catching-up peer performs (catchupFanOut),
+// clamped to at most
 // maxHeavyBurstRateMultiple times rate. A burst below the (clamped) floor
 // makes honest catchup traffic collide with the limiter: the resulting 429 is
 // never retried and subtree validation reports the serving peer as invalid.
@@ -230,14 +240,14 @@ func resolveHeavyBurst(logger ulogger.Logger, configured, floor, rate int) (int,
 
 	if configured > 0 {
 		if configured < clampedFloor {
-			logger.Warnf("[Asset] asset_httpHeavyRateBurst %d is below the catchup fan-out floor %d (subtreevalidation_getMissingTransactions, clamped to %dx the heavy rate); keeping the configured value because it was set explicitly - honest peer catchup may be rejected with 429", configured, clampedFloor, maxHeavyBurstRateMultiple)
+			logger.Warnf("[Asset] asset_httpHeavyRateBurst %d is below the catchup fan-out floor %d (the catchup fan-out, clamped to %dx the heavy rate); keeping the configured value because it was set explicitly - honest peer catchup may be rejected with 429", configured, clampedFloor, maxHeavyBurstRateMultiple)
 			return configured, true
 		}
 		return configured, false
 	}
 
 	if clampedFloor < floor {
-		logger.Warnf("[Asset] catchup-route heavy burst clamped to %d (%dx asset_httpHeavyRateLimit), below the catchup fan-out of %d (subtreevalidation_getMissingTransactions) - honest peer catchup may be rejected with 429; raise asset_httpHeavyRateLimit or set asset_httpHeavyRateBurst explicitly", clampedFloor, maxHeavyBurstRateMultiple, floor)
+		logger.Warnf("[Asset] catchup-route heavy burst clamped to %d (%dx asset_httpHeavyRateLimit), below the catchup fan-out of %d - honest peer catchup may be rejected with 429; raise asset_httpHeavyRateLimit or set asset_httpHeavyRateBurst explicitly", clampedFloor, maxHeavyBurstRateMultiple, floor)
 		return clampedFloor, true
 	}
 
