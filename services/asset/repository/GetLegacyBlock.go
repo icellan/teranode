@@ -79,10 +79,10 @@ func (repo *Repository) GetLegacyBlockReader(ctx context.Context, hash *chainhas
 
 	// Which pool this call draws from is decided at the HTTP boundary (see
 	// httpimpl.GetLegacyBlock), not here: ?wire=1 alone is not a trust signal, since
-	// any anonymous caller can set it. The boundary verifies the request's direct TCP
-	// peer is loopback before marking ctx, so a request that merely asks for wire
-	// format without actually originating from this node's own legacy peer server
-	// still draws from the anonymous pool.
+	// any anonymous caller can set it. The boundary verifies the request carries the
+	// asset_legacyPeerPoolToken shared secret before marking ctx, so a request that
+	// merely asks for wire format without presenting a matching token still draws
+	// from the anonymous pool.
 	sem := repo.semGetLegacyBlockReader
 	semName := "GetLegacyBlockReader"
 
