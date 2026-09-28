@@ -235,6 +235,10 @@ func TestReorgBlocks_MoveBackPath_WriterFlushFailureBeforeCommitFailsAndRollsBac
 
 	err = stp.Reorg([]*model.Block{moveBackBlock}, []*model.Block{})
 	require.Error(t, err, "a write flush failure during moveBack must fail the reorg before its commit point")
+	require.ErrorContains(t, err, "disk tx map storage error before committing reorg",
+		"must be this check's own error - not e.g. a panic from an unmocked blockchain call recovered into an error, "+
+			"which would also make require.Error pass without the fix actually having run")
+	require.ErrorContains(t, err, "flush failed", "and must actually be the flush failure")
 
 	require.Equal(t, tipHeader.Hash(), stp.GetCurrentBlockHeader().Hash(), "the header must not move on a rolled-back reorg")
 }

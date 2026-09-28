@@ -197,15 +197,19 @@ func TestMoveForwardBlock_PreCommitCheckFlushesBeforeFailing(t *testing.T) {
 
 	// resetSubtreeState swaps diskTxMap <-> diskTxMapShadow, so the pre-swap
 	// shadow becomes the new current map that the dequeued write above lands
-	// in. Install the failing batch on it before calling moveForwardBlock.
-	failing := &failingBatch{flushErr: errors.NewStorageError("flush failed")}
-	stp.diskTxMapShadow.disks[0].batch = failing
+	// in. Installed on every disk shard, not just disk 0, so the test does
+	// not depend on which disk queuedTxHash happens to shard to.
+	for i := range stp.diskTxMapShadow.disks {
+		stp.diskTxMapShadow.disks[i].batch = &failingBatch{flushErr: errors.NewStorageError("flush failed")}
+	}
 
 	originalCurrentTxMap := stp.currentTxMap
 
 	processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 	_, _, err := stp.moveForwardBlock(context.Background(), block, false, processedConflictingHashesMap, false, true)
 	require.Error(t, err, "a flush failure for this block's own writes must fail the call before commit, not be missed by an unflushed check")
+	require.ErrorContains(t, err, "disk tx map storage error before commit", "must be the pre-commit check's own error, not some unrelated failure")
+	require.ErrorContains(t, err, "flush failed", "and must actually be the flush failure, not e.g. a panic turned into an error")
 
 	requireSameMap(t, originalCurrentTxMap, stp.currentTxMap,
 		"a failure here must still be before the commit point: the double-buffer swap is rolled back")
@@ -280,6 +284,8 @@ func TestMoveForwardBlock_RemainderCheckBeforeDequeue_QueueUntouchedOnFailure(t 
 	processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 	_, _, err := stp.moveForwardBlock(context.Background(), block, false, processedConflictingHashesMap, false, true)
 	require.Error(t, err, "a remainder-pass write flush failure must fail the call before dequeue runs")
+	require.ErrorContains(t, err, "disk tx map storage error before dequeue", "must be this check's own error, not some unrelated failure")
+	require.ErrorContains(t, err, "flush failed", "and must actually be the flush failure")
 
 	require.Equal(t, int64(1), stp.queue.length(), "dequeueDuringBlockMovement must never have run: the queue is untouched")
 }

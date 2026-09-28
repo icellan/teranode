@@ -1504,6 +1504,31 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 		}
 	}
 
+	// Clear current tx map before touching chainedSubtrees/currentSubtree
+	// below: closeChainedSubtrees and replacing currentSubtree are themselves
+	// irreversible (mmap-backed subtrees are closed/unmapped), so checking
+	// here first means a failed rotation leaves STP fully intact - still on
+	// the old header, subtrees and map - rather than committed to an empty
+	// template with a stale, still-populated map. markNotOnLongestChain above
+	// only reads the pre-reset subtrees into a hash list for an external UTXO
+	// store call; it does not touch currentTxMap, chainedSubtrees or
+	// currentSubtree, so reordering around it changes nothing it depends on.
+	//
+	// Best-effort, like resetSubtreeState's Clear of the incoming half:
+	// verify rather than assume, so a failed rotation that leaves the map
+	// still populated fails reset outright instead of silently reloading on
+	// top of stale entries (SetIfNotExists would report them as "already
+	// exists" and drop the corresponding fresh reload data).
+	stp.currentTxMap.Clear()
+
+	if diskMap, ok := stp.currentTxMap.(*DiskTxMap); ok {
+		stp.reportDiskTxMapCloseWarn(diskMap, "reset_clear")
+	}
+
+	if remaining := stp.currentTxMap.Length(); remaining != 0 {
+		return errors.NewProcessingError("[SubtreeProcessor][reset] tx map still holds %d entries after clear, refusing to reload on top of stale state", remaining)
+	}
+
 	stp.closeChainedSubtrees()
 
 	itemsPerFile := int(stp.currentItemsPerFile.Load())
@@ -1515,21 +1540,6 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	stp.currentSubtree.Store(newSubtree)
 	if err := stp.currentSubtree.Load().AddCoinbaseNode(); err != nil {
 		return errors.NewProcessingError("[SubtreeProcessor][Reset] error adding coinbase placeholder to new current subtree", err)
-	}
-
-	// clear current tx map. Best-effort, like resetSubtreeState's Clear of the
-	// incoming half: verify rather than assume, so a failed rotation that
-	// leaves the map still populated fails reset outright instead of silently
-	// reloading on top of stale entries (SetIfNotExists would report them as
-	// "already exists" and drop the corresponding fresh reload data).
-	stp.currentTxMap.Clear()
-
-	if diskMap, ok := stp.currentTxMap.(*DiskTxMap); ok {
-		stp.reportDiskTxMapCloseWarn(diskMap, "reset_clear")
-	}
-
-	if remaining := stp.currentTxMap.Length(); remaining != 0 {
-		return errors.NewProcessingError("[SubtreeProcessor][reset] tx map still holds %d entries after clear, refusing to reload on top of stale state", remaining)
 	}
 
 	// clear remove map to prevent memory leak - entries for transactions that were
@@ -2964,11 +2974,16 @@ func (stp *SubtreeProcessor) addNodesDirectly(txs []*utxostore.UnminedTransactio
 // silently never reached disk - the filter still claims they exist, but every
 // later Get for them misses.
 //
-// Only diskTxMap needs flushing here: it is the map this operation writes
-// into (after any resetSubtreeState swap/allocation). diskTxMapShadow and
-// diskTxMapAnchor are read-only during the operation - getFromStore already
-// flushes the target disk synchronously before every read - so they have
-// nothing pending that a flush would surface sooner.
+// Only diskTxMap is flushed here: it is the map this operation writes into
+// (after any resetSubtreeState swap/allocation). diskTxMapShadow is read-only
+// during the operation. diskTxMapAnchor is NOT read-only in general -
+// moveBackBlockBulkBuild writes moved-back transactions into what becomes the
+// anchor during a multi-block reorg - but it is still covered without an
+// explicit flush here: every read (including the remainder pass that follows
+// moveBack) goes through getFromStoreOrErr, which flushes the target disk
+// synchronously before reading, and any resulting error lands in diskTxMapErr
+// via diskTxMapAnchor. Both halves also have nothing pending that a flush
+// would surface sooner than that synchronous per-read flush already does.
 func (stp *SubtreeProcessor) flushDiskTxMapWriters() {
 	if stp.diskTxMap != nil {
 		_ = stp.diskTxMap.Flush()
@@ -5334,17 +5349,21 @@ func (stp *SubtreeProcessor) processRemainderTransactionsAndDequeue(ctx context.
 		stp.logger.Debugf("[moveForwardBlock][%s] processRemainderTxHashes with %d subtrees DONE in %s", params.Block.String(), len(params.ChainedSubtrees), time.Since(remainderTxHashesStartTime).String())
 
 		// A second, cheaper pre-commit check before dequeueDuringBlockMovement
-		// drains the queue: this narrows (does not eliminate — the UTXO
-		// conflict-resolution swap earlier in moveForwardBlock is already
-		// irreversible) the #852 exposure window. A disk tx map error caught
-		// here still rolls back cleanly (the double-buffer swap defer applies,
-		// and the queue is still untouched), whereas the original check
-		// (moveForwardBlock, after dequeue) catching the very same
-		// processRemainderTxHashes write failure would do so only after
-		// dequeueDuringBlockMovement has already drained matching batches out
-		// of the queue - rollback then restores the in-memory subtree state
-		// but not the queue, permanently losing them (see
-		// move_forward_drain_loss_test.go).
+		// drains the queue: this narrows, but does not eliminate, the #852
+		// exposure window. Two things ahead of this point are already
+		// irreversible regardless: the UTXO conflict-resolution swap earlier
+		// in moveForwardBlock, and (on the dispatcher path, skipNotification
+		// false) any subtree announcements processRemainderTxHashes' own
+		// subtree-building already sent via newSubtreeChan while completing a
+		// subtree. Neither of those is undone by the rollback below. What this
+		// check DOES still protect is the queue: a disk tx map error caught
+		// here rolls back cleanly (the double-buffer swap defer applies, and
+		// the queue is untouched), whereas the original check (moveForwardBlock,
+		// after dequeue) catching the very same processRemainderTxHashes write
+		// failure would do so only after dequeueDuringBlockMovement has
+		// already drained matching batches out of the queue - rollback then
+		// restores the in-memory subtree state but not the queue, permanently
+		// losing them (see move_forward_drain_loss_test.go).
 		stp.flushDiskTxMapWriters()
 
 		if mapErr := stp.diskTxMapErr(); mapErr != nil {
