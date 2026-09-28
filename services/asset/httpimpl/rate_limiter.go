@@ -231,8 +231,10 @@ func catchupFanOut(tSettings *settings.Settings) int {
 // when it is below the floor: an operator's configured value is never
 // overridden. A single-line warning is logged instead, naming the risk. The
 // same warning is logged when the clamp itself lowers the burst below the
-// fan-out, which happens on auto-configured hosts with many cores.
-func resolveHeavyBurst(logger ulogger.Logger, configured, floor, rate int) (int, bool) {
+// fan-out, which happens on auto-configured hosts with many cores. warnFloor is
+// the missing-transactions fan-out: a clamp that stays at or above it cuts only
+// the block-catchup part of floor and is logged at INFO instead.
+func resolveHeavyBurst(logger ulogger.Logger, configured, floor, warnFloor, rate int) (int, bool) {
 	clampedFloor := floor
 	if maxFloor := rate * maxHeavyBurstRateMultiple; rate > 0 && clampedFloor > maxFloor {
 		clampedFloor = maxFloor
@@ -247,8 +249,16 @@ func resolveHeavyBurst(logger ulogger.Logger, configured, floor, rate int) (int,
 	}
 
 	if clampedFloor < floor {
-		logger.Warnf("[Asset] catchup-route heavy burst clamped to %d (%dx asset_httpHeavyRateLimit), below the catchup fan-out of %d - honest peer catchup may be rejected with 429; raise asset_httpHeavyRateLimit or set asset_httpHeavyRateBurst explicitly", clampedFloor, maxHeavyBurstRateMultiple, floor)
-		return clampedFloor, true
+		// Below the missing-transactions fan-out the clamp rejects the catchup
+		// POSTs this burst exists to admit, so warn. Cutting only the
+		// block-catchup part is the stock-config case and is documented, so it
+		// stays at INFO rather than warning on every default node.
+		if clampedFloor < warnFloor {
+			logger.Warnf("[Asset] catchup-route heavy burst clamped to %d (%dx asset_httpHeavyRateLimit), below the catchup fan-out of %d - honest peer catchup may be rejected with 429; raise asset_httpHeavyRateLimit or set asset_httpHeavyRateBurst explicitly", clampedFloor, maxHeavyBurstRateMultiple, floor)
+			return clampedFloor, true
+		}
+
+		logger.Infof("[Asset] catchup-route heavy burst clamped to %d (%dx asset_httpHeavyRateLimit), below the block-catchup fan-out of %d; large-block catchup may meet 429s on the burst - raise asset_httpHeavyRateLimit on nodes that serve catchup to many peers", clampedFloor, maxHeavyBurstRateMultiple, floor)
 	}
 
 	return clampedFloor, false

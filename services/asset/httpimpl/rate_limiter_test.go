@@ -364,6 +364,7 @@ func TestResolveHeavyBurst(t *testing.T) {
 		name       string
 		configured int
 		floor      int
+		warnFloor  int // 0 means the same as floor
 		rate       int
 		want       int
 		wantWarn   bool
@@ -376,12 +377,19 @@ func TestResolveHeavyBurst(t *testing.T) {
 		{name: "floor above 4x rate is clamped, and warns because the burst no longer covers the fan-out", configured: 0, floor: 100, rate: 10, want: 40, wantWarn: true},
 		{name: "configured above the clamped floor is kept, no warn", configured: 50, floor: 100, rate: 10, want: 50, wantWarn: false},
 		{name: "configured below the clamped floor is respected and warns against the clamped value", configured: 20, floor: 100, rate: 10, want: 20, wantWarn: true},
+		{name: "clamp cuts only the block-catchup part: stock defaults, no warn", configured: 0, floor: 64, warnFloor: 32, rate: 10, want: 40, wantWarn: false},
+		{name: "clamp cuts below the missing-transactions fan-out: warns", configured: 0, floor: 64, warnFloor: 48, rate: 10, want: 40, wantWarn: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			logger := ulogger.NewVerboseTestLogger(t)
-			got, warned := resolveHeavyBurst(logger, tt.configured, tt.floor, tt.rate)
+			warnFloor := tt.warnFloor
+			if warnFloor == 0 {
+				warnFloor = tt.floor
+			}
+
+			got, warned := resolveHeavyBurst(logger, tt.configured, tt.floor, warnFloor, tt.rate)
 			require.Equal(t, tt.want, got)
 			require.Equal(t, tt.wantWarn, warned)
 		})
