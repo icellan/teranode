@@ -227,16 +227,6 @@ type keyTagCollisionExemption struct {
 }
 
 var keyTagCollisionExemptions = map[string]keyTagCollisionExemption{
-	"blockmaxsize": {
-		fieldPaths: []string{"PolicySettings.BlockMaxSize", "BlockSettings.MaxSize"},
-		category:   categoryAccidentalBug,
-		reason: "PolicySettings.BlockMaxSize (default 0, controls what this node mines) and " +
-			"BlockSettings.MaxSize (default 4294967296, controls what it accepts) are different settings " +
-			"that accidentally share key:\"blockmaxsize\" (see settings_doc_test.go's docDefaultsExemptions " +
-			"entry for the same key, which documents the fallout in ExportMetadata()'s flat key->default map). " +
-			"BlockSettings.MaxSize is removed by the pending fix/remove-dead-block-maxsize-setting change; " +
-			"delete this exemption once that lands.",
-	},
 	"blockvalidation_processTxMetaUsingStore_BatchSize": {
 		fieldPaths: []string{"BlockSettings.ProcessTxMetaUsingStoreBatchSize", "BlockValidationSettings.ProcessTxMetaUsingStoreBatchSize"},
 		category:   categoryIntentionalSharing,
@@ -288,12 +278,15 @@ func TestSettingsKeyTagsAreUnique(t *testing.T) {
 	paths := make(map[string][]string)
 	collectKeyTagFieldPaths(reflect.TypeOf(Settings{}), paths)
 
+	seenExemptions := make(map[string]bool)
+
 	for key, fieldPaths := range paths {
 		if len(fieldPaths) <= 1 {
 			continue
 		}
 
 		if exempt, ok := keyTagCollisionExemptions[key]; ok {
+			seenExemptions[key] = true
 			require.ElementsMatch(t, exempt.fieldPaths, fieldPaths,
 				"exemption for key %q (%s) lists %v but the actual colliding fields are %v - update the exemption",
 				key, exempt.category, exempt.fieldPaths, fieldPaths)
@@ -301,6 +294,15 @@ func TestSettingsKeyTagsAreUnique(t *testing.T) {
 		}
 
 		t.Errorf("duplicate key tag %q is used by %d struct fields: %v", key, len(fieldPaths), fieldPaths)
+	}
+
+	// A key registered in keyTagCollisionExemptions but never seen above means
+	// its struct tag no longer collides (len(fieldPaths) <= 1 skipped it
+	// before ever consulting the exemption map) - the underlying duplication
+	// was fixed and the exemption is stale.
+	for key := range keyTagCollisionExemptions {
+		require.True(t, seenExemptions[key],
+			"stale exemption: key %q no longer has a colliding struct tag - remove it from keyTagCollisionExemptions", key)
 	}
 }
 

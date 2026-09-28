@@ -51,9 +51,13 @@
 These settings override the [global Postgres pool settings](../global_settings.md#postgresql-connection-pool)
 for the UTXO store only. Each is read directly (not through `PostgresPool`'s own struct tags, which only
 describe the opaque `utxostore_postgres_pool` field as a whole) via `getPostgresPoolSettings("utxostore",
-...)`, and all default to the zero value: if none of the seven are set, `PostgresPool` stays `nil` and the
-UTXO store falls back to the global settings below. There is no per-service override for the circuit
-breaker settings - those are global only.
+...)`, and all default to the zero value. The family is six numeric/duration settings plus `RetryEnabled`:
+`PostgresPool` stays `nil` unless one of the six (`MaxOpenConns`, `MaxIdleConns`, `ConnMaxLifetime`,
+`ConnMaxIdleTime`, `RetryMaxAttempts`, `RetryBaseDelay`) is non-zero - `RetryEnabled` alone does not create
+the pool. `RetryEnabled` also has no global fallback: once the pool exists (because one of the six is
+set), it replaces the global `RetryEnabled` value outright, `false` included - setting only
+`utxostore_postgres_retryEnabled = true` with no other per-service pool setting does nothing. There is no
+per-service override for the circuit breaker settings - those are global only.
 
 | Setting | Type | Default | Environment Variable | Usage |
 |---------|------|---------|---------------------|-------|
@@ -61,7 +65,7 @@ breaker settings - those are global only.
 | MaxIdleConns | int | 0 (falls back to global if unset) | utxostore_postgres_maxIdleConns | Maximum idle connections in pool |
 | ConnMaxLifetime | time.Duration | 0 (falls back to global if unset) | utxostore_postgres_connMaxLifetime | Maximum connection reuse duration |
 | ConnMaxIdleTime | time.Duration | 0 (falls back to global if unset) | utxostore_postgres_connMaxIdleTime | Maximum idle time before closing |
-| RetryEnabled | bool | false (falls back to global if unset) | utxostore_postgres_retryEnabled | Enable retries for transient errors |
+| RetryEnabled | bool | false (no global fallback; see above) | utxostore_postgres_retryEnabled | Enable retries for transient errors |
 | RetryMaxAttempts | int | 0 (falls back to global if unset) | utxostore_postgres_retryMaxAttempts | Maximum retry attempts |
 | RetryBaseDelay | time.Duration | 0 (falls back to global if unset) | utxostore_postgres_retryBaseDelay | Base delay for retry backoff |
 

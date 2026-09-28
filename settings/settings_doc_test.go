@@ -318,18 +318,6 @@ type docDefaultExemption struct {
 
 var docDefaultsExemptions = []docDefaultExemption{
 	{
-		file: "policy_settings.md",
-		key:  "blockmaxsize",
-		reason: "the key \"blockmaxsize\" is used by two different struct fields - PolicySettings.BlockMaxSize " +
-			"(default 0, documented here, controls what this node mines) and BlockSettings.MaxSize (default " +
-			"4294967296, controls what it accepts) - so ExportMetadata()'s flat key->default map holds whichever " +
-			"one the reflection walk visits last, currently BlockSettings.MaxSize, for BOTH the tag default and the " +
-			"runtime CurrentValue read back through the same map. This is a genuine settings.go ambiguity worth " +
-			"fixing separately (surfaced here, not fixed, because resolving it changes runtime key-resolution " +
-			"behaviour rather than a doc)",
-		unreliable: "both",
-	},
-	{
 		file: "blockvalidation_settings.md",
 		key:  "blockvalidation_processTxMetaUsingStore_Concurrency",
 		reason: "the doc (\"max(4, CPU/2)\") and the struct tag (default:\"auto\") agree with each other on the " +
@@ -679,9 +667,6 @@ func TestSettingsDocDefaultsMatchCode(t *testing.T) {
 				}
 
 				exemption, exempt := lookupExemption(base, row.key)
-				if exempt {
-					seenExemptions[exemption] = true
-				}
 
 				skipTag := exempt && (exemption.unreliable == "tag" || exemption.unreliable == "both")
 				skipRuntime := exempt && (exemption.unreliable == "runtime" || exemption.unreliable == "both")
@@ -699,17 +684,34 @@ func TestSettingsDocDefaultsMatchCode(t *testing.T) {
 				tagC := canonicalDefault(codeDefault)
 				runtimeC := canonicalDefault(runtimeDefault)
 
+				tagMismatch := docC != tagC
+				runtimeMismatch := docC != runtimeC
+				tagRuntimeMismatch := tagC != runtimeC
+
+				// Only count the exemption as still needed if the comparison(s)
+				// it suppresses would actually have failed without it - marking
+				// it seen merely because the row still exists in the doc (as a
+				// previous version of this check did) can never detect that the
+				// underlying mismatch was fixed, only that the row disappeared.
+				if exempt {
+					stillMismatched := (skipTag && tagMismatch) || (skipRuntime && runtimeMismatch) ||
+						(skipTag && skipRuntime && tagRuntimeMismatch)
+					if stillMismatched {
+						seenExemptions[exemption] = true
+					}
+				}
+
 				var mismatches []string
 
-				if !skipTag && docC != tagC {
+				if !skipTag && tagMismatch {
 					mismatches = append(mismatches, "doc/tag")
 				}
 
-				if !skipRuntime && docC != runtimeC {
+				if !skipRuntime && runtimeMismatch {
 					mismatches = append(mismatches, "doc/runtime")
 				}
 
-				if !skipTag && !skipRuntime && tagC != runtimeC {
+				if !skipTag && !skipRuntime && tagRuntimeMismatch {
 					mismatches = append(mismatches, "tag/runtime")
 				}
 
@@ -762,7 +764,8 @@ func TestSettingsDocDefaultsMatchCode(t *testing.T) {
 
 	for _, e := range docDefaultsExemptions {
 		require.True(t, seenExemptions[e],
-			"stale exemption: %s/%s no longer appears as a settings-table row - remove it from docDefaultsExemptions", e.file, e.key)
+			"stale exemption: %s/%s no longer disagrees between doc/tag/runtime on the comparison(s) it "+
+				"suppresses - remove it from docDefaultsExemptions", e.file, e.key)
 	}
 
 	for _, e := range nonSettingsKeyExemptions {
@@ -808,24 +811,7 @@ type pendingWireExemption struct {
 // runtimeUnreliableKeys() above folds those into this test's skip set too.
 // Listing them again here would make this list go stale the moment #1642
 // lands (both lists claim the mismatch, only one would still be true).
-var pendingWireExemptions = []pendingWireExemption{
-	{
-		key:    "p2p_peer_registry_ttl",
-		reason: "tagged 24h, resolves to 0s - not wired to a loader; being fixed in #1645",
-	},
-	{
-		key:    "p2p_peer_registry_cleanup_interval",
-		reason: "tagged 1h, resolves to 0s - not wired to a loader; being fixed in #1645",
-	},
-	{
-		key:    "p2p_peer_registry_max_size",
-		reason: "tagged 10000, resolves to 0 - not wired to a loader; being fixed in #1645",
-	},
-	{
-		key:    "blockchain_peerRegistrySaveInterval",
-		reason: "tagged 60s, resolves to 0s - not wired to a loader; being fixed in #1643",
-	},
-}
+var pendingWireExemptions []pendingWireExemption
 
 // TestSettingsTagMatchesRuntimeForAllKeys is the sound version of the
 // tag/runtime half of TestSettingsDocDefaultsMatchCode: it compares every
@@ -869,7 +855,9 @@ func TestSettingsTagMatchesRuntimeForAllKeys(t *testing.T) {
 		}
 
 		if _, exempt := pending[entry.Key]; exempt {
-			seenPending[entry.Key] = true
+			if canonicalDefault(entry.DefaultValue) != canonicalDefault(runtimeDefault) {
+				seenPending[entry.Key] = true
+			}
 			continue
 		}
 
@@ -911,7 +899,7 @@ func TestSettingsTagMatchesRuntimeForAllKeys(t *testing.T) {
 var checkedRowsPerDoc = map[string]int{
 	"global_settings.md":            44,
 	"kafka_settings.md":             19,
-	"policy_settings.md":            25,
+	"policy_settings.md":            26,
 	"alert_settings.md":             10,
 	"asset_settings.md":             35,
 	"blockassembly_settings.md":     42,
@@ -921,7 +909,7 @@ var checkedRowsPerDoc = map[string]int{
 	"coinbase_settings.md":          21,
 	"faucet_settings.md":            1,
 	"legacy_settings.md":            28,
-	"p2p_settings.md":               44,
+	"p2p_settings.md":               45,
 	"propagation_settings.md":       13,
 	"pruner_settings.md":            26,
 	"rpc_settings.md":               11,
