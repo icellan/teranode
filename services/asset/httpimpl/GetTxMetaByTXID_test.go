@@ -525,4 +525,16 @@ func TestApplyReadPolicyTimeout(t *testing.T) {
 		require.Greater(t, policy.TotalTimeout, time.Duration(0))
 		require.LessOrEqual(t, policy.TotalTimeout, 3*time.Second)
 	})
+
+	t.Run("already-expired ctx deadline still gets the fallback floor", func(t *testing.T) {
+		policy := &aero.BasePolicy{}
+
+		ctx, cancel := context.WithTimeout(context.Background(), -1*time.Second)
+		defer cancel()
+
+		applyReadPolicyTimeout(ctx, policy)
+
+		require.Greater(t, policy.TotalTimeout, time.Duration(0),
+			"an expired deadline must not leave TotalTimeout at zero")
+	})
 }

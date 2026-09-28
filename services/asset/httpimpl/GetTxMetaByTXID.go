@@ -31,9 +31,8 @@ func applyReadPolicyTimeout(ctx context.Context, policy *aero.BasePolicy) {
 	if deadline, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(deadline); remaining > 0 {
 			policy.TotalTimeout = remaining
+			return
 		}
-
-		return
 	}
 
 	if policy.TotalTimeout <= 0 {

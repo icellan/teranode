@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	aero "github.com/bsv-blockchain/aerospike-client-go/v8"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -160,6 +161,8 @@ func TestCatchupStatusProjection(t *testing.T) {
 // TestPeerProjection pins that the minimal peer shape drops ban, reputation and
 // error state while keeping the fields catchup peer selection needs.
 func TestPeerProjection(t *testing.T) {
+	lastMessageTime := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
 	peer := &blockchain.PeerInfo{
 		ID:               "peer-1",
 		ClientName:       "teranode/1.2.3",
@@ -172,9 +175,11 @@ func TestPeerProjection(t *testing.T) {
 		ReputationScore:  0.25,
 		MaliciousCount:   3,
 		LastCatchupError: "dial tcp 10.0.0.9:8000: connection refused",
+		LastMessageTime:  lastMessageTime,
 	}
 
 	minimal := minimalPeerInfoToResponse(peer)
+	require.Equal(t, lastMessageTime.Unix(), minimal.LastMessageTime)
 
 	encoded, err := json.Marshal(minimal)
 	require.NoError(t, err)
@@ -188,6 +193,7 @@ func TestPeerProjection(t *testing.T) {
 	require.NotContains(t, js, "malicious")
 	require.NotContains(t, js, "last_catchup_error")
 	require.NotContains(t, js, "connection refused")
+	require.Contains(t, js, "last_message_time")
 }
 
 // TestNewAerospikeRecordNilNode pins that a record with no owning node is
