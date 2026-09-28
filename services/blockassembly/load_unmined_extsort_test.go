@@ -9,6 +9,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/stretchr/testify/require"
 )
@@ -186,4 +187,38 @@ func TestUnminedSortDirs_FallsBackToTempDir(t *testing.T) {
 	require.Equal(t, []string{os.TempDir()}, unminedSortDirs(nil))
 	require.Equal(t, []string{os.TempDir()}, unminedSortDirs([]string{"", " "}))
 	require.Equal(t, []string{"/a", "/b"}, unminedSortDirs([]string{"/a", "", "/b"}))
+}
+
+type failingUnminedIterator struct{ err error }
+
+func (f *failingUnminedIterator) Next(context.Context) ([]*utxo.UnminedTransaction, error) {
+	return nil, f.err
+}
+func (f *failingUnminedIterator) Err() error   { return f.err }
+func (f *failingUnminedIterator) Close() error { return nil }
+
+func TestLoadUnminedSorted_Errors(t *testing.T) {
+	initPrometheusMetrics()
+
+	t.Run("invalid sort buffer", func(t *testing.T) {
+		ba, _, cleanup := setupDiskSortTest(t)
+		defer cleanup()
+
+		ba.settings.BlockAssembly.UnminedTxSortBufferRecords = 0
+
+		err := ba.loadUnminedSorted(context.Background(), &sliceUnminedIterator{}, map[uint32]bool{})
+		require.Error(t, err)
+	})
+
+	t.Run("iterator failure", func(t *testing.T) {
+		ba, _, cleanup := setupDiskSortTest(t)
+		defer cleanup()
+
+		ba.settings.BlockAssembly.UnminedTxDiskSortPaths = []string{t.TempDir()}
+		ba.settings.BlockAssembly.UnminedTxSortBufferRecords = 10
+
+		boom := errors.NewStorageError("scan failed")
+		err := ba.loadUnminedSorted(context.Background(), &failingUnminedIterator{err: boom}, map[uint32]bool{})
+		require.ErrorIs(t, err, boom)
+	})
 }

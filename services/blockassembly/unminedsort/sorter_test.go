@@ -455,3 +455,110 @@ func TestSorter_DrainReleasesSpareBuffer(t *testing.T) {
 	require.NoError(t, s.Drain(context.Background(), 1000, func([]*utxo.UnminedTransaction) error { return nil }))
 	require.Nil(t, s.spare)
 }
+
+func TestSorter_InvalidOptions(t *testing.T) {
+	_, err := New(Options{BufferRecords: 0})
+	require.Error(t, err)
+
+	// A sort "directory" that is a file.
+	file := filepath.Join(t.TempDir(), "not-a-dir")
+	require.NoError(t, os.WriteFile(file, []byte("x"), 0o600))
+
+	_, err = New(Options{Dirs: []string{file}, BufferRecords: 10})
+	require.Error(t, err)
+}
+
+func TestSorter_AddAndDrainAfterDrain(t *testing.T) {
+	s, err := New(Options{BufferRecords: 10})
+	require.NoError(t, err)
+
+	defer s.Close()
+
+	require.NoError(t, s.Drain(context.Background(), 10, func([]*utxo.UnminedTransaction) error { return nil }))
+	require.Error(t, s.Add(1, subtreepkg.Node{}, nil), "Add after Drain")
+	require.Error(t, s.Drain(context.Background(), 10, func([]*utxo.UnminedTransaction) error { return nil }), "second Drain")
+}
+
+// A spill that can't be written must fail the sorter, not lose the run.
+func TestSorter_SpillWriteFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+
+	dir := t.TempDir()
+
+	s, err := New(Options{Dirs: []string{dir}, BufferRecords: 100})
+	require.NoError(t, err)
+
+	defer func() {
+		for _, d := range s.dirs {
+			_ = os.Chmod(d, 0o755)
+		}
+
+		_ = s.Close()
+	}()
+
+	for _, d := range s.dirs {
+		require.NoError(t, os.Chmod(d, 0o500))
+	}
+
+	in := makeInputs(1000, false)
+
+	var addErr error
+	for i := range in {
+		if addErr = s.Add(in[i].createdAt, in[i].node, nil); addErr != nil {
+			break
+		}
+	}
+
+	if addErr == nil {
+		addErr = s.Drain(context.Background(), 100, func([]*utxo.UnminedTransaction) error { return nil })
+	}
+
+	require.Error(t, addErr)
+}
+
+// A run cut short on disk must fail the drain rather than silently dropping
+// the missing transactions.
+func TestSorter_TruncatedRun(t *testing.T) {
+	for _, withInpoints := range []bool{false, true} {
+		t.Run(map[bool]string{false: "no inpoints", true: "inpoints"}[withInpoints], func(t *testing.T) {
+			dir := t.TempDir()
+			in := makeInputs(3000, withInpoints)
+
+			s, err := New(Options{Dirs: []string{dir}, BufferRecords: 1000, WithInpoints: withInpoints})
+			require.NoError(t, err)
+
+			defer s.Close()
+
+			addAll(t, s, in, withInpoints)
+			require.NoError(t, s.waitSpill())
+			require.NotEmpty(t, s.runs)
+
+			info, err := os.Stat(s.runs[0])
+			require.NoError(t, err)
+			require.NoError(t, os.Truncate(s.runs[0], info.Size()-5))
+
+			err = s.Drain(context.Background(), 500, func([]*utxo.UnminedTransaction) error { return nil })
+			require.Error(t, err)
+		})
+	}
+}
+
+// Inpoints that no longer decode must fail the drain.
+func TestSorter_CorruptInpoints(t *testing.T) {
+	s, err := New(Options{BufferRecords: 1 << 20, WithInpoints: true})
+	require.NoError(t, err)
+
+	defer s.Close()
+
+	in := makeInputs(10, true)
+	addAll(t, s, in, true)
+
+	for i := range s.cur.arena {
+		s.cur.arena[i] = 0xFF
+	}
+
+	err = s.Drain(context.Background(), 10, func([]*utxo.UnminedTransaction) error { return nil })
+	require.Error(t, err)
+}
