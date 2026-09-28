@@ -104,7 +104,9 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 	t.Run("defaults preserve current behaviour", func(t *testing.T) {
 		s := NewSettings()
 
-		require.Equal(t, 0, s.Asset.MaxBatchRecords)
+		// asset_maxBatchRecords is the one exception in this group: it now
+		// defaults to a non-zero, enforced value (see its longdesc).
+		require.Equal(t, 16384, s.Asset.MaxBatchRecords)
 		require.Equal(t, int64(0), s.Asset.MaxBatchResponseBytes)
 		require.Equal(t, 0, s.Asset.MaxUTXOsPerTx)
 		require.Equal(t, 0, s.Asset.MaxBlockHeaders)
