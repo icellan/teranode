@@ -1602,13 +1602,19 @@ func TestHandleWebSocket_InitialStatusPrecedesBroadcasts(t *testing.T) {
 
 	wsURL, notificationCh := newWebSocketTestServer(t, s)
 
-	// Broadcast remote node_status messages continuously while the client
-	// connects; the first message it reads must still be our own node's.
+	// Broadcast remote node_status messages while the client connects; the
+	// first message it reads must still be our own node's. The burst stays
+	// below the per-client buffer: since the fan-out became non-blocking, a
+	// client whose buffer fills is evicted by design, and an unbounded flood
+	// could fill it on a slow runner before the write pump drained it,
+	// disconnecting the client before it read anything.
+	const burst = 50 // < the 100-message client buffer in HandleWebSocket
+
 	stopFlood := make(chan struct{})
 	defer close(stopFlood)
 
 	go func() {
-		for {
+		for i := 0; i < burst; i++ {
 			select {
 			case <-stopFlood:
 				return
