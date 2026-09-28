@@ -114,7 +114,7 @@ func makeUnminedBatches(total, batchSize int) [][]*utxo.UnminedTransaction {
 	return batches
 }
 
-func newAddNodesBenchProcessor(b *testing.B, itemsPerSubtree int, opts ...Options) (*SubtreeProcessor, func()) {
+func newAddNodesBenchProcessor(b testing.TB, itemsPerSubtree int, opts ...Options) (*SubtreeProcessor, func()) {
 	b.Helper()
 
 	settings := test.CreateBaseTestSettings(b)

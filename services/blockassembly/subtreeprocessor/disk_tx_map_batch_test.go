@@ -1,6 +1,7 @@
 package subtreeprocessor
 
 import (
+	"context"
 	"encoding/binary"
 	"testing"
 
@@ -118,4 +119,117 @@ func TestDiskTxMap_UpdateSubtreeIndexBatchAllMissing(t *testing.T) {
 	got, ok := m.Get(batchTestHash(1))
 	require.True(t, ok)
 	require.Equal(t, int16(3), got.SubtreeIndex)
+}
+
+// requireIndexesMatchChain checks that every tx in a chained subtree has its
+// DiskTxMap SubtreeIndex set to that subtree's position + 1.
+func requireIndexesMatchChain(t *testing.T, stp *SubtreeProcessor) int {
+	t.Helper()
+
+	checked := 0
+
+	for chainedIdx, st := range stp.chainedSubtrees {
+		for _, node := range st.Nodes {
+			if node.Hash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+				continue
+			}
+
+			got, ok := stp.diskTxMap.Get(node.Hash)
+			require.True(t, ok, "tx in chained subtree %d missing from the map", chainedIdx)
+			require.Equal(t, int16(chainedIdx+1), got.SubtreeIndex, "subtree index of a tx in chained subtree %d", chainedIdx)
+
+			checked++
+		}
+	}
+
+	return checked
+}
+
+func setAll(stp *SubtreeProcessor, nodes []subtreepkg.Node) {
+	for _, n := range nodes {
+		stp.diskTxMap.Set(n.Hash, &subtreepkg.TxInpoints{})
+	}
+}
+
+func batchTestNodes(start, n int) []subtreepkg.Node {
+	nodes := make([]subtreepkg.Node, n)
+	for i := range nodes {
+		nodes[i] = subtreepkg.Node{Hash: batchTestHash(start + i), Fee: 1, SizeInBytes: 250}
+	}
+
+	return nodes
+}
+
+// Subtrees completed by AddNodesDirectly (processCompleteSubtree) record their
+// chained index in the DiskTxMap.
+func TestDiskTxMap_SubtreeIndexAfterAddNodesDirectly(t *testing.T) {
+	stp, cleanup := newAddNodesBenchProcessor(t, 64, WithTxMapDirs([]string{t.TempDir(), t.TempDir()}))
+	defer cleanup()
+
+	require.NoError(t, stp.AddNodesDirectly(makeUnminedBatches(300, 300)[0], true))
+	require.GreaterOrEqual(t, len(stp.chainedSubtrees), 4)
+	require.Positive(t, requireIndexesMatchChain(t, stp))
+}
+
+// The reorg path builds subtrees in bulk; its index updates must match the
+// chain too.
+func TestDiskTxMap_SubtreeIndexAfterBulkBuild(t *testing.T) {
+	stp, cleanup := newAddNodesBenchProcessor(t, 64, WithTxMapDirs([]string{t.TempDir(), t.TempDir()}))
+	defer cleanup()
+
+	nodes := batchTestNodes(0, 300)
+	setAll(stp, nodes)
+
+	require.NoError(t, stp.bulkBuildSubtrees(context.Background(), nodes, 64))
+	require.GreaterOrEqual(t, len(stp.chainedSubtrees), 4)
+	require.Positive(t, requireIndexesMatchChain(t, stp))
+}
+
+// moveForward's parallel remainder build records the index for every subtree
+// it chains.
+func TestDiskTxMap_SubtreeIndexAfterParallelRemainderBuild(t *testing.T) {
+	stp, cleanup := newAddNodesBenchProcessor(t, 64, WithTxMapDirs([]string{t.TempDir(), t.TempDir()}))
+	defer cleanup()
+
+	nodes := batchTestNodes(1000, 300)
+	setAll(stp, nodes)
+
+	require.NoError(t, stp.parallelBuildRemainderSubtrees(context.Background(), nodes, true))
+	require.GreaterOrEqual(t, len(stp.chainedSubtrees), 4)
+	require.Positive(t, requireIndexesMatchChain(t, stp))
+}
+
+func TestDiskTxMap_UpdateSubtreeIndexBatchEdgeCases(t *testing.T) {
+	m, err := NewDiskTxMap(DiskTxMapOptions{BasePaths: []string{t.TempDir(), t.TempDir()}})
+	require.NoError(t, err)
+
+	defer m.Close()
+
+	require.NoError(t, m.UpdateSubtreeIndexBatch(nil, 1), "an empty batch is a no-op")
+
+	// One node leaves the other disk with nothing to do.
+	h := batchTestHash(7)
+	inp := subtreepkg.TxInpoints{}
+	m.Set(h, &inp)
+	require.NoError(t, m.UpdateSubtreeIndexBatch([]subtreepkg.Node{{Hash: h}}, 5))
+
+	got, ok := m.Get(h)
+	require.True(t, ok)
+	require.Equal(t, int16(5), got.SubtreeIndex)
+}
+
+// A store that can no longer be read fails the batch instead of silently
+// skipping the update.
+func TestDiskTxMap_UpdateSubtreeIndexBatchReadError(t *testing.T) {
+	m, err := NewDiskTxMap(DiskTxMapOptions{BasePaths: []string{t.TempDir()}})
+	require.NoError(t, err)
+
+	h := batchTestHash(9)
+	inp := subtreepkg.TxInpoints{}
+	m.Set(h, &inp)
+	require.NoError(t, m.Flush())
+
+	require.NoError(t, m.disks[0].store.Close())
+
+	require.Error(t, m.UpdateSubtreeIndexBatch([]subtreepkg.Node{{Hash: h}}, 2))
 }
