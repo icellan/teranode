@@ -462,3 +462,96 @@ func TestNext_EndsCleanlyWhenAllChannelsClosed(t *testing.T) {
 		require.Nil(t, batch)
 	}
 }
+
+// A handler error recorded during the scan must fail the scan even if the
+// client returned nil for the query as a whole: otherwise the failed record's
+// tx would be missing from the reload with no error raised.
+func TestRawHandlerSet_ResultIncludesRecordedHandlerError(t *testing.T) {
+	it := newHotpathTestIterator(8, time.Second)
+	set := newWatchdogSet(it, 1)
+
+	handlerErr := errors.NewProcessingError("invalid transaction data")
+	set.recordErr(handlerErr)
+
+	require.ErrorIs(t, set.result(nil), handlerErr)
+
+	queryErr := errors.NewStorageError("query failed")
+	require.ErrorIs(t, set.result(queryErr), queryErr, "a query error still takes precedence")
+
+	clean := newWatchdogSet(newHotpathTestIterator(8, time.Second), 1)
+	require.NoError(t, clean.result(nil))
+}
+
+// A handler blocked in flush on a slow consumer is busy, not stalled: with the
+// consumer blocked well past the idle timeout the watchdog must not fire, and
+// the scan proceeds once the consumer reads.
+func TestRawWatchdog_RealBlockedFlushIsNotAStall(t *testing.T) {
+	it := newHotpathTestIterator(0, 100*time.Millisecond) // unbuffered: flush blocks until read
+	set := &rawHandlerSet{it: it, ctx: context.Background()}
+	h := set.newHandler().(*rawUnminedHandler)
+
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+
+	stop := set.startWatch(ctx, cancel, it.queryIdleTimeout)
+	defer stop()
+
+	fed := make(chan error, 1)
+	go func() {
+		var err error
+		for i := 0; i < rawBatchSize && err == nil; i++ {
+			err = feed(t, h, rawMainRecordBins(i)) // the last record fills the batch and blocks in flush
+		}
+		fed <- err
+	}()
+
+	select {
+	case <-ctx.Done():
+		t.Fatalf("watchdog fired while the handler was blocked on the consumer: %v", context.Cause(ctx))
+	case <-time.After(5 * it.queryIdleTimeout):
+	}
+
+	batch := <-it.resultChan
+	require.Len(t, batch, rawBatchSize)
+	require.NoError(t, <-fed)
+	require.NoError(t, ctx.Err())
+}
+
+// A node retry mid-scan: the first command's handler commits some records and
+// is cut off inside the next one; the retry's handler replays from the last
+// committed record. Every record must come out exactly once.
+func TestRawHandlerSet_ExactlyOnceAcrossRetry(t *testing.T) {
+	it := newHotpathTestIterator(64, time.Second)
+	set := &rawHandlerSet{it: it, ctx: context.Background()}
+
+	const total, committed = 500, 200
+
+	first := set.newHandler().(*rawUnminedHandler)
+	for i := 0; i < committed; i++ {
+		require.NoError(t, feed(t, first, rawMainRecordBins(i)))
+	}
+
+	// Cut off mid-record: BeginRecord and some bins, no EndRecord.
+	require.NoError(t, first.BeginRecord(make([]byte, 20), 1, 0))
+	partial := rawMainRecordBins(committed)
+	require.NoError(t, first.Bin([]byte(partial[0].name), partial[0].ptype, partial[0].value))
+
+	// The retry resumes after the last committed record.
+	retry := set.newHandler().(*rawUnminedHandler)
+	for i := committed; i < total; i++ {
+		require.NoError(t, feed(t, retry, rawMainRecordBins(i)))
+	}
+
+	require.NoError(t, set.flushAll())
+
+	seen := map[chainhash.Hash]int{}
+	for _, tx := range collectResults(it) {
+		seen[tx.Hash]++
+	}
+
+	require.Len(t, seen, total)
+
+	for h, n := range seen {
+		require.Equal(t, 1, n, "%s delivered %d times", h, n)
+	}
+}

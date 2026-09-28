@@ -367,6 +367,23 @@ func (s *rawHandlerSet) flushAll() error {
 	return nil
 }
 
+// result is the scan's outcome once the query returned queryErr: that error,
+// else a failure sending the handlers' partial batches, else a record
+// processing error a handler recorded. The client should already have
+// returned such an error; checking it here means a dropped one can't silently
+// leave a tx out of the reload.
+func (s *rawHandlerSet) result(queryErr error) error {
+	if queryErr != nil {
+		return queryErr
+	}
+
+	if err := s.flushAll(); err != nil {
+		return err
+	}
+
+	return s.recordedErr()
+}
+
 func (s *rawHandlerSet) recordErr(err error) {
 	s.errMu.Lock()
 	if s.firstErr == nil {

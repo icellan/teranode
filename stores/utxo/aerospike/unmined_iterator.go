@@ -328,12 +328,12 @@ func (it *unminedTxIterator) queryRaw(ctx context.Context, policy *as.QueryPolic
 		return
 	}
 
-	var err error
+	var queryErr error
 	if qErr != nil {
-		err = qErr
-	} else {
-		err = handlers.flushAll()
+		queryErr = qErr
 	}
+
+	err := handlers.result(queryErr)
 
 	if err == nil || ctx.Err() != nil {
 		return
