@@ -1113,14 +1113,19 @@ func doHTTPRequestBodyReaderWithRetry(ctx context.Context, url string, cfg retry
 	lastAttemptSecond := int64(-1)
 
 	for attempt := 1; attempt <= cfg.maxAttempts; attempt++ {
-		if attempt > 1 && loadHTTPRequestSigner() != nil {
+		if attempt > 1 && signerSignsRequests(loadHTTPRequestSigner()) {
 			if err := waitOutRetrySecond(ctx, lastAttemptSecond); err != nil {
 				return nil, err
 			}
 		}
-		lastAttemptSecond = time.Now().Unix()
 
 		body, retryAfter, err := doHTTPRequestForStreamingWithRetryAfter(ctx, url, requestBody...)
+		// Read the clock after the attempt, not before it: the signer takes its
+		// timestamp while building the request, so a second that rolls over
+		// between a pre-attempt read and the signature would record S while the
+		// request was signed with S+1, and the next retry could land in S+1 and
+		// replay it. A post-attempt read is never earlier than the signed second.
+		lastAttemptSecond = time.Now().Unix()
 		if err == nil {
 			return body, nil
 		}

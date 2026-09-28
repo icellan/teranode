@@ -6,6 +6,11 @@ import (
 )
 
 // SubtreeValidationSettings configures the Merkle subtree validation service.
+// DefaultMissingTransactionsFetchTimeout is the default for
+// subtreevalidation_missingTransactionsFetchTimeout, and the value a non-positive
+// setting falls back to.
+const DefaultMissingTransactionsFetchTimeout = 10 * time.Minute
+
 type SubtreeValidationSettings struct {
 	QuorumPath                                string              `key:"subtree_quorum_path" desc:"Path for quorum configuration" default:"" category:"SubtreeValidation" usage:"Location of quorum configuration file" type:"string" longdesc:"### Purpose\nSpecifies the file path to quorum configuration for subtree validation consensus.\n\n### How It Works\nQuorum configuration defines which validators must agree for a subtree to be considered valid. The configuration file specifies validator endpoints and quorum thresholds for Byzantine fault tolerance.\n\n### Recommendations\n- **Multi-validator deployments** - Provide path to quorum configuration for fault tolerance\n- **Single-validator setups** - Leave empty (no quorum needed)"`
 	QuorumAbsoluteTimeout                     time.Duration       `key:"subtree_quorum_absolute_timeout" desc:"Absolute timeout for subtree quorum" default:"30s" category:"SubtreeValidation" usage:"Maximum wait for quorum agreement" type:"duration" longdesc:"### Purpose\nSets the maximum time to wait for quorum agreement on subtree validation.\n\n### How It Works\nWhen multiple validators participate in subtree validation, they must reach agreement within this timeout. If quorum is not reached, validation fails and the subtree is rejected.\n\n### Trade-offs\n| Setting | Benefit | Drawback |\n|---------|---------|----------|\n| Shorter | Faster failure detection | May timeout on slow networks |\n| Longer | More tolerant of latency | Slower failure recovery |\n\n### Recommendations\n- **30s** (default) - Reasonable for most distributed deployments\n- Increase for high-latency or geographically distributed validators"`
