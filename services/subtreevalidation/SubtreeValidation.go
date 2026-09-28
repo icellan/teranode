@@ -261,7 +261,7 @@ func (u *Server) DelTxMetaCacheMulti(ctx context.Context, hash *chainhash.Hash) 
 // tolerated the same way.
 func missingTransactionsFetchTimeout(tSettings *settings.Settings) time.Duration {
 	if tSettings == nil || tSettings.SubtreeValidation.MissingTransactionsFetchTimeout <= 0 {
-		return 5 * time.Minute
+		return settings.DefaultMissingTransactionsFetchTimeout
 	}
 
 	return tSettings.SubtreeValidation.MissingTransactionsFetchTimeout

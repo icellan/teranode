@@ -1802,3 +1802,16 @@ func TestDoHTTPRequestBodyReaderWithRetry_SignsEveryAttempt(t *testing.T) {
 	require.Len(t, seenTimestamps, 3, "each retry must be signed with a distinct timestamp")
 	require.Len(t, seenSignatures, 3, "each retry must produce a distinct signature")
 }
+
+// TestSignerSignsRequests pins which installed signers make the retry loop
+// wait out the current second: only one that actually signs. A signer with
+// no key installs cleanly but adds no signature, so there is nothing to
+// replay and no reason to delay its retries.
+func TestSignerSignsRequests(t *testing.T) {
+	require.False(t, signerSignsRequests(nil))
+	require.False(t, signerSignsRequests(NewEd25519RequestSigner(nil)))
+
+	priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+	require.NoError(t, err)
+	require.True(t, signerSignsRequests(NewEd25519RequestSigner(priv)))
+}
