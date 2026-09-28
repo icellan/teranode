@@ -86,7 +86,7 @@ import (
 //
 // Notes:
 //   - Each transaction hash in the request must be exactly 32 bytes
-//   - Response contains only found transactions
+//   - A hash that is not found fails the whole request with 404
 //   - Transactions are retrieved concurrently for better performance
 //   - Response order matches request order
 func (h *HTTP) GetTransactions() func(c echo.Context) error {
