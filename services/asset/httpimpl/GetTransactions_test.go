@@ -247,7 +247,9 @@ func verifyTransactions(t *testing.T, responseBody io.Reader, expectedHashes ...
 // route: POST /subtree/:hash/txs is the peer-catchup path and subtree validation
 // posts subtreevalidation_missingTransactionsBatchSize txids (16384 by default)
 // in a single request. A rejection here is never retried and demotes the honest
-// peer, so a full-size batch must still succeed with the shipped defaults.
+// peer, so a full-size batch must still succeed. This test runs with a zero
+// Settings (no record cap); TestGetTransactionsDefaultRecordCap covers the
+// shipped 16384 default.
 func TestGetTransactionsCatchupBatch(t *testing.T) {
 	initPrometheusMetrics()
 
@@ -305,7 +307,8 @@ func TestGetTransactionsEmptyBodySkipsSubtreeLoad(t *testing.T) {
 }
 
 // TestGetTransactionsRecordBudget checks asset_maxBatchRecords, which defaults to
-// 0 (unlimited, today's behaviour) and rejects only once an operator sets it.
+// 16384 (the catchup batch size); an explicit value below the catchup floor is
+// raised to it.
 func TestGetTransactionsRecordBudget(t *testing.T) {
 	initPrometheusMetrics()
 
@@ -627,7 +630,7 @@ func TestGetTransactionsReleasesSubtreePermitBeforeResponseWrite(t *testing.T) {
 // test for the slowloris fix: on the subtree path, GetSubtreeTransactions — which
 // takes the node-wide asset_concurrency_get_subtree_transactions permit — must not
 // be called until the request body has been read to completion. Dispatching while
-// reading (as the plain POST /transactions path does) would hold that shared,
+// reading (as an earlier version of this handler did) would hold that shared,
 // low-default (2) permit for the whole client-paced upload, letting a couple of
 // slow anonymous uploads pin both permits and starve every other caller of this
 // route, including honest peer catchup.

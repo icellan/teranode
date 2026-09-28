@@ -147,14 +147,10 @@ func (h *HTTP) GetTransactions() func(c echo.Context) error {
 
 // lookupAndStoreTransaction resolves hash — via transactionFromSubtreeData when
 // present, otherwise the UTXO store — reserves the response-byte budget, and
-// stores the serialized result in (*parts)[idx]. Shared by both GetTransactions
-// code paths below.
+// stores the serialized result in (*parts)[idx], for getTransactionsFromSubtree.
 //
-// parts is a pointer, not a slice, and every access to *parts here happens under
-// partsMu: on the streaming path the caller keeps growing the underlying slice
-// with append after some lookups are already dispatched, so reading the slice
-// header itself (not just indexing into it) must be synchronised, or a goroutine
-// here can race the caller's append.
+// The caller presizes parts to the number of hashes read before any lookup is
+// dispatched; partsMu guards the slot writes made concurrently from here.
 func (h *HTTP) lookupAndStoreTransaction(gCtx context.Context, hash chainhash.Hash, idx int,
 	transactionFromSubtreeData map[chainhash.Hash]*bt.Tx, parts *[][]byte, partsMu *sync.Mutex,
 	responseSize *atomic.Int64, maxBytes int64) (retErr error) {
@@ -229,8 +225,7 @@ const subtreeBatchHashHintCap = 1024
 // supplies: the slice's initial capacity is a hint taken from contentLength and
 // maxRecords, always capped by subtreeBatchHashHintCap, and never determines its
 // final size. maxRecords is
-// enforced as hashes are read, exactly as the dispatch-while-reading path
-// enforces it: an over-budget request is rejected here, before
+// enforced as hashes are read: an over-budget request is rejected here, before
 // GetSubtreeTransactions (and the permit it takes) is ever reached.
 func readSubtreeBatchHashes(body io.Reader, contentLength int64, maxRecords int) ([]chainhash.Hash, error) {
 	hint := 0
@@ -277,7 +272,7 @@ func readSubtreeBatchHashes(body io.Reader, contentLength int64, maxRecords int)
 // GetSubtreeTransactions takes a node-wide permit
 // (asset_concurrency_get_subtree_transactions, default 2) to bound the
 // underlying subtree-data deserialization. Dispatching lookups while reading the
-// request body — as the plain POST /transactions path does — would hold that
+// request body, as an earlier version of this handler did, would hold that
 // permit for the whole client-paced upload: a couple of slow anonymous uploads
 // can then pin both permits for up to the HTTP read timeout, starving every
 // other caller of this route, including honest peer catchup. So on this path the
@@ -364,10 +359,9 @@ func (h *HTTP) getTransactionsFromSubtree(ctx context.Context, c echo.Context, s
 // single buffer whose capacity is exactly the serialized length. The handler
 // used to reserve a flat 32MB before reading the first body byte, so every
 // in-flight request on this unauthenticated route cost 32MB regardless of how
-// much data it actually asked for. Callers build parts by growing it one slot
-// per hash read from the request body, not by presizing it from a
-// request-supplied record count, so this function never sees more capacity
-// than records actually dispatched.
+// much data it actually asked for. parts is sized from the hashes actually read,
+// which asset_maxBatchRecords bounds (16384 by default), so this function never
+// sees more capacity than records dispatched.
 func concatTransactionBytes(parts [][]byte) []byte {
 	total := 0
 
