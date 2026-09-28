@@ -109,9 +109,11 @@ func (h *HTTP) GetUTXOs(mode ReadMode) func(c echo.Context) error {
 			return writeUTXOsResponse(c, mode, nil)
 		}
 
-		// Admission budgets. Both default to 0 (unlimited), which is today's
-		// behaviour. Unlike POST /subtree/:hash/txs these routes are not on the
-		// peer-catchup path, so no floor is applied to the record budget.
+		// Admission budgets. asset_maxBatchRecords defaults to 16384 (enforced,
+		// see asset_maxBatchRecords longdesc); asset_maxBatchResponseBytes still
+		// defaults to 0 (unlimited). Unlike POST /subtree/:hash/txs these routes
+		// are not on the peer-catchup path, so no floor is applied to the record
+		// budget: the configured value (including the default) is enforced as-is.
 		if maxRecords := h.settings.Asset.MaxBatchRecords; maxRecords > 0 && numRecords > maxRecords {
 			return errBatchRecords(maxRecords)
 		}

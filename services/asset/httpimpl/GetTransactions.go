@@ -24,6 +24,10 @@ import (
 // HTTP Method:
 //   - POST
 //
+// Route:
+//   - POST /subtree/:hash/txs - this is the only route this handler is registered
+//     on; :hash is always non-empty through the router
+//
 // Request:
 //
 //	Content-Type: application/octet-stream
@@ -41,10 +45,18 @@ import (
 //
 // Error Responses:
 //
+//   - 400 Bad Request:
+//
+//   - Missing, malformed, or unknown subtree hash
+//
 //   - 404 Not Found:
 //
 //   - One or more transactions not found
 //     Example: {"message": "not found"}
+//
+//   - 413 Request Entity Too Large:
+//
+//   - Batch exceeds asset_maxBatchRecords or asset_maxBatchResponseBytes
 //
 //   - 500 Internal Server Error:
 //
@@ -58,12 +70,8 @@ import (
 //   - Concurrent transaction retrieval (up to 1024 goroutines)
 //   - The response buffer is sized from the serialized transactions, not from
 //     the requested record count
-//   - POST /transactions (no subtree hash) dispatches each hash to a lookup as
-//     it is read from the request body, rather than reading the whole body
-//     before any lookup starts, and the per-record result slice grows one slot
-//     per hash read, not presized from a request-supplied count
-//   - POST /subtree/:hash/txs reads the whole (bounded) body before dispatching
-//     any lookup, because GetSubtreeTransactions takes a node-wide permit
+//   - The whole (bounded) body is read before any lookup is dispatched, because
+//     GetSubtreeTransactions takes a node-wide permit
 //     (asset_concurrency_get_subtree_transactions): dispatching while reading
 //     would hold that shared permit for the client-paced upload, not just the
 //     lookup fan-out
@@ -75,12 +83,6 @@ import (
 //   - Number of transactions processed
 //   - Total response size
 //   - Processing duration
-//
-// Example Usage:
-//
-//	# Request multiple transactions
-//	POST /transactions
-//	Body: <32-byte-hash1><32-byte-hash2>...
 //
 // Notes:
 //   - Each transaction hash in the request must be exactly 32 bytes
@@ -133,11 +135,13 @@ func (h *HTTP) GetTransactions() func(c echo.Context) error {
 			_ = body.Close()
 		}()
 
-		if subtreeHash != nil {
-			return h.getTransactionsFromSubtree(ctx, c, subtreeHash, body)
+		if subtreeHash == nil {
+			// Unreachable through the router (POST /subtree/:hash/txs always supplies
+			// :hash), but the handler can be invoked directly (e.g. from a test).
+			return echo.NewHTTPError(http.StatusBadRequest, errors.NewInvalidArgumentError("missing subtree hash").Error())
 		}
 
-		return h.getTransactionsStreaming(ctx, c, body)
+		return h.getTransactionsFromSubtree(ctx, c, subtreeHash, body)
 	}
 }
 
@@ -352,129 +356,6 @@ func (h *HTTP) getTransactionsFromSubtree(ctx context.Context, c echo.Context, s
 	prometheusAssetHTTPGetTransactions.WithLabelValues("OK", "200").Add(float64(len(hashes)))
 
 	h.logger.Debugf("[Asset_http:GetTransactions] sending %d txs to client (%d bytes)", len(hashes), len(responseBytes))
-
-	return c.Blob(http.StatusOK, echo.MIMEOctetStream, responseBytes)
-}
-
-// getTransactionsStreaming serves POST /transactions (no subtree hash): each hash
-// is dispatched to a lookup as it is read from body, and the read loop stops
-// once a dispatched lookup has failed or the client's context is cancelled. This
-// path takes no node-wide permit, so pacing dispatch to the client's upload
-// speed does not pin a shared budget the way the subtree path's
-// GetSubtreeTransactions permit would.
-func (h *HTTP) getTransactionsStreaming(ctx context.Context, c echo.Context, body io.Reader) error {
-	maxRecords := h.maxBatchRecords()
-	maxBytes := h.maxBatchResponseBytes()
-
-	var (
-		partsMu      sync.Mutex
-		parts        [][]byte
-		responseSize atomic.Int64
-		recordsRead  int
-	)
-
-	// A derived, explicitly cancellable context: once the read loop stops on a
-	// read/budget error (firstErr below), cancel cuts short any lookup already
-	// dispatched but not yet observing the errgroup's own cancellation (which
-	// only fires once a goroutine itself returns an error), instead of letting
-	// up to 1024 of them run to completion after the request is already known
-	// to fail.
-	cancelCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	g, gCtx := errgroup.WithContext(cancelCtx)
-	util.SafeSetLimit(h.logger, g, 1024)
-
-	// dispatch budgets and launches the lookup for a single hash, appending it
-	// its own slot in parts. parts grows one slot per hash actually read, so
-	// it is never presized from a request-supplied count; the mutex guards
-	// both the append and every goroutine's indexed write, since a later
-	// append can reallocate the backing array while an earlier goroutine is
-	// still writing to its slot.
-	dispatch := func(hash chainhash.Hash) error {
-		if maxRecords > 0 && recordsRead >= maxRecords {
-			return errBatchRecords(maxRecords)
-		}
-
-		recordsRead++
-
-		partsMu.Lock()
-		idx := len(parts)
-		parts = append(parts, nil)
-		partsMu.Unlock()
-
-		g.Go(func() error {
-			return h.lookupAndStoreTransaction(gCtx, hash, idx, nil, &parts, &partsMu, &responseSize, maxBytes)
-		})
-
-		return nil
-	}
-
-	var hash chainhash.Hash
-
-	if _, err := io.ReadFull(body, hash[:]); err != nil {
-		if errors.Is(err, io.EOF) {
-			return c.Blob(http.StatusOK, echo.MIMEOctetStream, nil)
-		}
-
-		return echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error reading request body", err).Error())
-	}
-
-	// firstErr is the read/budget error that stopped the read loop, if any.
-	// It takes priority over waitErr: it is the reason no more hashes were
-	// read, whereas waitErr is whatever a dispatched lookup returned.
-	var firstErr error
-
-	if err := dispatch(hash); err != nil {
-		firstErr = err
-	}
-
-	for firstErr == nil {
-		if gCtx.Err() != nil {
-			// A dispatched lookup already failed, or the client's context was
-			// cancelled: stop reading more hashes from a body that can no
-			// longer produce a successful response.
-			break
-		}
-
-		if _, err := io.ReadFull(body, hash[:]); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-
-			firstErr = echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error reading request body", err).Error())
-
-			break
-		}
-
-		if err := dispatch(hash); err != nil {
-			firstErr = err
-			break
-		}
-	}
-
-	if firstErr != nil {
-		cancel()
-	}
-
-	h.observeBatchRecords("GetTransactions", recordsRead)
-
-	waitErr := g.Wait()
-
-	if firstErr != nil {
-		return firstErr
-	}
-
-	if waitErr != nil {
-		h.logger.Errorf("failed to get txs from repository: %s", waitErr.Error())
-		return waitErr
-	}
-
-	responseBytes := concatTransactionBytes(parts)
-
-	prometheusAssetHTTPGetTransactions.WithLabelValues("OK", "200").Add(float64(recordsRead))
-
-	h.logger.Debugf("[Asset_http:GetTransactions] sending %d txs to client (%d bytes)", recordsRead, len(responseBytes))
 
 	return c.Blob(http.StatusOK, echo.MIMEOctetStream, responseBytes)
 }

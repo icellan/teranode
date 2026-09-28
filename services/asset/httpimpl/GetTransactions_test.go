@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/services/asset/repository"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -20,31 +21,6 @@ import (
 
 func TestGetTransactions(t *testing.T) {
 	initPrometheusMetrics()
-
-	t.Run("Valid transaction hashes", func(t *testing.T) {
-		httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
-
-		// Set up mock responses for transaction hashes
-		// We use mock.Anything for the hash parameter since the exact value isn't critical for this test
-		mockRepo.On("GetTransaction", mock.Anything).Return(testTX1RawBytes, nil).Once()
-		mockRepo.On("GetTransaction", mock.Anything).Return(testTX2RawBytes, nil).Once()
-
-		// Create a slice with both transaction hashes
-		transactionHashes := append(testTX1Hash.CloneBytes(), testTX2Hash.CloneBytes()...)
-
-		// Set up the request
-		echoContext.Request().Body = io.NopCloser(bytes.NewReader(transactionHashes))
-
-		// Call GetTransactions handler
-		err := httpServer.GetTransactions()(echoContext)
-		require.NoError(t, err)
-
-		// Check response status code
-		assert.Equal(t, http.StatusOK, responseRecorder.Code)
-
-		// Verify transactions using helper function
-		verifyTransactions(t, bytes.NewReader(responseRecorder.Body.Bytes()), testTX1Hash.String(), testTX2Hash.String())
-	})
 
 	t.Run("Valid transaction hashes with subtree hash", func(t *testing.T) {
 		httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
@@ -116,10 +92,17 @@ func TestGetTransactions(t *testing.T) {
 	t.Run("Invalid transaction hash length", func(t *testing.T) {
 		httpServer, mockRepo, echoContext, _ := GetMockHTTP(t, nil)
 
+		subtreeHash := chainhash.HashH([]byte("subtreeHash"))
+
 		mockRepo.On("GetTransaction", mock.Anything, mock.Anything).Return(testTX1RawBytes, nil)
+		mockRepo.On("GetSubtreeExists", mock.Anything, mock.Anything).Return(true, nil).Once()
+		mockRepo.On("GetSubtreeTransactions", mock.Anything, mock.Anything).Return(make(map[chainhash.Hash]*bt.Tx), nil)
 
 		// set echo context
 		echoContext.Request().Header.Set(echo.HeaderContentType, echo.MIMEOctetStream)
+		echoContext.SetPath("/subtree/:hash/txs")
+		echoContext.SetParamNames("hash")
+		echoContext.SetParamValues(subtreeHash.String())
 
 		echoContext.Request().Body = io.NopCloser(bytes.NewReader([]byte{0x01, 0x02, 0x03, 0x04}))
 
@@ -138,11 +121,18 @@ func TestGetTransactions(t *testing.T) {
 	t.Run("Transaction not found", func(t *testing.T) {
 		httpServer, mockRepo, echoContext, _ := GetMockHTTP(t, nil)
 
+		subtreeHash := chainhash.HashH([]byte("subtreeHash"))
+
 		// set mock response
 		mockRepo.On("GetTransaction", mock.Anything, mock.Anything).Return(nil, errors.NewNotFoundError("transaction not found"))
+		mockRepo.On("GetSubtreeExists", mock.Anything, mock.Anything).Return(true, nil).Once()
+		mockRepo.On("GetSubtreeTransactions", mock.Anything, mock.Anything).Return(make(map[chainhash.Hash]*bt.Tx), nil)
 
 		// set echo context
 		echoContext.Request().Header.Set(echo.HeaderContentType, echo.MIMEOctetStream)
+		echoContext.SetPath("/subtree/:hash/txs")
+		echoContext.SetParamNames("hash")
+		echoContext.SetParamValues(subtreeHash.String())
 
 		echoContext.Request().Body = io.NopCloser(bytes.NewReader(testTX1Hash.CloneBytes()))
 
@@ -161,11 +151,18 @@ func TestGetTransactions(t *testing.T) {
 	t.Run("Repository error", func(t *testing.T) {
 		httpServer, mockRepo, echoContext, _ := GetMockHTTP(t, nil)
 
+		subtreeHash := chainhash.HashH([]byte("subtreeHash"))
+
 		// set mock response
 		mockRepo.On("GetTransaction", mock.Anything, mock.Anything).Return(nil, errors.NewStorageError("error getting transaction"))
+		mockRepo.On("GetSubtreeExists", mock.Anything, mock.Anything).Return(true, nil).Once()
+		mockRepo.On("GetSubtreeTransactions", mock.Anything, mock.Anything).Return(make(map[chainhash.Hash]*bt.Tx), nil)
 
 		// set echo context
 		echoContext.Request().Header.Set(echo.HeaderContentType, echo.MIMEOctetStream)
+		echoContext.SetPath("/subtree/:hash/txs")
+		echoContext.SetParamNames("hash")
+		echoContext.SetParamValues(subtreeHash.String())
 
 		echoContext.Request().Body = io.NopCloser(bytes.NewReader(testTX1Hash.CloneBytes()))
 
@@ -180,6 +177,32 @@ func TestGetTransactions(t *testing.T) {
 		// Check response body
 		assert.Equal(t, "PROCESSING (4): error getting transaction -> STORAGE_ERROR (69): error getting transaction", echoErr.Message)
 	})
+
+	t.Run("missing subtree hash is rejected", func(t *testing.T) {
+		httpServer, _, echoContext, _ := GetMockHTTP(t, nil)
+
+		echoContext.Request().Body = io.NopCloser(bytes.NewReader(testTX1Hash.CloneBytes()))
+
+		err := httpServer.GetTransactions()(echoContext)
+		echoErr := &echo.HTTPError{}
+		require.True(t, errors.As(err, &echoErr))
+		assert.Equal(t, http.StatusBadRequest, echoErr.Code)
+	})
+}
+
+// setSubtreeRoute points echoContext at the real POST /subtree/:hash/txs route,
+// and mockGetSubtreeTransactions makes GetSubtreeTransactions return an empty map
+// (falling every hash through to the GetTransaction store lookup below), the same
+// shape most of these tests exercised before GetTransactions was the only route.
+func setSubtreeRoute(c echo.Context, hash *chainhash.Hash) {
+	c.SetPath("/subtree/:hash/txs")
+	c.SetParamNames("hash")
+	c.SetParamValues(hash.String())
+}
+
+func mockGetSubtreeTransactions(mockRepo *repository.Mock) {
+	mockRepo.On("GetSubtreeExists", mock.Anything, mock.Anything).Return(true, nil).Once()
+	mockRepo.On("GetSubtreeTransactions", mock.Anything, mock.Anything).Return(make(map[chainhash.Hash]*bt.Tx), nil)
 }
 
 // verifyTransactions verifies that the response contains the expected transactions
@@ -289,6 +312,9 @@ func TestGetTransactionsRecordBudget(t *testing.T) {
 	t.Run("unset accepts any count", func(t *testing.T) {
 		httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
 
+		subtreeHash := chainhash.HashH([]byte("recordBudgetUnset"))
+		setSubtreeRoute(echoContext, &subtreeHash)
+		mockGetSubtreeTransactions(mockRepo)
 		mockRepo.On("GetTransaction", mock.Anything, mock.Anything).Return(testTX1RawBytes, nil)
 
 		echoContext.Request().Body = io.NopCloser(bytes.NewReader(bytes.Repeat(testTX1Hash.CloneBytes(), 8)))
@@ -301,6 +327,9 @@ func TestGetTransactionsRecordBudget(t *testing.T) {
 		httpServer, mockRepo, echoContext, _ := GetMockHTTP(t, nil)
 		httpServer.settings.Asset.MaxBatchRecords = 4
 
+		subtreeHash := chainhash.HashH([]byte("recordBudgetOverBudget"))
+		setSubtreeRoute(echoContext, &subtreeHash)
+		mockGetSubtreeTransactions(mockRepo)
 		mockRepo.On("GetTransaction", mock.Anything, mock.Anything).Return(testTX1RawBytes, nil)
 
 		echoContext.Request().Body = io.NopCloser(bytes.NewReader(bytes.Repeat(testTX1Hash.CloneBytes(), 5)))
@@ -310,6 +339,8 @@ func TestGetTransactionsRecordBudget(t *testing.T) {
 		echoErr := &echo.HTTPError{}
 		require.True(t, errors.As(err, &echoErr))
 		require.Equal(t, http.StatusRequestEntityTooLarge, echoErr.Code)
+
+		mockRepo.AssertNotCalled(t, "GetSubtreeTransactions", mock.Anything, mock.Anything)
 	})
 
 	t.Run("never enforced below the catchup batch size", func(t *testing.T) {
@@ -317,9 +348,59 @@ func TestGetTransactionsRecordBudget(t *testing.T) {
 		httpServer.settings.Asset.MaxBatchRecords = 4
 		httpServer.settings.SubtreeValidation.MissingTransactionsBatchSize = 16384
 
+		subtreeHash := chainhash.HashH([]byte("recordBudgetFloor"))
+		setSubtreeRoute(echoContext, &subtreeHash)
+		mockGetSubtreeTransactions(mockRepo)
 		mockRepo.On("GetTransaction", mock.Anything, mock.Anything).Return(testTX1RawBytes, nil)
 
 		echoContext.Request().Body = io.NopCloser(bytes.NewReader(bytes.Repeat(testTX1Hash.CloneBytes(), 64)))
+
+		require.NoError(t, httpServer.GetTransactions()(echoContext))
+		require.Equal(t, http.StatusOK, responseRecorder.Code)
+	})
+}
+
+// TestGetTransactionsDefaultRecordCap pins asset_maxBatchRecords' shipped default
+// (16384, matching subtreevalidation_missingTransactionsBatchSize's own default):
+// a batch one over that default is rejected with 413 before GetSubtreeTransactions
+// (and the node-wide permit it takes) is ever reached, and a batch at exactly the
+// default succeeds.
+func TestGetTransactionsDefaultRecordCap(t *testing.T) {
+	initPrometheusMetrics()
+
+	const shippedDefault = 16384
+
+	t.Run("one over the default is rejected before the permit is taken", func(t *testing.T) {
+		httpServer, mockRepo, echoContext, _ := GetMockHTTP(t, nil)
+		httpServer.settings.Asset.MaxBatchRecords = shippedDefault
+		httpServer.settings.SubtreeValidation.MissingTransactionsBatchSize = shippedDefault
+
+		subtreeHash := chainhash.HashH([]byte("defaultCapOverBudget"))
+		setSubtreeRoute(echoContext, &subtreeHash)
+		mockRepo.On("GetSubtreeExists", mock.Anything, mock.Anything).Return(true, nil).Once()
+
+		echoContext.Request().Body = io.NopCloser(bytes.NewReader(bytes.Repeat(testTX1Hash.CloneBytes(), shippedDefault+1)))
+
+		err := httpServer.GetTransactions()(echoContext)
+
+		echoErr := &echo.HTTPError{}
+		require.True(t, errors.As(err, &echoErr))
+		require.Equal(t, http.StatusRequestEntityTooLarge, echoErr.Code)
+
+		mockRepo.AssertNotCalled(t, "GetSubtreeTransactions", mock.Anything, mock.Anything)
+	})
+
+	t.Run("exactly the default is accepted", func(t *testing.T) {
+		httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
+		httpServer.settings.Asset.MaxBatchRecords = shippedDefault
+		httpServer.settings.SubtreeValidation.MissingTransactionsBatchSize = shippedDefault
+
+		subtreeHash := chainhash.HashH([]byte("defaultCapExact"))
+		setSubtreeRoute(echoContext, &subtreeHash)
+		mockGetSubtreeTransactions(mockRepo)
+		mockRepo.On("GetTransaction", mock.Anything, mock.Anything).Return(testTX1RawBytes, nil)
+
+		echoContext.Request().Body = io.NopCloser(bytes.NewReader(bytes.Repeat(testTX1Hash.CloneBytes(), shippedDefault)))
 
 		require.NoError(t, httpServer.GetTransactions()(echoContext))
 		require.Equal(t, http.StatusOK, responseRecorder.Code)
@@ -335,6 +416,9 @@ func TestGetTransactionsResponseByteBudget(t *testing.T) {
 	httpServer, mockRepo, echoContext, _ := GetMockHTTP(t, nil)
 	httpServer.settings.Asset.MaxBatchResponseBytes = int64(len(testTX1RawBytes))
 
+	subtreeHash := chainhash.HashH([]byte("responseByteBudget"))
+	setSubtreeRoute(echoContext, &subtreeHash)
+	mockGetSubtreeTransactions(mockRepo)
 	mockRepo.On("GetTransaction", mock.Anything, mock.Anything).Return(testTX1RawBytes, nil)
 
 	echoContext.Request().Body = io.NopCloser(bytes.NewReader(bytes.Repeat(testTX1Hash.CloneBytes(), 4)))
@@ -358,6 +442,9 @@ func TestGetTransactionsResponseByteBudgetFloor(t *testing.T) {
 	httpServer.settings.Asset.MaxBatchResponseBytes = 1
 	httpServer.settings.SubtreeValidation.MissingTransactionsBatchSize = 16384
 
+	subtreeHash := chainhash.HashH([]byte("responseByteBudgetFloor"))
+	setSubtreeRoute(echoContext, &subtreeHash)
+	mockGetSubtreeTransactions(mockRepo)
 	mockRepo.On("GetTransaction", mock.Anything, mock.Anything).Return(testTX1RawBytes, nil)
 
 	echoContext.Request().Body = io.NopCloser(bytes.NewReader(bytes.Repeat(testTX1Hash.CloneBytes(), 4)))
@@ -372,6 +459,10 @@ func TestGetTransactionsPreservesResponseOrder(t *testing.T) {
 	initPrometheusMetrics()
 
 	httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
+
+	subtreeHash := chainhash.HashH([]byte("preservesResponseOrder"))
+	setSubtreeRoute(echoContext, &subtreeHash)
+	mockGetSubtreeTransactions(mockRepo)
 
 	mockRepo.On("GetTransaction", mock.MatchedBy(func(h *chainhash.Hash) bool {
 		return h.IsEqual(testTX1Hash)
@@ -391,69 +482,22 @@ func TestGetTransactionsPreservesResponseOrder(t *testing.T) {
 	require.Equal(t, expected, responseRecorder.Body.Bytes())
 }
 
-// TestGetTransactionsDispatchesBeforeBodyFullyRead is the memory/shape regression:
-// the handler must dispatch each hash's lookup as it is read, not read the whole
-// body into a slice before any lookup starts. A blocking body reader proves it:
-// the first hash's lookup must run while the second hash has not been supplied
-// yet.
-func TestGetTransactionsDispatchesBeforeBodyFullyRead(t *testing.T) {
-	initPrometheusMetrics()
-
-	pr, pw := io.Pipe()
-	httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, pr)
-
-	firstLookupStarted := make(chan struct{})
-
-	mockRepo.On("GetTransaction", mock.MatchedBy(func(h *chainhash.Hash) bool {
-		return h.IsEqual(testTX1Hash)
-	})).Run(func(mock.Arguments) {
-		close(firstLookupStarted)
-	}).Return(testTX1RawBytes, nil).Once()
-	mockRepo.On("GetTransaction", mock.MatchedBy(func(h *chainhash.Hash) bool {
-		return h.IsEqual(testTX2Hash)
-	})).Return(testTX2RawBytes, nil).Once()
-
-	done := make(chan error, 1)
-
-	go func() {
-		done <- httpServer.GetTransactions()(echoContext)
-	}()
-
-	_, err := pw.Write(testTX1Hash.CloneBytes())
-	require.NoError(t, err)
-
-	select {
-	case <-firstLookupStarted:
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected the first hash's lookup to start before the rest of the body was read")
-	}
-
-	_, err = pw.Write(testTX2Hash.CloneBytes())
-	require.NoError(t, err)
-	require.NoError(t, pw.Close())
-
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("handler did not return after the body was fully supplied")
-	}
-
-	require.Equal(t, http.StatusOK, responseRecorder.Code)
-}
-
-// TestGetTransactionsStopsDispatchingAfterAFailure covers both the early-stop-on-
-// cancellation and reserve-before-serialize fixes: once a dispatched lookup has
-// failed, the handler must not keep dispatching (and therefore serializing) every
-// remaining hash in a large batch. On the previous implementation nothing checked
-// the shared context before dispatching or serializing, so every hash in the batch
-// was always looked up regardless of an earlier failure.
-func TestGetTransactionsStopsDispatchingAfterAFailure(t *testing.T) {
+// TestGetTransactionsFromSubtreeStopsProcessingAfterAFailure guards the
+// gCtx.Err() check in lookupAndStoreTransaction: once a dispatched lookup has
+// failed, goroutines still queued behind the 1024-way fan-out limit must skip
+// their own store lookup rather than running it anyway. Without that check,
+// every one of a large batch's hashes is looked up regardless of an earlier
+// failure.
+func TestGetTransactionsFromSubtreeStopsProcessingAfterAFailure(t *testing.T) {
 	initPrometheusMetrics()
 
 	const requestedHashes = 5000
 
 	httpServer, mockRepo, echoContext, _ := GetMockHTTP(t, nil)
+
+	subtreeHash := chainhash.HashH([]byte("stopsProcessingAfterFailure"))
+	setSubtreeRoute(echoContext, &subtreeHash)
+	mockGetSubtreeTransactions(mockRepo)
 
 	var calls atomic.Int64
 
@@ -471,7 +515,33 @@ func TestGetTransactionsStopsDispatchingAfterAFailure(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, echoErr.Code)
 
 	require.Less(t, calls.Load(), int64(requestedHashes),
-		"the handler must stop reading and dispatching more hashes once a lookup has already failed")
+		"once a lookup has already failed, queued goroutines must skip their own store lookup rather than running it anyway")
+}
+
+// TestGetTransactionsFromSubtreeReservesBudgetBeforeSerializing guards the
+// subtree-map branch's tx.Size() budget check: it must run, and reject an
+// over-budget batch with 413, even though the offending transaction comes from
+// the subtree-data map rather than the store.
+func TestGetTransactionsFromSubtreeReservesBudgetBeforeSerializing(t *testing.T) {
+	initPrometheusMetrics()
+
+	httpServer, mockRepo, echoContext, _ := GetMockHTTP(t, nil)
+	httpServer.settings.Asset.MaxBatchResponseBytes = 1
+
+	subtreeHash := chainhash.HashH([]byte("reservesBudgetBeforeSerializing"))
+	setSubtreeRoute(echoContext, &subtreeHash)
+
+	mockRepo.On("GetSubtreeExists", mock.Anything, mock.Anything).Return(true, nil).Once()
+	mockRepo.On("GetSubtreeTransactions", mock.Anything, mock.Anything).
+		Return(map[chainhash.Hash]*bt.Tx{*testTX1Hash: testTx1}, nil)
+
+	echoContext.Request().Body = io.NopCloser(bytes.NewReader(testTX1Hash.CloneBytes()))
+
+	err := httpServer.GetTransactions()(echoContext)
+
+	echoErr := &echo.HTTPError{}
+	require.True(t, errors.As(err, &echoErr))
+	require.Equal(t, http.StatusRequestEntityTooLarge, echoErr.Code)
 }
 
 // TestConcatTransactionBytesAllocatesExactly guards against a speculative
