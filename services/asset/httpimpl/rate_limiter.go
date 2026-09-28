@@ -26,6 +26,9 @@ const unverifiedLRUCapacity = 50_000
 // maxRetryAfterSeconds caps the Retry-After a 429 may advertise. Only a bucket
 // configured far below one request per hour can reach it; the cap exists so a
 // misconfiguration cannot hand a client an absurd — or numerically unusable — wait.
+// Teranode's own retry helper (util.DoHTTPRequestBodyReaderWithRetry) ignores any
+// Retry-After above its 5s maxDelay and falls back to its own ladder delay instead,
+// so this cap is for other, non-Teranode clients that may honour it verbatim.
 const maxRetryAfterSeconds = 3600
 
 // limiterEntry holds a rate limiter and the last time it was accessed.
@@ -281,8 +284,10 @@ func catchupHeavyBurst(logger ulogger.Logger, tSettings *settings.Settings) (int
 // floor is the concurrent fan-out a catching-up peer performs (catchupFanOut),
 // clamped to at most
 // maxHeavyBurstRateMultiple times rate. A burst below the (clamped) floor
-// makes honest catchup traffic collide with the limiter: the resulting 429 is
-// never retried and subtree validation reports the serving peer as invalid.
+// makes honest catchup traffic collide with the limiter: the resulting 429 on
+// POST /subtree/:hash/txs is retried with backoff (see
+// util.DoHTTPRequestBodyReaderWithRetry), but once the retry ladder is
+// exhausted subtree validation still reports the serving peer as invalid.
 //
 // An explicit, non-zero asset_httpHeavyRateBurst is always respected, even
 // when it is below the floor: an operator's configured value is never
