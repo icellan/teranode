@@ -1537,8 +1537,40 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	}
 
 	if remaining := stp.currentTxMap.Length(); remaining != 0 {
+		// Distinct from the generic disk_tx_map_errors_total{where=...}
+		// post-commit path: this is reset's own rotation failing, which dead-
+		// ends the usual escalation - reset returns an error here, so the
+		// deferred reportOrJoinDiskTxMapErr("reset") only joins any pending
+		// map error into it (err != nil) rather than requesting a reset, and
+		// resetWithOptions only logs the returned error. Counted separately
+		// so this specific, otherwise-silent dead end is visible; the caller
+		// (BlockAssembler.recordResetOutcome) still counts the returned error
+		// toward the consecutive-reset budget and the degraded gauge.
+		prometheusSubtreeProcessorDiskTxMapErrors.WithLabelValues("reset_rotation_failed").Inc()
+		stp.logger.Errorf("[SubtreeProcessor][reset] tx map rotation failed, still holds %d entries after clear; refusing to reload on top of stale state", remaining)
+
 		return errors.NewProcessingError("[SubtreeProcessor][reset] tx map still holds %d entries after clear, refusing to reload on top of stale state", remaining)
 	}
+
+	// The rotation above is itself the cure for any disk tx map error already
+	// pending, or already requesting a reset, before this point (a stale error
+	// from before reset started, or Clear's own pre-rotation flushAllDisks):
+	// every disk now has a fresh Badger generation, so nothing recorded
+	// against the discarded one is still true of the map's current content.
+	// Drain it log-only - it belongs to a generation that no longer exists,
+	// not to this reset - and clear any pending reset request: re-requesting
+	// here would request a reset FROM WITHIN a reset that just ran, looping
+	// forever on a persistent fault the rotation itself cannot fix (finding
+	// P1-1/P2-3). The reload immediately below can still create its own
+	// phantom against the fresh generation; AddDirectlyReportOnly/
+	// AddNodesDirectlyReportOnly/FlushDiskTxMapForLoad(isReload=true) each
+	// request a reset for that independently, and are deliberately left
+	// untouched by this drain.
+	if staleErr := stp.diskTxMapErr(); staleErr != nil {
+		stp.logDiskTxMapErr("reset_rotation_stale", staleErr)
+	}
+
+	stp.diskTxMapResetRequested.Store(false)
 
 	stp.closeChainedSubtrees()
 
@@ -5454,6 +5486,20 @@ func (stp *SubtreeProcessor) processRemainderTransactionsAndDequeue(ctx context.
 		if err := stp.processOwnBlockNodes(ctx, params.Block, params.ChainedSubtrees, params.CurrentSubtree, params.CurrentTxMap, params.SkipNotification); err != nil {
 			return err
 		}
+
+		// Unlike the foreign-block branch above, this path never dequeues:
+		// processOwnBlockNodes only reads the old half and SetIfNotExists's
+		// into the new one, so rollback here is fully safe and there is no
+		// #852 queue-drain exposure to narrow around. This check is therefore
+		// still pre-commit, not post-dequeue - flush this block's own writes
+		// (which may still be below writerFlushThreshold) and fail so the
+		// caller's rollback restores the pre-reset state and can retry, the
+		// same as the foreign-block pre-dequeue check above.
+		stp.flushDiskTxMapWriters()
+
+		if mapErr := stp.diskTxMapErr(); mapErr != nil {
+			return errors.NewStorageError("[moveForwardBlock][%s] disk tx map storage error before commit (own block)", params.Block.String(), mapErr)
+		}
 	}
 
 	return nil
@@ -5682,17 +5728,23 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 		return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing coinbase utxos", block.String(), err)
 	}
 
-	// This point is reached only after dequeueDuringBlockMovement has already
-	// drained the queue (when not skipped): rollback() does not requeue what
-	// it drained, so a disk tx map error surfacing here can only be from that
-	// pass's own writes (processCoinbaseUtxos does not touch the disk tx map,
-	// and every earlier write - resetSubtreeState, the remainder pass - was
-	// already flushed and checked pre-dequeue, above). Treat the dequeue
-	// drain as this block's own commit point: log and count the error and
-	// request a reset, the same as any other post-commit disk tx map error,
-	// instead of failing the call and losing the drained batches (a new #852
-	// trigger this fix removes - see move_forward_drain_loss_test.go and the
-	// PR review that flagged it).
+	// On the foreign-block path (the `if` branch above), this point is
+	// reached only after dequeueDuringBlockMovement has already drained the
+	// queue (when not skipped): rollback() does not requeue what it drained,
+	// so a disk tx map error surfacing here can only be from that pass's own
+	// writes (processCoinbaseUtxos does not touch the disk tx map, and every
+	// earlier write - resetSubtreeState, the remainder pass - was already
+	// flushed and checked pre-dequeue, above). Treat the dequeue drain as
+	// this block's own commit point: log and count the error and request a
+	// reset, the same as any other post-commit disk tx map error, instead of
+	// failing the call and losing the drained batches (a new #852 trigger
+	// this fix removes - see move_forward_drain_loss_test.go and the PR
+	// review that flagged it).
+	//
+	// On the own-block path (the `else` branch), there is no dequeue and
+	// nothing here can be post-commit: processOwnBlockNodes's own pre-commit
+	// check, above, already failed and rolled back on any map error, so
+	// nothing is pending by the time this runs - it is a no-op for that path.
 	//
 	// Flush first: dequeueDuringBlockMovement's own SetIfNotExists calls are
 	// batched and may still be below writerFlushThreshold, so a pending flush

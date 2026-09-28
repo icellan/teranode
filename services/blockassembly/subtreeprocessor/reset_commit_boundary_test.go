@@ -89,6 +89,33 @@ func TestReset_PostProcessReportOnlyMapErrorDoesNotFailReset(t *testing.T) {
 	require.True(t, stp.TakeResetRequested(), "a post-commit map error surfacing during reset's own reload must request a further reset - reset has no rollback of its own, so this is the only way the phantom it may have left gets cured")
 }
 
+// A disk tx map error recorded before reset ever started - or Clear's own
+// pre-rotation flushAllDisks - belongs to the generation Clear just rotated
+// away. Reset's Clear gives every disk a fresh Badger generation, so nothing
+// about that stale error is still true of the map's current content: it must
+// not survive to request a (redundant) reset once reset itself succeeds.
+// Without this, a stale pending error - or a prior reset's own unconsumed
+// request - makes every subsequent clean reset immediately request another
+// one, looping (finding P1-1/P2-3).
+func TestReset_StaleErrorBeforeResetDoesNotRequestReset(t *testing.T) {
+	stp := newSubtreeProcessorWithTxMapDirs(t, []string{t.TempDir()})
+
+	stp.diskTxMap.recordErr(errors.NewStorageError("old generation write failed"))
+
+	response := stp.reset(&model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+		Timestamp:      2200000002,
+		Bits:           model.NBit{},
+		Nonce:          9202,
+	}, nil, nil, false, func() error { return nil })
+	require.NoError(t, response, "a clean reset (no reload error) must succeed")
+
+	require.False(t, stp.TakeResetRequested(), "a stale pre-reset error must not survive the rotation to request a redundant reset")
+	require.NoError(t, stp.diskTxMapErr(), "the stale error must have been drained, not left pending")
+}
+
 // reset's currentTxMap.Clear() + Length()==0 check runs before
 // closeChainedSubtrees and before currentSubtree is replaced (F3): a failed
 // rotation must leave STP fully intact - still on the pre-reset header,
@@ -147,9 +174,20 @@ func TestReset_FailedTxMapClearLeavesSTPFullyIntact(t *testing.T) {
 		Nonce:          9301,
 	}
 
+	before := testutil.ToFloat64(prometheusSubtreeProcessorDiskTxMapErrors.WithLabelValues("reset_rotation_failed"))
+
 	resetErr := stp.reset(targetHeader, nil, nil, false, nil)
 	require.Error(t, resetErr, "a failed tx map rotation must fail reset")
 	require.ErrorContains(t, resetErr, "tx map still holds")
+
+	// A rotation failure dead-ends the usual post-commit escalation (reset
+	// fails outright, so reportOrJoinDiskTxMapErr("reset") only joins the map
+	// error into that failure instead of requesting a reset): it must still
+	// be visible through its own distinct counter, since the generic
+	// disk_tx_map_errors_total{where="reset"} label is never incremented on
+	// this path.
+	after := testutil.ToFloat64(prometheusSubtreeProcessorDiskTxMapErrors.WithLabelValues("reset_rotation_failed"))
+	require.Equal(t, before+1, after, "a rotation failure must be counted distinctly from the generic post-commit path")
 
 	require.Same(t, originalCurrentSubtree, stp.currentSubtree.Load(), "currentSubtree must be untouched: reset must fail before replacing it")
 	require.Equal(t, originalChainedLen, len(stp.chainedSubtrees), "chainedSubtrees must be untouched: closeChainedSubtrees must never run")

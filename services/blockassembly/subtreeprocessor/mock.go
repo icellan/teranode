@@ -79,15 +79,23 @@ func (m *MockSubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlo
 // this every heartbeat tick) to stub it would be pure noise. Tests pinning
 // the reset-request behaviour itself still set up an explicit expectation,
 // which takes priority.
-func (m *MockSubtreeProcessor) TakeResetRequested() bool {
-	for _, call := range m.ExpectedCalls {
-		if call.Method == "TakeResetRequested" {
-			args := m.Called()
-			return args.Bool(0)
+//
+// Recovers from testify's own "I don't know what to return" panic instead of
+// pre-checking m.ExpectedCalls directly: that slice is guarded by mock.Mock's
+// unexported mutex, and testify only takes it inside Called/On/MethodCalled,
+// so reading it here without going through one of those would race a
+// concurrent .On(...) call (e.g. a test wiring up more expectations while the
+// BlockAssembler main loop's heartbeat is already ticking).
+func (m *MockSubtreeProcessor) TakeResetRequested() (result bool) {
+	defer func() {
+		if recover() != nil {
+			result = false
 		}
-	}
+	}()
 
-	return false
+	args := m.Called()
+
+	return args.Bool(0)
 }
 
 func (m *MockSubtreeProcessor) GetCurrentBlockHeader() *model.BlockHeader {

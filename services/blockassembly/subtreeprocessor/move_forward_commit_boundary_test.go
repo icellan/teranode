@@ -216,6 +216,44 @@ func TestMoveForwardBlock_DequeueOwnWriteFailure_LogsCountsRequestsResetButSucce
 	require.True(t, stp.TakeResetRequested(), "a post-commit storage error from the dequeue pass must request a reset to cure the resulting phantom")
 }
 
+// The own-block path (all of the block's subtrees are already in
+// stp.chainedSubtrees) never dequeues - processOwnBlockNodes only reads the
+// old half and SetIfNotExists's into the new one - so unlike the dequeue
+// pass, a disk tx map error here is still pre-commit and rollback is fully
+// safe. It must fail moveForwardBlock, not be logged as
+// moveForwardBlock_postDequeue and committed with a phantom.
+func TestMoveForwardBlock_OwnBlockPreCommitErrorFailsAndRollsBack(t *testing.T) {
+	stp, block := newMoveForwardCommitBoundaryProcessor(t)
+
+	for i := 0; i < 40; i++ {
+		n := subtreepkg.Node{Hash: chainhash.HashH([]byte{byte(i), 7}), Fee: 1, SizeInBytes: 100}
+		require.NoError(t, stp.AddDirectly(&n, &subtreepkg.TxInpoints{}, true))
+	}
+
+	require.NotEmpty(t, stp.chainedSubtrees, "precondition: enough txs to chain at least one subtree")
+
+	// Make this block's Subtrees exactly our own chained subtree, so
+	// processBlockSubtrees clears blockSubtreesMap entirely and moveForwardBlock
+	// takes the own-block (else) branch, not the foreign-block dequeue path.
+	root := stp.chainedSubtrees[0].RootHash()
+	block.Subtrees = []*chainhash.Hash{root}
+
+	stp.flushDiskTxMapWriters()
+	require.NoError(t, stp.diskTxMapErr(), "precondition: no error pending before the call under test")
+
+	originalCurrentTxMap := stp.currentTxMap
+
+	boom := errors.NewStorageError("badger write failed")
+	stp.diskTxMap.recordErr(boom)
+
+	_, _, err := stp.moveForwardBlock(context.Background(), block, true, map[chainhash.Hash]struct{}{}, false, true)
+	require.ErrorIs(t, err, boom, "a pre-commit map error on the own-block path (no dequeue) must fail moveForwardBlock")
+
+	requireSameMap(t, originalCurrentTxMap, stp.currentTxMap, "the double-buffer swap must be rolled back: nothing here is post-commit")
+	require.NoError(t, stp.diskTxMapErr(), "the error was consumed by the failed call, not left pending")
+	require.False(t, stp.TakeResetRequested(), "a pre-commit failure must not request a reset: it rolled back cleanly and the caller can retry")
+}
+
 // Pins the actual P0 fix through the public entry point: a started processor
 // (dispatcher goroutine running) that hits a post-commit disk tx map error
 // must still report success to the caller and advance STP's header, with the

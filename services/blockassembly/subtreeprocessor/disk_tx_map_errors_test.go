@@ -553,6 +553,42 @@ func TestFlushDiskTxMapForLoad_ReportsTrailingUnflushedWriteFailureOnReload(t *t
 	require.Equal(t, before+1, after, "the trailing flush failure must still be logged and counted")
 }
 
+// DrainQueue's own writes (dequeueDuringBlockMovement adding a queued tx to
+// the current map) land after the caller's own end-of-load
+// FlushDiskTxMapForLoad call (BlockAssembler's startup Start() and reset's
+// postProcess both call DrainQueue after that flush already ran). A second
+// FlushDiskTxMapForLoad call after DrainQueue is what catches a trailing
+// unflushed write failure from DrainQueue itself; without it, this surfaces
+// later as a spurious "not found in currentTxMap" failure on an unrelated
+// block instead.
+func TestDrainQueue_TrailingUnflushedWriteFailure_CaughtByFlushDiskTxMapForLoad(t *testing.T) {
+	stp, cleanup := newAddNodesBenchProcessor(t, 64, WithTxMapDirs([]string{t.TempDir()}))
+	defer cleanup()
+
+	enqueueAt := time.Date(2030, 1, 2, 3, 4, 5, 0, time.UTC)
+	drainAt := enqueueAt.Add(1 * time.Millisecond)
+	stp.queue.clock = fixedClock{t: enqueueAt}
+	stp.clock = fixedClock{t: drainAt}
+
+	queuedTxHash := chainhash.HashH([]byte("queued-tx-drainqueue-flush"))
+	stp.queue.enqueueBatch(
+		[]subtreepkg.Node{{Hash: queuedTxHash, Fee: 1, SizeInBytes: 220}},
+		[]*subtreepkg.TxInpoints{{}},
+	)
+	require.Equal(t, int64(1), stp.queue.length(), "precondition: 1 batch enqueued")
+
+	failing := &failingBatch{flushErr: errors.NewStorageError("flush failed")}
+	for i := range stp.diskTxMap.disks {
+		stp.diskTxMap.disks[i].batch = failing
+	}
+
+	stp.DrainQueue(map[chainhash.Hash]struct{}{chainhash.HashH([]byte("unrelated-drop")): {}})
+	require.Equal(t, int64(0), stp.queue.length(), "precondition: DrainQueue actually drained the queue")
+
+	err := stp.FlushDiskTxMapForLoad("test_startup", false)
+	require.Error(t, err, "a trailing unflushed DrainQueue write failure must be caught, not missed until some later, unrelated call")
+}
+
 // Errors recorded on the inactive half of the double buffer are reported too.
 func TestDiskTxMapErr_IncludesShadow(t *testing.T) {
 	stp, cleanup := newAddNodesBenchProcessor(t, 64, WithTxMapDirs([]string{t.TempDir()}))
