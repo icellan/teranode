@@ -210,8 +210,12 @@ func TestGetBlockHeadersToCommonAncestorMainChainDeepLocatorSkipsTheWalk(t *test
 	headers, metas, err := getBlockHeadersToCommonAncestor(ctx, store, tipHash, locator, 100, 0)
 	require.NoError(t, err)
 
-	require.Equal(t, int64(0), store.getBlockHeadersCalls.Load(),
-		"a main-chain target must be answered by a range read, not the paging walk")
+	// The range read now answers via a single GetBlockHeaders call (same query
+	// the walk uses, so metas match it exactly) rather than the multi-batch
+	// paging walk, so exactly one call is expected here, not the several
+	// numberOfHeaders-sized pages the walk would need to reach height 5.
+	require.Equal(t, int64(1), store.getBlockHeadersCalls.Load(),
+		"a main-chain target must be answered by a single range read, not the paging walk")
 
 	// Same result the walk produces: 100 headers, ending at the ancestor
 	// (height 5, since 5+100-1=104 < tip), descending.
@@ -221,6 +225,57 @@ func TestGetBlockHeadersToCommonAncestorMainChainDeepLocatorSkipsTheWalk(t *test
 	require.Equal(t, hashes[5].String(), headers[len(headers)-1].Hash().String())
 	require.Equal(t, uint32(104), metas[0].Height)
 	require.Equal(t, uint32(5), metas[len(metas)-1].Height)
+}
+
+// TestGetBlockHeadersToCommonAncestorRangeReadMatchesWalkMetas is the
+// fail-on-revert regression for the range read losing metadata columns the
+// walk fills in: chain_work, timestamp (from inserted_at), processed_at and
+// the mined_set/subtrees_set/invalid flags. It gives a few blocks in the
+// returned range non-default metadata so a dropped column isn't masked by a
+// zero-value coincidence, then forces the walk (asset_maxLocatorWalkDepth
+// equivalent: a generous maxWalkDepth) for the same deep locator and requires
+// the range read (maxWalkDepth=0, the default) to return identical headers
+// and metas.
+func TestGetBlockHeadersToCommonAncestorRangeReadMatchesWalkMetas(t *testing.T) {
+	const numBlocks = 2_500
+
+	store, hashes := buildCommonAncestorTestChain(t, numBlocks)
+	ctx := context.Background()
+
+	tipHash := hashes[numBlocks]
+	// Ancestor is deep: height 5, matching the range-read scenario above.
+	locator := []*chainhash.Hash{hashes[5]}
+
+	require.NoError(t, store.SetBlockMinedSet(ctx, hashes[10]))
+	require.NoError(t, store.SetBlockSubtreesSet(ctx, hashes[20]))
+	require.NoError(t, store.SetBlockProcessedAt(ctx, hashes[30]))
+
+	walkHeaders, walkMetas, err := getBlockHeadersToCommonAncestor(ctx, store, tipHash, locator, 100, numBlocks+10)
+	require.NoError(t, err)
+	require.NotEmpty(t, store.getBlockHeadersCalls.Load(), "forcing maxWalkDepth must exercise the walk")
+
+	rangeHeaders, rangeMetas, err := getBlockHeadersToCommonAncestor(ctx, store, tipHash, locator, 100, 0)
+	require.NoError(t, err)
+
+	require.Equal(t, walkHeaders, rangeHeaders, "range read headers must match the forced walk exactly")
+	require.Equal(t, walkMetas, rangeMetas, "range read metas (chain_work, timestamp, processed_at, flags, heights) must match the forced walk exactly")
+
+	// Sanity: the metadata this test pins really is non-default, so a dropped
+	// column would show up as a mismatch above rather than a trivial pass.
+	require.NotEmpty(t, walkMetas[0].ChainWork)
+	require.NotZero(t, walkMetas[0].Timestamp)
+
+	var sawMinedSet, sawSubtreesSet, sawProcessedAt bool
+
+	for _, meta := range walkMetas {
+		sawMinedSet = sawMinedSet || meta.MinedSet
+		sawSubtreesSet = sawSubtreesSet || meta.SubtreesSet
+		sawProcessedAt = sawProcessedAt || meta.ProcessedAt != nil
+	}
+
+	require.True(t, sawMinedSet, "test setup must exercise a non-default mined_set")
+	require.True(t, sawSubtreesSet, "test setup must exercise a non-default subtrees_set")
+	require.True(t, sawProcessedAt, "test setup must exercise a non-nil processed_at")
 }
 
 // TestGetBlockHeadersToCommonAncestorForkTargetUsesTheWalk asserts that a

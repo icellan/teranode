@@ -3509,25 +3509,48 @@ func getCommonAncestorHeadersByRange(ctx context.Context, store blockchain_store
 		endHeight = startHeight + uint32(maxHeaders) - 1
 	}
 
-	headers, metas, err := store.GetBlockHeadersByHeight(ctx, startHeight, endHeight)
+	// GetBlockHeadersByHeight's query selects a narrower column set than
+	// GetBlockHeaders (no chain_work, mined_set, subtrees_set, invalid or
+	// processed_at, and it never derives Timestamp from inserted_at), so a
+	// caller reading metas through it silently gets incomplete ones. Use
+	// GetBlockHeaders instead: it is the same query the walk below uses, so
+	// the range read and the walk are guaranteed to return identical metas.
+	// GetBlockHeaders walks backward from a starting hash, so resolve the
+	// hash at endHeight first - hashTarget itself when the range wasn't
+	// clamped above, otherwise a lookup restricted to hashTarget's own chain,
+	// which is safe because the caller has already confirmed hashTarget is on
+	// the main chain.
+	endHash := hashTarget
+
+	if endHeight != targetMeta.Height {
+		hashesByHeight, ok, hashErr := store.MainChainBlockHashesByHeights(ctx, hashTarget, []uint32{endHeight})
+		if hashErr != nil {
+			return nil, nil, false, errors.NewStorageError("failed to get block hash at height", hashErr)
+		}
+
+		if !ok {
+			return nil, nil, false, nil
+		}
+
+		hash, found := hashesByHeight[endHeight]
+		if !found {
+			return nil, nil, false, nil
+		}
+
+		endHash = hash
+	}
+
+	numberOfHeaders := uint64(endHeight-startHeight) + 1
+
+	headers, metas, err := store.GetBlockHeaders(ctx, endHash, numberOfHeaders)
 	if err != nil {
-		return nil, nil, false, errors.NewStorageError("failed to get block headers by height", err)
+		return nil, nil, false, errors.NewStorageError("failed to get block headers", err)
 	}
 
-	// GetBlockHeadersByHeight returns ascending height order; the walk returns
-	// descending (hashTarget-side first), so reverse to match it exactly. The
-	// returned slices are shared with the store's response cache, so this must
-	// build new slices rather than reversing in place - mutating the cached
-	// slice would corrupt every future cache hit for the same height range.
-	reversedHeaders := make([]*model.BlockHeader, len(headers))
-	reversedMetas := make([]*model.BlockHeaderMeta, len(metas))
-
-	for i, header := range headers {
-		reversedHeaders[len(headers)-1-i] = header
-		reversedMetas[len(metas)-1-i] = metas[i]
-	}
-
-	return reversedHeaders, reversedMetas, true, nil
+	// GetBlockHeaders already returns descending height order (endHash-side
+	// first), which is exactly the order the walk below returns - no reversal
+	// needed.
+	return headers, metas, true, nil
 }
 
 // GetBlockHeadersFromCommonAncestor retrieves block headers from a common ancestor.
