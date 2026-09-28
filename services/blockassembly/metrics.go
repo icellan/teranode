@@ -85,11 +85,11 @@ var (
 	// prometheusBlockAssemblyQueueHeadAge tracks how long the oldest queued batch has been waiting
 	prometheusBlockAssemblyQueueHeadAge prometheus.Gauge
 
-	// prometheusBlockAssemblyDiskTxMapDegraded is 1 while auto-reset on a disk
-	// tx map storage error has been suspended after N consecutive
-	// storage-triggered resets (a persistent disk fault the rotation itself
-	// cannot cure), and 0 otherwise. Cleared by the next reset or
-	// moveForward that completes without a new storage error.
+	// prometheusBlockAssemblyDiskTxMapDegraded is 1 while block assembly is
+	// degraded because a reset for a disk tx map storage error hit a storage
+	// error again (a disk fault a fresh rotation can't cure), and 0 otherwise.
+	// Storage-triggered resets are suspended while it is 1; any reset that
+	// completes without a storage error clears it.
 	prometheusBlockAssemblyDiskTxMapDegraded prometheus.Gauge
 
 	// prometheusBlockAssemblerLivenessHeartbeatAge tracks how long since the main select loop last beat

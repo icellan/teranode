@@ -177,43 +177,12 @@ type BlockAssembler struct {
 	// resetCh handles reset requests for the assembler
 	resetCh chan resetRequest
 
-	// diskTxMapResetConsecutive counts consecutive storage-triggered resets
-	// (see resetRequest.StorageTriggered) that did not cure the disk tx map
-	// fault: the reset itself failed, or its own reload immediately left (or
-	// found) another pending reset request. Reset to 0 by any reset that
-	// completes clean. Touched only by the main loop goroutine
-	// (startChannelListeners' heartbeat and resetCh cases), so it needs no
-	// locking.
-	diskTxMapResetConsecutive int
-
-	// diskTxMapResetNotBefore is the earliest time the next storage-triggered
-	// reset may fire: exponential backoff between consecutive unsuccessful
-	// ones, so a persistent disk fault cannot spin the reset loop as fast as
-	// the heartbeat ticks.
-	diskTxMapResetNotBefore time.Time
-
-	// diskTxMapResetBackoffBase is the base of the exponential backoff
-	// applied between consecutive unsuccessful storage-triggered resets.
-	// Set from diskTxMapResetBaseBackoff by NewBlockAssembler; held
-	// per-assembler, like heartbeatInterval, so a test can shrink it without
-	// racing another test's running loop.
-	diskTxMapResetBackoffBase time.Duration
-
-	// diskTxMapResetInFlight is true from the moment a storage-triggered
-	// reset is requested (resetStorageTriggered) until its outcome is
-	// recorded (recordResetOutcome). resetStorageTriggered only queues the
-	// request and returns - the actual reset runs asynchronously in the
-	// resetCh case - so without this, a heartbeat tick firing again before
-	// that request is even picked up would queue a second one, potentially
-	// over-counting consecutive failures for what is really one attempt.
-	// Only ever touched by the main loop goroutine.
-	diskTxMapResetInFlight bool
-
-	// diskTxMapDegraded is true once diskTxMapResetConsecutive has reached
-	// maxConsecutiveDiskTxMapResets: auto-reset on a disk tx map storage
-	// error is suspended (a persistent disk fault the rotation itself cannot
-	// cure), and prometheusBlockAssemblyDiskTxMapDegraded reflects it. Only a
-	// reset that completes clean (storage-triggered or not) clears it.
+	// diskTxMapDegraded is set when a storage-triggered reset (see
+	// resetRequest.StorageTriggered) still hit a disk tx map storage error
+	// itself: the disk fault is one a fresh rotation can't cure, so further
+	// storage-triggered resets are suspended rather than reloading in a loop.
+	// Any reset that completes clean clears it (onResetDone). Touched only by
+	// the main loop goroutine.
 	diskTxMapDegraded bool
 
 	// reconcileCh signals the channel listener to reconcile BA's tip with the
@@ -280,6 +249,10 @@ type blockWithMeta struct {
 //   - *BlockAssembler: New block assembler instance
 func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, stats *gocore.Stat, utxoStore utxo.Store,
 	subtreeStore blob.Store, blockchainClient blockchain.ClientI, newSubtreeChan chan subtreeprocessor.NewSubtreeRequest) (*BlockAssembler, error) {
+	// The main loop updates metrics (e.g. the disk tx map degraded gauge)
+	// whether or not a Server was built around this assembler.
+	initPrometheusMetrics()
+
 	bytesLittleEndian := make([]byte, 4)
 
 	if tSettings.ChainCfgParams == nil {
@@ -307,21 +280,20 @@ func NewBlockAssembler(ctx context.Context, logger ulogger.Logger, tSettings *se
 	}
 
 	b := &BlockAssembler{
-		logger:                    logger,
-		stats:                     stats.NewStat("BlockAssembler"),
-		settings:                  tSettings,
-		utxoStore:                 utxoStore,
-		subtreeStore:              subtreeStore,
-		blockchainClient:          blockchainClient,
-		subtreeProcessor:          subtreeProcessor,
-		currentChainMap:           make(map[chainhash.Hash]uint32, tSettings.BlockAssembly.MaxBlockReorgCatchup),
-		currentChainMapIDs:        make(map[uint32]struct{}, tSettings.BlockAssembly.MaxBlockReorgCatchup),
-		defaultMiningNBits:        defaultMiningBits,
-		resetCh:                   make(chan resetRequest, 2),
-		reconcileCh:               make(chan struct{}, 1),
-		currentRunningState:       atomic.Value{},
-		heartbeatInterval:         defaultHeartbeatInterval,
-		diskTxMapResetBackoffBase: diskTxMapResetBaseBackoff,
+		logger:              logger,
+		stats:               stats.NewStat("BlockAssembler"),
+		settings:            tSettings,
+		utxoStore:           utxoStore,
+		subtreeStore:        subtreeStore,
+		blockchainClient:    blockchainClient,
+		subtreeProcessor:    subtreeProcessor,
+		currentChainMap:     make(map[chainhash.Hash]uint32, tSettings.BlockAssembly.MaxBlockReorgCatchup),
+		currentChainMapIDs:  make(map[uint32]struct{}, tSettings.BlockAssembly.MaxBlockReorgCatchup),
+		defaultMiningNBits:  defaultMiningBits,
+		resetCh:             make(chan resetRequest, 2),
+		reconcileCh:         make(chan struct{}, 1),
+		currentRunningState: atomic.Value{},
+		heartbeatInterval:   defaultHeartbeatInterval,
 	}
 
 	b.setCurrentRunningState(StateStarting)
@@ -426,18 +398,6 @@ func (b *BlockAssembler) GetChainedSubtreesTotalSize() uint64 {
 // Tests shrink the per-assembler field instead, so waiting several tick
 // intervals costs milliseconds rather than tens of seconds.
 const defaultHeartbeatInterval = 5 * time.Second
-
-// maxConsecutiveDiskTxMapResets bounds storage-triggered resets (see
-// resetRequest.StorageTriggered): once diskTxMapResetConsecutive reaches
-// this, auto-reset is suspended and prometheusBlockAssemblyDiskTxMapDegraded
-// is set, rather than looping resets forever against a persistent disk
-// fault the rotation itself cannot cure.
-const maxConsecutiveDiskTxMapResets = 3
-
-// diskTxMapResetBaseBackoff is the base of the exponential backoff applied
-// between consecutive unsuccessful storage-triggered resets (doubling: base,
-// 2×base, 4×base, ...).
-const diskTxMapResetBaseBackoff = time.Minute
 
 // effectiveHeartbeatInterval is the idle tick the listener goroutine will
 // actually use. NewBlockAssembler always sets a positive interval, but the
@@ -553,33 +513,18 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 				// from the UTXO store, the source of truth, curing any
 				// phantom the storage error left in the filter.
 				//
-				// Bounded: a persistent disk fault (the rotation itself
-				// cannot cure it) would otherwise make every reset's own
-				// reload immediately re-request another one, looping forever
-				// (issue found in review). diskTxMapDegraded and the backoff
-				// window below cap it at maxConsecutiveDiskTxMapResets; the
-				// outcome is recorded in the resetCh case, once the reset
-				// this triggers has actually run.
-				switch {
-				case b.diskTxMapDegraded:
-					// Retry budget already exhausted; stay degraded until some
-					// other reset (manual, reorg, ...) completes clean. Don't
-					// even poll: whatever is pending stays pending rather than
-					// being silently consumed with nothing acting on it.
-				case b.diskTxMapResetInFlight:
-					// A storage-triggered reset requested by an earlier tick
-					// hasn't been picked up and recorded yet (it runs
-					// asynchronously); avoid queuing a duplicate for what is
-					// really the same attempt.
-				case time.Now().Before(b.diskTxMapResetNotBefore):
-					// Backing off from the last unsuccessful attempt; same
-					// reasoning as diskTxMapDegraded above - leave a pending
-					// request unconsumed so a fault that occurred only once
-					// during the backoff window is not silently dropped.
-				case b.subtreeProcessor.TakeResetRequested():
-					b.logger.Warnf("[BlockAssembler] disk tx map reported a post-commit storage error; resetting block assembly (consecutive=%d)", b.diskTxMapResetConsecutive+1)
-					b.diskTxMapResetInFlight = true
-					b.resetStorageTriggered()
+				//
+				// One storage-triggered reset per fault: if that reset hits a
+				// storage error itself, the node is degraded and requests are
+				// consumed without resetting again, so a persistent disk fault
+				// can't loop full reloads. A clean reset of any kind clears it.
+				if b.subtreeProcessor.TakeResetRequested() {
+					if b.diskTxMapDegraded {
+						b.logger.Debugf("[BlockAssembler] disk tx map degraded; not resetting for another post-commit storage error")
+					} else {
+						b.logger.Warnf("[BlockAssembler] disk tx map reported a post-commit storage error; resetting block assembly")
+						b.resetStorageTriggered()
+					}
 				}
 
 			case resetReq := <-b.resetCh:
@@ -594,7 +539,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 
 				err := b.reset(ctx, resetReq.ValidateInputs)
 
-				b.recordResetOutcome(resetReq.StorageTriggered, err)
+				b.onResetDone(resetReq.StorageTriggered, err)
 
 				// The Reset path replays moveForward blocks through the same
 				// conflict resolution, so it can queue refusals too. Unlike the
@@ -1840,9 +1785,8 @@ type resetRequest struct {
 
 	// StorageTriggered marks a reset requested because the subtree processor
 	// reported a post-commit disk tx map storage error (see
-	// SubtreeProcessor.TakeResetRequested). Only resets from that source
-	// count toward diskTxMapResetConsecutive / the backoff / the degraded
-	// gauge - a manual or reorg-triggered reset never does.
+	// SubtreeProcessor.TakeResetRequested). Only such a reset can leave block
+	// assembly degraded (onResetDone); a clean reset of any kind clears it.
 	StorageTriggered bool
 }
 
@@ -1880,9 +1824,8 @@ func (b *BlockAssembler) resetWithOptions(fullReset bool, validateInputs bool) {
 
 // resetStorageTriggered requests a reset because the subtree processor
 // reported a post-commit disk tx map storage error (heartbeatTicker.C's
-// TakeResetRequested poll). Only resets requested this way count toward
-// diskTxMapResetConsecutive / the backoff / the degraded gauge, via
-// recordResetOutcome once the resetCh handler has run it.
+// TakeResetRequested poll). onResetDone decides, once the resetCh handler has
+// run it, whether it cured the map or left block assembly degraded.
 func (b *BlockAssembler) resetStorageTriggered() {
 	go func() {
 		errCh := make(chan error, 1)
@@ -1898,60 +1841,33 @@ func (b *BlockAssembler) resetStorageTriggered() {
 	}()
 }
 
-// recordResetOutcome updates the consecutive-failure counter, backoff window
-// and degraded gauge for a reset the resetCh handler just ran, given its
-// error. storageTriggered selects whether a failed-to-cure outcome counts
-// against the storage-reset budget (see resetRequest.StorageTriggered) - a
-// manual or reorg-triggered reset never increments the counter, but any
-// reset that completes clean still clears it, since the map got a fresh
-// rotation and reload either way.
-//
-// "Cured" means: reset itself returned no error, AND its own reload (run via
-// postProcess, inside reset) did not leave or create a fresh disk tx map
-// reset request - checked here via TakeResetRequested, which also drains it
-// so it is not picked up a second time by the next heartbeat tick.
-func (b *BlockAssembler) recordResetOutcome(storageTriggered bool, resetErr error) {
-	if storageTriggered {
-		b.diskTxMapResetInFlight = false
-	}
+// onResetDone updates the disk tx map degraded state once a reset has run,
+// from how it ended (every reset completion path calls it): a reset that
+// completed without a storage error clears degraded; a storage-triggered
+// reset that hit a storage error itself (SubtreeProcessor.
+// LastResetStorageFailed) sets it. Anything else - a reset failing for a
+// non-storage reason, or a manual/reorg reset whose reload left a phantom
+// (that raises its own request, which the heartbeat acts on) - leaves it as
+// it is.
+func (b *BlockAssembler) onResetDone(storageTriggered bool, resetErr error) {
+	storageFailed := b.subtreeProcessor.LastResetStorageFailed()
 
-	cured := resetErr == nil && !b.subtreeProcessor.TakeResetRequested()
-
-	if cured {
-		b.diskTxMapResetConsecutive = 0
-		b.diskTxMapResetNotBefore = time.Time{}
-
+	switch {
+	case resetErr == nil && !storageFailed:
 		if b.diskTxMapDegraded {
-			b.diskTxMapDegraded = false
-			prometheusBlockAssemblyDiskTxMapDegraded.Set(0)
-			b.logger.Infof("[BlockAssembler] disk tx map reset succeeded; clearing degraded state")
+			b.logger.Infof("[BlockAssembler] reset completed without a disk tx map storage error; no longer degraded")
 		}
 
-		return
-	}
-
-	if !storageTriggered {
-		// Not our budget to spend: a manual/reorg-triggered reset failing (or
-		// leaving a phantom) says nothing about whether auto-reset should
-		// keep retrying.
-		return
-	}
-
-	b.diskTxMapResetConsecutive++
-
-	if b.diskTxMapResetConsecutive >= maxConsecutiveDiskTxMapResets {
+		b.diskTxMapDegraded = false
+		prometheusBlockAssemblyDiskTxMapDegraded.Set(0)
+	case storageTriggered && storageFailed:
 		if !b.diskTxMapDegraded {
-			b.logger.Errorf("[BlockAssembler] disk tx map storage error persisted across %d consecutive resets; suspending auto-reset (likely a persistent disk fault) until a reset clears it", b.diskTxMapResetConsecutive)
+			b.logger.Errorf("[BlockAssembler] reset for a disk tx map storage error hit a storage error again (reset error: %v); degraded, not resetting again until a reset completes clean", resetErr)
 		}
 
 		b.diskTxMapDegraded = true
 		prometheusBlockAssemblyDiskTxMapDegraded.Set(1)
-
-		return
 	}
-
-	backoff := b.diskTxMapResetBackoffBase << (b.diskTxMapResetConsecutive - 1)
-	b.diskTxMapResetNotBefore = time.Now().Add(backoff)
 }
 
 // GetMiningCandidate retrieves a candidate block for mining.
@@ -2226,7 +2142,10 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 		// make sure we wait for the reset to complete
 		// validateInputs=true: getConflictingNodes() may miss conflicts not stored in subtree
 		// files; validateUnminedTxInputs() independently catches them via SpendingData.
-		if err = b.reset(ctx, true); err != nil {
+		err = b.reset(ctx, true)
+		b.onResetDone(false, err)
+
+		if err != nil {
 			b.logger.Errorf("[BlockAssembler] error resetting after large reorg: %v", err)
 		}
 
@@ -2272,7 +2191,10 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 		// already detected by reorgBlocks; re-running validateInputs here is redundant
 		// and currently broken (fields.Inputs alone does not populate data.Tx in the
 		// SQL store, so validateUnminedTxInputs always returns false).
-		if err = b.reset(ctx, reorgFailed); err != nil {
+		err = b.reset(ctx, reorgFailed)
+		b.onResetDone(false, err)
+
+		if err != nil {
 			return errors.NewProcessingError("error resetting block assembly after reorg with invalid block", err)
 		}
 

@@ -410,6 +410,10 @@ type SubtreeProcessor struct {
 	// reset rather than storming.
 	diskTxMapResetRequested atomic.Bool
 
+	// lastResetStorageFailed is true when the most recent reset hit a disk tx
+	// map storage error itself (see reset). Read by LastResetStorageFailed.
+	lastResetStorageFailed atomic.Bool
+
 	// txMapPool is a reusable transactionMap built in CreateTransactionMap.
 	// Allocated lazily on the first call (sized for that block) and Clear()ed
 	// between calls to avoid per-block ~600M-entry allocations that dominate
@@ -1472,6 +1476,22 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	// disk tx map error here can only be reported, never used to fail back to
 	// a "nothing changed" state that does not exist - so on success it is
 	// logged and counted, and only joined into an existing failure.
+	//
+	// lastResetStorageFailed records whether this reset itself hit a disk tx
+	// map storage error, so BlockAssembler can tell whether a
+	// storage-triggered reset cured the map without consuming the reset
+	// request (only its heartbeat does that). The rotation below clears any
+	// earlier request, so a request still pending when reset returns was
+	// raised by this reset's own reload or its final report. Registered
+	// before the report so it runs after it.
+	stp.lastResetStorageFailed.Store(false)
+
+	defer func() {
+		if stp.diskTxMapResetRequested.Load() {
+			stp.lastResetStorageFailed.Store(true)
+		}
+	}()
+
 	defer stp.reportOrJoinDiskTxMapErr("reset", &err)
 
 	ctx := context.Background()
@@ -1543,10 +1563,11 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 		// deferred reportOrJoinDiskTxMapErr("reset") only joins any pending
 		// map error into it (err != nil) rather than requesting a reset, and
 		// resetWithOptions only logs the returned error. Counted separately
-		// so this specific, otherwise-silent dead end is visible; the caller
-		// (BlockAssembler.recordResetOutcome) still counts the returned error
-		// toward the consecutive-reset budget and the degraded gauge.
+		// so this specific, otherwise-silent dead end is visible; it also marks
+		// the reset as storage-failed, so a storage-triggered reset ending
+		// here leaves block assembly degraded (BlockAssembler.onResetDone).
 		prometheusSubtreeProcessorDiskTxMapErrors.WithLabelValues("reset_rotation_failed").Inc()
+		stp.lastResetStorageFailed.Store(true)
 		stp.logger.Errorf("[SubtreeProcessor][reset] tx map rotation failed, still holds %d entries after clear; refusing to reload on top of stale state", remaining)
 
 		return errors.NewProcessingError("[SubtreeProcessor][reset] tx map still holds %d entries after clear, refusing to reload on top of stale state", remaining)
@@ -3158,6 +3179,13 @@ func (stp *SubtreeProcessor) requestReset(where string) {
 // own reset (BlockAssembler.Reset), which reloads unmined transactions from
 // the UTXO store - the source of truth - curing any phantom the storage error
 // left behind.
+// LastResetStorageFailed reports whether the most recent reset hit a disk tx
+// map storage error itself: its rotation failed, or its reload raised a new
+// reset request. It does not consume that request.
+func (stp *SubtreeProcessor) LastResetStorageFailed() bool {
+	return stp.lastResetStorageFailed.Load()
+}
+
 func (stp *SubtreeProcessor) TakeResetRequested() bool {
 	return stp.diskTxMapResetRequested.CompareAndSwap(true, false)
 }

@@ -8,6 +8,7 @@ package subtreeprocessor
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -36,6 +37,13 @@ var _ Interface = (*MockSubtreeProcessor)(nil)
 //   - Validating transaction processing workflows
 type MockSubtreeProcessor struct {
 	mock.Mock
+
+	// ResetRequested and ResetStorageFailed back TakeResetRequested and
+	// LastResetStorageFailed without testify expectations: the BlockAssembler
+	// main loop polls TakeResetRequested every heartbeat, so tests set these
+	// directly. TakeResetRequested reads and clears, like the real code.
+	ResetRequested     atomic.Bool
+	ResetStorageFailed atomic.Bool
 }
 
 func (m *MockSubtreeProcessor) GetCurrentTxMap() TxInpointsMap {
@@ -72,30 +80,15 @@ func (m *MockSubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlo
 	return args.Get(0).(ResetResponse)
 }
 
-// TakeResetRequested implements Interface.TakeResetRequested. Defaults to
-// false without requiring an explicit .On(...) expectation: most callers
-// never exercise the post-commit disk tx map error path this reports, and
-// requiring every test that starts the BlockAssembler main loop (which polls
-// this every heartbeat tick) to stub it would be pure noise. Tests pinning
-// the reset-request behaviour itself still set up an explicit expectation,
-// which takes priority.
-//
-// Recovers from testify's own "I don't know what to return" panic instead of
-// pre-checking m.ExpectedCalls directly: that slice is guarded by mock.Mock's
-// unexported mutex, and testify only takes it inside Called/On/MethodCalled,
-// so reading it here without going through one of those would race a
-// concurrent .On(...) call (e.g. a test wiring up more expectations while the
-// BlockAssembler main loop's heartbeat is already ticking).
-func (m *MockSubtreeProcessor) TakeResetRequested() (result bool) {
-	defer func() {
-		if recover() != nil {
-			result = false
-		}
-	}()
+// TakeResetRequested implements Interface.TakeResetRequested: read and clear
+// ResetRequested.
+func (m *MockSubtreeProcessor) TakeResetRequested() bool {
+	return m.ResetRequested.Swap(false)
+}
 
-	args := m.Called()
-
-	return args.Bool(0)
+// LastResetStorageFailed implements Interface.LastResetStorageFailed.
+func (m *MockSubtreeProcessor) LastResetStorageFailed() bool {
+	return m.ResetStorageFailed.Load()
 }
 
 func (m *MockSubtreeProcessor) GetCurrentBlockHeader() *model.BlockHeader {

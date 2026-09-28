@@ -193,3 +193,50 @@ func TestReset_FailedTxMapClearLeavesSTPFullyIntact(t *testing.T) {
 	require.Equal(t, originalChainedLen, len(stp.chainedSubtrees), "chainedSubtrees must be untouched: closeChainedSubtrees must never run")
 	require.Equal(t, originalHeader.Hash(), stp.currentBlockHeader.Load().Hash(), "header must be untouched")
 }
+
+func resetTestHeader(nonce uint32) *model.BlockHeader {
+	return &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+		Timestamp:      2200000003,
+		Bits:           model.NBit{},
+		Nonce:          nonce,
+	}
+}
+
+// LastResetStorageFailed reports whether the most recent reset itself hit a
+// disk tx map storage error (its rotation failed, or its reload raised a new
+// reset request). BlockAssembler uses it to decide whether a storage-triggered
+// reset cured the map, without consuming the request.
+func TestReset_LastResetStorageFailed(t *testing.T) {
+	t.Run("clean reset", func(t *testing.T) {
+		stp := newSubtreeProcessorWithTxMapDirs(t, []string{t.TempDir()})
+
+		require.NoError(t, stp.reset(resetTestHeader(9301), nil, nil, false, func() error { return nil }))
+		require.False(t, stp.LastResetStorageFailed())
+	})
+
+	t.Run("reload raises a new request", func(t *testing.T) {
+		stp := newSubtreeProcessorWithTxMapDirs(t, []string{t.TempDir()})
+
+		require.NoError(t, stp.reset(resetTestHeader(9302), nil, nil, false, func() error {
+			stp.requestReset("test_reload")
+			return nil
+		}))
+		require.True(t, stp.LastResetStorageFailed())
+		require.True(t, stp.TakeResetRequested(), "the reload's request stays pending for the heartbeat")
+
+		// The next clean reset clears it.
+		require.NoError(t, stp.reset(resetTestHeader(9303), nil, nil, false, func() error { return nil }))
+		require.False(t, stp.LastResetStorageFailed())
+	})
+
+	t.Run("a request raised before the rotation does not count", func(t *testing.T) {
+		stp := newSubtreeProcessorWithTxMapDirs(t, []string{t.TempDir()})
+		stp.requestReset("before_reset")
+
+		require.NoError(t, stp.reset(resetTestHeader(9304), nil, nil, false, func() error { return nil }))
+		require.False(t, stp.LastResetStorageFailed())
+	})
+}
