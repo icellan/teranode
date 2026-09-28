@@ -484,6 +484,12 @@ var localServiceHTTPClient = &http.Client{
 		t.MaxIdleConnsPerHost = 100
 		return t
 	}(),
+	// A redirect target is not necessarily loopback or TLS-protected, and this client's
+	// requests can carry the legacy peer pool's internal token header. Don't follow: return
+	// the redirect response as-is so the token never reaches whatever the target is.
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
 }
 
 // DoLocalServiceHTTPRequestBodyReader streams a GET from one of this node's own services,
