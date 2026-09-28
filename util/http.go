@@ -806,6 +806,32 @@ func buildOutboundRequest(ctx context.Context, rawURL string, requestBody ...[]b
 	return req, nil
 }
 
+// waitOutRetrySecond blocks until the wall clock has moved past prevSecond, if it hasn't
+// already. Ed25519 signing is deterministic and the signed timestamp (X-Peer-Timestamp)
+// has one-second resolution, so retrying a signed request within the same Unix second it
+// was last signed in produces a byte-identical signature. The receiver's replay cache
+// rejects that as a replay and drops the peer to the unverified tier, on exactly the
+// retries meant to recover from a transient rejection. prevSecond < 0 (no previous
+// attempt yet) is a no-op. Only called for signed requests on the retry path; the plain
+// (non-retry) path and unsigned requests are unaffected.
+func waitOutRetrySecond(ctx context.Context, prevSecond int64) error {
+	if prevSecond < 0 || time.Now().Unix() != prevSecond {
+		return nil
+	}
+
+	untilNextSecond := time.Until(time.Unix(prevSecond+1, 0))
+	if untilNextSecond <= 0 {
+		return nil
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(untilNextSecond):
+		return nil
+	}
+}
+
 // executeHTTPRequestWithClient performs the request through client, which decides what
 // addresses may be reached.
 func executeHTTPRequestWithClient(ctx context.Context, cancelFn context.CancelFunc, client *http.Client, rawURL string, requestBody ...[]byte) (io.ReadCloser, context.CancelFunc, error) {
@@ -1064,8 +1090,13 @@ var defaultRetryConfig = retryConfig{
 //   - Other errors (404, 500, network errors) are returned immediately — they are not
 //     transient admission rejections.
 //   - Backoff is exponential starting at 250ms, doubling, capped at 5s. Up to 6 attempts,
-//     so a server that never relents costs ~7.75s of backoff before the final error.
-//   - Honors the server's Retry-After header on each rejection (clamped to maxDelay).
+//     so a server that never relents and never sends Retry-After costs ~7.75s of backoff
+//     before the final error.
+//   - Honors the server's Retry-After header on each rejection, replacing that attempt's
+//     ladder delay outright when the header value is <= maxDelay; a larger value is
+//     ignored and the ladder delay is used instead. Retry-After is not a ceiling on top
+//     of the ladder — a compliant peer sending Retry-After: 5 on every rejection costs
+//     5 x 5s = 25s, well above the Retry-After-free worst case above.
 //   - ctx cancellation aborts the retry loop and returns the parent ctx error.
 //   - The final error keeps the classification of the last rejection, so a caller can
 //     still tell a rate limit apart from an unavailable server after the ladder runs out.
@@ -1079,8 +1110,16 @@ func DoHTTPRequestBodyReaderWithRetry(ctx context.Context, url string, requestBo
 func doHTTPRequestBodyReaderWithRetry(ctx context.Context, url string, cfg retryConfig, requestBody ...[]byte) (io.ReadCloser, error) {
 	delay := cfg.initialDelay
 	var lastErr error
+	lastAttemptSecond := int64(-1)
 
 	for attempt := 1; attempt <= cfg.maxAttempts; attempt++ {
+		if attempt > 1 && loadHTTPRequestSigner() != nil {
+			if err := waitOutRetrySecond(ctx, lastAttemptSecond); err != nil {
+				return nil, err
+			}
+		}
+		lastAttemptSecond = time.Now().Unix()
+
 		body, retryAfter, err := doHTTPRequestForStreamingWithRetryAfter(ctx, url, requestBody...)
 		if err == nil {
 			return body, nil
