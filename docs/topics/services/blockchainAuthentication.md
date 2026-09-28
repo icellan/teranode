@@ -41,8 +41,12 @@ If processes cannot be upgraded separately, perform a coordinated restart with t
 key configured everywhere. An older client can pass HealthGRPC but fail all useful
 operations against the new server. Leaving the key empty does not provide a
 migration bypass: Blockchain refuses startup. A mismatched key returns
-`Unauthenticated`. Rotation requires coordinating the shared value across the fleet;
-this change does not add simultaneous support for two keys.
+`Unauthenticated`. Because HealthGRPC is public, the Blockchain client proves its
+key with one protected call: a client built with a rejected key fails construction
+with a configuration error, and a key that stops matching later (rotation, a
+restarted Blockchain) turns the caller's readiness check red. Rotation requires
+coordinating the shared value across the fleet; this change does not add
+simultaneous support for two keys.
 
 ## Transport and reflection
 

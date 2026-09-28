@@ -63,6 +63,7 @@ func startAuthenticatedBlockchain(t *testing.T, reflection bool) (*Blockchain, *
 		}
 		require.NoError(t, b.Stop(context.Background()))
 		util.CleanupListeners(s.Context)
+		logger.Shutdown() // stop late store goroutines from logging through a finished t
 		require.NoError(t, store.Close(context.Background()))
 	})
 	select {
@@ -210,6 +211,53 @@ func TestBlockchainRequiredAuthClients(t *testing.T) {
 		require.Equal(t, "auth-peer", peer.ID)
 		require.NoError(t, registry.Close())
 	}
+}
+
+func TestBlockchainRequiredAuthClientWrongKey(t *testing.T) {
+	_, s, conn := startAuthenticatedBlockchain(t, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	// HealthGRPC is public, so construction must prove the key with a protected call.
+	wrongKey := "mismatched-admin-api-key-0123456789"
+	wrong := test.CreateBaseTestSettings(t)
+	wrong.GRPCAdminAPIKey = wrongKey
+	wrong.BlockChain.GRPCAddress = s.BlockChain.GRPCAddress
+	client, err := NewClient(ctx, ulogger.NewErrorTestLogger(t), wrong, "wrong-key-client")
+	require.Nil(t, client)
+	require.ErrorContains(t, err, "rejected grpc_admin_api_key")
+	require.NotContains(t, err.Error(), wrongKey)
+	// A key that stops matching after construction must turn readiness red.
+	// The fixture's own HealthGRPC self-check dials the unresolved :0 address,
+	// so stub it healthy and send the key probe over the real transport.
+	c := &Client{client: &healthyAPI{BlockchainAPIClient: blockchain_api.NewBlockchainAPIClient(conn)}}
+	code, msg, err := c.Health(ctx, false)
+	require.Error(t, err)
+	require.Equal(t, http.StatusFailedDependency, code)
+	require.Contains(t, msg, "rejected grpc_admin_api_key")
+	code, _, err = c.Health(metadata.AppendToOutgoingContext(ctx, "x-api-key", blockchainAuthTestKey), false)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, code)
+	// Only Unauthenticated is fatal: a server without the interceptor stays ready.
+	old := &Client{client: &healthyAPI{fsmErr: status.Error(codes.Unimplemented, "old server")}}
+	code, _, err = old.Health(ctx, false)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, code)
+}
+
+type healthyAPI struct {
+	blockchain_api.BlockchainAPIClient
+	fsmErr error
+}
+
+func (h *healthyAPI) HealthGRPC(context.Context, *emptypb.Empty, ...grpc.CallOption) (*blockchain_api.HealthResponse, error) {
+	return &blockchain_api.HealthResponse{Ok: true}, nil
+}
+
+func (h *healthyAPI) GetFSMCurrentState(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*blockchain_api.GetFSMStateResponse, error) {
+	if h.fsmErr != nil {
+		return nil, h.fsmErr
+	}
+	return h.BlockchainAPIClient.GetFSMCurrentState(ctx, in, opts...)
 }
 
 func TestBlockchainRequiredAuthHTTP(t *testing.T) {

@@ -869,6 +869,11 @@ func (m *mockHealthClient) HealthGRPC(ctx context.Context, in *emptypb.Empty, op
 	return m.resp, m.err
 }
 
+// GetFSMCurrentState accepts the readiness key probe, as a server does for a matching key.
+func (m *mockHealthClient) GetFSMCurrentState(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*blockchain_api.GetFSMStateResponse, error) {
+	return &blockchain_api.GetFSMStateResponse{State: blockchain_api.FSMStateType_RUNNING}, nil
+}
+
 type mockBlockClient struct {
 	blockchain_api.BlockchainAPIClient
 	responseGetBlock                             *blockchain_api.GetBlockResponse
