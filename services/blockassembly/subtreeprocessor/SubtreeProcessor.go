@@ -361,6 +361,10 @@ type SubtreeProcessor struct {
 	// exposes it for exactly that question.
 	stopped atomic.Bool
 
+	// stopWaitTimeout bounds how long Stop waits for the goroutine to exit;
+	// zero means defaultStopWaitTimeout. Tests shorten it.
+	stopWaitTimeout time.Duration
+
 	// precomputedMiningData holds pre-computed data for mining candidate generation.
 	// Updated by the main goroutine, read atomically by GetMiningCandidate.
 	precomputedMiningData atomic.Pointer[PrecomputedMiningData]
@@ -7392,6 +7396,9 @@ func DeserializeHashesFromReaderIntoBuckets(
 	return nil
 }
 
+// defaultStopWaitTimeout is how long Stop waits for the processor goroutine.
+const defaultStopWaitTimeout = 5 * time.Second
+
 // Stop gracefully shuts down the SubtreeProcessor.
 // It cancels the processor context, which triggers the main goroutine to stop
 // and properly clean up resources including the announcement ticker.
@@ -7406,11 +7413,21 @@ func (stp *SubtreeProcessor) Stop(ctx context.Context) {
 			h.f()
 			// Wait for the main goroutine to exit before cleaning up chainedSubtrees
 			// to avoid data race with closeChainedSubtrees()
-			deadline := time.Now().Add(5 * time.Second)
+			timeout := stp.stopWaitTimeout
+			if timeout <= 0 {
+				timeout = defaultStopWaitTimeout
+			}
+
+			deadline := time.Now().Add(timeout)
 			for !stp.stopped.Load() {
 				if time.Now().After(deadline) {
-					stp.logger.Warnf("[SubtreeProcessor] Stop timeout waiting for goroutine to exit")
-					break
+					// A handler (a long moveForwardBlock, a reset's reload) is
+					// still running and still using the subtrees and disk tx
+					// maps: closing them under it panics its next map write
+					// ("send on closed channel") or unmaps a subtree it is
+					// reading. Leave them for process exit.
+					stp.logger.Warnf("[SubtreeProcessor] Stop timeout waiting for goroutine to exit; leaving subtrees and disk tx maps open for process exit")
+					return
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
