@@ -1,10 +1,12 @@
 package subtreeprocessor
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/stretchr/testify/require"
 )
 
@@ -72,4 +74,55 @@ func TestNewSubtreeProcessor_RemovesStaleDiskTxMapDirs(t *testing.T) {
 	for _, dir := range kept {
 		require.NoError(t, os.RemoveAll(dir))
 	}
+}
+
+// A process can run several subtree processors on the same txMapDirs (a
+// multi-node test daemon inherits one txMapDirs setting for every node). The
+// sweep must not remove a live processor's dirs: only dirs from before this
+// process started, or from another pid, are stale. A previous run with the
+// same pid (a container's pid 1) is older than this process, so it is swept.
+func TestNewSubtreeProcessor_SweepSparesThisProcessesLiveDirs(t *testing.T) {
+	dir := t.TempDir()
+
+	samePidOlderRun := filepath.Join(dir, fmt.Sprintf("ba-txmap-disk0-1790000000000000000-%d", os.Getpid()))
+	require.NoError(t, os.MkdirAll(samePidOlderRun, 0o700))
+
+	first := newSubtreeProcessorWithTxMapDirs(t, []string{dir})
+	require.NoDirExists(t, samePidOlderRun, "a previous run with the same pid is still stale")
+
+	liveDirs := func() []string {
+		entries, err := os.ReadDir(dir)
+		require.NoError(t, err)
+
+		var names []string
+
+		for _, e := range entries {
+			if e.IsDir() && staleDiskTxMapDirPattern.MatchString(e.Name()) {
+				names = append(names, e.Name())
+			}
+		}
+
+		return names
+	}
+
+	firstDirs := liveDirs()
+	require.Len(t, firstDirs, 2)
+
+	second := newSubtreeProcessorWithTxMapDirs(t, []string{dir})
+	require.NotNil(t, second.diskTxMap)
+
+	for _, name := range firstDirs {
+		require.DirExists(t, filepath.Join(dir, name), "the second processor must not remove the first one's live dirs")
+	}
+
+	// The first processor's map still works.
+	first.diskTxMap.Set(batchTestHash(1), &subtreepkg.TxInpoints{})
+	require.NoError(t, first.diskTxMap.Flush())
+	require.NoError(t, first.diskTxMap.TakeErr())
+
+	// Cleanups run last-registered first, and each checks the shared dir holds
+	// nothing still open, so release the first processor's maps here.
+	require.NoError(t, first.diskTxMap.Close())
+	require.NoError(t, first.diskTxMapShadow.Close())
+	first.diskTxMap, first.diskTxMapShadow = nil, nil
 }

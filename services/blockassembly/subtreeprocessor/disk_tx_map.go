@@ -7,8 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
@@ -178,17 +180,32 @@ type DiskTxMapOptions struct {
 // staleDiskTxMapDirPattern matches the Badger directory names the subtree
 // processor's disk tx maps create: tempstore.New's <prefix>-<unixnano>-<pid>,
 // where NewDiskTxMap's prefix is <map prefix>-disk<i> and the map prefix is
-// ba-txmap, ba-txmap-shadow or ba-txmap-reorg (see SubtreeProcessor).
-var staleDiskTxMapDirPattern = regexp.MustCompile(`^ba-txmap(-shadow|-reorg)?-disk\d+-\d+-\d+$`)
+// ba-txmap, ba-txmap-shadow or ba-txmap-reorg (see SubtreeProcessor). The
+// submatches are the creation time and the pid.
+var staleDiskTxMapDirPattern = regexp.MustCompile(`^ba-txmap(?:-shadow|-reorg)?-disk\d+-(\d+)-(\d+)$`)
 
-// removeStaleDiskTxMapDirs removes the disk tx map directories under paths.
-// Only Close removes a map's directories, so a process that exited without
-// closing its maps (killed, or a Stop that timed out on a running handler)
-// leaves them behind. Called before the subtree processor creates its own:
-// every such directory then belongs to a previous run, whose pid can't tell
-// it apart (a container's process is often pid 1 on every start). It returns
-// the directories removed and the first error; a path that doesn't exist yet
-// is not an error.
+// processStartNanos is when this process started, for telling its own disk
+// tx map dirs from a previous run's with the same pid.
+var processStartNanos = time.Now().UnixNano()
+
+// createdByThisProcess reports whether a dir name matched by
+// staleDiskTxMapDirPattern carries this process's pid and a creation time
+// after it started. A previous run with the same pid (a container's process
+// is often pid 1 on every start) is older.
+func createdByThisProcess(match []string) bool {
+	nanos, nanosErr := strconv.ParseInt(match[1], 10, 64)
+	pid, pidErr := strconv.Atoi(match[2])
+
+	return nanosErr == nil && pidErr == nil && pid == os.Getpid() && nanos >= processStartNanos
+}
+
+// removeStaleDiskTxMapDirs removes the disk tx map directories under paths
+// left by previous runs. Only Close removes a map's directories, so a process
+// that exited without closing its maps (killed, or a Stop that timed out on a
+// running handler) leaves them behind. Dirs this process created are kept: it
+// can run several subtree processors on the same paths (a multi-node test
+// daemon), and those dirs may be live. It returns the directories removed and
+// the first error; a path that doesn't exist yet is not an error.
 func removeStaleDiskTxMapDirs(paths []string) (removed []string, err error) {
 	for _, path := range paths {
 		entries, readErr := os.ReadDir(path)
@@ -201,7 +218,12 @@ func removeStaleDiskTxMapDirs(paths []string) (removed []string, err error) {
 		}
 
 		for _, entry := range entries {
-			if !entry.IsDir() || !staleDiskTxMapDirPattern.MatchString(entry.Name()) {
+			if !entry.IsDir() {
+				continue
+			}
+
+			match := staleDiskTxMapDirPattern.FindStringSubmatch(entry.Name())
+			if match == nil || createdByThisProcess(match) {
 				continue
 			}
 
