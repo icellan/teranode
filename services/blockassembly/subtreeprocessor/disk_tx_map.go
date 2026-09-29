@@ -31,6 +31,10 @@ const (
 	// logBufferSize is how much a segment buffers before writing it out.
 	logBufferSize = 512 << 10
 
+	// logMaxBuffered bounds what a segment holds in memory while a write is
+	// in progress: an append past it waits for the disk (backpressure).
+	logMaxBuffered = 8 * logBufferSize
+
 	// logReadAhead is how much a read of a written payload fetches in one
 	// call; larger payloads take a second read.
 	logReadAhead = 512
@@ -58,9 +62,30 @@ const (
 )
 
 // indexShard is one of 4096 independent segments of the in-RAM index.
+//
+// readers counts the reads in progress on this shard's entries, per
+// generation parity (see generation): Clear and Close wait for the old
+// generation's counts to drain before unmapping its files. Counting per shard
+// keeps the per-read cost on a cache line the read already holds.
 type indexShard struct {
-	mu    sync.Mutex
-	index map[chainhash.Hash]uint64 // see packEntry
+	mu      sync.Mutex
+	index   map[chainhash.Hash]uint64 // see packEntry
+	readers [2]atomic.Int32
+}
+
+// generation is one set of payload log files: a directory under every base
+// path with its segments. Clear replaces the whole generation. parity
+// alternates between consecutive generations and selects the indexShard
+// reader count that pins this one.
+type generation struct {
+	dirs   []string
+	logs   []payloadLog
+	parity int
+}
+
+// logOf returns the payload log segment for a hash.
+func (g *generation) logOf(hash chainhash.Hash) int {
+	return int(shardOf(hash)) % len(g.logs)
 }
 
 // logFile is the part of *os.File a payload log segment uses; tests replace
@@ -82,20 +107,21 @@ type logFile interface {
 // read is a copy instead of a pread syscall. Only bytes below written (the end
 // of the last successful write) are read through them, since touching a
 // mapping past the end of the file faults. A record that straddles two
-// windows, or lies past the last one, is read with pread.
+// windows, or lies past the last one, is read with pread. Records never span
+// two buffers, so a record in a lost range was lost whole.
 type payloadLog struct {
-	mu           sync.Mutex
-	wmu          sync.Mutex
-	file         logFile
-	fd           int // for mapping windows; -1 once mapping is off
-	buf          []byte
-	inflight     []byte // being written; nil when no write is in progress
-	spare        []byte // the last written buffer, reused as the next buf
-	flushed      int64
-	written      int64
-	windows      [][]byte // window i maps [i*mapWindowSize, (i+1)*mapWindowSize)
-	mapped       [][]byte // every mapping made, for close; tests clear windows only
-	bytesWritten int64    // read concurrently by Stats(); access via sync/atomic
+	mu       sync.Mutex
+	wmu      sync.Mutex
+	file     logFile
+	fd       int // for mapping windows; -1 once mapping is off
+	buf      []byte
+	inflight []byte // being written; nil when no write is in progress
+	spare    []byte // the last written buffer, reused as the next buf
+	flushed  int64
+	written  int64
+	lost     [][2]int64 // [start, end) of every buffer a failed write lost
+	windows  [][]byte   // window i maps [i*mapWindowSize, (i+1)*mapWindowSize)
+	mapped   [][]byte   // every mapping made, for close; tests clear windows only
 }
 
 // DiskTxMap implements TxInpointsMap with an exact in-RAM index and the
@@ -109,12 +135,24 @@ type payloadLog struct {
 //   - A map generation is never compacted: Delete forgets the hash and Set
 //     appends a new payload. Clear discards the whole generation, which is
 //     how the subtree processor recycles each half of its double buffer.
+//   - Reads may run concurrently with Clear and Close (the async subtree meta
+//     storer reads a half the processor rotates): a read pins the generation
+//     its entry points into, and Clear and Close wait for those pins before
+//     unmapping it. Writes must not run concurrently with Clear or Close.
 type DiskTxMap struct {
 	shards    [numIndexShards]indexShard
-	logs      []payloadLog
-	dirs      []string // this generation's directory under each base path
+	gen       atomic.Pointer[generation] // nil once closed
 	basePaths []string
 	prefix    string
+
+	// bytesWritten counts payload bytes written over the map's life, across
+	// generations, for Stats.
+	bytesWritten atomic.Int64
+
+	// retainedEntries is the most entries any cleared generation held: clear()
+	// keeps each shard map's capacity, so the index holds at least that much
+	// RAM however few entries it has now.
+	retainedEntries atomic.Int64
 
 	// errMu guards err, the first storage error since the last TakeErr. Map
 	// operations have no error return, so failures are recorded here and
@@ -280,13 +318,12 @@ func NewDiskTxMap(opts DiskTxMapOptions) (*DiskTxMap, error) {
 		prefix:    prefix,
 	}
 
-	dirs, logs, err := m.openGeneration()
+	g, err := m.openGeneration(0)
 	if err != nil {
 		return nil, err
 	}
 
-	m.dirs = dirs
-	m.logs = logs
+	m.gen.Store(g)
 
 	for i := range m.shards {
 		m.shards[i].index = make(map[chainhash.Hash]uint64)
@@ -298,12 +335,12 @@ func NewDiskTxMap(opts DiskTxMapOptions) (*DiskTxMap, error) {
 // openGeneration creates a fresh directory under every base path with its
 // log segments. It is all-or-nothing: on failure it removes whatever it
 // created.
-func (m *DiskTxMap) openGeneration() ([]string, []payloadLog, error) {
+func (m *DiskTxMap) openGeneration(parity int) (*generation, error) {
 	dirs := make([]string, 0, len(m.basePaths))
 	logs := make([]payloadLog, len(m.basePaths)*logSegmentsPerDir)
 	opened := 0
 
-	fail := func(err error) ([]string, []payloadLog, error) {
+	fail := func(err error) (*generation, error) {
 		for i := 0; i < opened; i++ {
 			_ = logs[i].close()
 		}
@@ -312,7 +349,7 @@ func (m *DiskTxMap) openGeneration() ([]string, []payloadLog, error) {
 			_ = os.RemoveAll(dir)
 		}
 
-		return nil, nil, err
+		return nil, err
 	}
 
 	for i, path := range m.basePaths {
@@ -341,7 +378,7 @@ func (m *DiskTxMap) openGeneration() ([]string, []payloadLog, error) {
 		opened++
 	}
 
-	return dirs, logs, nil
+	return &generation{dirs: dirs, logs: logs, parity: parity}, nil
 }
 
 // packEntry packs a payload offset and a SubtreeIndex into an index value.
@@ -362,11 +399,6 @@ func shardOf(hash chainhash.Hash) uint16 {
 	return binary.LittleEndian.Uint16(hash[:2]) % numIndexShards
 }
 
-// logOf returns the payload log segment for a hash.
-func (m *DiskTxMap) logOf(hash chainhash.Hash) int {
-	return int(shardOf(hash)) % len(m.logs)
-}
-
 // serializePayload returns the bytes stored for inpoints. A TxInpoints that
 // can't be serialized is recorded as an error and stored as an empty payload,
 // which reads back as an error.
@@ -380,19 +412,30 @@ func (m *DiskTxMap) serializePayload(hash chainhash.Hash, inpoints *subtreepkg.T
 	return payload
 }
 
-// appendPayload appends a record to log segment logIdx and returns its
-// offset. Callers append before taking the hash's index shard lock and
-// publish the entry after, so the shard lock never waits on a segment lock;
-// a record whose entry loses a race to a duplicate is dead space until the
-// generation is cleared.
-func (m *DiskTxMap) appendPayload(logIdx int, payload []byte) int64 {
-	l := &m.logs[logIdx]
+// appendPayload appends a record to the hash's log segment and returns its
+// offset, or -1 (recorded as an error) if the segment is past what an index
+// entry can address. Callers append before taking the hash's index shard lock
+// and publish the entry after, so the shard lock never waits on a segment
+// lock; a record whose entry loses a race to a duplicate is dead space until
+// the generation is cleared.
+func (m *DiskTxMap) appendPayload(g *generation, hash chainhash.Hash, payload []byte) int64 {
+	logIdx := g.logOf(hash)
+	l := &g.logs[logIdx]
 
 	l.mu.Lock()
+	offset := m.appendLocked(l, logIdx, payload)
+	m.afterAppendUnlock(g, logIdx)
 
+	return offset
+}
+
+// appendLocked appends one record to segment l and returns its offset, or -1
+// (recorded as an error) past the addressable offset. The caller holds l.mu.
+func (m *DiskTxMap) appendLocked(l *payloadLog, logIdx int, payload []byte) int64 {
 	offset := l.flushed + int64(len(l.inflight)) + int64(len(l.buf))
 	if offset > maxLogOffset {
 		m.recordErr(errors.NewStorageError("disk tx map: log segment %d exceeds the maximum offset", logIdx))
+		return -1
 	}
 
 	var header [recordHeaderSize]byte
@@ -402,19 +445,32 @@ func (m *DiskTxMap) appendPayload(logIdx int, payload []byte) int64 {
 	l.buf = append(l.buf, header[:]...)
 	l.buf = append(l.buf, payload...)
 
+	return offset
+}
+
+// afterAppendUnlock releases segment logIdx's lock after appends, then
+// starts a write if its buffer is full, or waits for the disk if too much is
+// buffered behind a write in progress. The caller holds the segment's mu.
+func (m *DiskTxMap) afterAppendUnlock(g *generation, logIdx int) {
+	l := &g.logs[logIdx]
+
 	// Hand a full buffer to a write unless one is already in progress; then
 	// buf keeps growing and the next append past the threshold starts one.
 	startWrite := len(l.buf) >= logBufferSize && l.takeBufLocked()
+	mustWait := !startWrite && len(l.buf) >= logMaxBuffered
 
 	l.mu.Unlock()
 
-	if startWrite {
+	switch {
+	case startWrite:
 		l.wmu.Lock()
-		m.writeInflight(logIdx)
+		m.writeInflight(g, logIdx)
 		l.wmu.Unlock()
+	case mustWait:
+		// The disk is behind: wait for the write in progress, then write what
+		// has piled up, rather than let buf grow without bound.
+		m.drainSegment(g, logIdx)
 	}
-
-	return offset
 }
 
 // takeBufLocked makes buf the in-flight buffer, reporting whether it did (not
@@ -439,8 +495,8 @@ func (l *payloadLog) takeBufLocked() bool {
 // file, without holding mu. On failure the buffered records are lost: they
 // read back as errors, and later records are written after them as usual.
 // The caller holds wmu.
-func (m *DiskTxMap) writeInflight(logIdx int) {
-	l := &m.logs[logIdx]
+func (m *DiskTxMap) writeInflight(g *generation, logIdx int) {
+	l := &g.logs[logIdx]
 
 	l.mu.Lock()
 	data, at, f := l.inflight, l.flushed, l.file
@@ -452,13 +508,17 @@ func (m *DiskTxMap) writeInflight(logIdx int) {
 
 	n, err := f.WriteAt(data, at)
 
-	atomic.AddInt64(&l.bytesWritten, int64(n))
+	m.bytesWritten.Add(int64(n))
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if err != nil {
 		m.recordErr(errors.NewStorageError("disk tx map: writing log segment %d", logIdx, err))
+
+		// A partial write leaves some of these bytes in the file, and a later
+		// write past them makes them readable: mark the whole range lost.
+		l.lost = append(l.lost, [2]int64{at, at + int64(len(data))})
 	} else {
 		l.written = at + int64(n)
 		l.mapWindowsLocked()
@@ -469,9 +529,10 @@ func (m *DiskTxMap) writeInflight(logIdx int) {
 	l.spare = data
 }
 
-// readPayload returns the payload of the record at offset in segment logIdx.
-func (m *DiskTxMap) readPayload(logIdx int, offset int64) ([]byte, error) {
-	l := &m.logs[logIdx]
+// readPayload returns the payload of the record at offset in segment logIdx
+// of g. The caller has pinned g (pinEntry), so its mappings stay valid.
+func readPayload(g *generation, logIdx int, offset int64) ([]byte, error) {
+	l := &g.logs[logIdx]
 
 	l.mu.Lock()
 
@@ -498,6 +559,14 @@ func (m *DiskTxMap) readPayload(logIdx int, offset int64) ([]byte, error) {
 	}
 
 	f, windows, written := l.file, l.windows, l.written
+
+	for _, r := range l.lost {
+		if offset >= r[0] && offset < r[1] {
+			l.mu.Unlock()
+			return nil, errors.NewStorageError("disk tx map: no record at %d on log segment %d (a lost write)", offset, logIdx)
+		}
+	}
+
 	l.mu.Unlock()
 
 	// Bytes below flushed never change, so they are read unlocked. Past
@@ -539,6 +608,11 @@ func (m *DiskTxMap) readPayload(logIdx int, offset int64) ([]byte, error) {
 		return parseRecord(buf, logIdx, offset)
 	}
 
+	// Don't size an allocation from a length the file doesn't back.
+	if offset+int64(recordHeaderSize+size) > written {
+		return nil, errors.NewStorageError("disk tx map: truncated record at %d on log segment %d", offset, logIdx)
+	}
+
 	full := make([]byte, recordHeaderSize+size)
 	copy(full, buf)
 
@@ -563,6 +637,42 @@ func parseRecord(b []byte, logIdx int, offset int64) ([]byte, error) {
 	return b[recordHeaderSize : recordHeaderSize+size], nil
 }
 
+// pinEntry returns hash's entry and pins the generation it points into, so
+// that generation's files stay mapped until unpin. The entry and the
+// generation are read under the same shard lock that Clear takes before it
+// swaps generations, so they always belong together.
+func (m *DiskTxMap) pinEntry(hash chainhash.Hash) (s *indexShard, g *generation, entry uint64, ok bool) {
+	s = &m.shards[shardOf(hash)]
+
+	s.mu.Lock()
+
+	entry, ok = s.index[hash]
+	if ok {
+		if g = m.gen.Load(); g == nil {
+			ok = false
+		} else {
+			s.readers[g.parity].Add(1)
+		}
+	}
+
+	s.mu.Unlock()
+
+	return s, g, entry, ok
+}
+
+func unpin(s *indexShard, g *generation) {
+	s.readers[g.parity].Add(-1)
+}
+
+// waitForReaders waits until no read pins a generation with this parity.
+func (m *DiskTxMap) waitForReaders(parity int) {
+	for i := range m.shards {
+		for m.shards[i].readers[parity].Load() != 0 {
+			runtime.Gosched()
+		}
+	}
+}
+
 // SetIfNotExists inserts hash with inpoints if it is not in the map. Whether
 // it is in the map is decided by the in-RAM index alone. The existing
 // inpoints are not returned (no caller uses them): a duplicate returns nil,
@@ -579,7 +689,10 @@ func (m *DiskTxMap) SetIfNotExists(hash chainhash.Hash, inpoints *subtreepkg.TxI
 
 	// Serialized and appended outside the lock; wasted only on a racing
 	// duplicate.
-	offset := m.appendPayload(m.logOf(hash), m.serializePayload(hash, inpoints))
+	offset := m.appendPayload(m.gen.Load(), hash, m.serializePayload(hash, inpoints))
+	if offset < 0 {
+		return nil, false
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -599,24 +712,31 @@ func (m *DiskTxMap) SetIfNotExists(hash chainhash.Hash, inpoints *subtreepkg.TxI
 // entry for hash or can't read it; a read error is recorded on src, as Get
 // records it.
 func (m *DiskTxMap) SetIfNotExistsFrom(src *DiskTxMap, hash chainhash.Hash) (wasSet, found bool) {
-	ss := &src.shards[shardOf(hash)]
-	ss.mu.Lock()
-	entry, exists := ss.index[hash]
-	ss.mu.Unlock()
-
+	ss, sg, entry, exists := src.pinEntry(hash)
 	if !exists {
 		return false, false
 	}
 
-	payload, err := src.readPayload(src.logOf(hash), entryOffset(entry))
+	defer unpin(ss, sg)
+
+	s := &m.shards[shardOf(hash)]
+
+	// A duplicate costs neither the read nor a dead record.
+	if m.Exists(hash) {
+		return false, true
+	}
+
+	payload, err := readPayload(sg, sg.logOf(hash), entryOffset(entry))
 	if err != nil {
 		src.recordErr(err)
 		return false, false
 	}
 
-	offset := m.appendPayload(m.logOf(hash), payload)
+	offset := m.appendPayload(m.gen.Load(), hash, payload)
+	if offset < 0 {
+		return false, true
+	}
 
-	s := &m.shards[shardOf(hash)]
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -627,6 +747,167 @@ func (m *DiskTxMap) SetIfNotExistsFrom(src *DiskTxMap, hash chainhash.Hash) (was
 	s.index[hash] = packEntry(offset, entrySubtreeIndex(entry))
 
 	return true, true
+}
+
+// MoveFrom inserts every hash in hashes with the inpoints and SubtreeIndex it
+// has in src, like one SetIfNotExistsFrom per hash, setting wasSet[i] for
+// each. It groups the work so each index shard and log segment lock is taken
+// once per group instead of once per hash. It returns the position of the
+// first hash src doesn't have or can't read (a read error is recorded on src,
+// as Get records it), or -1. On a miss nothing is inserted into m.
+func (m *DiskTxMap) MoveFrom(src *DiskTxMap, hashes []chainhash.Hash, wasSet []bool) int {
+	n := len(hashes)
+	if n == 0 {
+		return -1
+	}
+
+	// Group positions by index shard (counting sort).
+	var shardStart [numIndexShards + 1]int32
+	for i := range hashes {
+		shardStart[shardOf(hashes[i])+1]++
+	}
+
+	for sh := 1; sh <= numIndexShards; sh++ {
+		shardStart[sh] += shardStart[sh-1]
+	}
+
+	byShard := make([]int32, n)
+	fill := shardStart
+
+	for i := range hashes {
+		sh := shardOf(hashes[i])
+		byShard[fill[sh]] = int32(i) //nolint:gosec // n fits in int32
+		fill[sh]++
+	}
+
+	// Look up and pin every source entry, one shard lock per group.
+	entries := make([]uint64, n)
+
+	var pinned [numIndexShards]*generation
+
+	defer func() {
+		for sh, g := range pinned {
+			if g != nil {
+				unpin(&src.shards[sh], g)
+			}
+		}
+	}()
+
+	missing := n
+
+	for sh := 0; sh < numIndexShards; sh++ {
+		group := byShard[shardStart[sh]:shardStart[sh+1]]
+		if len(group) == 0 {
+			continue
+		}
+
+		ss := &src.shards[sh]
+		ss.mu.Lock()
+
+		g := src.gen.Load()
+
+		for _, i := range group {
+			e, ok := ss.index[hashes[i]]
+			if !ok || g == nil {
+				missing = min(missing, int(i))
+				continue
+			}
+
+			entries[i] = e
+		}
+
+		if g != nil {
+			ss.readers[g.parity].Add(1)
+			pinned[sh] = g
+		}
+
+		ss.mu.Unlock()
+	}
+
+	if missing < n {
+		return missing
+	}
+
+	// Copy the payloads, grouped by destination segment: one segment lock
+	// per group for the appends.
+	dg := m.gen.Load()
+	numLogs := len(dg.logs)
+
+	segStart := make([]int32, numLogs+1)
+	for i := range hashes {
+		segStart[int(shardOf(hashes[i]))%numLogs+1]++
+	}
+
+	for k := 1; k <= numLogs; k++ {
+		segStart[k] += segStart[k-1]
+	}
+
+	bySeg := make([]int32, n)
+	segFill := append([]int32(nil), segStart...)
+
+	for i := range hashes {
+		k := int(shardOf(hashes[i])) % numLogs
+		bySeg[segFill[k]] = int32(i) //nolint:gosec // n fits in int32
+		segFill[k]++
+	}
+
+	offsets := make([]int64, n)
+	payloads := make([][]byte, 0, 256)
+
+	for k := 0; k < numLogs; k++ {
+		group := bySeg[segStart[k]:segStart[k+1]]
+		if len(group) == 0 {
+			continue
+		}
+
+		payloads = payloads[:0]
+
+		for _, i := range group {
+			sg := pinned[shardOf(hashes[i])]
+
+			payload, err := readPayload(sg, sg.logOf(hashes[i]), entryOffset(entries[i]))
+			if err != nil {
+				src.recordErr(err)
+				return int(i)
+			}
+
+			payloads = append(payloads, payload)
+		}
+
+		l := &dg.logs[k]
+		l.mu.Lock()
+
+		for j, i := range group {
+			offsets[i] = m.appendLocked(l, k, payloads[j])
+		}
+
+		m.afterAppendUnlock(dg, k)
+	}
+
+	// Publish, one destination shard lock per group.
+	for sh := 0; sh < numIndexShards; sh++ {
+		group := byShard[shardStart[sh]:shardStart[sh+1]]
+		if len(group) == 0 {
+			continue
+		}
+
+		s := &m.shards[sh]
+		s.mu.Lock()
+
+		for _, i := range group {
+			if _, exists := s.index[hashes[i]]; exists || offsets[i] < 0 {
+				wasSet[i] = false
+				continue
+			}
+
+			s.index[hashes[i]] = packEntry(offsets[i], entrySubtreeIndex(entries[i]))
+			wasSet[i] = true
+		}
+
+		s.mu.Unlock()
+	}
+
+	return -1
 }
 
 // Exists returns true if the hash is in the map.
@@ -655,18 +936,16 @@ func (m *DiskTxMap) Get(hash chainhash.Hash) (*subtreepkg.TxInpoints, bool) {
 // operations must use this so a read error they cause is not misattributed to
 // whichever operation next checks the map's pending error.
 func (m *DiskTxMap) GetWithErr(hash chainhash.Hash) (*subtreepkg.TxInpoints, bool, error) {
-	s := &m.shards[shardOf(hash)]
-	s.mu.Lock()
-	entry, exists := s.index[hash]
-	s.mu.Unlock()
-
+	s, g, entry, exists := m.pinEntry(hash)
 	if !exists {
 		return nil, false, nil
 	}
 
-	logIdx := m.logOf(hash)
+	defer unpin(s, g)
 
-	payload, err := m.readPayload(logIdx, entryOffset(entry))
+	logIdx := g.logOf(hash)
+
+	payload, err := readPayload(g, logIdx, entryOffset(entry))
 	if err != nil {
 		return nil, false, err
 	}
@@ -709,7 +988,10 @@ func (m *DiskTxMap) Length() int {
 
 // Set stores inpoints for a hash, overwriting any existing entry.
 func (m *DiskTxMap) Set(hash chainhash.Hash, inpoints *subtreepkg.TxInpoints) {
-	offset := m.appendPayload(m.logOf(hash), m.serializePayload(hash, inpoints))
+	offset := m.appendPayload(m.gen.Load(), hash, m.serializePayload(hash, inpoints))
+	if offset < 0 {
+		return
+	}
 
 	s := &m.shards[shardOf(hash)]
 	s.mu.Lock()
@@ -731,12 +1013,32 @@ func (m *DiskTxMap) SetBatch(txs []*utxostore.UnminedTransaction) {
 // rather than assume this succeeded - resetSubtreeState does, and fails the
 // block instead of installing a half that is still populated.
 func (m *DiskTxMap) Clear() {
-	dirs, logs, err := m.openGeneration()
+	old := m.gen.Load()
+
+	g, err := m.openGeneration(old.parity ^ 1)
 	if err != nil {
 		m.recordErr(errors.NewStorageError("disk tx map: rotating to a fresh generation", err))
 		return
 	}
 
+	if n := int64(m.Length()); n > m.retainedEntries.Load() {
+		m.retainedEntries.Store(n)
+	}
+
+	m.retire(old, g)
+
+	// The rotation has succeeded: failing to discard the old generation only
+	// leaves its directory behind, so it must not fail the caller. See
+	// TakeCloseWarn.
+	if err = closeGeneration(old); err != nil {
+		m.recordCloseWarn(errors.NewStorageError("disk tx map: discarding previous generation", err))
+	}
+}
+
+// retire empties the index, installs next (nil on Close) in place of old, and
+// waits for every read that pinned old. Every shard is emptied before the
+// swap, so no read can pair an old entry with the next generation.
+func (m *DiskTxMap) retire(old, next *generation) {
 	// clear keeps each map's capacity: the next block refills it to a similar
 	// size, and regrowing 4096 maps from empty every block costs more than
 	// holding the memory.
@@ -746,15 +1048,8 @@ func (m *DiskTxMap) Clear() {
 		m.shards[i].mu.Unlock()
 	}
 
-	oldDirs, oldLogs := m.dirs, m.logs
-	m.dirs, m.logs = dirs, logs
-
-	// The rotation has succeeded: failing to discard the old generation only
-	// leaves its directory behind, so it must not fail the caller. See
-	// TakeCloseWarn.
-	if err = closeGeneration(oldDirs, oldLogs); err != nil {
-		m.recordCloseWarn(errors.NewStorageError("disk tx map: discarding previous generation", err))
-	}
+	m.gen.Store(next)
+	m.waitForReaders(old.parity)
 }
 
 // mapWindowsLocked maps windows until they cover every written byte. A
@@ -793,18 +1088,18 @@ func (l *payloadLog) close() error {
 }
 
 // closeGeneration closes a generation's log segments and removes its dirs.
-func closeGeneration(dirs []string, logs []payloadLog) error {
+func closeGeneration(g *generation) error {
 	// Collect only non-nil errors: teranode errors.Join panics on a nil
 	// argument after a non-nil first one.
 	var errs []error
 
-	for i := range logs {
-		if err := logs[i].close(); err != nil {
+	for i := range g.logs {
+		if err := g.logs[i].close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
 
-	for _, dir := range dirs {
+	for _, dir := range g.dirs {
 		if err := os.RemoveAll(dir); err != nil {
 			errs = append(errs, err)
 		}
@@ -820,33 +1115,48 @@ func closeGeneration(dirs []string, logs []payloadLog) error {
 // Flush writes every segment's buffered records to its file. Write errors
 // are recorded on the map, not returned.
 func (m *DiskTxMap) Flush() error {
-	for i := range m.logs {
-		l := &m.logs[i]
+	g := m.gen.Load()
 
-		// Holding wmu, write whatever is in flight and then the rest of buf.
-		l.wmu.Lock()
-
-		for {
-			m.writeInflight(i)
-
-			l.mu.Lock()
-			more := l.takeBufLocked()
-			l.mu.Unlock()
-
-			if !more {
-				break
-			}
-		}
-
-		l.wmu.Unlock()
+	for i := range g.logs {
+		m.drainSegment(g, i)
 	}
 
 	return nil
 }
 
-// Close releases the log files and removes this generation's directories.
+// drainSegment writes whatever segment logIdx has in flight and then the rest
+// of its buffer.
+func (m *DiskTxMap) drainSegment(g *generation, logIdx int) {
+	l := &g.logs[logIdx]
+
+	l.wmu.Lock()
+	defer l.wmu.Unlock()
+
+	for {
+		m.writeInflight(g, logIdx)
+
+		l.mu.Lock()
+		more := l.takeBufLocked()
+		l.mu.Unlock()
+
+		if !more {
+			return
+		}
+	}
+}
+
+// Close empties the map, waits for reads in progress, and releases the log
+// files and directories. The map must not be used afterwards; a read that
+// races Close finds nothing.
 func (m *DiskTxMap) Close() error {
-	return closeGeneration(m.dirs, m.logs)
+	old := m.gen.Load()
+	if old == nil {
+		return nil
+	}
+
+	m.retire(old, nil)
+
+	return closeGeneration(old)
 }
 
 // UpdateSubtreeIndex sets the SubtreeIndex of hash's entry.
@@ -870,25 +1180,31 @@ func (m *DiskTxMap) UpdateSubtreeIndex(hash chainhash.Hash, subtreeIndex int16) 
 // It only touches the in-RAM index, split over GOMAXPROCS goroutines since the
 // subtree processor calls it for every completed subtree.
 func (m *DiskTxMap) UpdateSubtreeIndexBatch(nodes []subtreepkg.Node, subtreeIndex int16) error {
+	update := func(part []subtreepkg.Node) {
+		for i := range part {
+			s := &m.shards[shardOf(part[i].Hash)]
+			s.mu.Lock()
+
+			if entry, exists := s.index[part[i].Hash]; exists {
+				s.index[part[i].Hash] = withSubtreeIndex(entry, subtreeIndex)
+			}
+
+			s.mu.Unlock()
+		}
+	}
+
 	chunk := max(subtreeIndexChunkMin, (len(nodes)+runtime.GOMAXPROCS(0)-1)/runtime.GOMAXPROCS(0))
+	if chunk >= len(nodes) {
+		update(nodes)
+		return nil
+	}
 
 	var wg sync.WaitGroup
 
 	for start := 0; start < len(nodes); start += chunk {
 		part := nodes[start:min(start+chunk, len(nodes))]
 
-		wg.Go(func() {
-			for i := range part {
-				s := &m.shards[shardOf(part[i].Hash)]
-				s.mu.Lock()
-
-				if entry, exists := s.index[part[i].Hash]; exists {
-					s.index[part[i].Hash] = withSubtreeIndex(entry, subtreeIndex)
-				}
-
-				s.mu.Unlock()
-			}
-		})
+		wg.Go(func() { update(part) })
 	}
 
 	wg.Wait()
@@ -899,24 +1215,19 @@ func (m *DiskTxMap) UpdateSubtreeIndexBatch(nodes []subtreepkg.Node, subtreeInde
 // DiskMapStats holds lightweight metrics for a disk-backed map.
 type DiskMapStats struct {
 	Entries          int64
-	IndexMemBytes    int64 // estimated RAM held by the index
-	DiskBytesWritten int64
+	IndexMemBytes    int64 // estimated RAM held by the index, including capacity kept across Clear
+	DiskBytesWritten int64 // payload bytes written over the map's life
 }
 
 // Stats returns current metrics. It may be called concurrently with writes
-// (e.g. reportDiskMapStats during moveForwardBlock), so bytesWritten is read
-// atomically.
+// (e.g. reportDiskMapStats during moveForwardBlock), so the counters are
+// atomic.
 func (m *DiskTxMap) Stats() DiskMapStats {
-	var diskBytes int64
-	for i := range m.logs {
-		diskBytes += atomic.LoadInt64(&m.logs[i].bytesWritten)
-	}
-
 	entries := int64(m.Length())
 
 	return DiskMapStats{
 		Entries:          entries,
-		IndexMemBytes:    entries * indexBytesPerEntry,
-		DiskBytesWritten: diskBytes,
+		IndexMemBytes:    max(entries, m.retainedEntries.Load()) * indexBytesPerEntry,
+		DiskBytesWritten: m.bytesWritten.Load(),
 	}
 }

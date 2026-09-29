@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 )
 
@@ -20,12 +21,20 @@ func BenchmarkRemainderMove(b *testing.B) {
 	const batchSize = 1024
 
 	for _, total := range []int{8 << 20} {
-		for _, dirs := range []int{0, 1, 2} {
+		for _, v := range []struct {
+			dirs int
+			bulk bool
+		}{{0, false}, {1, false}, {1, true}, {2, true}} {
+			dirs, bulk := v.dirs, v.bulk
 			disk := dirs > 0
 
 			name := "memTxMap"
 			if disk {
 				name = fmt.Sprintf("diskTxMap_%ddir", dirs)
+			}
+
+			if bulk {
+				name += "_bulk"
 			}
 
 			for _, warm := range []bool{false, true} {
@@ -76,13 +85,13 @@ func BenchmarkRemainderMove(b *testing.B) {
 						}
 
 						if warm {
-							moveRemainder(b, nodes, from, to, disk)
+							moveRemainder(b, nodes, from, to, disk, bulk)
 							to.Clear()
 						}
 
 						b.StartTimer()
 
-						moveRemainder(b, nodes, from, to, disk)
+						moveRemainder(b, nodes, from, to, disk, bulk)
 					}
 
 					b.ReportMetric(float64(b.N*total)/b.Elapsed().Seconds(), "txs/s")
@@ -93,8 +102,8 @@ func BenchmarkRemainderMove(b *testing.B) {
 }
 
 // moveRemainder moves every node's entry from one map to the other over
-// GOMAXPROCS workers.
-func moveRemainder(b *testing.B, nodes [][]subtreepkg.Node, from, to TxInpointsMap, disk bool) {
+// GOMAXPROCS workers: per hash, or with one MoveFrom per worker (bulk).
+func moveRemainder(b *testing.B, nodes [][]subtreepkg.Node, from, to TxInpointsMap, disk, bulk bool) {
 	workers := runtime.GOMAXPROCS(0)
 	perWorker := (len(nodes) + workers - 1) / workers
 
@@ -104,6 +113,21 @@ func moveRemainder(b *testing.B, nodes [][]subtreepkg.Node, from, to TxInpointsM
 		part := nodes[min(w*perWorker, len(nodes)):min((w+1)*perWorker, len(nodes))]
 
 		wg.Go(func() {
+			if bulk {
+				var hashes []chainhash.Hash
+				for _, batch := range part {
+					for k := range batch {
+						hashes = append(hashes, batch[k].Hash)
+					}
+				}
+
+				if to.(*DiskTxMap).MoveFrom(from.(*DiskTxMap), hashes, make([]bool, len(hashes))) >= 0 {
+					b.Error("remainder tx not found")
+				}
+
+				return
+			}
+
 			for _, batch := range part {
 				for k := range batch {
 					if disk {
