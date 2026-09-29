@@ -243,9 +243,10 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SubtreeDataStreamingChunkSize:   getInt("asset_subtreeDataStreamingChunkSize", 10000, alternativeContext...),
 			SubtreeDataStreamingConcurrency: getInt("asset_subtreeDataStreamingConcurrency", 2, alternativeContext...),
 
-			// Batch and response admission budgets. Each defaults to 0/false/empty, preserving today's
-			// behaviour; several keys are already wired (enforced for any non-default value) while
-			// others remain warn-only prep - see each key's own longdesc for its current status.
+			// Batch and response admission budgets. Most default to 0/false/empty, preserving today's
+			// behaviour; asset_maxBatchRecords is the exception (16384). Several keys are already wired
+			// (enforced for any non-default value) while others remain warn-only prep - see each key's
+			// own longdesc for its current status.
 			MaxBatchRecords:          getInt("asset_maxBatchRecords", 16384, alternativeContext...),
 			MaxBatchResponseBytes:    getInt64("asset_maxBatchResponseBytes", 0, alternativeContext...),
 			MaxUTXOsPerTx:            getInt("asset_maxUTXOsPerTx", 0, alternativeContext...),
