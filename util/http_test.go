@@ -1830,4 +1830,10 @@ func TestWaitOutRetrySecondHonoursCancellationAndBackwardSteps(t *testing.T) {
 	require.Less(t, time.Since(start), 500*time.Millisecond, "a cancelled context must not sleep out the second")
 
 	require.NoError(t, waitOutRetrySecond(context.Background(), time.Now().Unix()-5), "a second already behind the clock needs no wait")
+
+	// A previous second far ahead of the clock (a large backwards step) is beyond
+	// maxRetrySecondWait: nothing signed recently can collide, so don't sleep it out.
+	start = time.Now()
+	require.NoError(t, waitOutRetrySecond(context.Background(), time.Now().Unix()+5))
+	require.Less(t, time.Since(start), 500*time.Millisecond, "a large backwards step must not be slept out")
 }
