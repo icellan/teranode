@@ -41,7 +41,7 @@ import (
 //
 //	Status: 200 OK
 //	Content-Type: application/octet-stream
-//	Body: Concatenated transaction data for all found transactions
+//	Body: Concatenated transaction data for every requested transaction, in request order
 //
 // Error Responses:
 //
@@ -450,7 +450,7 @@ func (h *HTTP) observeBatchRecords(route string, records int) {
 	}
 
 	if batchRecordWarner.allow() {
-		h.logger.Warnf("[Asset_http:%s] batch of %d records exceeds the catchup-sized threshold %d, asset_maxBatchRecords is unset (unlimited)", route, records, threshold)
+		h.logger.Warnf("[Asset_http:%s] batch of %d records exceeds the catchup-sized threshold %d, asset_maxBatchRecords is 0 (cap disabled)", route, records, threshold)
 	}
 }
 
