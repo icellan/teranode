@@ -231,85 +231,9 @@ func TestDiskTxMap_SetOverwritesAndDeleteForgets(t *testing.T) {
 	require.True(t, wasSet, "a deleted hash can be added again")
 }
 
-// SetIfNotExistsFrom moves an entry between maps as raw payload bytes: the
-// result must read back exactly like Get + SetIfNotExists would give,
-// including the SubtreeIndex, whether the source payload is still buffered
-// or already written.
-func TestDiskTxMap_SetIfNotExistsFrom(t *testing.T) {
-	src := newErrTestDiskTxMap(t)
-	defer src.Close()
-
-	dst := newErrTestDiskTxMap(t)
-	defer dst.Close()
-
-	const n = 200
-
-	for i := 0; i < n; i++ {
-		inp := subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{batchTestHash(i + 1000), batchTestHash(i + 2000)}, []uint32{1, uint32(i), 2, 0, 1})
-		inp.SubtreeIndex = int16(i % 5)
-		src.Set(batchTestHash(i), &inp)
-
-		if i == n/2 {
-			require.NoError(t, src.Flush(), "half written, half still buffered")
-		}
-	}
-
-	for i := 0; i < n; i++ {
-		wasSet, found := dst.SetIfNotExistsFrom(src, batchTestHash(i))
-		require.True(t, found)
-		require.True(t, wasSet)
-	}
-
-	for i := 0; i < n; i++ {
-		want, ok := src.Get(batchTestHash(i))
-		require.True(t, ok)
-
-		got, ok := dst.Get(batchTestHash(i))
-		require.True(t, ok)
-		require.Equal(t, want.SubtreeIndex, got.SubtreeIndex, "entry %d", i)
-		require.Equal(t, want.GetParentTxHashes(), got.GetParentTxHashes(), "entry %d", i)
-		require.Equal(t, want.GetTxInpoints(), got.GetTxInpoints(), "entry %d", i)
-	}
-
-	wasSet, found := dst.SetIfNotExistsFrom(src, batchTestHash(0))
-	require.True(t, found)
-	require.False(t, wasSet, "a hash already in dst is a duplicate")
-
-	wasSet, found = dst.SetIfNotExistsFrom(src, batchTestHash(10*n))
-	require.False(t, found, "a hash missing from src is reported as not found")
-	require.False(t, wasSet)
-
-	require.Equal(t, n, dst.Length())
-	require.NoError(t, src.TakeErr())
-	require.NoError(t, dst.TakeErr())
-}
-
-// A source read error is recorded on the source map, as Get would, and the
-// hash is reported as not found.
-func TestDiskTxMap_SetIfNotExistsFromReadError(t *testing.T) {
-	src := newErrTestDiskTxMap(t)
-	defer src.Close()
-
-	dst := newErrTestDiskTxMap(t)
-	defer dst.Close()
-
-	inp := subtreepkg.TxInpoints{}
-	src.Set(batchTestHash(1), &inp)
-	require.NoError(t, src.Flush())
-
-	failDiskTxMapLogs(src, 0, errors.NewStorageError("read failed"))
-
-	wasSet, found := dst.SetIfNotExistsFrom(src, batchTestHash(1))
-	require.False(t, found)
-	require.False(t, wasSet)
-	require.False(t, dst.Exists(batchTestHash(1)))
-	require.Error(t, src.TakeErr())
-	require.NoError(t, dst.TakeErr())
-}
-
 // Concurrent moves of the same hashes insert each exactly once, and every
 // entry reads back its own payload, whichever mover won.
-func TestDiskTxMap_SetIfNotExistsFromConcurrentSameHashes(t *testing.T) {
+func TestDiskTxMap_MoveFromConcurrentSameHashes(t *testing.T) {
 	src := newErrTestDiskTxMap(t)
 	defer src.Close()
 
@@ -329,18 +253,26 @@ func TestDiskTxMap_SetIfNotExistsFromConcurrentSameHashes(t *testing.T) {
 		mu       sync.Mutex
 	)
 
+	hashes := make([]chainhash.Hash, n)
+	for i := range hashes {
+		hashes[i] = batchTestHash(i)
+	}
+
 	for w := 0; w < 8; w++ {
 		wg.Go(func() {
-			for i := 0; i < n; i++ {
-				wasSet, found := dst.SetIfNotExistsFrom(src, batchTestHash(i))
-				require.True(t, found)
+			moved := make([]bool, n)
 
-				if wasSet {
-					mu.Lock()
+			missing, err := dst.MoveFrom(src, hashes, moved)
+			require.NoError(t, err)
+			require.Equal(t, -1, missing)
+
+			mu.Lock()
+			for i, ok := range moved {
+				if ok {
 					inserted[i]++
-					mu.Unlock()
 				}
 			}
+			mu.Unlock()
 		})
 	}
 
@@ -669,7 +601,7 @@ func TestDiskTxMap_StatsSurviveClear(t *testing.T) {
 	require.Equal(t, before.IndexMemBytes, after.IndexMemBytes, "cleared maps keep their capacity")
 }
 
-// MoveFrom moves a whole set of hashes like one SetIfNotExistsFrom per hash:
+// MoveFrom moves a whole set of hashes like one Get + SetIfNotExists per hash:
 // payloads and SubtreeIndex arrive intact whether the source record is
 // buffered or written, hashes already in dst are reported as not set, and
 // every set hash is inserted exactly once.
@@ -715,7 +647,9 @@ func TestDiskTxMap_MoveFrom(t *testing.T) {
 			dst.Set(hashes[3], &own)
 
 			wasSet := make([]bool, n)
-			require.Equal(t, -1, dst.MoveFrom(src, hashes, wasSet))
+			missing, err := dst.MoveFrom(src, hashes, wasSet)
+			require.NoError(t, err)
+			require.Equal(t, -1, missing)
 
 			for i := 0; i < n; i++ {
 				require.Equal(t, i != 3, wasSet[i], "wasSet of %d", i)
@@ -751,7 +685,10 @@ func TestDiskTxMap_MoveFromMissing(t *testing.T) {
 	src.Set(batchTestHash(1), &inp)
 
 	hashes := []chainhash.Hash{batchTestHash(1), batchTestHash(2)}
-	require.Equal(t, 1, dst.MoveFrom(src, hashes, make([]bool, 2)))
+	missing, err := dst.MoveFrom(src, hashes, make([]bool, 2))
+	require.NoError(t, err)
+	require.Equal(t, 1, missing)
+	require.False(t, dst.Exists(batchTestHash(1)), "nothing is inserted on a miss")
 }
 
 // A source read error is recorded on src and reported like a missing hash.
@@ -768,7 +705,77 @@ func TestDiskTxMap_MoveFromReadError(t *testing.T) {
 
 	failDiskTxMapLogs(src, 0, errors.NewStorageError("read failed"))
 
-	require.Equal(t, 0, dst.MoveFrom(src, []chainhash.Hash{batchTestHash(1)}, make([]bool, 1)))
-	require.Error(t, src.TakeErr())
+	missing, err := dst.MoveFrom(src, []chainhash.Hash{batchTestHash(1)}, make([]bool, 1))
+	require.Error(t, err, "the read error is returned")
+	require.Equal(t, 0, missing)
+	require.Error(t, src.TakeErr(), "and recorded on src")
 	require.False(t, dst.Exists(batchTestHash(1)))
+}
+
+// Maps created back to back on the same prefix and path (several subtree
+// processors sharing txMapDirs in one process) must never share, and so
+// truncate, each other's files, even when the clock gives them the same
+// timestamp.
+func TestDiskTxMap_GenerationsNeverShareDirs(t *testing.T) {
+	dir := t.TempDir()
+
+	// Every generation gets the same timestamp.
+	fixed := time.Unix(1_800_000_000, 0)
+	generationClock = func() time.Time { return fixed }
+
+	t.Cleanup(func() { generationClock = time.Now })
+
+	const n = 64
+
+	maps := make([]*DiskTxMap, n)
+
+	for i := range maps {
+		m, err := NewDiskTxMap(DiskTxMapOptions{BasePaths: []string{dir}, Prefix: "same"})
+		require.NoError(t, err)
+
+		t.Cleanup(func() { _ = m.Close() })
+
+		inp := subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{batchTestHash(i + 1000)}, []uint32{1, 0})
+		m.Set(batchTestHash(0), &inp)
+		require.NoError(t, m.Flush())
+
+		maps[i] = m
+	}
+
+	seen := make(map[string]bool)
+
+	for i, m := range maps {
+		for _, d := range m.gen.Load().dirs {
+			require.False(t, seen[d], "map %d reuses directory %s", i, d)
+			seen[d] = true
+		}
+
+		got, ok := m.Get(batchTestHash(0))
+		require.True(t, ok, "map %d lost its entry", i)
+		require.Equal(t, []chainhash.Hash{batchTestHash(i + 1000)}, got.GetParentTxHashes(), "map %d reads another map's payload", i)
+	}
+}
+
+// A hash already in dst is a duplicate without reading src, so an unreadable
+// source record can't fail the move for it.
+func TestDiskTxMap_MoveFromSkipsDuplicatesWithoutReading(t *testing.T) {
+	src := newErrTestDiskTxMap(t)
+	defer src.Close()
+
+	dst := newErrTestDiskTxMap(t)
+	defer dst.Close()
+
+	inp := subtreepkg.TxInpoints{}
+	src.Set(batchTestHash(1), &inp)
+	require.NoError(t, src.Flush())
+	dst.Set(batchTestHash(1), &inp)
+
+	failDiskTxMapLogs(src, 0, errors.NewStorageError("read failed"))
+
+	moved := make([]bool, 1)
+	missing, err := dst.MoveFrom(src, []chainhash.Hash{batchTestHash(1)}, moved)
+	require.NoError(t, err)
+	require.Equal(t, -1, missing)
+	require.False(t, moved[0])
+	require.NoError(t, src.TakeErr(), "src was never read")
 }

@@ -14,7 +14,7 @@ import (
 // every tx that stays queued after a block: move its inpoints from the
 // previous half into the fresh half, split over GOMAXPROCS workers as
 // legacyParallelGetAndSetIfNotExists does (Get + SetIfNotExists in memory,
-// SetIfNotExistsFrom between disk maps).
+// one MoveFrom per worker between disk maps).
 //
 // Run with -benchtime=1x; each iteration moves total transactions.
 func BenchmarkRemainderMove(b *testing.B) {
@@ -24,7 +24,7 @@ func BenchmarkRemainderMove(b *testing.B) {
 		for _, v := range []struct {
 			dirs int
 			bulk bool
-		}{{0, false}, {1, false}, {1, true}, {2, true}} {
+		}{{0, false}, {1, true}, {2, true}} {
 			dirs, bulk := v.dirs, v.bulk
 			disk := dirs > 0
 
@@ -102,7 +102,8 @@ func BenchmarkRemainderMove(b *testing.B) {
 }
 
 // moveRemainder moves every node's entry from one map to the other over
-// GOMAXPROCS workers: per hash, or with one MoveFrom per worker (bulk).
+// GOMAXPROCS workers: per hash in memory, or with one MoveFrom per worker
+// between disk maps (bulk).
 func moveRemainder(b *testing.B, nodes [][]subtreepkg.Node, from, to TxInpointsMap, disk, bulk bool) {
 	workers := runtime.GOMAXPROCS(0)
 	perWorker := (len(nodes) + workers - 1) / workers
@@ -121,7 +122,7 @@ func moveRemainder(b *testing.B, nodes [][]subtreepkg.Node, from, to TxInpointsM
 					}
 				}
 
-				if to.(*DiskTxMap).MoveFrom(from.(*DiskTxMap), hashes, make([]bool, len(hashes))) >= 0 {
+				if missing, _ := to.(*DiskTxMap).MoveFrom(from.(*DiskTxMap), hashes, make([]bool, len(hashes))); missing >= 0 {
 					b.Error("remainder tx not found")
 				}
 
@@ -130,15 +131,6 @@ func moveRemainder(b *testing.B, nodes [][]subtreepkg.Node, from, to TxInpointsM
 
 			for _, batch := range part {
 				for k := range batch {
-					if disk {
-						if _, found := to.(*DiskTxMap).SetIfNotExistsFrom(from.(*DiskTxMap), batch[k].Hash); !found {
-							b.Error("remainder tx not found")
-							return
-						}
-
-						continue
-					}
-
 					parents, found := from.Get(batch[k].Hash)
 					if !found {
 						b.Error("remainder tx not found")

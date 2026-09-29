@@ -1615,7 +1615,7 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 
 	// The rotation above is itself the cure for any disk tx map error already
 	// pending, or already requesting a reset, before this point (a stale error
-	// from before reset started, or Clear's own pre-rotation flushAllDisks):
+	// from before reset started):
 	// every disk now has a fresh generation of log files, so nothing recorded
 	// against the discarded one is still true of the map's current content.
 	// Drain it log-only - it belongs to a generation that no longer exists,
@@ -3096,7 +3096,7 @@ func (stp *SubtreeProcessor) flushDiskTxMapWriters() {
 
 // diskTxMapErr returns, and clears, the storage errors the disk-backed tx maps
 // recorded since the last call. Map operations have no error return and
-// writes are asynchronous, so operations check this when they finish: a
+// payload writes are buffered, so operations check this when they finish: a
 // failure fails the operation that observes it and the processor keeps
 // running.
 //
@@ -5363,7 +5363,7 @@ func (stp *SubtreeProcessor) diskTxMapStats() DiskMapStats {
 // none are outstanding.
 //
 // A retired map is being discarded either way, so any error it recorded (or
-// hits during its final Close flush) cannot be undone by failing this call -
+// hits during Close) cannot be undone by failing this call -
 // there is nothing left to roll back to. Log and count it instead of
 // recordErr-ing it onto the surviving map, which would let it resurface later
 // misattributed to whatever operation next checks the map's pending error.
@@ -5374,7 +5374,7 @@ func (stp *SubtreeProcessor) closeRetiredDiskTxMaps() {
 		}
 
 		closeErr := retired.Close()
-		takeErr := retired.TakeErr() // after Close, so a final-flush error is included
+		takeErr := retired.TakeErr()
 
 		// errors.Join here (not a []error slice) so build the argument list
 		// ourselves, skipping nils: teranode/errors.Join calls Error() on
@@ -6890,7 +6890,11 @@ func (stp *SubtreeProcessor) legacyParallelGetAndSetIfNotExists(
 			}
 
 			moved := make([]bool, len(moveHashes))
-			if missing := dstDisk.MoveFrom(srcDisk, moveHashes, moved); missing >= 0 {
+			if missing, moveErr := dstDisk.MoveFrom(srcDisk, moveHashes, moved); missing >= 0 {
+				if moveErr != nil {
+					return errors.NewProcessingError("error reading node %s from currentTxMap", moveHashes[missing].String(), moveErr)
+				}
+
 				return errors.NewProcessingError("node %s not found in currentTxMap", moveHashes[missing].String())
 			}
 

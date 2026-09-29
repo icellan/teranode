@@ -240,6 +240,9 @@ type DiskTxMapOptions struct {
 // SubtreeProcessor). The submatches are the creation time and the pid.
 var staleDiskTxMapDirPattern = regexp.MustCompile(`^ba-txmap(?:-shadow|-reorg)?-disk\d+-(\d+)-(\d+)$`)
 
+// generationClock stamps generation directory names; tests replace it.
+var generationClock = time.Now
+
 // processStartNanos is when this process started, for telling its own disk
 // tx map dirs from a previous run's with the same pid.
 var processStartNanos = time.Now().UnixNano()
@@ -353,13 +356,26 @@ func (m *DiskTxMap) openGeneration(parity int) (*generation, error) {
 	}
 
 	for i, path := range m.basePaths {
-		dir := filepath.Join(path, fmt.Sprintf("%s-disk%d-%d-%d", m.prefix, i, time.Now().UnixNano(), os.Getpid()))
-
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+		if err := os.MkdirAll(path, 0o700); err != nil {
 			return fail(errors.NewStorageError("disk tx map: creating directory on disk %d (%s)", i, path, err))
 		}
 
-		dirs = append(dirs, dir)
+		// The directory must be new: another map in this process with the
+		// same prefix can pick the same timestamp, and sharing its directory
+		// would truncate its live files. Step the timestamp until it's free.
+		for nanos := generationClock().UnixNano(); ; nanos++ {
+			dir := filepath.Join(path, fmt.Sprintf("%s-disk%d-%d-%d", m.prefix, i, nanos, os.Getpid()))
+
+			err := os.Mkdir(dir, 0o700)
+			if err == nil {
+				dirs = append(dirs, dir)
+				break
+			}
+
+			if !os.IsExist(err) {
+				return fail(errors.NewStorageError("disk tx map: creating directory on disk %d (%s)", i, path, err))
+			}
+		}
 	}
 
 	// Segment k lives under base path k % len(basePaths), so consecutive
@@ -367,14 +383,13 @@ func (m *DiskTxMap) openGeneration(parity int) (*generation, error) {
 	for k := range logs {
 		name := filepath.Join(dirs[k%len(dirs)], fmt.Sprintf("seg-%d.log", k))
 
-		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			return fail(errors.NewStorageError("disk tx map: creating log segment %s", name, err))
 		}
 
 		logs[k].file = f
 		logs[k].fd = int(f.Fd()) //nolint:gosec // fd fits in int
-		logs[k].buf = make([]byte, 0, logBufferSize+logReadAhead)
 		opened++
 	}
 
@@ -441,6 +456,10 @@ func (m *DiskTxMap) appendLocked(l *payloadLog, logIdx int, payload []byte) int6
 	var header [recordHeaderSize]byte
 	header[0] = recordMagic
 	binary.LittleEndian.PutUint32(header[1:], uint32(len(payload))) //nolint:gosec // a TxInpoints is far below 4GB
+
+	if l.buf == nil {
+		l.buf = make([]byte, 0, logBufferSize+logReadAhead)
+	}
 
 	l.buf = append(l.buf, header[:]...)
 	l.buf = append(l.buf, payload...)
@@ -667,8 +686,14 @@ func unpin(s *indexShard, g *generation) {
 // waitForReaders waits until no read pins a generation with this parity.
 func (m *DiskTxMap) waitForReaders(parity int) {
 	for i := range m.shards {
-		for m.shards[i].readers[parity].Load() != 0 {
-			runtime.Gosched()
+		for spins := 0; m.shards[i].readers[parity].Load() != 0; spins++ {
+			// Reads are short copies; back off to sleeping in case one is
+			// stuck in a slow pread rather than burn a core.
+			if spins < 100 {
+				runtime.Gosched()
+			} else {
+				time.Sleep(50 * time.Microsecond)
+			}
 		}
 	}
 }
@@ -706,59 +731,21 @@ func (m *DiskTxMap) SetIfNotExists(hash chainhash.Hash, inpoints *subtreepkg.TxI
 	return nil, true
 }
 
-// SetIfNotExistsFrom inserts hash with the inpoints and SubtreeIndex it has in
-// src, like src.Get followed by SetIfNotExists, but copies the stored bytes
-// instead of decoding and re-encoding them. found is false when src has no
-// entry for hash or can't read it; a read error is recorded on src, as Get
-// records it.
-func (m *DiskTxMap) SetIfNotExistsFrom(src *DiskTxMap, hash chainhash.Hash) (wasSet, found bool) {
-	ss, sg, entry, exists := src.pinEntry(hash)
-	if !exists {
-		return false, false
-	}
-
-	defer unpin(ss, sg)
-
-	s := &m.shards[shardOf(hash)]
-
-	// A duplicate costs neither the read nor a dead record.
-	if m.Exists(hash) {
-		return false, true
-	}
-
-	payload, err := readPayload(sg, sg.logOf(hash), entryOffset(entry))
-	if err != nil {
-		src.recordErr(err)
-		return false, false
-	}
-
-	offset := m.appendPayload(m.gen.Load(), hash, payload)
-	if offset < 0 {
-		return false, true
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, exists = s.index[hash]; exists {
-		return false, true
-	}
-
-	s.index[hash] = packEntry(offset, entrySubtreeIndex(entry))
-
-	return true, true
-}
-
 // MoveFrom inserts every hash in hashes with the inpoints and SubtreeIndex it
-// has in src, like one SetIfNotExistsFrom per hash, setting wasSet[i] for
-// each. It groups the work so each index shard and log segment lock is taken
-// once per group instead of once per hash. It returns the position of the
-// first hash src doesn't have or can't read (a read error is recorded on src,
-// as Get records it), or -1. On a miss nothing is inserted into m.
-func (m *DiskTxMap) MoveFrom(src *DiskTxMap, hashes []chainhash.Hash, wasSet []bool) int {
+// has in src, like src.Get followed by SetIfNotExists per hash, setting
+// wasSet[i] for each, but copies the stored bytes instead of decoding and
+// re-encoding them. Hashes already in m are not copied. It groups the work so
+// each index shard and log segment lock is taken once per group instead of
+// once per hash.
+//
+// It returns -1 and nil on success. Otherwise nothing is inserted into m, and
+// it returns the position of the first hash (in input order) src doesn't
+// have, or the position of a hash src couldn't read with the read error,
+// which is also recorded on src, as Get records it.
+func (m *DiskTxMap) MoveFrom(src *DiskTxMap, hashes []chainhash.Hash, wasSet []bool) (int, error) {
 	n := len(hashes)
 	if n == 0 {
-		return -1
+		return -1, nil
 	}
 
 	// Group positions by index shard (counting sort).
@@ -778,6 +765,26 @@ func (m *DiskTxMap) MoveFrom(src *DiskTxMap, hashes []chainhash.Hash, wasSet []b
 		sh := shardOf(hashes[i])
 		byShard[fill[sh]] = int32(i) //nolint:gosec // n fits in int32
 		fill[sh]++
+	}
+
+	// Skip hashes m already has: a duplicate costs neither a read nor a
+	// dead record.
+	skip := make([]bool, n)
+
+	for sh := 0; sh < numIndexShards; sh++ {
+		group := byShard[shardStart[sh]:shardStart[sh+1]]
+		if len(group) == 0 {
+			continue
+		}
+
+		s := &m.shards[sh]
+		s.mu.Lock()
+
+		for _, i := range group {
+			_, skip[i] = s.index[hashes[i]]
+		}
+
+		s.mu.Unlock()
 	}
 
 	// Look up and pin every source entry, one shard lock per group.
@@ -807,6 +814,10 @@ func (m *DiskTxMap) MoveFrom(src *DiskTxMap, hashes []chainhash.Hash, wasSet []b
 		g := src.gen.Load()
 
 		for _, i := range group {
+			if skip[i] {
+				continue
+			}
+
 			e, ok := ss.index[hashes[i]]
 			if !ok || g == nil {
 				missing = min(missing, int(i))
@@ -825,7 +836,7 @@ func (m *DiskTxMap) MoveFrom(src *DiskTxMap, hashes []chainhash.Hash, wasSet []b
 	}
 
 	if missing < n {
-		return missing
+		return missing, nil
 	}
 
 	// Copy the payloads, grouped by destination segment: one segment lock
@@ -861,24 +872,41 @@ func (m *DiskTxMap) MoveFrom(src *DiskTxMap, hashes []chainhash.Hash, wasSet []b
 		}
 
 		payloads = payloads[:0]
+		todo := group[:0:0]
 
 		for _, i := range group {
+			if skip[i] {
+				continue
+			}
+
 			sg := pinned[shardOf(hashes[i])]
 
 			payload, err := readPayload(sg, sg.logOf(hashes[i]), entryOffset(entries[i]))
 			if err != nil {
 				src.recordErr(err)
-				return int(i)
+				return int(i), err
 			}
 
 			payloads = append(payloads, payload)
+			todo = append(todo, i)
 		}
 
 		l := &dg.logs[k]
 		l.mu.Lock()
 
-		for j, i := range group {
+		// Let a write start (or the buffer bound apply) every logBufferSize
+		// bytes, as single appends would.
+		appended := 0
+
+		for j, i := range todo {
 			offsets[i] = m.appendLocked(l, k, payloads[j])
+
+			if appended += recordHeaderSize + len(payloads[j]); appended >= logBufferSize {
+				m.afterAppendUnlock(dg, k)
+				l.mu.Lock()
+
+				appended = 0
+			}
 		}
 
 		m.afterAppendUnlock(dg, k)
@@ -895,7 +923,7 @@ func (m *DiskTxMap) MoveFrom(src *DiskTxMap, hashes []chainhash.Hash, wasSet []b
 		s.mu.Lock()
 
 		for _, i := range group {
-			if _, exists := s.index[hashes[i]]; exists || offsets[i] < 0 {
+			if _, exists := s.index[hashes[i]]; skip[i] || exists || offsets[i] < 0 {
 				wasSet[i] = false
 				continue
 			}
@@ -907,7 +935,7 @@ func (m *DiskTxMap) MoveFrom(src *DiskTxMap, hashes []chainhash.Hash, wasSet []b
 		s.mu.Unlock()
 	}
 
-	return -1
+	return -1, nil
 }
 
 // Exists returns true if the hash is in the map.
@@ -1026,6 +1054,15 @@ func (m *DiskTxMap) Clear() {
 	}
 
 	m.retire(old, g)
+
+	// Reuse the old generation's buffers: nothing reads or writes old any
+	// more, and what they still hold belongs to the discarded generation.
+	for k := range g.logs {
+		if k < len(old.logs) {
+			g.logs[k].buf, old.logs[k].buf = old.logs[k].buf[:0], nil
+			g.logs[k].spare, old.logs[k].spare = old.logs[k].spare, nil
+		}
+	}
 
 	// The rotation has succeeded: failing to discard the old generation only
 	// leaves its directory behind, so it must not fail the caller. See
