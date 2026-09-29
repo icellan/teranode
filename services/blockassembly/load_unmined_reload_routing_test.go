@@ -44,9 +44,10 @@ func TestLoadUnminedTransactions_IsReloadSelectsEntryPoint(t *testing.T) {
 			name: "disk sort",
 			configure: func(t *testing.T, ba *BlockAssembler) {
 				ba.settings.BlockAssembly.UnminedTxDiskSortEnabled = true
-				ba.settings.BlockAssembly.UnminedTxDiskSortPath = t.TempDir()
+				ba.settings.BlockAssembly.UnminedTxDiskSortPaths = []string{t.TempDir()}
 			},
-			// The disk-sorted load adds transactions one at a time.
+			// The disk-sorted load adds the merged runs in batches.
+			batched: true,
 		},
 	}
 
