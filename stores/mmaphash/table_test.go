@@ -473,3 +473,85 @@ func TestNewCreatesMissingDir(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, inserted)
 }
+
+// TestLookupConcurrentWithGrow runs lookups while two writers force repeated
+// grows. A lookup of a key whose insert has completed must always find it with
+// its value, whichever table generation it lands on.
+func TestLookupConcurrentWithGrow(t *testing.T) {
+	cases := []struct {
+		name       string
+		expected   uint64
+		loadFactor float64
+		keys       uint64
+		minGrows   uint64
+		key        func(uint64) []byte
+	}{
+		// Many grows in one segment, triggered from both writers.
+		{name: "one_segment", expected: 100, keys: 20000, minGrows: 2, key: func(i uint64) []byte { return mkKey(32, i) }},
+		// A grow that has to take several segment locks. Scrambled keys: mkKey's
+		// sequential bucket bytes build long probe runs at load factor 1.
+		{name: "multi_segment", expected: 131072, loadFactor: 1, keys: 150000, minGrows: 1, key: mkBenchKey},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tbl, err := New(Options{Dir: t.TempDir(), Prefix: "lookgrow", KeySize: 32, ValueSize: 8, Expected: tc.expected, LoadFactor: tc.loadFactor})
+			require.NoError(t, err)
+			defer tbl.Close()
+
+			// Keys [0, published) have been inserted by the sequential writer.
+			var published atomic.Uint64
+			var done atomic.Bool
+			var writers, readers sync.WaitGroup
+
+			writers.Add(2)
+			go func() {
+				defer writers.Done()
+				for i := uint64(0); i < tc.keys; i++ {
+					if _, _, err := tbl.Upsert(tc.key(i), i); err != nil {
+						t.Errorf("upsert %d: %v", i, err)
+						return
+					}
+					published.Store(i + 1)
+				}
+			}()
+			// A second writer on a disjoint key range, so grows are also
+			// triggered from another goroutine.
+			go func() {
+				defer writers.Done()
+				for i := tc.keys; i < 2*tc.keys; i++ {
+					if _, _, err := tbl.Upsert(tc.key(i), i); err != nil {
+						t.Errorf("upsert %d: %v", i, err)
+						return
+					}
+				}
+			}()
+
+			for r := 0; r < 4; r++ {
+				readers.Add(1)
+				go func(r uint64) {
+					defer readers.Done()
+					for i := r; !done.Load(); i += 7919 {
+						p := published.Load()
+						if p == 0 {
+							continue
+						}
+						k := i % p
+						v, found, err := tbl.Lookup(tc.key(k))
+						if err != nil || !found || v != k {
+							t.Errorf("lookup %d: value=%d found=%v err=%v", k, v, found, err)
+							return
+						}
+					}
+				}(uint64(r))
+			}
+
+			writers.Wait()
+			done.Store(true)
+			readers.Wait()
+
+			require.GreaterOrEqual(t, tbl.gen.Load(), tc.minGrows, "the test must exercise the grows it is sized for")
+			require.Equal(t, int64(2*tc.keys), tbl.Len())
+		})
+	}
+}
