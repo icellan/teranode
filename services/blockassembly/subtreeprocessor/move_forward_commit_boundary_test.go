@@ -126,6 +126,7 @@ func TestMoveForwardBlock_DiskTxMapErrorBeforeCommitFailsAndRollsBack(t *testing
 	requireSameMap(t, originalCurrentTxMap, stp.currentTxMap, "currentTxMap must be unchanged")
 
 	require.NoError(t, stp.diskTxMapErr(), "the error was consumed by the failed call, not left pending")
+	require.True(t, stp.TakeResetRequested(), "a pre-commit failure still requests a reset: the drained error may be an earlier write that never reached disk, whose phantom the rollback keeps")
 
 	// Retry: the same block, now with no map error pending, must succeed.
 	retryErr := stp.MoveForwardBlock(block)
@@ -251,7 +252,7 @@ func TestMoveForwardBlock_OwnBlockPreCommitErrorFailsAndRollsBack(t *testing.T) 
 
 	requireSameMap(t, originalCurrentTxMap, stp.currentTxMap, "the double-buffer swap must be rolled back: nothing here is post-commit")
 	require.NoError(t, stp.diskTxMapErr(), "the error was consumed by the failed call, not left pending")
-	require.False(t, stp.TakeResetRequested(), "a pre-commit failure must not request a reset: it rolled back cleanly and the caller can retry")
+	require.True(t, stp.TakeResetRequested(), "a pre-commit failure still requests a reset: the drained error may be an earlier write that never reached disk, whose phantom the rollback keeps")
 }
 
 // Pins the actual P0 fix through the public entry point: a started processor

@@ -1523,20 +1523,15 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	// a map error joined into the failure, or a request still pending, when
 	// reset returns was this reset's own. Before the rotation both are left
 	// over from before the reset, and a request stays pending for the
-	// heartbeat; so must a map error joined into a pre-rotation failure,
-	// since the rotation that would have cured its phantom never ran.
+	// heartbeat (diskTxMapErr raises one for a map error joined into a
+	// pre-rotation failure, whose phantom the rotation never cured).
 	stp.lastResetStorageFailed.Store(false)
 	stp.lastResetRotated.Store(false)
 
 	defer func() {
 		joined := stp.reportOrJoinDiskTxMapErr("reset", &err)
 
-		switch {
-		case !stp.lastResetRotated.Load():
-			if joined {
-				stp.requestReset("reset_pre_rotation")
-			}
-		case joined || stp.diskTxMapResetRequested.Load():
+		if stp.lastResetRotated.Load() && (joined || stp.diskTxMapResetRequested.Load()) {
 			stp.lastResetStorageFailed.Store(true)
 		}
 	}()
@@ -3108,6 +3103,13 @@ func (stp *SubtreeProcessor) flushDiskTxMapWriters() {
 // failure fails the operation that observes it and the processor keeps
 // running.
 //
+// A non-nil result also requests a reset, wherever it is drained. The drain
+// can't tell whether the error came from the draining operation's own writes
+// (which its rollback undoes) or from an earlier write that never reached
+// disk, whose phantom survives any rollback and would fail every retry; only
+// a reset cures that. reset's post-rotation stale drain is the one exception
+// and clears the request itself.
+//
 // Also checks diskTxMapAnchor: during a multi-block reorg (disableCurrentTxMapPool),
 // resetSubtreeState pins the map reorgBlocks captured for rollback there
 // instead of swapping it into diskTxMapShadow, and processRemainderTxHashes
@@ -3137,6 +3139,12 @@ func (stp *SubtreeProcessor) diskTxMapErr() error {
 			errs = append(errs, err)
 		}
 	}
+
+	if len(errs) == 0 {
+		return nil
+	}
+
+	stp.requestReset("disk_tx_map_err")
 
 	return errors.Join(errs...)
 }

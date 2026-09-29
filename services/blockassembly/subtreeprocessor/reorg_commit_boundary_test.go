@@ -125,6 +125,7 @@ func TestReorgBlocks_CatchupPath_DiskTxMapErrorBeforeCommitFailsAndRollsBack(t *
 	require.ErrorIs(t, err, boom)
 
 	require.Equal(t, startHeader.Hash(), stp.GetCurrentBlockHeader().Hash(), "the header must not advance on a rolled-back reorg")
+	require.True(t, stp.TakeResetRequested(), "a pre-commit failure still requests a reset: the drained error may be an earlier write that never reached disk, whose phantom the rollback keeps")
 
 	retryErr := stp.Reorg([]*model.Block{}, []*model.Block{block})
 	require.NoError(t, retryErr, "a retry after the transient error clears must succeed")
@@ -241,4 +242,5 @@ func TestReorgBlocks_MoveBackPath_WriterFlushFailureBeforeCommitFailsAndRollsBac
 	require.ErrorContains(t, err, "flush failed", "and must actually be the flush failure")
 
 	require.Equal(t, tipHeader.Hash(), stp.GetCurrentBlockHeader().Hash(), "the header must not move on a rolled-back reorg")
+	require.True(t, stp.TakeResetRequested(), "a pre-commit failure still requests a reset: the drained error may be an earlier write that never reached disk, whose phantom the rollback keeps")
 }

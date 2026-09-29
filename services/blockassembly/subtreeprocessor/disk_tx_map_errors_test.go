@@ -602,3 +602,21 @@ func TestDiskTxMapErr_IncludesShadow(t *testing.T) {
 	require.ErrorIs(t, stp.diskTxMapErr(), boom)
 	require.NoError(t, stp.diskTxMapErr())
 }
+
+// Draining a pending map error requests a reset wherever it happens: the
+// drain can't tell whether the error came from the draining operation's own
+// writes or from an earlier write that never reached disk, whose phantom only
+// a reset cures. Nothing pending requests nothing.
+func TestDiskTxMapErr_RequestsReset(t *testing.T) {
+	stp, cleanup := newAddNodesBenchProcessor(t, 64, WithTxMapDirs([]string{t.TempDir()}))
+	defer cleanup()
+
+	require.NoError(t, stp.diskTxMapErr())
+	require.False(t, stp.TakeResetRequested())
+
+	boom := errors.NewStorageError("badger write failed")
+	stp.diskTxMap.recordErr(boom)
+
+	require.ErrorIs(t, stp.diskTxMapErr(), boom)
+	require.True(t, stp.TakeResetRequested())
+}
