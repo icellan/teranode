@@ -1,0 +1,463 @@
+package subtreeprocessor
+
+import (
+	"io"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/stretchr/testify/require"
+)
+
+// failingLogFile stands in for a payload log segment's file. It fails the
+// next failWrites writes and every read while readErr is set, delegating to
+// the real file otherwise.
+type failingLogFile struct {
+	mu         sync.Mutex
+	real       logFile
+	failWrites int
+	readErr    error
+}
+
+func (f *failingLogFile) WriteAt(p []byte, off int64) (int, error) {
+	f.mu.Lock()
+	if f.failWrites > 0 {
+		f.failWrites--
+		f.mu.Unlock()
+
+		return 0, errors.NewStorageError("write failed")
+	}
+	f.mu.Unlock()
+
+	return f.real.WriteAt(p, off)
+}
+
+func (f *failingLogFile) ReadAt(p []byte, off int64) (int, error) {
+	f.mu.Lock()
+	err := f.readErr
+	f.mu.Unlock()
+
+	if err != nil {
+		return 0, err
+	}
+
+	return f.real.ReadAt(p, off)
+}
+
+func (f *failingLogFile) Close() error { return f.real.Close() }
+
+// failDiskTxMapLogs wraps every payload log segment of m in a failingLogFile
+// and returns the wrappers.
+func failDiskTxMapLogs(m *DiskTxMap, failWrites int, readErr error) []*failingLogFile {
+	wrappers := make([]*failingLogFile, len(m.logs))
+
+	for i := range m.logs {
+		l := &m.logs[i]
+		l.mu.Lock()
+		wrappers[i] = &failingLogFile{real: l.file, failWrites: failWrites, readErr: readErr}
+		l.file = wrappers[i]
+
+		if readErr != nil {
+			// read through the file, where the failure is injected
+			l.windows = nil
+			l.fd = -1
+		}
+		l.mu.Unlock()
+	}
+
+	return wrappers
+}
+
+// Dedup is answered by the in-RAM index alone: a known hash is refused even
+// when the payload log can't be read, and nothing is recorded.
+func TestDiskTxMap_SetIfNotExistsNeverReadsPayload(t *testing.T) {
+	m := newErrTestDiskTxMap(t)
+	defer m.Close()
+
+	hash := batchTestHash(1)
+	inp := subtreepkg.TxInpoints{}
+
+	_, wasSet := m.SetIfNotExists(hash, &inp)
+	require.True(t, wasSet)
+	require.NoError(t, m.Flush())
+
+	failDiskTxMapLogs(m, 0, io.ErrUnexpectedEOF)
+
+	_, wasSet = m.SetIfNotExists(hash, &inp)
+	require.False(t, wasSet, "a known hash is a duplicate, whatever the payload log says")
+	require.Equal(t, 1, m.Length())
+	require.True(t, m.Exists(hash))
+	require.NoError(t, m.TakeErr(), "dedup must not touch the payload log")
+}
+
+// The subtree index lives in the RAM index: updating it never reads or
+// rewrites the payload, so it works with the log unreadable.
+func TestDiskTxMap_UpdateSubtreeIndexBatchIsRAMOnly(t *testing.T) {
+	m := newErrTestDiskTxMap(t)
+	defer m.Close()
+
+	nodes := make([]subtreepkg.Node, 0, 100)
+
+	for i := 0; i < 100; i++ {
+		inp := subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{batchTestHash(i + 1000)}, []uint32{1, uint32(i)})
+		m.Set(batchTestHash(i), &inp)
+		nodes = append(nodes, subtreepkg.Node{Hash: batchTestHash(i)})
+	}
+
+	require.NoError(t, m.Flush())
+
+	wrappers := failDiskTxMapLogs(m, 0, io.ErrUnexpectedEOF)
+
+	require.NoError(t, m.UpdateSubtreeIndexBatch(nodes, 9))
+	require.NoError(t, m.UpdateSubtreeIndex(nodes[0].Hash, 11))
+	require.NoError(t, m.TakeErr())
+
+	for _, w := range wrappers {
+		w.readErr = nil
+	}
+
+	for i, node := range nodes {
+		got, ok := m.Get(node.Hash)
+		require.True(t, ok)
+
+		want := int16(9)
+		if i == 0 {
+			want = 11
+		}
+
+		require.Equal(t, want, got.SubtreeIndex, "subtree index of %d", i)
+		require.Equal(t, []chainhash.Hash{batchTestHash(i + 1000)}, got.GetParentTxHashes(), "inpoints of %d", i)
+	}
+}
+
+// A payload whose write failed must read back as an error, never as an empty
+// TxInpoints: an empty parent list would silently drop the tx's parents.
+func TestDiskTxMap_LostWriteReadsAsError(t *testing.T) {
+	m := newErrTestDiskTxMap(t)
+	defer m.Close()
+
+	failDiskTxMapLogs(m, 1, nil)
+
+	lost := batchTestHash(1)
+	inp := subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{batchTestHash(2)}, []uint32{1, 0})
+	m.Set(lost, &inp)
+	require.NoError(t, m.Flush())
+	require.Error(t, m.TakeErr(), "the failed write is reported")
+
+	// A later write to the same segment succeeds and lands after the lost one.
+	kept := batchTestHash(3)
+	for i := 4; m.logOf(kept) != m.logOf(lost); i++ {
+		kept = batchTestHash(i)
+	}
+
+	m.Set(kept, &inp)
+	require.NoError(t, m.Flush())
+	require.NoError(t, m.TakeErr(), "the log recovers after a failed write")
+
+	got, ok := m.Get(kept)
+	require.True(t, ok)
+	require.Equal(t, []chainhash.Hash{batchTestHash(2)}, got.GetParentTxHashes())
+
+	_, ok, err := m.GetWithErr(lost)
+	require.False(t, ok)
+	require.Error(t, err, "the lost payload must be an error, not an empty TxInpoints")
+}
+
+// Reads are served from the unwritten buffer and from the file alike, for
+// payloads of every size, including ones larger than a single read.
+func TestDiskTxMap_GetAcrossBufferAndFile(t *testing.T) {
+	m := newErrTestDiskTxMap(t)
+	defer m.Close()
+
+	const n = 3000
+
+	want := make([]subtreepkg.TxInpoints, n)
+
+	for i := 0; i < n; i++ {
+		parents := make([]chainhash.Hash, i%40+1) // up to ~1.5KB per payload
+		vouts := make([]uint32, 0, 2*len(parents))
+
+		for p := range parents {
+			parents[p] = batchTestHash(i*100 + p)
+			vouts = append(vouts, 1, uint32(p))
+		}
+
+		want[i] = subtreepkg.NewTxInpointsFromPacked(parents, vouts)
+		m.Set(batchTestHash(i), &want[i])
+
+		if i == n/2 {
+			require.NoError(t, m.Flush(), "half on disk, half still buffered")
+		}
+	}
+
+	for i := 0; i < n; i++ {
+		got, ok := m.Get(batchTestHash(i))
+		require.True(t, ok, "entry %d", i)
+		require.Equal(t, want[i].GetParentTxHashes(), got.GetParentTxHashes(), "entry %d", i)
+		require.Equal(t, want[i].GetTxInpoints(), got.GetTxInpoints(), "entry %d", i)
+	}
+
+	require.NoError(t, m.TakeErr())
+}
+
+// Set overwrites the payload; Delete forgets the hash.
+func TestDiskTxMap_SetOverwritesAndDeleteForgets(t *testing.T) {
+	m := newErrTestDiskTxMap(t)
+	defer m.Close()
+
+	hash := batchTestHash(1)
+	first := subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{batchTestHash(10)}, []uint32{1, 0})
+	second := subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{batchTestHash(20)}, []uint32{1, 3})
+
+	m.Set(hash, &first)
+	m.Set(hash, &second)
+	require.Equal(t, 1, m.Length())
+
+	got, ok := m.Get(hash)
+	require.True(t, ok)
+	require.Equal(t, []chainhash.Hash{batchTestHash(20)}, got.GetParentTxHashes())
+
+	require.True(t, m.Delete(hash))
+	require.False(t, m.Exists(hash))
+	require.Equal(t, 0, m.Length())
+	require.False(t, m.Delete(hash), "deleting an unknown hash reports false")
+
+	_, wasSet := m.SetIfNotExists(hash, &first)
+	require.True(t, wasSet, "a deleted hash can be added again")
+}
+
+// SetIfNotExistsFrom moves an entry between maps as raw payload bytes: the
+// result must read back exactly like Get + SetIfNotExists would give,
+// including the SubtreeIndex, whether the source payload is still buffered
+// or already written.
+func TestDiskTxMap_SetIfNotExistsFrom(t *testing.T) {
+	src := newErrTestDiskTxMap(t)
+	defer src.Close()
+
+	dst := newErrTestDiskTxMap(t)
+	defer dst.Close()
+
+	const n = 200
+
+	for i := 0; i < n; i++ {
+		inp := subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{batchTestHash(i + 1000), batchTestHash(i + 2000)}, []uint32{1, uint32(i), 2, 0, 1})
+		inp.SubtreeIndex = int16(i % 5)
+		src.Set(batchTestHash(i), &inp)
+
+		if i == n/2 {
+			require.NoError(t, src.Flush(), "half written, half still buffered")
+		}
+	}
+
+	for i := 0; i < n; i++ {
+		wasSet, found := dst.SetIfNotExistsFrom(src, batchTestHash(i))
+		require.True(t, found)
+		require.True(t, wasSet)
+	}
+
+	for i := 0; i < n; i++ {
+		want, ok := src.Get(batchTestHash(i))
+		require.True(t, ok)
+
+		got, ok := dst.Get(batchTestHash(i))
+		require.True(t, ok)
+		require.Equal(t, want.SubtreeIndex, got.SubtreeIndex, "entry %d", i)
+		require.Equal(t, want.GetParentTxHashes(), got.GetParentTxHashes(), "entry %d", i)
+		require.Equal(t, want.GetTxInpoints(), got.GetTxInpoints(), "entry %d", i)
+	}
+
+	wasSet, found := dst.SetIfNotExistsFrom(src, batchTestHash(0))
+	require.True(t, found)
+	require.False(t, wasSet, "a hash already in dst is a duplicate")
+
+	wasSet, found = dst.SetIfNotExistsFrom(src, batchTestHash(10*n))
+	require.False(t, found, "a hash missing from src is reported as not found")
+	require.False(t, wasSet)
+
+	require.Equal(t, n, dst.Length())
+	require.NoError(t, src.TakeErr())
+	require.NoError(t, dst.TakeErr())
+}
+
+// A source read error is recorded on the source map, as Get would, and the
+// hash is reported as not found.
+func TestDiskTxMap_SetIfNotExistsFromReadError(t *testing.T) {
+	src := newErrTestDiskTxMap(t)
+	defer src.Close()
+
+	dst := newErrTestDiskTxMap(t)
+	defer dst.Close()
+
+	inp := subtreepkg.TxInpoints{}
+	src.Set(batchTestHash(1), &inp)
+	require.NoError(t, src.Flush())
+
+	failDiskTxMapLogs(src, 0, errors.NewStorageError("read failed"))
+
+	wasSet, found := dst.SetIfNotExistsFrom(src, batchTestHash(1))
+	require.False(t, found)
+	require.False(t, wasSet)
+	require.False(t, dst.Exists(batchTestHash(1)))
+	require.Error(t, src.TakeErr())
+	require.NoError(t, dst.TakeErr())
+}
+
+// Concurrent moves of the same hashes insert each exactly once, and every
+// entry reads back its own payload, whichever mover won.
+func TestDiskTxMap_SetIfNotExistsFromConcurrentSameHashes(t *testing.T) {
+	src := newErrTestDiskTxMap(t)
+	defer src.Close()
+
+	dst := newErrTestDiskTxMap(t)
+	defer dst.Close()
+
+	const n = 5000
+
+	for i := 0; i < n; i++ {
+		inp := subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{batchTestHash(i + n)}, []uint32{1, uint32(i)})
+		src.Set(batchTestHash(i), &inp)
+	}
+
+	var (
+		wg       sync.WaitGroup
+		inserted = make([]int32, n)
+		mu       sync.Mutex
+	)
+
+	for w := 0; w < 8; w++ {
+		wg.Go(func() {
+			for i := 0; i < n; i++ {
+				wasSet, found := dst.SetIfNotExistsFrom(src, batchTestHash(i))
+				require.True(t, found)
+
+				if wasSet {
+					mu.Lock()
+					inserted[i]++
+					mu.Unlock()
+				}
+			}
+		})
+	}
+
+	wg.Wait()
+
+	require.Equal(t, n, dst.Length())
+
+	for i := 0; i < n; i++ {
+		require.Equal(t, int32(1), inserted[i], "hash %d inserted once", i)
+
+		got, ok := dst.Get(batchTestHash(i))
+		require.True(t, ok)
+		require.Equal(t, []chainhash.Hash{batchTestHash(i + n)}, got.GetParentTxHashes(), "entry %d", i)
+		require.Equal(t, []subtreepkg.Inpoint{{Hash: batchTestHash(i + n), Index: uint32(i)}}, got.GetTxInpoints(), "entry %d", i)
+	}
+
+	require.NoError(t, dst.TakeErr())
+}
+
+// blockingLogFile holds every write until release is closed.
+type blockingLogFile struct {
+	logFile
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (f *blockingLogFile) WriteAt(p []byte, off int64) (int, error) {
+	f.once.Do(func() { close(f.started) })
+	<-f.release
+
+	return f.logFile.WriteAt(p, off)
+}
+
+// A segment write happens outside the segment lock: while it is in progress,
+// appends to the same segment don't wait for it, and the records being
+// written stay readable.
+func TestDiskTxMap_AppendAndReadDuringSegmentWrite(t *testing.T) {
+	m := newErrTestDiskTxMap(t)
+	defer m.Close()
+
+	// Every hash below goes to segment 0.
+	var hashes []chainhash.Hash
+	for i := 0; len(hashes) < 30_000; i++ {
+		if h := batchTestHash(i); m.logOf(h) == 0 {
+			hashes = append(hashes, h)
+		}
+	}
+
+	l := &m.logs[0]
+	blocking := &blockingLogFile{logFile: l.file, started: make(chan struct{}), release: make(chan struct{})}
+
+	l.mu.Lock()
+	l.file = blocking
+	l.mu.Unlock()
+
+	inp := func(i int) *subtreepkg.TxInpoints {
+		in := subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{batchTestHash(i + 1_000_000)}, []uint32{1, uint32(i)})
+		return &in
+	}
+
+	// Fill segment 0 past logBufferSize; the append that crosses it starts
+	// the write, which blocks.
+	next := 0
+
+	go func() {
+		for ; next < len(hashes); next++ {
+			m.Set(hashes[next], inp(next))
+
+			select {
+			case <-blocking.started:
+				next++
+				return
+			default:
+			}
+		}
+	}()
+
+	select {
+	case <-blocking.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no segment write started")
+	}
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		// Records in the buffer being written.
+		got, ok := m.Get(hashes[0])
+		require.True(t, ok)
+		require.Equal(t, []chainhash.Hash{batchTestHash(1_000_000)}, got.GetParentTxHashes())
+
+		// Appends to the same segment.
+		extra := batchTestHash(-1)
+		for m.logOf(extra) != 0 {
+			extra[0]++
+		}
+
+		m.Set(extra, inp(7))
+
+		got, ok = m.Get(extra)
+		require.True(t, ok)
+		require.Equal(t, []chainhash.Hash{batchTestHash(1_000_007)}, got.GetParentTxHashes())
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		close(blocking.release)
+		t.Fatal("an append or read waited for the segment write")
+	}
+
+	close(blocking.release)
+	require.NoError(t, m.Flush())
+
+	got, ok := m.Get(hashes[0])
+	require.True(t, ok)
+	require.Equal(t, []chainhash.Hash{batchTestHash(1_000_000)}, got.GetParentTxHashes())
+	require.NoError(t, m.TakeErr())
+}

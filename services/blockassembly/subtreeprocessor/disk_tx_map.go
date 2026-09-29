@@ -1,12 +1,13 @@
 package subtreeprocessor
 
 import (
-	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -15,84 +16,109 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
-	"github.com/bsv-blockchain/teranode/stores/tempstore"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
-	cuckoo "github.com/seiflotfy/cuckoofilter"
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/semaphore"
+	"golang.org/x/sys/unix"
 )
 
 const (
-	defaultFilterCapacity = 10_000_000
-	numFilterShards       = 4096
-	writeChBuffer         = 1_000_000
-	writerFlushThreshold  = 50_000
+	numIndexShards = 4096
+
+	// logSegmentsPerDir is how many payload log files each configured dir
+	// holds per generation. Appends to one segment are serialized, so more
+	// segments means less contention between the parallel dequeue filters.
+	logSegmentsPerDir = 64
+
+	// logBufferSize is how much a segment buffers before writing it out.
+	logBufferSize = 512 << 10
+
+	// logReadAhead is how much a read of a written payload fetches in one
+	// call; larger payloads take a second read.
+	logReadAhead = 512
+
+	// recordMagic starts every payload record, so a record lost to a failed
+	// write (a zero-filled hole or the end of the file) reads as an error
+	// instead of as an empty TxInpoints.
+	recordMagic      = 0xA5
+	recordHeaderSize = 5 // magic + uint32 payload length
+
+	// indexBytesPerEntry is the measured RAM cost of one index entry (Go map
+	// of 32-byte key to uint64 value, averaged over map growth), for Stats.
+	indexBytesPerEntry = 80
+
+	// maxLogOffset is the largest offset an index entry can hold (48 bits).
+	maxLogOffset = 1<<48 - 1
+
+	// mapWindowSize is the size of each read-only window a log segment is
+	// mapped in, as the file grows. A multiple of the page size.
+	mapWindowSize = 64 << 20
+
+	// subtreeIndexChunkMin is the fewest nodes UpdateSubtreeIndexBatch hands
+	// to one goroutine; smaller batches aren't worth splitting.
+	subtreeIndexChunkMin = 16 << 10
 )
 
-// filterShard is one of 4096 independent existence-check segments.
-type filterShard struct {
-	mu     sync.Mutex
-	slowMu sync.Mutex // serializes slow-path (disk check) to prevent clearRecent race
-	filter *cuckoo.Filter
-	recent map[chainhash.Hash]struct{}
+// indexShard is one of 4096 independent segments of the in-RAM index.
+type indexShard struct {
+	mu    sync.Mutex
+	index map[chainhash.Hash]uint64 // see packEntry
 }
 
-// writeEntry is a pending Badger write sent via channel.
-type writeEntry struct {
-	key       chainhash.Hash
-	inpoints  *subtreepkg.TxInpoints
-	flushDone chan struct{} // non-nil = flush request
-	batch     *[]writeEntry // non-nil = several writes in one message (pointer keeps the channel element small)
+// logFile is the part of *os.File a payload log segment uses; tests replace
+// it to inject failures.
+type logFile interface {
+	io.WriterAt
+	io.ReaderAt
+	Close() error
 }
 
-// shardBatch is the writer's pending Badger batch; tempstore.WriteBatch
-// implements it.
-type shardBatch interface {
-	Set(key, value []byte) error
-	Flush() error
-	Cancel()
-}
-
-// diskShard is one Badger instance on a single disk, with its own writer goroutine.
-// Multiple disk shards across physical disks give linear I/O scaling.
-type diskShard struct {
-	store        *tempstore.BadgerTempStore
-	batch        shardBatch
-	newBatch     func() shardBatch // creates a fresh batch against the current store; recreated by Clear
-	writeCh      chan writeEntry
-	done         chan struct{}
-	path         string
-	prefix       string
-	bytesWritten int64 // written by this disk's writerLoop, read concurrently by Stats(); access via sync/atomic
-
-	// pending bounds entries sent by SetBatch and not yet written; released
-	// by the writer. Set is bounded by writeCh's capacity instead.
-	pending    *semaphore.Weighted
-	pendingCap int64
-}
-
-// DiskTxMap implements TxInpointsMap using sharded cuckoo filters for fast
-// in-memory existence checks and multi-disk BadgerDB for on-disk TxInpoints storage.
+// payloadLog is one append-only segment of serialized TxInpoints. Records
+// are appended to buf. Once buf is full it becomes inflight and is written
+// outside mu, so appends and reads never wait for the disk: bytes below
+// flushed are in the file and immutable, bytes in [flushed, flushed+len(inflight))
+// are in inflight, and later bytes are in buf. wmu serializes the writes.
 //
-// Architecture (designed for 10M+ TPS):
-//   - 4096 independent cuckoo filter shards (~1 GB total at 1B entries)
-//   - Hot path: per-shard lock + filter check + map insert + channel send = ~100-200ns
-//   - N Badger instances across N physical disks, each with a dedicated writer goroutine
-//   - Write throughput scales linearly with disk count (~500K/s per disk)
-//   - TxInpoints read only during rare ops (reorg, removeTx)
+// Written bytes are read through windows, read-only shared mappings of
+// consecutive mapWindowSize ranges of the file, added as writes reach them: a
+// read is a copy instead of a pread syscall. Only bytes below written (the end
+// of the last successful write) are read through them, since touching a
+// mapping past the end of the file faults. A record that straddles two
+// windows, or lies past the last one, is read with pread.
+type payloadLog struct {
+	mu           sync.Mutex
+	wmu          sync.Mutex
+	file         logFile
+	fd           int // for mapping windows; -1 once mapping is off
+	buf          []byte
+	inflight     []byte // being written; nil when no write is in progress
+	spare        []byte // the last written buffer, reused as the next buf
+	flushed      int64
+	written      int64
+	windows      [][]byte // window i maps [i*mapWindowSize, (i+1)*mapWindowSize)
+	mapped       [][]byte // every mapping made, for close; tests clear windows only
+	bytesWritten int64    // read concurrently by Stats(); access via sync/atomic
+}
+
+// DiskTxMap implements TxInpointsMap with an exact in-RAM index and the
+// TxInpoints themselves in append-only log files on disk.
+//
+//   - Membership (SetIfNotExists, Exists) and the SubtreeIndex are answered by
+//     the index alone: hash -> (payload offset, SubtreeIndex), ~80 bytes per
+//     entry. Dedup never touches disk.
+//   - Payloads are appended to one of logSegmentsPerDir segments per
+//     configured dir, chosen by hash, and read back only by Get.
+//   - A map generation is never compacted: Delete forgets the hash and Set
+//     appends a new payload. Clear discards the whole generation, which is
+//     how the subtree processor recycles each half of its double buffer.
 type DiskTxMap struct {
-	shards         [numFilterShards]filterShard
-	disks          []diskShard
-	numDisks       int
-	count          atomic.Int64
-	basePaths      []string
-	prefix         string
-	capacity       uint
-	filterMemBytes int64 // total cuckoo filter memory, computed once at construction
+	shards    [numIndexShards]indexShard
+	logs      []payloadLog
+	dirs      []string // this generation's directory under each base path
+	basePaths []string
+	prefix    string
 
 	// errMu guards err, the first storage error since the last TakeErr. Map
-	// operations have no error return and writes are asynchronous, so failures
-	// are recorded here and surfaced by the subtree processor.
+	// operations have no error return, so failures are recorded here and
+	// surfaced by the subtree processor.
 	errMu sync.Mutex
 	err   error
 
@@ -148,8 +174,8 @@ func (m *DiskTxMap) recordErr(err error) {
 }
 
 // TakeErr returns the first storage error recorded since the last call, and
-// clears it. A non-nil error means earlier writes, reads or deletes did not
-// reach disk; writes in a failed flush are lost.
+// clears it. A non-nil error means earlier writes or reads did not reach
+// disk; payloads in a failed write are lost and read back as errors.
 func (m *DiskTxMap) TakeErr() error {
 	m.errMu.Lock()
 	defer m.errMu.Unlock()
@@ -162,26 +188,18 @@ func (m *DiskTxMap) TakeErr() error {
 
 // DiskTxMapOptions configures the DiskTxMap.
 type DiskTxMapOptions struct {
-	// BasePaths is a list of directories for Badger storage, each ideally on a separate
-	// physical disk for I/O parallelism. If empty, BasePath is used as a single disk.
+	// BasePaths is a list of directories for the payload logs, each ideally on
+	// a separate physical disk. If empty, BasePath is used as a single disk.
 	BasePaths []string
 	// BasePath is used when BasePaths is empty (single-disk mode).
-	BasePath       string
-	Prefix         string
-	FilterCapacity uint
-
-	// MaxPendingWrites bounds the entries SetBatch has queued for the disk
-	// writers across all disks (0 = default): SetBatch waits for room before
-	// sending. It doesn't bound the caller's own batch, which SetBatch groups
-	// by disk before sending.
-	MaxPendingWrites int
+	BasePath string
+	Prefix   string
 }
 
-// staleDiskTxMapDirPattern matches the Badger directory names the subtree
-// processor's disk tx maps create: tempstore.New's <prefix>-<unixnano>-<pid>,
-// where NewDiskTxMap's prefix is <map prefix>-disk<i> and the map prefix is
-// ba-txmap, ba-txmap-shadow or ba-txmap-reorg (see SubtreeProcessor). The
-// submatches are the creation time and the pid.
+// staleDiskTxMapDirPattern matches the generation directory names the subtree
+// processor's disk tx maps create: <prefix>-disk<i>-<unixnano>-<pid>, where
+// the map prefix is ba-txmap, ba-txmap-shadow or ba-txmap-reorg (see
+// SubtreeProcessor). The submatches are the creation time and the pid.
 var staleDiskTxMapDirPattern = regexp.MustCompile(`^ba-txmap(?:-shadow|-reorg)?-disk\d+-(\d+)-(\d+)$`)
 
 // processStartNanos is when this process started, for telling its own disk
@@ -244,604 +262,392 @@ func removeStaleDiskTxMapDirs(paths []string) (removed []string, err error) {
 	return removed, err
 }
 
-// NewDiskTxMap creates a new DiskTxMap with N Badger disk shards.
+// NewDiskTxMap creates a new DiskTxMap with its payload logs spread over the
+// configured dirs.
 func NewDiskTxMap(opts DiskTxMapOptions) (*DiskTxMap, error) {
-	capacity := opts.FilterCapacity
-	if capacity == 0 {
-		capacity = defaultFilterCapacity
-	}
-
 	prefix := opts.Prefix
 	if prefix == "" {
 		prefix = "disktxmap"
 	}
 
-	// Resolve disk paths
 	paths := opts.BasePaths
 	if len(paths) == 0 {
 		paths = []string{opts.BasePath}
 	}
 
-	maxPending := opts.MaxPendingWrites
-	if maxPending <= 0 {
-		maxPending = writeChBuffer
-	}
-
-	pendingPerDisk := int64(maxPending / len(paths))
-	if pendingPerDisk < 1 {
-		pendingPerDisk = 1
-	}
-
 	m := &DiskTxMap{
-		numDisks:  len(paths),
 		basePaths: paths,
 		prefix:    prefix,
-		capacity:  capacity,
-		disks:     make([]diskShard, len(paths)),
 	}
 
-	// Create Badger stores — one per disk path
-	for i, path := range paths {
-		store, err := tempstore.New(tempstore.Options{
-			BasePath:   path,
-			Prefix:     fmt.Sprintf("%s-disk%d", prefix, i),
-			SyncWrites: false,
-		})
-		if err != nil {
-			// Clean up already-created stores
-			for j := 0; j < i; j++ {
-				_ = m.disks[j].store.Close()
-			}
-			return nil, errors.NewServiceError("failed to create badger store for disk %d (%s)", i, path, err)
-		}
-
-		m.disks[i] = diskShard{
-			store:    store,
-			batch:    store.NewWriteBatch(),
-			newBatch: func() shardBatch { return store.NewWriteBatch() },
-			writeCh:  make(chan writeEntry, writeChBuffer/len(paths)),
-			done:     make(chan struct{}),
-			path:     path,
-			prefix:   fmt.Sprintf("%s-disk%d", prefix, i),
-
-			pending:    semaphore.NewWeighted(pendingPerDisk),
-			pendingCap: pendingPerDisk,
-		}
+	dirs, logs, err := m.openGeneration()
+	if err != nil {
+		return nil, err
 	}
 
-	// Initialize filter shards
-	perShard := capacity / numFilterShards
-	if perShard < 1024 {
-		perShard = 1024
-	}
+	m.dirs = dirs
+	m.logs = logs
+
 	for i := range m.shards {
-		m.shards[i].filter = cuckoo.NewFilter(uint(perShard))
-		m.shards[i].recent = make(map[chainhash.Hash]struct{}, 64)
-	}
-
-	m.filterMemBytes = int64(numFilterShards) * int64(dtmGetNextPow2(uint(perShard)))
-
-	// Start one writer goroutine per disk
-	for i := range m.disks {
-		go m.writerLoop(i)
+		m.shards[i].index = make(map[chainhash.Hash]uint64)
 	}
 
 	return m, nil
 }
 
-// writerLoop is the dedicated goroutine for a single disk shard.
-func (m *DiskTxMap) writerLoop(diskIdx int) {
-	d := &m.disks[diskIdx]
-	pending := 0
-	for entry := range d.writeCh {
-		if entry.flushDone != nil {
-			if pending > 0 {
-				m.flushBatch(diskIdx)
-				m.clearRecentMapsForDisk(diskIdx)
-				pending = 0
-			}
-			close(entry.flushDone)
-			continue
+// openGeneration creates a fresh directory under every base path with its
+// log segments. It is all-or-nothing: on failure it removes whatever it
+// created.
+func (m *DiskTxMap) openGeneration() ([]string, []payloadLog, error) {
+	dirs := make([]string, 0, len(m.basePaths))
+	logs := make([]payloadLog, len(m.basePaths)*logSegmentsPerDir)
+	opened := 0
+
+	fail := func(err error) ([]string, []payloadLog, error) {
+		for i := 0; i < opened; i++ {
+			_ = logs[i].close()
 		}
 
-		if entry.batch != nil {
-			entries := *entry.batch
-			for i := range entries {
-				value := serializeTxMapValue(entries[i].inpoints)
-				m.recordSetErr(diskIdx, d.batch.Set(entries[i].key[:], value))
-				atomic.AddInt64(&d.bytesWritten, int64(chainhash.HashSize+len(value)))
-			}
-
-			pending += len(entries)
-			d.pending.Release(int64(len(entries)))
-		} else {
-			value := serializeTxMapValue(entry.inpoints)
-			m.recordSetErr(diskIdx, d.batch.Set(entry.key[:], value))
-			atomic.AddInt64(&d.bytesWritten, int64(chainhash.HashSize+len(value)))
-			pending++
+		for _, dir := range dirs {
+			_ = os.RemoveAll(dir)
 		}
 
-		if pending >= writerFlushThreshold {
-			m.flushBatch(diskIdx)
-			m.clearRecentMapsForDisk(diskIdx)
-			pending = 0
+		return nil, nil, err
+	}
+
+	for i, path := range m.basePaths {
+		dir := filepath.Join(path, fmt.Sprintf("%s-disk%d-%d-%d", m.prefix, i, time.Now().UnixNano(), os.Getpid()))
+
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fail(errors.NewStorageError("disk tx map: creating directory on disk %d (%s)", i, path, err))
 		}
+
+		dirs = append(dirs, dir)
 	}
 
-	if pending > 0 {
-		m.flushBatch(diskIdx)
-		m.clearRecentMapsForDisk(diskIdx)
+	// Segment k lives under base path k % len(basePaths), so consecutive
+	// segments, and the hashes that map to them, alternate between disks.
+	for k := range logs {
+		name := filepath.Join(dirs[k%len(dirs)], fmt.Sprintf("seg-%d.log", k))
+
+		f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil {
+			return fail(errors.NewStorageError("disk tx map: creating log segment %s", name, err))
+		}
+
+		logs[k].file = f
+		logs[k].fd = int(f.Fd()) //nolint:gosec // fd fits in int
+		logs[k].buf = make([]byte, 0, logBufferSize+logReadAhead)
+		opened++
 	}
-	close(d.done)
+
+	return dirs, logs, nil
 }
 
-// flushBatch flushes the disk's pending batch and records any error. A failed
-// Badger batch stays failed - Badger keeps the commit error and marks the
-// batch finished, so every subsequent Set/Flush on it fails too - so on error
-// this cancels it and installs a fresh one from newBatch, recovering the shard
-// for later writes instead of failing every write until the next Clear
-// rotation happens to succeed.
-func (m *DiskTxMap) flushBatch(diskIdx int) {
-	d := &m.disks[diskIdx]
+// packEntry packs a payload offset and a SubtreeIndex into an index value.
+func packEntry(offset int64, subtreeIndex int16) uint64 {
+	return uint64(offset)<<16 | uint64(uint16(subtreeIndex)) //nolint:gosec // offset < 2^48, SubtreeIndex stored as raw bits
+}
 
-	err := d.batch.Flush()
-	m.recordFlushErr(diskIdx, err)
+func entryOffset(e uint64) int64 { return int64(e >> 16) } //nolint:gosec // 48-bit value
+
+func entrySubtreeIndex(e uint64) int16 { return int16(uint16(e)) } //nolint:gosec // raw bits, as stored
+
+func withSubtreeIndex(e uint64, subtreeIndex int16) uint64 {
+	return e&^0xFFFF | uint64(uint16(subtreeIndex)) //nolint:gosec // raw bits
+}
+
+// shardOf returns the index shard for a hash.
+func shardOf(hash chainhash.Hash) uint16 {
+	return binary.LittleEndian.Uint16(hash[:2]) % numIndexShards
+}
+
+// logOf returns the payload log segment for a hash.
+func (m *DiskTxMap) logOf(hash chainhash.Hash) int {
+	return int(shardOf(hash)) % len(m.logs)
+}
+
+// serializePayload returns the bytes stored for inpoints. A TxInpoints that
+// can't be serialized is recorded as an error and stored as an empty payload,
+// which reads back as an error.
+func (m *DiskTxMap) serializePayload(hash chainhash.Hash, inpoints *subtreepkg.TxInpoints) []byte {
+	payload, err := inpoints.Serialize()
+	if err != nil {
+		m.recordErr(errors.NewProcessingError("disk tx map: serializing inpoints of %s", hash.String(), err))
+		return nil
+	}
+
+	return payload
+}
+
+// appendPayload appends a record to log segment logIdx and returns its
+// offset. Callers append before taking the hash's index shard lock and
+// publish the entry after, so the shard lock never waits on a segment lock;
+// a record whose entry loses a race to a duplicate is dead space until the
+// generation is cleared.
+func (m *DiskTxMap) appendPayload(logIdx int, payload []byte) int64 {
+	l := &m.logs[logIdx]
+
+	l.mu.Lock()
+
+	offset := l.flushed + int64(len(l.inflight)) + int64(len(l.buf))
+	if offset > maxLogOffset {
+		m.recordErr(errors.NewStorageError("disk tx map: log segment %d exceeds the maximum offset", logIdx))
+	}
+
+	var header [recordHeaderSize]byte
+	header[0] = recordMagic
+	binary.LittleEndian.PutUint32(header[1:], uint32(len(payload))) //nolint:gosec // a TxInpoints is far below 4GB
+
+	l.buf = append(l.buf, header[:]...)
+	l.buf = append(l.buf, payload...)
+
+	// Hand a full buffer to a write unless one is already in progress; then
+	// buf keeps growing and the next append past the threshold starts one.
+	startWrite := len(l.buf) >= logBufferSize && l.takeBufLocked()
+
+	l.mu.Unlock()
+
+	if startWrite {
+		l.wmu.Lock()
+		m.writeInflight(logIdx)
+		l.wmu.Unlock()
+	}
+
+	return offset
+}
+
+// takeBufLocked makes buf the in-flight buffer, reporting whether it did (not
+// when a write is already in progress or buf is empty). The caller holds mu.
+func (l *payloadLog) takeBufLocked() bool {
+	if l.inflight != nil || len(l.buf) == 0 {
+		return false
+	}
+
+	l.inflight = l.buf
+	l.buf = l.spare[:0]
+	l.spare = nil
+
+	if l.buf == nil {
+		l.buf = make([]byte, 0, logBufferSize+logReadAhead)
+	}
+
+	return true
+}
+
+// writeInflight writes segment logIdx's in-flight buffer, if any, to its
+// file, without holding mu. On failure the buffered records are lost: they
+// read back as errors, and later records are written after them as usual.
+// The caller holds wmu.
+func (m *DiskTxMap) writeInflight(logIdx int) {
+	l := &m.logs[logIdx]
+
+	l.mu.Lock()
+	data, at, f := l.inflight, l.flushed, l.file
+	l.mu.Unlock()
+
+	if data == nil {
+		return
+	}
+
+	n, err := f.WriteAt(data, at)
+
+	atomic.AddInt64(&l.bytesWritten, int64(n))
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	if err != nil {
-		d.batch.Cancel()
-		d.batch = d.newBatch()
+		m.recordErr(errors.NewStorageError("disk tx map: writing log segment %d", logIdx, err))
+	} else {
+		l.written = at + int64(n)
+		l.mapWindowsLocked()
 	}
+
+	l.flushed = at + int64(len(data))
+	l.inflight = nil
+	l.spare = data
 }
 
-func (m *DiskTxMap) recordSetErr(diskIdx int, err error) {
-	if err != nil {
-		m.recordErr(errors.NewStorageError("disk tx map: queueing write on disk %d", diskIdx, err))
+// readPayload returns the payload of the record at offset in segment logIdx.
+func (m *DiskTxMap) readPayload(logIdx int, offset int64) ([]byte, error) {
+	l := &m.logs[logIdx]
+
+	l.mu.Lock()
+
+	if offset >= l.flushed {
+		// Still in memory: in the buffer being written, or in buf after it.
+		mem, rel := l.inflight, offset-l.flushed
+		if rel >= int64(len(l.inflight)) {
+			mem, rel = l.buf, rel-int64(len(l.inflight))
+		}
+
+		if rel+recordHeaderSize > int64(len(mem)) {
+			l.mu.Unlock()
+			return nil, errors.NewStorageError("disk tx map: record at %d on log segment %d is past the end of the log", offset, logIdx)
+		}
+
+		payload, err := parseRecord(mem[rel:], logIdx, offset)
+		if err == nil {
+			payload = append([]byte(nil), payload...)
+		}
+
+		l.mu.Unlock()
+
+		return payload, err
 	}
-}
 
-func (m *DiskTxMap) recordFlushErr(diskIdx int, err error) {
-	if err != nil {
-		m.recordErr(errors.NewStorageError("disk tx map: writing batch on disk %d", diskIdx, err))
+	f, windows, written := l.file, l.windows, l.written
+	l.mu.Unlock()
+
+	// Bytes below flushed never change, so they are read unlocked. Past
+	// written they were lost to a failed write.
+	if offset+recordHeaderSize > written {
+		return nil, errors.NewStorageError("disk tx map: no record at %d on log segment %d (a lost write)", offset, logIdx)
 	}
+
+	if w, rel := offset/mapWindowSize, offset%mapWindowSize; w < int64(len(windows)) && rel+recordHeaderSize <= mapWindowSize {
+		window := windows[w]
+		end := rel + recordHeaderSize + int64(binary.LittleEndian.Uint32(window[rel+1:rel+recordHeaderSize]))
+
+		if window[rel] != recordMagic || offset+(end-rel) > written {
+			return nil, errors.NewStorageError("disk tx map: no record at %d on log segment %d (a lost write)", offset, logIdx)
+		}
+
+		if end <= mapWindowSize {
+			// Decoding copies, so the payload can alias the mapping.
+			return parseRecord(window[rel:end], logIdx, offset)
+		}
+		// The record straddles two windows: read it with pread.
+	}
+
+	buf := make([]byte, logReadAhead)
+
+	n, err := f.ReadAt(buf, offset)
+	if err != nil && !(errors.Is(err, io.EOF) && n >= recordHeaderSize) {
+		return nil, errors.NewStorageError("disk tx map: reading record at %d on log segment %d", offset, logIdx, err)
+	}
+
+	buf = buf[:n]
+
+	if buf[0] != recordMagic {
+		return nil, errors.NewStorageError("disk tx map: no record at %d on log segment %d (a lost write)", offset, logIdx)
+	}
+
+	size := int(binary.LittleEndian.Uint32(buf[1:recordHeaderSize]))
+	if recordHeaderSize+size <= len(buf) {
+		return parseRecord(buf, logIdx, offset)
+	}
+
+	full := make([]byte, recordHeaderSize+size)
+	copy(full, buf)
+
+	if _, err = f.ReadAt(full[len(buf):], offset+int64(len(buf))); err != nil {
+		return nil, errors.NewStorageError("disk tx map: reading record at %d on log segment %d", offset, logIdx, err)
+	}
+
+	return parseRecord(full, logIdx, offset)
 }
 
-// diskOf returns the disk shard index for a hash.
-func (m *DiskTxMap) diskOf(hash chainhash.Hash) int {
-	return int(shardOf(hash)) % m.numDisks
+// parseRecord returns the payload of the record at the start of b.
+func parseRecord(b []byte, logIdx int, offset int64) ([]byte, error) {
+	if len(b) < recordHeaderSize || b[0] != recordMagic {
+		return nil, errors.NewStorageError("disk tx map: no record at %d on log segment %d (a lost write)", offset, logIdx)
+	}
+
+	size := int(binary.LittleEndian.Uint32(b[1:recordHeaderSize]))
+	if size == 0 || recordHeaderSize+size > len(b) {
+		return nil, errors.NewStorageError("disk tx map: truncated or empty record at %d on log segment %d", offset, logIdx)
+	}
+
+	return b[recordHeaderSize : recordHeaderSize+size], nil
 }
 
-// SetIfNotExists atomically checks if hash exists and inserts it if not.
+// SetIfNotExists inserts hash with inpoints if it is not in the map. Whether
+// it is in the map is decided by the in-RAM index alone. The existing
+// inpoints are not returned (no caller uses them): a duplicate returns nil,
+// false.
 func (m *DiskTxMap) SetIfNotExists(hash chainhash.Hash, inpoints *subtreepkg.TxInpoints) (*subtreepkg.TxInpoints, bool) {
 	s := &m.shards[shardOf(hash)]
 
 	s.mu.Lock()
-
-	if s.filter.Lookup(hash[:]) {
-		if _, inRecent := s.recent[hash]; inRecent {
-			s.mu.Unlock()
-			return nil, false
-		}
-
+	if _, exists := s.index[hash]; exists {
 		s.mu.Unlock()
-
-		// Serialize slow path: prevents clearRecentMapsForDisk from clearing
-		// an entry between another goroutine's insert and our re-check.
-		// Held through channel send so the next slow-path entrant's flushDisk
-		// is guaranteed to find our entry on disk (FIFO channel ordering).
-		s.slowMu.Lock()
-
-		s.mu.Lock()
-		if _, inRecent := s.recent[hash]; inRecent {
-			s.mu.Unlock()
-			s.slowMu.Unlock()
-			return nil, false
-		}
-		s.mu.Unlock()
-
-		existing := m.getFromStore(hash)
-		if existing != nil {
-			s.slowMu.Unlock()
-			return existing, false
-		}
-
-		s.mu.Lock()
-		if _, inRecent := s.recent[hash]; inRecent {
-			s.mu.Unlock()
-			s.slowMu.Unlock()
-			return nil, false
-		}
-
-		s.filter.Insert(hash[:])
-		s.recent[hash] = struct{}{}
-		s.mu.Unlock()
-
-		m.disks[m.diskOf(hash)].writeCh <- writeEntry{key: hash, inpoints: inpoints}
-		m.count.Add(1)
-
-		s.slowMu.Unlock()
-		return nil, true
+		return nil, false
 	}
-
-	// Fast path: filter negative (new entry)
-	s.filter.Insert(hash[:])
-	s.recent[hash] = struct{}{}
 	s.mu.Unlock()
 
-	m.disks[m.diskOf(hash)].writeCh <- writeEntry{key: hash, inpoints: inpoints}
-	m.count.Add(1)
+	// Serialized and appended outside the lock; wasted only on a racing
+	// duplicate.
+	offset := m.appendPayload(m.logOf(hash), m.serializePayload(hash, inpoints))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.index[hash]; exists {
+		return nil, false
+	}
+
+	s.index[hash] = packEntry(offset, inpoints.SubtreeIndex)
 
 	return nil, true
 }
 
-// Exists returns true if the hash has been seen.
+// SetIfNotExistsFrom inserts hash with the inpoints and SubtreeIndex it has in
+// src, like src.Get followed by SetIfNotExists, but copies the stored bytes
+// instead of decoding and re-encoding them. found is false when src has no
+// entry for hash or can't read it; a read error is recorded on src, as Get
+// records it.
+func (m *DiskTxMap) SetIfNotExistsFrom(src *DiskTxMap, hash chainhash.Hash) (wasSet, found bool) {
+	ss := &src.shards[shardOf(hash)]
+	ss.mu.Lock()
+	entry, exists := ss.index[hash]
+	ss.mu.Unlock()
+
+	if !exists {
+		return false, false
+	}
+
+	payload, err := src.readPayload(src.logOf(hash), entryOffset(entry))
+	if err != nil {
+		src.recordErr(err)
+		return false, false
+	}
+
+	offset := m.appendPayload(m.logOf(hash), payload)
+
+	s := &m.shards[shardOf(hash)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists = s.index[hash]; exists {
+		return false, true
+	}
+
+	s.index[hash] = packEntry(offset, entrySubtreeIndex(entry))
+
+	return true, true
+}
+
+// Exists returns true if the hash is in the map.
 func (m *DiskTxMap) Exists(hash chainhash.Hash) bool {
 	s := &m.shards[shardOf(hash)]
 	s.mu.Lock()
-	exists := s.filter.Lookup(hash[:])
+	_, exists := s.index[hash]
 	s.mu.Unlock()
+
 	return exists
 }
 
-// Get retrieves the TxInpoints for a hash from the correct disk shard.
-//
-// This goes straight to disk without checking the cuckoo filter. The filter is
-// optimized for absence checks (SetIfNotExists duplicate detection), but Get is
-// predominantly called for hashes that ARE in the map. The filter would add
-// lock+lookup overhead on every call while almost never avoiding a disk read.
-// BadgerDB's own SST bloom filters handle the "key not found" case efficiently.
+// Get retrieves the TxInpoints for a hash, recording a read error on the map.
 func (m *DiskTxMap) Get(hash chainhash.Hash) (*subtreepkg.TxInpoints, bool) {
-	inpoints := m.getFromStore(hash)
-	if inpoints == nil {
-		return nil, false
-	}
-	return inpoints, true
-}
-
-// Delete removes a hash from the filter, recent map, and the correct disk shard.
-// Flushes the disk shard first to prevent a pending write from re-creating the entry.
-func (m *DiskTxMap) Delete(hash chainhash.Hash) bool {
-	s := &m.shards[shardOf(hash)]
-	s.mu.Lock()
-	s.filter.Delete(hash[:])
-	delete(s.recent, hash)
-	s.mu.Unlock()
-
-	diskIdx := m.diskOf(hash)
-	m.flushDisk(diskIdx)
-
-	// A failed delete leaves the value readable through Get, which skips the
-	// filter. The recorded error requests a reset (diskTxMapErr), which
-	// rebuilds the map.
-	if err := m.disks[diskIdx].store.Delete(hash[:]); err != nil {
-		m.recordErr(errors.NewStorageError("disk tx map: deleting %s on disk %d", hash, diskIdx, err))
-	}
-
-	m.count.Add(-1)
-	return true
-}
-
-// Length returns the number of entries.
-func (m *DiskTxMap) Length() int {
-	return int(m.count.Load())
-}
-
-// Set stores inpoints for a hash, overwriting any existing entry.
-func (m *DiskTxMap) Set(hash chainhash.Hash, inpoints *subtreepkg.TxInpoints) {
-	s := &m.shards[shardOf(hash)]
-	s.mu.Lock()
-	isNew := !s.filter.Lookup(hash[:])
-	if isNew {
-		s.filter.Insert(hash[:])
-	}
-	s.recent[hash] = struct{}{}
-	s.mu.Unlock()
-
-	if isNew {
-		m.count.Add(1)
-	}
-	m.disks[m.diskOf(hash)].writeCh <- writeEntry{key: hash, inpoints: inpoints}
-}
-
-// SetBatch stores each tx's inpoints like Set, sending one message per disk
-// instead of one per tx. It marks the whole batch as recently written before
-// sending any of it, so it must not run concurrently with SetIfNotExists for
-// the same hashes (AddNodesDirectly, its caller, runs alone).
-func (m *DiskTxMap) SetBatch(txs []*utxostore.UnminedTransaction) {
-	perDisk := make([][]writeEntry, m.numDisks)
-
-	var added int64
-
-	for _, tx := range txs {
-		hash := tx.Hash
-		s := &m.shards[shardOf(hash)]
-
-		s.mu.Lock()
-		if !s.filter.Lookup(hash[:]) {
-			s.filter.Insert(hash[:])
-			added++
-		}
-		s.recent[hash] = struct{}{}
-		s.mu.Unlock()
-
-		d := m.diskOf(hash)
-		perDisk[d] = append(perDisk[d], writeEntry{key: hash, inpoints: tx.TxInpoints})
-	}
-
-	m.count.Add(added)
-
-	for d, entries := range perDisk {
-		disk := &m.disks[d]
-
-		for len(entries) > 0 {
-			n := min(int64(len(entries)), disk.pendingCap)
-
-			// Background never cancels, so Acquire only waits for the writer.
-			_ = disk.pending.Acquire(context.Background(), n)
-
-			chunk := entries[:n]
-			disk.writeCh <- writeEntry{batch: &chunk}
-			entries = entries[n:]
-		}
-	}
-}
-
-// Clear removes all entries and recreates filters and stores.
-// Clear is all-or-nothing: either every disk shard rotates onto a fresh Badger
-// generation and the filters reset with it, or nothing changes at all.
-//
-// A partial clear is silently corrupting rather than merely stale. Get reads
-// straight from the store without consulting the cuckoo filter, so fresh
-// filters over a store that still holds the previous generation's keys answer
-// lookups that should miss with the old inpoints, while count reports an empty
-// map. Callers that need an empty map must therefore check Length() afterwards
-// rather than assume this succeeded — resetSubtreeState does, and fails the
-// block instead of installing a half that is still populated.
-func (m *DiskTxMap) Clear() {
-	m.flushAllDisks()
-
-	// Build every replacement before touching a single shard, so a failure
-	// part-way through leaves nothing half-rotated.
-	replacements := make([]*tempstore.BadgerTempStore, len(m.disks))
-
-	for i := range m.disks {
-		store, err := tempstore.New(tempstore.Options{
-			BasePath:   m.disks[i].path,
-			Prefix:     m.disks[i].prefix,
-			SyncWrites: false,
-		})
-		if err != nil {
-			for _, created := range replacements[:i] {
-				_ = created.Close()
-			}
-
-			m.recordErr(errors.NewStorageError("disk tx map: rotating store on disk %d", i, err))
-
-			return
-		}
-
-		replacements[i] = store
-	}
-
-	perShard := m.capacity / numFilterShards
-	if perShard < 1024 {
-		perShard = 1024
-	}
-
-	for i := range m.shards {
-		m.shards[i].mu.Lock()
-		m.shards[i].filter = cuckoo.NewFilter(uint(perShard))
-		m.shards[i].recent = make(map[chainhash.Hash]struct{}, 64)
-		m.shards[i].mu.Unlock()
-	}
-
-	for i := range m.disks {
-		d := &m.disks[i]
-		d.batch.Cancel()
-
-		if err := d.store.Close(); err != nil {
-			// Rotation for every disk already succeeded by this point (the
-			// replacement loop above returns early on any failure) - this is
-			// a leaked directory from the discarded generation, not a data
-			// problem, so it must not fail the caller. See TakeCloseWarn.
-			m.recordCloseWarn(errors.NewStorageError("disk tx map: closing previous generation on disk %d", i, err))
-		}
-
-		store := replacements[i]
-		d.store = store
-		d.batch = store.NewWriteBatch()
-		d.newBatch = func() shardBatch { return store.NewWriteBatch() }
-	}
-
-	m.count.Store(0)
-}
-
-// Flush persists all pending writes across all disk shards.
-func (m *DiskTxMap) Flush() error {
-	m.flushAllDisks()
-	return nil
-}
-
-// Close releases all resources across all disk shards.
-func (m *DiskTxMap) Close() error {
-	for i := range m.disks {
-		close(m.disks[i].writeCh)
-	}
-	for i := range m.disks {
-		<-m.disks[i].done
-	}
-	// Collect only non-nil errors: teranode errors.Join panics on a nil
-	// argument after a non-nil first one.
-	var errs []error
-	for i := range m.disks {
-		if err := m.disks[i].store.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if len(errs) == 0 {
-		return nil
-	}
-	return errors.Join(errs...)
-}
-
-// UpdateSubtreeIndex updates the SubtreeIndex for a hash in the correct disk shard.
-func (m *DiskTxMap) UpdateSubtreeIndex(hash chainhash.Hash, subtreeIndex int16) error {
-	m.flushDisk(m.diskOf(hash))
-
-	d := &m.disks[m.diskOf(hash)]
-	val, err := d.store.Get(hash[:])
-	if err != nil {
-		return errors.NewStorageError("disk tx map: reading %s for subtree index update", hash.String(), err)
-	}
-
-	if val == nil {
-		return errors.NewNotFoundError("entry not found for hash %s", hash.String())
-	}
-
-	if len(val) >= 2 {
-		// Copy before modifying — BadgerDB returned bytes must not be mutated in-place
-		valCopy := make([]byte, len(val))
-		copy(valCopy, val)
-		binary.LittleEndian.PutUint16(valCopy[:2], uint16(subtreeIndex))
-		return d.store.Put(hash[:], valCopy)
-	}
-
-	return errors.NewProcessingError("value too short for hash %s", hash.String())
-}
-
-// UpdateSubtreeIndexBatch sets the SubtreeIndex of every node's entry, like one
-// UpdateSubtreeIndex call per node, but with a single flush and, per disk, one
-// read transaction and one write batch. Nodes without an entry are skipped.
-//
-// Like UpdateSubtreeIndex, it rewrites each value it read, so the caller must
-// not write these entries concurrently (the subtree processor goroutine owns
-// the map).
-func (m *DiskTxMap) UpdateSubtreeIndexBatch(nodes []subtreepkg.Node, subtreeIndex int16) error {
-	if len(nodes) == 0 {
-		return nil
-	}
-
-	perDisk := make([][]int32, m.numDisks)
-	for i := range nodes {
-		d := m.diskOf(nodes[i].Hash)
-		perDisk[d] = append(perDisk[d], int32(i)) //nolint:gosec // subtree node counts fit in int32
-	}
-
-	m.flushAllDisks()
-
-	var g errgroup.Group
-
-	for diskIdx, idxs := range perDisk {
-		if len(idxs) == 0 {
-			continue
-		}
-
-		g.Go(func() error {
-			return m.updateSubtreeIndexOnDisk(diskIdx, nodes, idxs, subtreeIndex)
-		})
-	}
-
-	return g.Wait()
-}
-
-func (m *DiskTxMap) updateSubtreeIndexOnDisk(diskIdx int, nodes []subtreepkg.Node, idxs []int32, subtreeIndex int16) error {
-	store := m.disks[diskIdx].store
-	wb := store.NewWriteBatch()
-
-	// Always release the batch: tempstore's Flush opens a fresh Badger batch,
-	// and an abandoned one pins Badger's read watermark for the life of the
-	// store, retaining every later commit's conflict keys.
-	defer wb.Cancel()
-
-	err := store.GetEach(len(idxs), func(i int) []byte {
-		return nodes[idxs[i]].Hash[:]
-	}, func(i int, val []byte) error {
-		if len(val) < 2 {
-			return nil
-		}
-
-		// The value is only valid during the callback and the batch keeps it.
-		updated := make([]byte, len(val))
-		copy(updated, val)
-		binary.LittleEndian.PutUint16(updated[:2], uint16(subtreeIndex)) //nolint:gosec // stored as the raw int16 bits, as in UpdateSubtreeIndex
-
-		return wb.Set(nodes[idxs[i]].Hash[:], updated)
-	})
-	if err != nil {
-		return errors.NewStorageError("updating subtree index on disk %d", diskIdx, err)
-	}
-
-	if err = wb.Flush(); err != nil {
-		return errors.NewStorageError("flushing subtree index on disk %d", diskIdx, err)
-	}
-
-	return nil
-}
-
-// flushDisk sends a flush request to a single disk shard and waits for completion.
-func (m *DiskTxMap) flushDisk(diskIdx int) {
-	done := make(chan struct{})
-	m.disks[diskIdx].writeCh <- writeEntry{flushDone: done}
-	<-done
-}
-
-// flushAllDisks flushes all disk shards in parallel.
-func (m *DiskTxMap) flushAllDisks() {
-	dones := make([]chan struct{}, m.numDisks)
-	for i := range m.disks {
-		dones[i] = make(chan struct{})
-		m.disks[i].writeCh <- writeEntry{flushDone: dones[i]}
-	}
-	for _, done := range dones {
-		<-done
-	}
-}
-
-// clearRecentMapsForDisk clears recent maps for filter shards mapped to a specific disk.
-func (m *DiskTxMap) clearRecentMapsForDisk(diskIdx int) {
-	for i := range m.shards {
-		if i%m.numDisks != diskIdx {
-			continue
-		}
-		m.shards[i].mu.Lock()
-		if len(m.shards[i].recent) > 0 {
-			m.shards[i].recent = make(map[chainhash.Hash]struct{}, 64)
-		}
-		m.shards[i].mu.Unlock()
-	}
-}
-
-// getFromStore retrieves and deserializes TxInpoints from the correct disk
-// shard, recording any read error on the map for a later operation boundary
-// to report.
-func (m *DiskTxMap) getFromStore(hash chainhash.Hash) *subtreepkg.TxInpoints {
-	inpoints, err := m.getFromStoreOrErr(hash)
+	inpoints, found, err := m.GetWithErr(hash)
 	if err != nil {
 		m.recordErr(err)
-		return nil
+		return nil, false
 	}
 
-	return inpoints
-}
-
-// getFromStoreOrErr is getFromStore without the side effect of recording the
-// error on the map. Used by GetWithErr, whose callers run concurrently with
-// processor operations (e.g. the async subtree storer) and must handle their
-// own read errors rather than have them land on whichever operation happens
-// to check the map's pending error next.
-func (m *DiskTxMap) getFromStoreOrErr(hash chainhash.Hash) (*subtreepkg.TxInpoints, error) {
-	diskIdx := m.diskOf(hash)
-	m.flushDisk(diskIdx)
-
-	val, err := m.disks[diskIdx].store.Get(hash[:])
-	if err != nil {
-		return nil, errors.NewStorageError("disk tx map: reading %s on disk %d", hash, diskIdx, err)
-	}
-
-	if val == nil {
-		return nil, nil
-	}
-
-	return deserializeTxMapValue(val), nil
+	return inpoints, found
 }
 
 // GetWithErr behaves like Get but returns the read error to the caller instead
@@ -849,93 +655,268 @@ func (m *DiskTxMap) getFromStoreOrErr(hash chainhash.Hash) (*subtreepkg.TxInpoin
 // operations must use this so a read error they cause is not misattributed to
 // whichever operation next checks the map's pending error.
 func (m *DiskTxMap) GetWithErr(hash chainhash.Hash) (*subtreepkg.TxInpoints, bool, error) {
-	inpoints, err := m.getFromStoreOrErr(hash)
+	s := &m.shards[shardOf(hash)]
+	s.mu.Lock()
+	entry, exists := s.index[hash]
+	s.mu.Unlock()
+
+	if !exists {
+		return nil, false, nil
+	}
+
+	logIdx := m.logOf(hash)
+
+	payload, err := m.readPayload(logIdx, entryOffset(entry))
 	if err != nil {
 		return nil, false, err
 	}
 
-	if inpoints == nil {
-		return nil, false, nil
-	}
-
-	return inpoints, true, nil
-}
-
-// shardOf returns the filter shard index for a hash.
-func shardOf(hash chainhash.Hash) uint16 {
-	return binary.LittleEndian.Uint16(hash[:2]) % numFilterShards
-}
-
-// serializeTxMapValue encodes SubtreeIndex + TxInpoints into bytes.
-func serializeTxMapValue(inpoints *subtreepkg.TxInpoints) []byte {
-	serialized, err := inpoints.Serialize()
+	inpoints, err := subtreepkg.NewTxInpointsFromBytes(payload)
 	if err != nil {
-		buf := make([]byte, 2)
-		binary.LittleEndian.PutUint16(buf, uint16(inpoints.SubtreeIndex))
-		return buf
+		return nil, false, errors.NewStorageError("disk tx map: decoding inpoints of %s on log segment %d", hash.String(), logIdx, err)
 	}
 
-	buf := make([]byte, 2+len(serialized))
-	binary.LittleEndian.PutUint16(buf[:2], uint16(inpoints.SubtreeIndex))
-	copy(buf[2:], serialized)
+	inpoints.SubtreeIndex = entrySubtreeIndex(entry)
 
-	return buf
+	return &inpoints, true, nil
 }
 
-// deserializeTxMapValue decodes SubtreeIndex + TxInpoints from bytes.
-func deserializeTxMapValue(data []byte) *subtreepkg.TxInpoints {
-	if len(data) < 2 {
-		return nil
+// Delete removes a hash from the map, reporting whether it was there. Its
+// payload stays in the log until the generation is cleared.
+func (m *DiskTxMap) Delete(hash chainhash.Hash) bool {
+	s := &m.shards[shardOf(hash)]
+	s.mu.Lock()
+	_, exists := s.index[hash]
+	delete(s.index, hash)
+	s.mu.Unlock()
+
+	return exists
+}
+
+// Length returns the number of entries. It locks every index shard, so it is
+// for block boundaries, not the per-tx path.
+func (m *DiskTxMap) Length() int {
+	n := 0
+
+	for i := range m.shards {
+		m.shards[i].mu.Lock()
+		n += len(m.shards[i].index)
+		m.shards[i].mu.Unlock()
 	}
 
-	subtreeIndex := int16(binary.LittleEndian.Uint16(data[:2]))
+	return n
+}
 
-	inpoints := &subtreepkg.TxInpoints{
-		SubtreeIndex: subtreeIndex,
+// Set stores inpoints for a hash, overwriting any existing entry.
+func (m *DiskTxMap) Set(hash chainhash.Hash, inpoints *subtreepkg.TxInpoints) {
+	offset := m.appendPayload(m.logOf(hash), m.serializePayload(hash, inpoints))
+
+	s := &m.shards[shardOf(hash)]
+	s.mu.Lock()
+	s.index[hash] = packEntry(offset, inpoints.SubtreeIndex)
+	s.mu.Unlock()
+}
+
+// SetBatch stores each tx's inpoints like Set.
+func (m *DiskTxMap) SetBatch(txs []*utxostore.UnminedTransaction) {
+	for _, tx := range txs {
+		m.Set(tx.Hash, tx.TxInpoints)
+	}
+}
+
+// Clear removes all entries by moving onto a fresh generation of log files.
+// Clear is all-or-nothing: either every dir gets a fresh generation and the
+// index resets with it, or nothing changes and the failure is recorded.
+// Callers that need an empty map must therefore check Length() afterwards
+// rather than assume this succeeded - resetSubtreeState does, and fails the
+// block instead of installing a half that is still populated.
+func (m *DiskTxMap) Clear() {
+	dirs, logs, err := m.openGeneration()
+	if err != nil {
+		m.recordErr(errors.NewStorageError("disk tx map: rotating to a fresh generation", err))
+		return
 	}
 
-	if len(data) > 2 {
-		parsed, err := subtreepkg.NewTxInpointsFromBytes(data[2:])
-		if err == nil {
-			parsed.SubtreeIndex = subtreeIndex
-			return &parsed
+	// clear keeps each map's capacity: the next block refills it to a similar
+	// size, and regrowing 4096 maps from empty every block costs more than
+	// holding the memory.
+	for i := range m.shards {
+		m.shards[i].mu.Lock()
+		clear(m.shards[i].index)
+		m.shards[i].mu.Unlock()
+	}
+
+	oldDirs, oldLogs := m.dirs, m.logs
+	m.dirs, m.logs = dirs, logs
+
+	// The rotation has succeeded: failing to discard the old generation only
+	// leaves its directory behind, so it must not fail the caller. See
+	// TakeCloseWarn.
+	if err = closeGeneration(oldDirs, oldLogs); err != nil {
+		m.recordCloseWarn(errors.NewStorageError("disk tx map: discarding previous generation", err))
+	}
+}
+
+// mapWindowsLocked maps windows until they cover every written byte. A
+// failed mapping turns mapping off for the segment; reads then use pread.
+// The caller holds the segment lock.
+func (l *payloadLog) mapWindowsLocked() {
+	for l.fd >= 0 && int64(len(l.windows))*mapWindowSize < l.written {
+		window, err := unix.Mmap(l.fd, int64(len(l.windows))*mapWindowSize, mapWindowSize, unix.PROT_READ, unix.MAP_SHARED)
+		if err != nil {
+			l.fd = -1
+			return
+		}
+
+		l.windows = append(l.windows, window)
+		l.mapped = append(l.mapped, window)
+	}
+}
+
+// close unmaps and closes the segment's file.
+func (l *payloadLog) close() error {
+	var unmapErr error
+
+	for _, window := range l.mapped {
+		if err := unix.Munmap(window); err != nil && unmapErr == nil {
+			unmapErr = err
 		}
 	}
 
-	return inpoints
+	l.windows, l.mapped = nil, nil
+
+	if err := l.file.Close(); err != nil {
+		return err
+	}
+
+	return unmapErr
+}
+
+// closeGeneration closes a generation's log segments and removes its dirs.
+func closeGeneration(dirs []string, logs []payloadLog) error {
+	// Collect only non-nil errors: teranode errors.Join panics on a nil
+	// argument after a non-nil first one.
+	var errs []error
+
+	for i := range logs {
+		if err := logs[i].close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	for _, dir := range dirs {
+		if err := os.RemoveAll(dir); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) == 0 {
+		return nil
+	}
+
+	return errors.Join(errs...)
+}
+
+// Flush writes every segment's buffered records to its file. Write errors
+// are recorded on the map, not returned.
+func (m *DiskTxMap) Flush() error {
+	for i := range m.logs {
+		l := &m.logs[i]
+
+		// Holding wmu, write whatever is in flight and then the rest of buf.
+		l.wmu.Lock()
+
+		for {
+			m.writeInflight(i)
+
+			l.mu.Lock()
+			more := l.takeBufLocked()
+			l.mu.Unlock()
+
+			if !more {
+				break
+			}
+		}
+
+		l.wmu.Unlock()
+	}
+
+	return nil
+}
+
+// Close releases the log files and removes this generation's directories.
+func (m *DiskTxMap) Close() error {
+	return closeGeneration(m.dirs, m.logs)
+}
+
+// UpdateSubtreeIndex sets the SubtreeIndex of hash's entry.
+func (m *DiskTxMap) UpdateSubtreeIndex(hash chainhash.Hash, subtreeIndex int16) error {
+	s := &m.shards[shardOf(hash)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry, exists := s.index[hash]
+	if !exists {
+		return errors.NewNotFoundError("entry not found for hash %s", hash.String())
+	}
+
+	s.index[hash] = withSubtreeIndex(entry, subtreeIndex)
+
+	return nil
+}
+
+// UpdateSubtreeIndexBatch sets the SubtreeIndex of every node's entry, like
+// one UpdateSubtreeIndex call per node. Nodes without an entry are skipped.
+// It only touches the in-RAM index, split over GOMAXPROCS goroutines since the
+// subtree processor calls it for every completed subtree.
+func (m *DiskTxMap) UpdateSubtreeIndexBatch(nodes []subtreepkg.Node, subtreeIndex int16) error {
+	chunk := max(subtreeIndexChunkMin, (len(nodes)+runtime.GOMAXPROCS(0)-1)/runtime.GOMAXPROCS(0))
+
+	var wg sync.WaitGroup
+
+	for start := 0; start < len(nodes); start += chunk {
+		part := nodes[start:min(start+chunk, len(nodes))]
+
+		wg.Go(func() {
+			for i := range part {
+				s := &m.shards[shardOf(part[i].Hash)]
+				s.mu.Lock()
+
+				if entry, exists := s.index[part[i].Hash]; exists {
+					s.index[part[i].Hash] = withSubtreeIndex(entry, subtreeIndex)
+				}
+
+				s.mu.Unlock()
+			}
+		})
+	}
+
+	wg.Wait()
+
+	return nil
 }
 
 // DiskMapStats holds lightweight metrics for a disk-backed map.
 type DiskMapStats struct {
 	Entries          int64
-	FilterMemBytes   int64
+	IndexMemBytes    int64 // estimated RAM held by the index
 	DiskBytesWritten int64
 }
 
-// Stats returns current metrics. It may be called concurrently with active
-// writer goroutines (e.g. reportDiskMapStats during moveForwardBlock before
-// Clear()), so bytesWritten is read atomically.
+// Stats returns current metrics. It may be called concurrently with writes
+// (e.g. reportDiskMapStats during moveForwardBlock), so bytesWritten is read
+// atomically.
 func (m *DiskTxMap) Stats() DiskMapStats {
 	var diskBytes int64
-	for i := range m.disks {
-		diskBytes += atomic.LoadInt64(&m.disks[i].bytesWritten)
+	for i := range m.logs {
+		diskBytes += atomic.LoadInt64(&m.logs[i].bytesWritten)
 	}
+
+	entries := int64(m.Length())
+
 	return DiskMapStats{
-		Entries:          m.count.Load(),
-		FilterMemBytes:   m.filterMemBytes,
+		Entries:          entries,
+		IndexMemBytes:    entries * indexBytesPerEntry,
 		DiskBytesWritten: diskBytes,
 	}
-}
-
-// dtmGetNextPow2 mirrors the cuckoo filter library's unexported bucket allocation function.
-func dtmGetNextPow2(n uint) uint {
-	n--
-	n |= n >> 1
-	n |= n >> 2
-	n |= n >> 4
-	n |= n >> 8
-	n |= n >> 16
-	n |= n >> 32
-	n++
-	return n
 }

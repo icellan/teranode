@@ -244,7 +244,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "subtreeprocessor",
 			Name:      "diskmap_filter_ram_bytes",
-			Help:      "Cuckoo filter memory in bytes for disk-backed transaction map",
+			Help:      "Estimated in-RAM index memory in bytes for disk-backed transaction map",
 		},
 	)
 
@@ -280,7 +280,7 @@ func _initPrometheusMetrics() {
 // reportDiskMapStats sets Prometheus gauges for the disk-backed transaction map.
 func reportDiskMapStats(stats DiskMapStats) {
 	prometheusSubtreeProcessorDiskMapEntries.Set(float64(stats.Entries))
-	prometheusSubtreeProcessorDiskMapFilterRAM.Set(float64(stats.FilterMemBytes))
+	prometheusSubtreeProcessorDiskMapFilterRAM.Set(float64(stats.IndexMemBytes))
 	prometheusSubtreeProcessorDiskMapDiskWritten.Set(float64(stats.DiskBytesWritten))
 }
 

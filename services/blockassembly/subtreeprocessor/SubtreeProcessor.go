@@ -712,8 +712,6 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 	// moveForwardBlock's "captured map stays readable until commit" contract,
 	// and fails on the first block that carries non-coinbase transactions.
 	if len(stp.txMapDirs) > 0 {
-		capacity := uint(initialItemsPerFile * ExpectedNumberOfSubtrees)
-
 		// Left by a previous run that exited without closing its maps.
 		removed, sweepErr := removeStaleDiskTxMapDirs(stp.txMapDirs)
 		if len(removed) > 0 {
@@ -724,11 +722,11 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 			logger.Warnf("[SubtreeProcessor] error removing stale disk tx map dirs, their disk space stays in use: %v", sweepErr)
 		}
 
-		diskMap, diskErr := stp.newDiskTxMap("ba-txmap", capacity)
+		diskMap, diskErr := stp.newDiskTxMap("ba-txmap")
 		if diskErr != nil {
 			logger.Warnf("DiskTxMap creation failed, using in-memory map: %v", diskErr)
 		} else {
-			shadowMap, shadowErr := stp.newDiskTxMap("ba-txmap-shadow", capacity)
+			shadowMap, shadowErr := stp.newDiskTxMap("ba-txmap-shadow")
 			if shadowErr != nil {
 				_ = diskMap.Close()
 				logger.Warnf("DiskTxMap shadow creation failed, using in-memory map: %v", shadowErr)
@@ -5309,11 +5307,10 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 // newDiskTxMap builds one half of the disk-backed currentTxMap over the
 // configured txMapDirs. Each call creates its own Badger generation per disk,
 // named "<prefix>-disk<N>-<UnixNano>-<pid>", so halves never share storage.
-func (stp *SubtreeProcessor) newDiskTxMap(prefix string, capacity uint) (*DiskTxMap, error) {
+func (stp *SubtreeProcessor) newDiskTxMap(prefix string) (*DiskTxMap, error) {
 	return NewDiskTxMap(DiskTxMapOptions{
-		BasePaths:      stp.txMapDirs,
-		Prefix:         prefix,
-		FilterCapacity: capacity,
+		BasePaths: stp.txMapDirs,
+		Prefix:    prefix,
 	})
 }
 
@@ -5345,18 +5342,17 @@ func (stp *SubtreeProcessor) finishReorgDiskTxMaps() {
 	stp.closeRetiredDiskTxMaps()
 }
 
-// diskTxMapStats combines the gauges for the whole double buffer. Both halves
-// are allocated at full capacity and both stay resident for the process
-// lifetime, so reporting the active half alone understates filter memory — the
-// number operators size the pod from — by half. Entries come from the active
-// half only: the shadow is empty by invariant, and double-counting it would
-// make the entry gauge meaningless.
+// diskTxMapStats combines the gauges for the whole double buffer: index memory
+// and bytes written are summed over both halves, since a half that still holds
+// the previous block (until the commit point clears it) holds its RAM too.
+// Entries come from the active half only: the shadow is empty by invariant,
+// and double-counting it would make the entry gauge meaningless.
 func (stp *SubtreeProcessor) diskTxMapStats() DiskMapStats {
 	stats := stp.diskTxMap.Stats()
 
 	if stp.diskTxMapShadow != nil {
 		shadow := stp.diskTxMapShadow.Stats()
-		stats.FilterMemBytes += shadow.FilterMemBytes
+		stats.IndexMemBytes += shadow.IndexMemBytes
 		stats.DiskBytesWritten += shadow.DiskBytesWritten
 	}
 
@@ -5426,7 +5422,7 @@ func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool)
 			// which a two-buffer swap cannot promise across more than one
 			// iteration. Allocate a fresh map and retire the displaced one for
 			// reorgBlocks to close once it knows which map survives.
-			freshMap, freshErr := stp.newDiskTxMap("ba-txmap-reorg", stp.diskTxMap.capacity)
+			freshMap, freshErr := stp.newDiskTxMap("ba-txmap-reorg")
 			if freshErr != nil {
 				return errors.NewProcessingError("[resetSubtreeState] error creating disk tx map for reorg", freshErr)
 			}
@@ -6825,6 +6821,11 @@ func (stp *SubtreeProcessor) legacyParallelGetAndSetIfNotExists(
 		batchSize = 1
 	}
 
+	// Between two disk maps the stored bytes are copied as they are, instead
+	// of decoded by Get and re-encoded by SetIfNotExists.
+	srcDisk, _ := currentTxMap.(*DiskTxMap)
+	dstDisk, _ := stp.currentTxMap.(*DiskTxMap)
+
 	g, _ := errgroup.WithContext(context.Background())
 
 	for i := 0; i < len(nodes); i += batchSize {
@@ -6853,12 +6854,22 @@ func (stp *SubtreeProcessor) legacyParallelGetAndSetIfNotExists(
 					continue
 				}
 
-				nodeParents, found := currentTxMap.Get(node.Hash)
-				if !found {
-					return errors.NewProcessingError("node %s not found in currentTxMap", node.Hash.String())
+				var wasSet bool
+
+				if srcDisk != nil && dstDisk != nil {
+					var found bool
+					if wasSet, found = dstDisk.SetIfNotExistsFrom(srcDisk, node.Hash); !found {
+						return errors.NewProcessingError("node %s not found in currentTxMap", node.Hash.String())
+					}
+				} else {
+					nodeParents, found := currentTxMap.Get(node.Hash)
+					if !found {
+						return errors.NewProcessingError("node %s not found in currentTxMap", node.Hash.String())
+					}
+
+					_, wasSet = stp.currentTxMap.SetIfNotExists(node.Hash, nodeParents)
 				}
 
-				_, wasSet := stp.currentTxMap.SetIfNotExists(node.Hash, nodeParents)
 				wasInserted[idx] = wasSet
 
 				if !wasSet {
