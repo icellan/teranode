@@ -185,11 +185,22 @@ type BlockAssembler struct {
 	// the main loop goroutine.
 	diskTxMapDegraded bool
 
-	// diskTxMapResetRetry is set when a storage-triggered reset failed before
-	// the tx map rotation, so the phantom it was for is still there; the next
-	// heartbeat retries it (onResetDone). Touched only by the main loop
-	// goroutine.
-	diskTxMapResetRetry bool
+	// diskTxMapResetPending is set when a storage-triggered reset is owed but
+	// did not run: it failed before the tx map rotation, so the phantom it was
+	// for is still there (onResetDone), or its request arrived within
+	// storageResetMinInterval of the previous one. The heartbeat runs it once
+	// allowed; any reset that rotates cancels it. Touched only by the main
+	// loop goroutine.
+	diskTxMapResetPending bool
+
+	// storageResetMinInterval is the least time between the end of one
+	// storage-triggered reset and the start of the next (zero means
+	// defaultStorageResetMinInterval), so a fault that each reset cures but
+	// that comes back straight after can't run a full unmined reload every
+	// heartbeat. lastStorageResetDone is when the last one finished. Touched
+	// only by the main loop goroutine.
+	storageResetMinInterval time.Duration
+	lastStorageResetDone    time.Time
 
 	// reconcileCh signals the channel listener to reconcile BA's tip with the
 	// blockchain service's tip via processNewBlockAnnouncement. Buffered cap 1
@@ -526,16 +537,21 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 				// can't loop full reloads. A clean reset of any kind clears it.
 				// A storage-triggered reset that failed before the tx map
 				// rotation left its phantom in place and is retried here too.
+				// Storage-triggered resets are paced by
+				// storageResetMinInterval; a request arriving sooner waits.
 				requested := b.subtreeProcessor.TakeResetRequested()
-				if b.diskTxMapResetRetry {
-					b.diskTxMapResetRetry = false
+				if b.diskTxMapResetPending {
+					b.diskTxMapResetPending = false
 					requested = true
 				}
 
 				if requested {
-					if b.diskTxMapDegraded {
+					switch {
+					case b.diskTxMapDegraded:
 						b.logger.Debugf("[BlockAssembler] disk tx map degraded; not resetting for another post-commit storage error")
-					} else {
+					case time.Since(b.lastStorageResetDone) < b.storageResetInterval():
+						b.diskTxMapResetPending = true
+					default:
 						b.logger.Warnf("[BlockAssembler] disk tx map reported a post-commit storage error; resetting block assembly")
 						b.resetStorageTriggered()
 					}
@@ -1872,6 +1888,18 @@ func (b *BlockAssembler) resetStorageTriggered() {
 	}()
 }
 
+// defaultStorageResetMinInterval is the default storageResetMinInterval.
+const defaultStorageResetMinInterval = 10 * time.Minute
+
+// storageResetInterval returns storageResetMinInterval, or its default.
+func (b *BlockAssembler) storageResetInterval() time.Duration {
+	if b.storageResetMinInterval > 0 {
+		return b.storageResetMinInterval
+	}
+
+	return defaultStorageResetMinInterval
+}
+
 // resetAndRecord runs a reset that is not storage-triggered (the reorg
 // fallbacks) and records its outcome like the resetCh handler does.
 func (b *BlockAssembler) resetAndRecord(ctx context.Context, validateInputs bool) error {
@@ -1893,9 +1921,13 @@ func (b *BlockAssembler) resetAndRecord(ctx context.Context, validateInputs bool
 //     discarded the phantom, or a manual/reorg reset whose reload left one,
 //     which raises its own request): unchanged.
 func (b *BlockAssembler) onResetDone(storageTriggered bool, resp subtreeprocessor.ResetResponse, resetErr error) {
-	// Any rotation discards the phantom a pending retry was for.
+	if storageTriggered {
+		b.lastStorageResetDone = time.Now()
+	}
+
+	// Any rotation discards the phantom a pending reset was for.
 	if resp.Rotated {
-		b.diskTxMapResetRetry = false
+		b.diskTxMapResetPending = false
 	}
 
 	switch {
@@ -1915,7 +1947,7 @@ func (b *BlockAssembler) onResetDone(storageTriggered bool, resp subtreeprocesso
 		prometheusBlockAssemblyDiskTxMapDegraded.Set(1)
 	case storageTriggered && resetErr != nil && !resp.Rotated:
 		b.logger.Warnf("[BlockAssembler] reset for a disk tx map storage error failed before the tx map rotation; retrying on the next heartbeat: %v", resetErr)
-		b.diskTxMapResetRetry = true
+		b.diskTxMapResetPending = true
 	}
 }
 

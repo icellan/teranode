@@ -65,6 +65,7 @@ func startWithMock(t *testing.T, m *subtreeprocessor.MockSubtreeProcessor, befor
 
 	items := setupBlockAssemblyTest(t)
 	items.blockAssembler.heartbeatInterval = 10 * time.Millisecond
+	items.blockAssembler.storageResetMinInterval = time.Nanosecond // tests that pace resets set their own
 	injectMockStp(t, items, m)
 
 	for _, fn := range before {
@@ -289,14 +290,54 @@ func TestBlockAssembler_OnResetDone(t *testing.T) {
 			items := setupBlockAssemblyTest(t)
 			b := items.blockAssembler
 			b.diskTxMapDegraded = tc.degradedBefore
-			b.diskTxMapResetRetry = tc.retryBefore
+			b.diskTxMapResetPending = tc.retryBefore
 			prometheusBlockAssemblyDiskTxMapDegraded.Set(map[bool]float64{false: 0, true: 1}[tc.degradedBefore])
 
 			b.onResetDone(tc.storageTriggered, tc.resp, tc.resetErr)
 
 			require.Equal(t, tc.degradedAfter, b.diskTxMapDegraded)
 			require.Equal(t, map[bool]float64{false: 0, true: 1}[tc.degradedAfter], degradedGauge())
-			require.Equal(t, tc.retry, b.diskTxMapResetRetry)
+			require.Equal(t, tc.retry, b.diskTxMapResetPending)
 		})
 	}
+}
+
+// A fault that misses each storage-triggered reset's reload but hits the next
+// operation makes every such reset end clean and raise a new request at once.
+// Storage-triggered resets are paced: the next starts no sooner than
+// storageResetMinInterval after the previous one finished, and a request
+// arriving sooner is kept, not dropped.
+func TestBlockAssembler_StorageTriggeredResetsArePaced(t *testing.T) {
+	intermittent := func(m *subtreeprocessor.MockSubtreeProcessor) subtreeprocessor.ResetResponse {
+		m.ResetRequested.Store(true) // the fault hits again right after the reset
+		return subtreeprocessor.ResetResponse{Rotated: true}
+	}
+
+	t.Run("a request within the interval waits", func(t *testing.T) {
+		m, resets := resetTestMock(intermittent)
+		m.ResetRequested.Store(true)
+
+		startWithMock(t, m, func(items *baTestItems) {
+			items.blockAssembler.storageResetMinInterval = time.Hour
+		})
+
+		require.Eventually(t, func() bool { return resets.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
+		require.Never(t, func() bool { return resets.Load() > 1 }, 300*time.Millisecond, 10*time.Millisecond,
+			"no second storage-triggered reset within the interval")
+		require.Zero(t, degradedGauge(), "a paced reset is not a degraded node")
+	})
+
+	t.Run("the waiting request runs once the interval has passed", func(t *testing.T) {
+		m, resets := resetTestMock(intermittent)
+		m.ResetRequested.Store(true)
+
+		startWithMock(t, m, func(items *baTestItems) {
+			items.blockAssembler.storageResetMinInterval = 150 * time.Millisecond
+		})
+
+		require.Eventually(t, func() bool { return resets.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
+		require.Never(t, func() bool { return resets.Load() > 1 }, 100*time.Millisecond, 10*time.Millisecond)
+		require.Eventually(t, func() bool { return resets.Load() == 2 }, 2*time.Second, 5*time.Millisecond,
+			"the request raised within the interval was kept and runs after it")
+	})
 }
