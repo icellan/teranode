@@ -714,6 +714,16 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 	if len(stp.txMapDirs) > 0 {
 		capacity := uint(initialItemsPerFile * ExpectedNumberOfSubtrees)
 
+		// Left by a previous run that exited without closing its maps.
+		removed, sweepErr := removeStaleDiskTxMapDirs(stp.txMapDirs)
+		if len(removed) > 0 {
+			logger.Infof("[SubtreeProcessor] removed %d stale disk tx map dirs left by a previous run: %v", len(removed), removed)
+		}
+
+		if sweepErr != nil {
+			logger.Warnf("[SubtreeProcessor] error removing stale disk tx map dirs, their disk space stays in use: %v", sweepErr)
+		}
+
 		diskMap, diskErr := stp.newDiskTxMap("ba-txmap", capacity)
 		if diskErr != nil {
 			logger.Warnf("DiskTxMap creation failed, using in-memory map: %v", diskErr)

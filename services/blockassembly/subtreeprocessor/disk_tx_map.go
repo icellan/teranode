@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sync"
 	"sync/atomic"
 
@@ -170,6 +173,53 @@ type DiskTxMapOptions struct {
 	// sending. It doesn't bound the caller's own batch, which SetBatch groups
 	// by disk before sending.
 	MaxPendingWrites int
+}
+
+// staleDiskTxMapDirPattern matches the Badger directory names the subtree
+// processor's disk tx maps create: tempstore.New's <prefix>-<unixnano>-<pid>,
+// where NewDiskTxMap's prefix is <map prefix>-disk<i> and the map prefix is
+// ba-txmap, ba-txmap-shadow or ba-txmap-reorg (see SubtreeProcessor).
+var staleDiskTxMapDirPattern = regexp.MustCompile(`^ba-txmap(-shadow|-reorg)?-disk\d+-\d+-\d+$`)
+
+// removeStaleDiskTxMapDirs removes the disk tx map directories under paths.
+// Only Close removes a map's directories, so a process that exited without
+// closing its maps (killed, or a Stop that timed out on a running handler)
+// leaves them behind. Called before the subtree processor creates its own:
+// every such directory then belongs to a previous run, whose pid can't tell
+// it apart (a container's process is often pid 1 on every start). It returns
+// the directories removed and the first error; a path that doesn't exist yet
+// is not an error.
+func removeStaleDiskTxMapDirs(paths []string) (removed []string, err error) {
+	for _, path := range paths {
+		entries, readErr := os.ReadDir(path)
+		if readErr != nil {
+			if !os.IsNotExist(readErr) && err == nil {
+				err = errors.NewStorageError("failed to list disk tx map dir %s", path, readErr)
+			}
+
+			continue
+		}
+
+		for _, entry := range entries {
+			if !entry.IsDir() || !staleDiskTxMapDirPattern.MatchString(entry.Name()) {
+				continue
+			}
+
+			dir := filepath.Join(path, entry.Name())
+
+			if rmErr := os.RemoveAll(dir); rmErr != nil {
+				if err == nil {
+					err = errors.NewStorageError("failed to remove stale disk tx map dir %s", dir, rmErr)
+				}
+
+				continue
+			}
+
+			removed = append(removed, dir)
+		}
+	}
+
+	return removed, err
 }
 
 // NewDiskTxMap creates a new DiskTxMap with N Badger disk shards.
