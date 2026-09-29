@@ -1513,14 +1513,20 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	// a map error joined into the failure, or a request still pending, when
 	// reset returns was this reset's own. Before the rotation both are left
 	// over from before the reset, and a request stays pending for the
-	// heartbeat.
+	// heartbeat; so must a map error joined into a pre-rotation failure,
+	// since the rotation that would have cured its phantom never ran.
 	stp.lastResetStorageFailed.Store(false)
 	stp.lastResetRotated.Store(false)
 
 	defer func() {
 		joined := stp.reportOrJoinDiskTxMapErr("reset", &err)
 
-		if stp.lastResetRotated.Load() && (joined || stp.diskTxMapResetRequested.Load()) {
+		switch {
+		case !stp.lastResetRotated.Load():
+			if joined {
+				stp.requestReset("reset_pre_rotation")
+			}
+		case joined || stp.diskTxMapResetRequested.Load():
 			stp.lastResetStorageFailed.Store(true)
 		}
 	}()

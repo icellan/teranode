@@ -1887,11 +1887,17 @@ func (b *BlockAssembler) resetAndRecord(ctx context.Context, validateInputs bool
 //   - storage-triggered and hit a storage error itself (resp.StorageFailed):
 //     sets degraded;
 //   - storage-triggered and failed before the tx map rotation: the phantom it
-//     was for is still there, so the next heartbeat retries it;
+//     was for is still there, so the next heartbeat retries it (any reset
+//     that rotates cancels that retry);
 //   - anything else (a non-storage failure after the rotation, which
 //     discarded the phantom, or a manual/reorg reset whose reload left one,
 //     which raises its own request): unchanged.
 func (b *BlockAssembler) onResetDone(storageTriggered bool, resp subtreeprocessor.ResetResponse, resetErr error) {
+	// Any rotation discards the phantom a pending retry was for.
+	if resp.Rotated {
+		b.diskTxMapResetRetry = false
+	}
+
 	switch {
 	case resetErr == nil && !resp.StorageFailed:
 		if b.diskTxMapDegraded {

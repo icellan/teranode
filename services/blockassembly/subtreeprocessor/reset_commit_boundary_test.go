@@ -285,4 +285,25 @@ func TestRunReset_StorageOutcome(t *testing.T) {
 		require.False(t, resp.StorageFailed, "a UTXO store failure before the rotation is not a disk tx map storage failure")
 		require.True(t, stp.TakeResetRequested(), "the rotation never ran, so the earlier request is still pending")
 	})
+
+	t.Run("a failure before the rotation with a map error pending", func(t *testing.T) {
+		stp := newSubtreeProcessorWithTxMapDirs(t, []string{t.TempDir()})
+
+		node := &subtreepkg.Node{Hash: chainhash.HashH([]byte("pre-rotation-tx-2")), Fee: 1, SizeInBytes: 100}
+		require.NoError(t, stp.AddDirectly(node, &subtreepkg.TxInpoints{}, true))
+
+		failing := &utxo.MockUtxostore{}
+		failing.On("MarkTransactionsOnLongestChain", mock.Anything, mock.Anything, false).
+			Return(errors.NewStorageError("utxo store unavailable"))
+		stp.utxoStore = failing
+
+		// An earlier operation's post-commit error, not yet reported.
+		stp.diskTxMap.recordErr(errors.NewStorageError("badger write failed"))
+
+		resp := stp.runReset(&resetBlocks{blockHeader: resetTestHeader(9307), postProcess: clean})
+		require.Error(t, resp.Err)
+		require.False(t, resp.Rotated)
+		require.False(t, resp.StorageFailed, "the map error is left over from before this reset")
+		require.True(t, stp.TakeResetRequested(), "the map error is joined into the failure and drained, and the rotation that would cure its phantom never ran, so it must still request a reset")
+	})
 }

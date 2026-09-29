@@ -268,6 +268,7 @@ func TestBlockAssembler_OnResetDone(t *testing.T) {
 		resetErr         error
 		degradedBefore   bool
 		degradedAfter    bool
+		retryBefore      bool
 		retry            bool
 	}{
 		{name: "storage-triggered reset fails on storage", storageTriggered: true, resp: subtreeprocessor.ResetResponse{Rotated: true, StorageFailed: true}, degradedAfter: true},
@@ -280,11 +281,15 @@ func TestBlockAssembler_OnResetDone(t *testing.T) {
 		{name: "storage-triggered failure after the rotation is not retried", storageTriggered: true, resp: subtreeprocessor.ResetResponse{Rotated: true}, resetErr: otherErr},
 		{name: "manual failure before the rotation is not retried", resetErr: otherErr},
 		{name: "non-storage failure keeps degraded", resetErr: otherErr, degradedBefore: true, degradedAfter: true},
+		{name: "a clean reset cancels a pending retry", resp: subtreeprocessor.ResetResponse{Rotated: true}, retryBefore: true},
+		{name: "a failure after the rotation cancels a pending retry", resp: subtreeprocessor.ResetResponse{Rotated: true}, resetErr: otherErr, retryBefore: true},
+		{name: "a failure before the rotation keeps a pending retry", resetErr: otherErr, retryBefore: true, retry: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			items := setupBlockAssemblyTest(t)
 			b := items.blockAssembler
 			b.diskTxMapDegraded = tc.degradedBefore
+			b.diskTxMapResetRetry = tc.retryBefore
 			prometheusBlockAssemblyDiskTxMapDegraded.Set(map[bool]float64{false: 0, true: 1}[tc.degradedBefore])
 
 			b.onResetDone(tc.storageTriggered, tc.resp, tc.resetErr)
