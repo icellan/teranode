@@ -16,4 +16,8 @@ import (
 // fail a slow but honest peer mid-batch.
 func TestMissingTransactionsFetchTimeoutDefault(t *testing.T) {
 	require.Equal(t, 10*time.Minute, NewSettings().SubtreeValidation.MissingTransactionsFetchTimeout)
+
+	// NewSettings reads settings.conf, so the line above can't see the Go fallback
+	// that a missing or non-positive value uses. Pin the constant itself.
+	require.Equal(t, 10*time.Minute, DefaultMissingTransactionsFetchTimeout)
 }

@@ -50,7 +50,6 @@ func SetHTTPRequestSigner(signer HTTPRequestSigner) {
 	httpRequestSigner.Store(signer)
 }
 
-// loadHTTPRequestSigner returns the current signer, or nil if none is set.
 // signerSignsRequests reports whether signer actually adds a signature. An
 // Ed25519RequestSigner without a private key installs cleanly but signs
 // nothing, so its requests carry no timestamp that a retry could replay.
@@ -66,6 +65,7 @@ func signerSignsRequests(signer HTTPRequestSigner) bool {
 	return true
 }
 
+// loadHTTPRequestSigner returns the current signer, or nil if none is set.
 func loadHTTPRequestSigner() HTTPRequestSigner {
 	v := httpRequestSigner.Load()
 	if v == nil {

@@ -1815,3 +1815,19 @@ func TestSignerSignsRequests(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, signerSignsRequests(NewEd25519RequestSigner(priv)))
 }
+
+// TestWaitOutRetrySecondHonoursCancellationAndBackwardSteps pins two branches of
+// the same-second wait: a previous second that is not behind the clock (the same
+// second, or one ahead after a backwards clock step) makes it wait, and a
+// cancelled context ends that wait with the context's error instead of sleeping.
+func TestWaitOutRetrySecondHonoursCancellationAndBackwardSteps(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	err := waitOutRetrySecond(ctx, time.Now().Unix()+1)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Less(t, time.Since(start), 500*time.Millisecond, "a cancelled context must not sleep out the second")
+
+	require.NoError(t, waitOutRetrySecond(context.Background(), time.Now().Unix()-5), "a second already behind the clock needs no wait")
+}

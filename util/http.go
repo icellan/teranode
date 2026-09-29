@@ -837,12 +837,21 @@ func buildOutboundRequest(ctx context.Context, rawURL string, requestBody ...[]b
 // attempt yet) is a no-op. Only called for signed requests on the retry path; the plain
 // (non-retry) path and unsigned requests are unaffected.
 func waitOutRetrySecond(ctx context.Context, prevSecond int64) error {
-	if prevSecond < 0 || time.Now().Unix() != prevSecond {
+	// Wait while the clock is not past the previous attempt's second: the same
+	// second, or an earlier one after a small backwards step, could reproduce a
+	// signature the receiver has already seen.
+	if prevSecond < 0 || time.Now().Unix() > prevSecond {
 		return nil
 	}
 
 	untilNextSecond := time.Until(time.Unix(prevSecond+1, 0))
 	if untilNextSecond <= 0 {
+		return nil
+	}
+
+	// A large backwards step lands in a second not signed recently, so there is
+	// nothing to replay; don't sleep it out.
+	if untilNextSecond > maxRetrySecondWait {
 		return nil
 	}
 
@@ -853,6 +862,11 @@ func waitOutRetrySecond(ctx context.Context, prevSecond int64) error {
 		return nil
 	}
 }
+
+// maxRetrySecondWait bounds waitOutRetrySecond. A retry only needs to reach the
+// next second; anything longer means the clock stepped back far enough that the
+// signed timestamp can't collide with one sent in the replay window.
+const maxRetrySecondWait = 2 * time.Second
 
 // executeHTTPRequestWithClient performs the request through client, which decides what
 // addresses may be reached.
@@ -1123,8 +1137,10 @@ var defaultRetryConfig = retryConfig{
 //   - The final error keeps the classification of the last rejection, so a caller can
 //     still tell a rate limit apart from an unavailable server after the ladder runs out.
 //
-// Each attempt is a fresh GET — for POST callers passing requestBody, the body is re-sent
-// each time. Make sure that's idempotent before using this helper for non-GET workloads.
+// Each attempt is a new request built the same way as the plain path: a GET, or a POST
+// with application/octet-stream when requestBody is passed, signed when a signer is
+// installed. A POST body is re-sent on every attempt, so only use this for requests
+// that are idempotent.
 func DoHTTPRequestBodyReaderWithRetry(ctx context.Context, url string, requestBody ...[]byte) (io.ReadCloser, error) {
 	return doHTTPRequestBodyReaderWithRetry(ctx, url, defaultRetryConfig, requestBody...)
 }
@@ -1185,7 +1201,7 @@ func doHTTPRequestBodyReaderWithRetry(ctx context.Context, url string, cfg retry
 		errFn = errors.NewServiceRateLimitedError
 	}
 
-	return nil, errFn("http request [%s] still rejected after %d attempts: %v", url, cfg.maxAttempts, lastErr)
+	return nil, errFn("http request [%s] still rejected after %d attempts", url, cfg.maxAttempts, lastErr)
 }
 
 // doHTTPRequestForStreamingWithRetryAfter is doHTTPRequestForStreaming + extracts
