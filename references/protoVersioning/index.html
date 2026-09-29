@@ -10,27 +10,31 @@
       
       
       
-        <link rel="canonical" href="https://bsv-blockchain.github.io/teranode/topics/commands/recoverReplayedTransactions/">
+        <link rel="canonical" href="https://bsv-blockchain.github.io/teranode/references/protoVersioning/">
       
       
+        <link rel="prev" href="../kafkaMessageFormat/">
+      
+      
+        <link rel="next" href="../networkConsensusRules/">
       
       
         
       
       
-      <link rel="icon" href="../../../assets/favicon.png">
+      <link rel="icon" href="../../assets/favicon.png">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
       
-        <title>Recover replayed confirmed transactions - Teranode</title>
+        <title>Proto Versioning Policy - Teranode</title>
       
     
     
-      <link rel="stylesheet" href="../../../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
       
         
-        <link rel="stylesheet" href="../../../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
       
       
 
@@ -44,14 +48,14 @@
         
         
         
-        <link rel="stylesheet" href="../../../assets/external/fonts.googleapis.com/css.56f7ac64.css">
+        <link rel="stylesheet" href="../../assets/external/fonts.googleapis.com/css.56f7ac64.css">
         <style>:root{--md-text-font:"Inter";--md-code-font:"JetBrains Mono"}</style>
       
     
     
-      <link rel="stylesheet" href="../../../overrides/custom.css?v=8cf07571">
+      <link rel="stylesheet" href="../../overrides/custom.css?v=8cf07571">
     
-    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
 
@@ -76,7 +80,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#recover-replayed-confirmed-transactions" class="md-skip">
+        <a href="#protobuf-package-versioning-policy" class="md-skip">
           Skip to content
         </a>
       
@@ -92,9 +96,9 @@
 
 <header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
   <nav class="md-header__inner md-grid" aria-label="Header">
-    <a href="../../.." title="Teranode" class="md-header__button md-logo" aria-label="Teranode" data-md-component="logo">
+    <a href="../.." title="Teranode" class="md-header__button md-logo" aria-label="Teranode" data-md-component="logo">
       
-  <img src="../../../assets/bsv-logo.png" alt="logo">
+  <img src="../../assets/bsv-logo.png" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -111,7 +115,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Recover replayed confirmed transactions
+              Proto Versioning Policy
             
           </span>
         </div>
@@ -223,7 +227,7 @@
   
   
     <li class="md-tabs__item">
-      <a href="../../.." class="md-tabs__link">
+      <a href="../.." class="md-tabs__link">
         
   
   
@@ -251,7 +255,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../../howto/developerSetup/" class="md-tabs__link">
+        <a href="../../howto/developerSetup/" class="md-tabs__link">
           
   
   
@@ -276,7 +280,7 @@
     
     
       <li class="md-tabs__item">
-        <a href="../../teranodeIntro/" class="md-tabs__link">
+        <a href="../../topics/teranodeIntro/" class="md-tabs__link">
           
   
   
@@ -294,11 +298,13 @@
   
   
   
+    
+  
   
     
     
-      <li class="md-tabs__item">
-        <a href="../../../references/projectStructure/" class="md-tabs__link">
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../projectStructure/" class="md-tabs__link">
           
   
   
@@ -340,9 +346,9 @@
 
 <nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
   <label class="md-nav__title" for="__drawer">
-    <a href="../../.." title="Teranode" class="md-nav__button md-logo" aria-label="Teranode" data-md-component="logo">
+    <a href="../.." title="Teranode" class="md-nav__button md-logo" aria-label="Teranode" data-md-component="logo">
       
-  <img src="../../../assets/bsv-logo.png" alt="logo">
+  <img src="../../assets/bsv-logo.png" alt="logo">
 
     </a>
     Teranode
@@ -369,7 +375,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../.." class="md-nav__link">
+      <a href="../.." class="md-nav__link">
         
   
   
@@ -534,7 +540,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/developerSetup/" class="md-nav__link">
+      <a href="../../howto/developerSetup/" class="md-nav__link">
         
   
   
@@ -562,7 +568,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/forkAndPullRequestGuidelines/" class="md-nav__link">
+      <a href="../../howto/forkAndPullRequestGuidelines/" class="md-nav__link">
         
   
   
@@ -590,7 +596,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/locallyRunningServices/" class="md-nav__link">
+      <a href="../../howto/locallyRunningServices/" class="md-nav__link">
         
   
   
@@ -618,7 +624,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/howToRemoteDebugTeranode/" class="md-nav__link">
+      <a href="../../howto/howToRemoteDebugTeranode/" class="md-nav__link">
         
   
   
@@ -654,7 +660,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/generatingProtobuf/" class="md-nav__link">
+      <a href="../../howto/generatingProtobuf/" class="md-nav__link">
         
   
   
@@ -682,7 +688,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/addingNewProtobufServices/" class="md-nav__link">
+      <a href="../../howto/addingNewProtobufServices/" class="md-nav__link">
         
   
   
@@ -710,7 +716,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/configuringGrpcLogging/" class="md-nav__link">
+      <a href="../../howto/configuringGrpcLogging/" class="md-nav__link">
         
   
   
@@ -738,7 +744,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/runningTests/" class="md-nav__link">
+      <a href="../../howto/runningTests/" class="md-nav__link">
         
   
   
@@ -766,7 +772,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/automatedTestingHowTo/" class="md-nav__link">
+      <a href="../../howto/automatedTestingHowTo/" class="md-nav__link">
         
   
   
@@ -794,7 +800,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/chain-integrity-testing/" class="md-nav__link">
+      <a href="../../howto/chain-integrity-testing/" class="md-nav__link">
         
   
   
@@ -822,7 +828,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/makefile/" class="md-nav__link">
+      <a href="../../howto/makefile/" class="md-nav__link">
         
   
   
@@ -850,7 +856,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/bugReporting/" class="md-nav__link">
+      <a href="../../howto/bugReporting/" class="md-nav__link">
         
   
   
@@ -878,7 +884,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/developersHowToTeranodeCLI/" class="md-nav__link">
+      <a href="../../howto/developersHowToTeranodeCLI/" class="md-nav__link">
         
   
   
@@ -1038,7 +1044,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToInstallation/" class="md-nav__link">
+      <a href="../../howto/miners/docker/minersHowToInstallation/" class="md-nav__link">
         
   
   
@@ -1066,7 +1072,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToInstallation/" class="md-nav__link">
+      <a href="../../howto/miners/kubernetes/minersHowToInstallation/" class="md-nav__link">
         
   
   
@@ -1170,7 +1176,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToConfigureTheNode/" class="md-nav__link">
+      <a href="../../howto/miners/docker/minersHowToConfigureTheNode/" class="md-nav__link">
         
   
   
@@ -1198,7 +1204,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToConfigureTheNode/" class="md-nav__link">
+      <a href="../../howto/miners/kubernetes/minersHowToConfigureTheNode/" class="md-nav__link">
         
   
   
@@ -1226,7 +1232,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToExposeP2P/" class="md-nav__link">
+      <a href="../../howto/miners/kubernetes/minersHowToExposeP2P/" class="md-nav__link">
         
   
   
@@ -1254,7 +1260,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToAerospikeTuning/" class="md-nav__link">
+      <a href="../../howto/miners/minersHowToAerospikeTuning/" class="md-nav__link">
         
   
   
@@ -1282,7 +1288,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToInteractWithAssetServer/" class="md-nav__link">
+      <a href="../../howto/miners/minersHowToInteractWithAssetServer/" class="md-nav__link">
         
   
   
@@ -1310,7 +1316,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToInteractWithFSM/" class="md-nav__link">
+      <a href="../../howto/miners/minersHowToInteractWithFSM/" class="md-nav__link">
         
   
   
@@ -1338,7 +1344,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToInteractWithRPCServer/" class="md-nav__link">
+      <a href="../../howto/miners/minersHowToInteractWithRPCServer/" class="md-nav__link">
         
   
   
@@ -1432,7 +1438,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToStopStartDockerTeranode/" class="md-nav__link">
+      <a href="../../howto/miners/docker/minersHowToStopStartDockerTeranode/" class="md-nav__link">
         
   
   
@@ -1460,7 +1466,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToStopStartKubernetesTeranode/" class="md-nav__link">
+      <a href="../../howto/miners/kubernetes/minersHowToStopStartKubernetesTeranode/" class="md-nav__link">
         
   
   
@@ -1554,7 +1560,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersUpdatingTeranode/" class="md-nav__link">
+      <a href="../../howto/miners/docker/minersUpdatingTeranode/" class="md-nav__link">
         
   
   
@@ -1582,7 +1588,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersUpdatingTeranode/" class="md-nav__link">
+      <a href="../../howto/miners/kubernetes/minersUpdatingTeranode/" class="md-nav__link">
         
   
   
@@ -1676,7 +1682,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersSecurityBestPractices/" class="md-nav__link">
+      <a href="../../howto/miners/docker/minersSecurityBestPractices/" class="md-nav__link">
         
   
   
@@ -1704,7 +1710,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersSecurityBestPractices/" class="md-nav__link">
+      <a href="../../howto/miners/kubernetes/minersSecurityBestPractices/" class="md-nav__link">
         
   
   
@@ -1798,7 +1804,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToTroubleshooting/" class="md-nav__link">
+      <a href="../../howto/miners/docker/minersHowToTroubleshooting/" class="md-nav__link">
         
   
   
@@ -1826,7 +1832,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToTroubleshooting/" class="md-nav__link">
+      <a href="../../howto/miners/kubernetes/minersHowToTroubleshooting/" class="md-nav__link">
         
   
   
@@ -1920,7 +1926,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToResetTeranode/" class="md-nav__link">
+      <a href="../../howto/miners/docker/minersHowToResetTeranode/" class="md-nav__link">
         
   
   
@@ -1948,7 +1954,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToResetTeranode/" class="md-nav__link">
+      <a href="../../howto/miners/kubernetes/minersHowToResetTeranode/" class="md-nav__link">
         
   
   
@@ -2042,7 +2048,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/docker/minersHowToSyncTheNode/" class="md-nav__link">
+      <a href="../../howto/miners/docker/minersHowToSyncTheNode/" class="md-nav__link">
         
   
   
@@ -2070,7 +2076,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/kubernetes/minersHowToSyncTheNode/" class="md-nav__link">
+      <a href="../../howto/miners/kubernetes/minersHowToSyncTheNode/" class="md-nav__link">
         
   
   
@@ -2106,7 +2112,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToMonitoring/" class="md-nav__link">
+      <a href="../../howto/miners/minersHowToMonitoring/" class="md-nav__link">
         
   
   
@@ -2198,7 +2204,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToBackup/" class="md-nav__link">
+      <a href="../../howto/miners/minersHowToBackup/" class="md-nav__link">
         
   
   
@@ -2226,7 +2232,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToCPUMiner/" class="md-nav__link">
+      <a href="../../howto/miners/minersHowToCPUMiner/" class="md-nav__link">
         
   
   
@@ -2254,7 +2260,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToTeranodeCLI/" class="md-nav__link">
+      <a href="../../howto/miners/minersHowToTeranodeCLI/" class="md-nav__link">
         
   
   
@@ -2282,7 +2288,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersManagingDiskSpace/" class="md-nav__link">
+      <a href="../../howto/miners/minersManagingDiskSpace/" class="md-nav__link">
         
   
   
@@ -2310,7 +2316,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../howto/miners/minersHowToUseListenMode/" class="md-nav__link">
+      <a href="../../howto/miners/minersHowToUseListenMode/" class="md-nav__link">
         
   
   
@@ -2455,7 +2461,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../teranodeIntro/" class="md-nav__link">
+      <a href="../../topics/teranodeIntro/" class="md-nav__link">
         
   
   
@@ -2483,7 +2489,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../architecture/teranode-overall-system-design/" class="md-nav__link">
+      <a href="../../topics/architecture/teranode-overall-system-design/" class="md-nav__link">
         
   
   
@@ -2511,7 +2517,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../architecture/teranode-architecture-brief/" class="md-nav__link">
+      <a href="../../topics/architecture/teranode-architecture-brief/" class="md-nav__link">
         
   
   
@@ -2539,7 +2545,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../architecture/teranode-microservices-overview/" class="md-nav__link">
+      <a href="../../topics/architecture/teranode-microservices-overview/" class="md-nav__link">
         
   
   
@@ -2567,7 +2573,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../transactionLifecycle/" class="md-nav__link">
+      <a href="../../topics/transactionLifecycle/" class="md-nav__link">
         
   
   
@@ -2595,7 +2601,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../architecture/stateManagement/" class="md-nav__link">
+      <a href="../../topics/architecture/stateManagement/" class="md-nav__link">
         
   
   
@@ -2623,7 +2629,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../state-machine.diagram/" class="md-nav__link">
+      <a href="../../state-machine.diagram/" class="md-nav__link">
         
   
   
@@ -2651,7 +2657,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../architecture/understandingDoubleSpends/" class="md-nav__link">
+      <a href="../../topics/architecture/understandingDoubleSpends/" class="md-nav__link">
         
   
   
@@ -2679,7 +2685,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../technologyStack/" class="md-nav__link">
+      <a href="../../topics/technologyStack/" class="md-nav__link">
         
   
   
@@ -2707,7 +2713,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../understandingTheTestingFramework/" class="md-nav__link">
+      <a href="../../topics/understandingTheTestingFramework/" class="md-nav__link">
         
   
   
@@ -2735,7 +2741,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../functionalRequirementTests/" class="md-nav__link">
+      <a href="../../topics/functionalRequirementTests/" class="md-nav__link">
         
   
   
@@ -2823,7 +2829,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../features/two_phase_commit/" class="md-nav__link">
+      <a href="../../topics/features/two_phase_commit/" class="md-nav__link">
         
   
   
@@ -2851,7 +2857,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../features/peer_registry_reputation/" class="md-nav__link">
+      <a href="../../topics/features/peer_registry_reputation/" class="md-nav__link">
         
   
   
@@ -2879,7 +2885,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../features/utxo_lock_records/" class="md-nav__link">
+      <a href="../../topics/features/utxo_lock_records/" class="md-nav__link">
         
   
   
@@ -2915,7 +2921,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../dashboard/" class="md-nav__link">
+      <a href="../../topics/dashboard/" class="md-nav__link">
         
   
   
@@ -2943,7 +2949,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../tui_tools/" class="md-nav__link">
+      <a href="../../topics/tui_tools/" class="md-nav__link">
         
   
   
@@ -3041,7 +3047,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/alert/" class="md-nav__link">
+      <a href="../../topics/services/alert/" class="md-nav__link">
         
   
   
@@ -3069,7 +3075,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/assetServer/" class="md-nav__link">
+      <a href="../../topics/services/assetServer/" class="md-nav__link">
         
   
   
@@ -3097,7 +3103,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/blockAssembly/" class="md-nav__link">
+      <a href="../../topics/services/blockAssembly/" class="md-nav__link">
         
   
   
@@ -3125,7 +3131,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/blockValidation/" class="md-nav__link">
+      <a href="../../topics/services/blockValidation/" class="md-nav__link">
         
   
   
@@ -3153,7 +3159,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/blockchain/" class="md-nav__link">
+      <a href="../../topics/services/blockchain/" class="md-nav__link">
         
   
   
@@ -3181,7 +3187,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/propagation/" class="md-nav__link">
+      <a href="../../topics/services/propagation/" class="md-nav__link">
         
   
   
@@ -3209,7 +3215,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/subtreeValidation/" class="md-nav__link">
+      <a href="../../topics/services/subtreeValidation/" class="md-nav__link">
         
   
   
@@ -3237,7 +3243,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/validator/" class="md-nav__link">
+      <a href="../../topics/services/validator/" class="md-nav__link">
         
   
   
@@ -3341,7 +3347,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/blockPersister/" class="md-nav__link">
+      <a href="../../topics/services/blockPersister/" class="md-nav__link">
         
   
   
@@ -3369,7 +3375,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/p2p/" class="md-nav__link">
+      <a href="../../topics/services/p2p/" class="md-nav__link">
         
   
   
@@ -3397,7 +3403,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../P2P_NAT_TRAVERSAL/" class="md-nav__link">
+      <a href="../../P2P_NAT_TRAVERSAL/" class="md-nav__link">
         
   
   
@@ -3425,7 +3431,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/pruner/" class="md-nav__link">
+      <a href="../../topics/services/pruner/" class="md-nav__link">
         
   
   
@@ -3453,7 +3459,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/legacy/" class="md-nav__link">
+      <a href="../../topics/services/legacy/" class="md-nav__link">
         
   
   
@@ -3481,7 +3487,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/rpc/" class="md-nav__link">
+      <a href="../../topics/services/rpc/" class="md-nav__link">
         
   
   
@@ -3509,7 +3515,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../services/utxoPersister/" class="md-nav__link">
+      <a href="../../topics/services/utxoPersister/" class="md-nav__link">
         
   
   
@@ -3603,7 +3609,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../stores/blob/" class="md-nav__link">
+      <a href="../../topics/stores/blob/" class="md-nav__link">
         
   
   
@@ -3631,7 +3637,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../stores/utxo/" class="md-nav__link">
+      <a href="../../topics/stores/utxo/" class="md-nav__link">
         
   
   
@@ -3731,7 +3737,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../datamodel/block_data_model/" class="md-nav__link">
+      <a href="../../topics/datamodel/block_data_model/" class="md-nav__link">
         
   
   
@@ -3759,7 +3765,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../datamodel/block_header_data_model/" class="md-nav__link">
+      <a href="../../topics/datamodel/block_header_data_model/" class="md-nav__link">
         
   
   
@@ -3787,7 +3793,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../datamodel/subtree_data_model/" class="md-nav__link">
+      <a href="../../topics/datamodel/subtree_data_model/" class="md-nav__link">
         
   
   
@@ -3815,7 +3821,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../datamodel/transaction_data_model/" class="md-nav__link">
+      <a href="../../topics/datamodel/transaction_data_model/" class="md-nav__link">
         
   
   
@@ -3843,7 +3849,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../datamodel/utxo_data_model/" class="md-nav__link">
+      <a href="../../topics/datamodel/utxo_data_model/" class="md-nav__link">
         
   
   
@@ -3935,7 +3941,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../kafka/kafka/" class="md-nav__link">
+      <a href="../../topics/kafka/kafka/" class="md-nav__link">
         
   
   
@@ -4027,7 +4033,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../seeder/" class="md-nav__link">
+      <a href="../../topics/commands/seeder/" class="md-nav__link">
         
   
   
@@ -4067,8 +4073,10 @@
       
   
   
+    
   
   
+  
     
     
       
@@ -4090,19 +4098,22 @@
     
     
       
+        
+        
+      
       
         
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" checked>
         
           
-          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
             
   
   
@@ -4120,7 +4131,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_4">
             <span class="md-nav__icon md-icon"></span>
             
@@ -4138,7 +4149,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/projectStructure/" class="md-nav__link">
+      <a href="../projectStructure/" class="md-nav__link">
         
   
   
@@ -4163,8 +4174,10 @@
                 
   
   
+    
   
   
+  
     
     
       
@@ -4180,23 +4193,28 @@
       
         
       
-    
-    
-    
-      
-      
         
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    
       
-        
-        
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2" >
+      
         
           
-          <label class="md-nav__link" for="__nav_4_2" id="__nav_4_2_label" tabindex="0">
+          
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_4_2" id="__nav_4_2_label" tabindex="">
             
   
   
@@ -4214,7 +4232,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_2_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_2_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_4_2">
             <span class="md-nav__icon md-icon"></span>
             
@@ -4232,7 +4250,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/errorHandling/" class="md-nav__link">
+      <a href="../errorHandling/" class="md-nav__link">
         
   
   
@@ -4260,7 +4278,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/glossary/" class="md-nav__link">
+      <a href="../glossary/" class="md-nav__link">
         
   
   
@@ -4288,7 +4306,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/codingConventions/" class="md-nav__link">
+      <a href="../codingConventions/" class="md-nav__link">
         
   
   
@@ -4316,7 +4334,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/kafkaMessageFormat/" class="md-nav__link">
+      <a href="../kafkaMessageFormat/" class="md-nav__link">
         
   
   
@@ -4341,10 +4359,118 @@
                 
   
   
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Proto Versioning Policy
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Proto Versioning Policy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#the-rule" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The rule
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#when-a-breaking-change-lands" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When a breaking change lands
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#scope" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scope
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
   
   
     <li class="md-nav__item">
-      <a href="../../../references/networkConsensusRules/" class="md-nav__link">
+      <a href="../networkConsensusRules/" class="md-nav__link">
         
   
   
@@ -4409,10 +4535,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_6" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_2_7" >
         
           
-          <label class="md-nav__link" for="__nav_4_2_6" id="__nav_4_2_6_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_2_7" id="__nav_4_2_7_label" tabindex="0">
             
   
   
@@ -4430,8 +4556,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_6_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_4_2_6">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_4_2_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_2_7">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -4448,7 +4574,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/alertProto/" class="md-nav__link">
+      <a href="../protobuf_docs/alertProto/" class="md-nav__link">
         
   
   
@@ -4476,7 +4602,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/assetProto/" class="md-nav__link">
+      <a href="../protobuf_docs/assetProto/" class="md-nav__link">
         
   
   
@@ -4504,7 +4630,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/blockassemblyProto/" class="md-nav__link">
+      <a href="../protobuf_docs/blockassemblyProto/" class="md-nav__link">
         
   
   
@@ -4532,7 +4658,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/blockchainProto/" class="md-nav__link">
+      <a href="../protobuf_docs/blockchainProto/" class="md-nav__link">
         
   
   
@@ -4560,7 +4686,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/blockvalidationProto/" class="md-nav__link">
+      <a href="../protobuf_docs/blockvalidationProto/" class="md-nav__link">
         
   
   
@@ -4588,7 +4714,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/legacyPeerProto/" class="md-nav__link">
+      <a href="../protobuf_docs/legacyPeerProto/" class="md-nav__link">
         
   
   
@@ -4616,7 +4742,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/p2pProto/" class="md-nav__link">
+      <a href="../protobuf_docs/p2pProto/" class="md-nav__link">
         
   
   
@@ -4644,7 +4770,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/propagationProto/" class="md-nav__link">
+      <a href="../protobuf_docs/propagationProto/" class="md-nav__link">
         
   
   
@@ -4672,7 +4798,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/prunerProto/" class="md-nav__link">
+      <a href="../protobuf_docs/prunerProto/" class="md-nav__link">
         
   
   
@@ -4700,7 +4826,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/subtreevalidationProto/" class="md-nav__link">
+      <a href="../protobuf_docs/subtreevalidationProto/" class="md-nav__link">
         
   
   
@@ -4728,7 +4854,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/protobuf_docs/validatorProto/" class="md-nav__link">
+      <a href="../protobuf_docs/validatorProto/" class="md-nav__link">
         
   
   
@@ -4796,17 +4922,20 @@
       
       
         
+          
+          
+        
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_3" >
         
           
-          <label class="md-nav__link" for="__nav_4_3" id="__nav_4_3_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_3" id="__nav_4_3_label" tabindex="">
             
   
   
@@ -4842,7 +4971,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/alert_reference/" class="md-nav__link">
+      <a href="../services/alert_reference/" class="md-nav__link">
         
   
   
@@ -4870,7 +4999,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/asset_reference/" class="md-nav__link">
+      <a href="../services/asset_reference/" class="md-nav__link">
         
   
   
@@ -4898,7 +5027,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/blockassembly_reference/" class="md-nav__link">
+      <a href="../services/blockassembly_reference/" class="md-nav__link">
         
   
   
@@ -4926,7 +5055,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/blockvalidation_reference/" class="md-nav__link">
+      <a href="../services/blockvalidation_reference/" class="md-nav__link">
         
   
   
@@ -4954,7 +5083,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/blockchain_reference/" class="md-nav__link">
+      <a href="../services/blockchain_reference/" class="md-nav__link">
         
   
   
@@ -4982,7 +5111,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/propagation_reference/" class="md-nav__link">
+      <a href="../services/propagation_reference/" class="md-nav__link">
         
   
   
@@ -5010,7 +5139,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/subtreevalidation_reference/" class="md-nav__link">
+      <a href="../services/subtreevalidation_reference/" class="md-nav__link">
         
   
   
@@ -5038,7 +5167,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/validator_reference/" class="md-nav__link">
+      <a href="../services/validator_reference/" class="md-nav__link">
         
   
   
@@ -5094,17 +5223,20 @@
       
       
         
+          
+          
+        
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_4" >
         
           
-          <label class="md-nav__link" for="__nav_4_4" id="__nav_4_4_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_4" id="__nav_4_4_label" tabindex="">
             
   
   
@@ -5140,7 +5272,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/blockpersister_reference/" class="md-nav__link">
+      <a href="../services/blockpersister_reference/" class="md-nav__link">
         
   
   
@@ -5168,7 +5300,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/p2p_reference/" class="md-nav__link">
+      <a href="../services/p2p_reference/" class="md-nav__link">
         
   
   
@@ -5196,7 +5328,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/legacy_reference/" class="md-nav__link">
+      <a href="../services/legacy_reference/" class="md-nav__link">
         
   
   
@@ -5224,7 +5356,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/pruner_reference/" class="md-nav__link">
+      <a href="../services/pruner_reference/" class="md-nav__link">
         
   
   
@@ -5252,7 +5384,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/rpc_reference/" class="md-nav__link">
+      <a href="../services/rpc_reference/" class="md-nav__link">
         
   
   
@@ -5280,7 +5412,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/services/utxopersister_reference/" class="md-nav__link">
+      <a href="../services/utxopersister_reference/" class="md-nav__link">
         
   
   
@@ -5328,17 +5460,20 @@
       
       
         
+          
+          
+        
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_5" >
         
           
-          <label class="md-nav__link" for="__nav_4_5" id="__nav_4_5_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_5" id="__nav_4_5_label" tabindex="">
             
   
   
@@ -5374,7 +5509,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/stores/blob_reference/" class="md-nav__link">
+      <a href="../stores/blob_reference/" class="md-nav__link">
         
   
   
@@ -5402,7 +5537,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/stores/utxo_reference/" class="md-nav__link">
+      <a href="../stores/utxo_reference/" class="md-nav__link">
         
   
   
@@ -5460,17 +5595,20 @@
       
       
         
+          
+          
+        
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6" >
         
           
-          <label class="md-nav__link" for="__nav_4_6" id="__nav_4_6_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_6" id="__nav_4_6_label" tabindex="">
             
   
   
@@ -5506,7 +5644,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/" class="md-nav__link">
+      <a href="../settings/" class="md-nav__link">
         
   
   
@@ -5534,7 +5672,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings_reference/" class="md-nav__link">
+      <a href="../settings_reference/" class="md-nav__link">
         
   
   
@@ -5562,7 +5700,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/global_settings/" class="md-nav__link">
+      <a href="../settings/global_settings/" class="md-nav__link">
         
   
   
@@ -5590,7 +5728,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/policy_settings/" class="md-nav__link">
+      <a href="../settings/policy_settings/" class="md-nav__link">
         
   
   
@@ -5618,7 +5756,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/kafka_settings/" class="md-nav__link">
+      <a href="../settings/kafka_settings/" class="md-nav__link">
         
   
   
@@ -5728,7 +5866,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/alert_settings/" class="md-nav__link">
+      <a href="../settings/services/alert_settings/" class="md-nav__link">
         
   
   
@@ -5756,7 +5894,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/asset_settings/" class="md-nav__link">
+      <a href="../settings/services/asset_settings/" class="md-nav__link">
         
   
   
@@ -5784,7 +5922,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/blockassembly_settings/" class="md-nav__link">
+      <a href="../settings/services/blockassembly_settings/" class="md-nav__link">
         
   
   
@@ -5812,7 +5950,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/blockchain_settings/" class="md-nav__link">
+      <a href="../settings/services/blockchain_settings/" class="md-nav__link">
         
   
   
@@ -5840,7 +5978,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/blockpersister_settings/" class="md-nav__link">
+      <a href="../settings/services/blockpersister_settings/" class="md-nav__link">
         
   
   
@@ -5868,7 +6006,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/blockvalidation_settings/" class="md-nav__link">
+      <a href="../settings/services/blockvalidation_settings/" class="md-nav__link">
         
   
   
@@ -5896,7 +6034,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/legacy_settings/" class="md-nav__link">
+      <a href="../settings/services/legacy_settings/" class="md-nav__link">
         
   
   
@@ -5924,7 +6062,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/p2p_settings/" class="md-nav__link">
+      <a href="../settings/services/p2p_settings/" class="md-nav__link">
         
   
   
@@ -5952,7 +6090,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/propagation_settings/" class="md-nav__link">
+      <a href="../settings/services/propagation_settings/" class="md-nav__link">
         
   
   
@@ -5980,7 +6118,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/pruner_settings/" class="md-nav__link">
+      <a href="../settings/services/pruner_settings/" class="md-nav__link">
         
   
   
@@ -6008,7 +6146,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/rpc_settings/" class="md-nav__link">
+      <a href="../settings/services/rpc_settings/" class="md-nav__link">
         
   
   
@@ -6036,7 +6174,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/subtreevalidation_settings/" class="md-nav__link">
+      <a href="../settings/services/subtreevalidation_settings/" class="md-nav__link">
         
   
   
@@ -6064,7 +6202,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/utxopersister_settings/" class="md-nav__link">
+      <a href="../settings/services/utxopersister_settings/" class="md-nav__link">
         
   
   
@@ -6092,7 +6230,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/services/validator_settings/" class="md-nav__link">
+      <a href="../settings/services/validator_settings/" class="md-nav__link">
         
   
   
@@ -6188,7 +6326,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/stores/aerospike_settings/" class="md-nav__link">
+      <a href="../settings/stores/aerospike_settings/" class="md-nav__link">
         
   
   
@@ -6216,7 +6354,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/stores/blob_settings/" class="md-nav__link">
+      <a href="../settings/stores/blob_settings/" class="md-nav__link">
         
   
   
@@ -6244,7 +6382,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/settings/stores/utxo_settings/" class="md-nav__link">
+      <a href="../settings/stores/utxo_settings/" class="md-nav__link">
         
   
   
@@ -6310,17 +6448,20 @@
       
       
         
+          
+          
+        
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
         <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_7" >
         
           
-          <label class="md-nav__link" for="__nav_4_7" id="__nav_4_7_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_4_7" id="__nav_4_7_label" tabindex="">
             
   
   
@@ -6356,7 +6497,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../misc/BIP-239/" class="md-nav__link">
+      <a href="../../misc/BIP-239/" class="md-nav__link">
         
   
   
@@ -6384,7 +6525,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/gitCommitSigningSetupGuide/" class="md-nav__link">
+      <a href="../gitCommitSigningSetupGuide/" class="md-nav__link">
         
   
   
@@ -6412,7 +6553,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/licenseInformation/" class="md-nav__link">
+      <a href="../licenseInformation/" class="md-nav__link">
         
   
   
@@ -6440,7 +6581,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/prometheusMetrics/" class="md-nav__link">
+      <a href="../prometheusMetrics/" class="md-nav__link">
         
   
   
@@ -6468,7 +6609,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/teranodeDaemonReference/" class="md-nav__link">
+      <a href="../teranodeDaemonReference/" class="md-nav__link">
         
   
   
@@ -6496,7 +6637,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/testingTechnicalReference/" class="md-nav__link">
+      <a href="../testingTechnicalReference/" class="md-nav__link">
         
   
   
@@ -6524,7 +6665,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../references/thirdPartySoftwareRequirements/" class="md-nav__link">
+      <a href="../thirdPartySoftwareRequirements/" class="md-nav__link">
         
   
   
@@ -6587,10 +6728,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#operator-preconditions" class="md-nav__link">
+  <a href="#the-rule" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Operator preconditions
+        The rule
       
     </span>
   </a>
@@ -6598,10 +6739,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#invocation" class="md-nav__link">
+  <a href="#when-a-breaking-change-lands" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Invocation
+        When a breaking change lands
       
     </span>
   </a>
@@ -6609,21 +6750,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#evidence-and-repair-scope" class="md-nav__link">
+  <a href="#scope" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Evidence and repair scope
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#interrupted-work-and-results" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Interrupted work and results
+        Scope
       
     </span>
   </a>
@@ -6648,6 +6778,64 @@
   
 
 
+  <nav class="md-path" aria-label="Navigation" >
+    <ol class="md-path__list">
+      
+        
+  
+  
+    <li class="md-path__item">
+      <a href="../.." class="md-path__link">
+        
+  <span class="md-ellipsis">
+    Home
+  </span>
+
+      </a>
+    </li>
+  
+
+      
+      
+        
+  
+  
+    
+    
+      <li class="md-path__item">
+        <a href="../projectStructure/" class="md-path__link">
+          
+  <span class="md-ellipsis">
+    Reference
+  </span>
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+    
+    
+      <li class="md-path__item">
+        <a href="../errorHandling/" class="md-path__link">
+          
+  <span class="md-ellipsis">
+    API & Protobuf
+  </span>
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ol>
+  </nav>
+
               
               <article class="md-content__inner md-typeset">
                 
@@ -6658,181 +6846,134 @@
   
 
 
-<h1 id="recover-replayed-confirmed-transactions">Recover replayed confirmed transactions<a class="headerlink" href="#recover-replayed-confirmed-transactions" title="Permanent link">&para;</a></h1>
-<p><code>teranode-cli recoverreplayedtransactions</code> audits the persisted Aerospike store
-for confirmed transactions recreated after pruning, and missing replay markers
-on surviving parents. One job inventories the store, authenticates local chain
-evidence, applies proven repairs when requested, and verifies persisted results.
-Audit is the default. It never purges all unmined transactions.</p>
-<p><code>resetblockassembly</code> rebuilds assembly from persisted state. It can reload these
-recreated records; clearing assembly alone does not repair the store.</p>
-<h2 id="operator-preconditions">Operator preconditions<a class="headerlink" href="#operator-preconditions" title="Permanent link">&para;</a></h2>
-<ol>
-<li>Put the node in <strong>IDLE</strong>. Stop/drain every writer sharing the UTXO, blockchain
-   and archive stores, or restart services into an inactive configuration.
-   Include propagation/validator, block/subtree validation, assembly and retries,
-   block persister, pruner/blob deletion, legacy ingestion, other replicas and
-   DAH/background cleanup. Disable automatic restart/resume during recovery.
-   Restarting services alone does not prove that writes have stopped.</li>
-<li>Keep the existing blockchain metadata service reachable in IDLE, plus SQL,
-   Aerospike and retained archives. Prevent external chain/FSM changes. The job
-   uses existing blockchain read RPCs and a direct Aerospike client; it does not
-   start normal UTXO cleaners or construct a blockchain store that runs migrations.</li>
-<li>Preserve backups and incident evidence. Use a private directory on durable
-   storage, owned by the operator, mode <code>0700</code>. Allow enough disk for the complete
-   store census, targeted chain evidence and mutation before-images. Files are
-   private <code>0600</code> files. Keep them out of automatic cleanup paths.</li>
-<li>Run only one recovery job against the store, including across hosts. The work
-   directory lock prevents concurrent use of that directory; it is not a
-   distributed store lease.</li>
-</ol>
-<p>The CLI reads persisted <code>fsm_state</code> through the existing blockchain API and
-accepts only <code>IDLE</code>. Missing state or a failed read stops the job. It checks state
-and the pinned tip throughout scans, before mutations and during verification;
-a watchdog also cancels work if these checks fail. There is no force override
-and no automatic transition to IDLE or RUNNING.</p>
-<p><strong>These checks detect changes; they are not an atomic write lock.</strong> Operators
-must isolate writers. IDLE alone does not stop all already-running background
-workers: for example, the pruner's startup gate and catchup pause do not form a
-maintenance barrier. <code>--maintenance</code> acknowledges the isolation procedure.</p>
-<h2 id="invocation">Invocation<a class="headerlink" href="#invocation" title="Permanent link">&para;</a></h2>
-<p>Use the node's normal settings context, Aerospike namespace/set, output batch
-size, external transaction store and subtree archive configuration.</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># Read-only audit; no UTXO writes.</span>
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>teranode-cli<span class="w"> </span>recoverreplayedtransactions<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span>--work-dir<span class="w"> </span>/var/lib/teranode/recovery-audit
-</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>
-</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="c1"># Fresh apply: inventory, evidence, repair and store verification in one job.</span>
-</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>teranode-cli<span class="w"> </span>recoverreplayedtransactions<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">  </span>--work-dir<span class="w"> </span>/var/lib/teranode/recovery-apply<span class="w"> </span>--apply<span class="w"> </span>--maintenance
-</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>
-</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="c1"># Explicitly resume that interrupted apply, while writers remain stopped.</span>
-</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>teranode-cli<span class="w"> </span>recoverreplayedtransactions<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">  </span>--work-dir<span class="w"> </span>/var/lib/teranode/recovery-apply<span class="w"> </span>--apply<span class="w"> </span>--maintenance<span class="w"> </span>--resume
+<h1 id="protobuf-package-versioning-policy">Protobuf Package Versioning Policy<a class="headerlink" href="#protobuf-package-versioning-policy" title="Permanent link">&para;</a></h1>
+<p>Teranode's <code>.proto</code> files (the <code>*_api</code> service definitions under <code>services/*/*_api/</code>,
+plus <code>pruner_api</code>) do not carry a version suffix in their <code>package</code> declaration
+today. That's a deliberate, temporary state, not a claim that these packages have
+never changed shape.</p>
+<p>Several of them have already taken breaking changes without a package version
+bump:</p>
+<ul>
+<li><code>blockassembly_api.AddTxBatchColumnarRequest</code> — the parent-vout layout moved
+  from fields 8/9 to fields 10/11 (<code>reserved 8, 9;</code>).</li>
+<li><code>validator_api.ValidateTransactionRequest</code> — field 10 (<code>parent_metadata</code>) was
+  removed (<code>reserved 10;</code>), superseded by field 12.</li>
+<li><code>blockchain_api.FSMEventType</code> / <code>FSMStateType</code> — enum value 3 was removed
+  (<code>reserved 3;</code>).</li>
+</ul>
+<p><code>reserved</code> is corruption hygiene, not a versioning strategy: it stops the old
+number/name being reused so an old sender's bytes can't be silently decoded as
+the new field, but it does not make the two shapes interoperable. An old client
+still sending the old field to a new server just has that data dropped as
+unknown. Each of the cases above was handled by a deliberate, hand-reasoned
+mechanism instead (a documented upgrade-ordering requirement, in the validator
+case) rather than by a version bump. This policy is about the case that hasn't
+come up yet: a change that <code>reserved</code> can't express -- an RPC whose
+request/response shape changes, or streaming semantics that flip -- where old
+and new must coexist on the wire during a rollout.</p>
+<h2 id="the-rule">The rule<a class="headerlink" href="#the-rule" title="Permanent link">&para;</a></h2>
+<ul>
+<li>A package with no version suffix (<code>package blockchain_api;</code>) is implicitly
+  <strong>v1</strong> -- the unsuffixed name IS v1, not a placeholder for it. Nothing needs
+  to change about it as long as every change to that <code>.proto</code> stays
+  wire-compatible (new optional fields, new RPCs, new enum values appended at
+  the end, <code>reserved</code> on removed/renumbered fields, etc.).</li>
+<li>A version suffix is only added <strong>at the moment a breaking change is
+  introduced that <code>reserved</code> can't express</strong>, and the first suffixed version is
+  <strong><code>.v2</code></strong>, not <code>.v1</code> -- the unsuffixed package already occupies <code>v1</code>, and every
+  node still speaking the old format is a <code>v1</code> peer. Renaming the incompatible
+  format to <code>.v1</code> would claim a label the deployed format already owns.</li>
+<li>Do not pre-emptively add a version suffix to a package that hasn't had a
+  breaking change. The proto package name is part of every gRPC method path
+  (<code>/&lt;package&gt;.&lt;Service&gt;/&lt;Method&gt;</code>) and every message's fully-qualified name, so
+  renaming it breaks every RPC on the service, not just the message that
+  changed -- that cost is paid once, when it's actually needed. (It does not
+  change Go imports: every file here sets <code>option go_package</code> explicitly, so
+  <code>protoc-gen-go</code> derives the Go package/import path from that, not from the
+  proto package name.)</li>
+</ul>
+<p>Each <code>.proto</code> file's <code>package</code> declaration carries a short comment recording
+this:</p>
+<div class="language-proto highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1">// Version: v1 (implicit). No version suffix; the unsuffixed name IS v1. A</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="c1">// breaking change adds the next suffixed version (v2) alongside it -- see</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="c1">// docs/references/protoVersioning.md.</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="kn">package</span><span class="w"> </span><span class="nn">blockchain_api</span><span class="p">;</span>
 </span></code></pre></div>
-<p>These are alternatives, not three mandatory stages. A fresh apply includes its
-own complete audit. A new run requires an empty work directory; an audit's
-artifacts cannot be silently repurposed as an apply. Resume requires the same
-store identity, configuration (including the reorg retention policy), compatible
-artifact version and pinned tip. Artifacts from older versions without the
-retention policy are not accepted by this version; never edit a journal or its
-version fields to bypass that refusal.</p>
-<p>The default timeout is 30 minutes; use <code>--timeout</code> for a longer maintenance
-window. <code>--concurrency</code> limits Aerospike scan node fan-out (default 1, range 1–64).
-Archive parsing remains bounded and sequential. Full history scans can take much
-longer than the default timeout; plan the window before starting and explicitly
-set <code>--timeout</code> to cover it. Mainnet-scale runtime has not been measured. The
-scan uses at most two body passes, expands unresolved ancestry transitively with
-a depth limit of 256 and a shared limit of 10,000 processed records/input edges,
-and batches
-header writes and guard checks. Reaching a limit leaves unresolved evidence;
-it never authorizes a repair. The watchdog still checks maintenance every five
-seconds, and phase boundaries check it synchronously.</p>
-<h2 id="evidence-and-repair-scope">Evidence and repair scope<a class="headerlink" href="#evidence-and-repair-scope" title="Permanent link">&para;</a></h2>
-<p>The census covers masters and pagination records, including unmined records,
-missing/inconsistent mined metadata, locked/conflicting/creating states,
-parent spend references, absent children lacking markers and affected
-dependencies. It does not depend on current assembly membership. Unsupported
-schemas or unknown page owners remain findings; they are never disposable data.</p>
-<p>The evidence source is the node's validated local canonical chain at the pinned
-tip. No external SV Node RPC is required. The job authenticates retained raw
-transactions against subtree and block Merkle commitments and verifies header
-ancestry. A fully-spent classification requires positive canonical inclusion
-and a correctly ordered canonical spending transaction for every spendable
-output, using the existing chain-era burned-output policy. Both confirmation
-and the latest authenticated spend must be outside the reorg retention window:
-<code>max(confirmation height, last spend height) + retention &lt;= pinned tip height</code>.
-Retention is the greater of <code>global_blockHeightRetention</code> and the effective UTXO
-retention including its adjustment. A zero retention policy is refused by the
-command. Discovery seals this policy; apply rechecks it and fresh evidence before
-writing markers or deleting records. Recent fully-spent records remain unresolved
-so a reorg can still recover their transactions. Empty mined metadata,
-a missing UTXO record or local spent flags alone never authorize deletion.</p>
-<p>The history scan starts at genesis to make absence claims conservative. Missing,
-malformed or oversized archives create coverage gaps. Positive inclusion/spend
-proofs may still authorize repairs despite unrelated gaps; missing coverage
-cannot prove that a transaction is unconfirmed or an output is live. The index
-retains targeted evidence and its dependencies, not all historical raw bytes.
-Subtree transaction data is streamed, with bounded individual transaction and
-block parsing; blocks exceeding limits remain unresolved.</p>
-<p>Repairs are limited to positively proven recreated fully-spent records and
-missing markers for absent fully-spent children. A marker on the parent record
-that owns the spent output is sufficient, including a pagination record without
-a master marker; this matches normal pruning and replay validation. Normally mined dependent
-records and legitimate unconfirmed transactions are preserved. Confirmed
-records with live outputs, unexplained flags, unsafe parent ownership or expiry,
-and incomplete evidence remain untouched. This recovers this incident's
-persisted state; it is not general reconstruction of arbitrary UTXO corruption.</p>
-<p>For each repair the job preserves original input spend owners, writes and reads
-back required parent/page replay markers, and conditionally deletes only sealed
-records using their generations. It preserves native bin types and expiration,
-refuses finite-expiry replay guards, does not unspend inputs and does not delete
-retained archive blobs. The durable journal records intent before remote writes
-and verified outcomes afterward. Shared parents and dependency order are tracked.</p>
-<h2 id="interrupted-work-and-results">Interrupted work and results<a class="headerlink" href="#interrupted-work-and-results" title="Permanent link">&para;</a></h2>
-<p>Keep writers stopped on failure and retain the entire work directory. Explicit
-resume reconciles only this job's exact expected before/after states. Interrupted
-read-only phases can be rebuilt; a partial scan is never treated as complete.
-A completed, sealed history index is reused only after a fresh census confirms
-that all its targets are covered; newly discovered targets require rebuilding.
-An unfinished body scan still restarts from its read-only phase boundary, so a
-larger maintenance timeout is essential for large stores. SIGINT, SIGTERM and
-SIGHUP cancel through the job context and attempt to persist the final report;
-SIGKILL and power loss cannot run that cleanup.
-Foreign changes, a different tip or unexplained disappearance stop recovery.
-Do not edit/delete a journal to bypass a failure or restore before-images over
-a chain that has advanced. There is no automatic rollback.</p>
-<p>Mutation journal commits use SQLite <code>synchronous=EXTRA</code> with DELETE journaling,
-including directory synchronization before remote writes. Journal schema and
-identity header are committed together; resume may initialize a provably empty
-journal left before that commit, but refuses existing headerless state or foreign
-schemas. <a href="https://www.sqlite.org/pragma.html#pragma_synchronous">SQLite durability details</a>.</p>
-<p>Progress goes to stderr. The final JSON summary goes to stdout and <code>report.json</code>;
-<code>manifest.sqlite</code>, <code>history.sqlite</code>, <code>journal.sqlite</code> and <code>job.json</code> retain the
-private audit, evidence, mutation journal and phase checkpoint.</p>
-<table>
-<thead>
-<tr>
-<th>Exit</th>
-<th>Meaning</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>0</td>
-<td>Complete audit with no repairable or unresolved findings, or complete store repair; JSON distinguishes <code>applied</code>.</td>
-</tr>
-<tr>
-<td>1</td>
-<td>Unsafe precondition, interruption, operational failure or failed verification.</td>
-</tr>
-<tr>
-<td>2</td>
-<td>Audit found repairable records, or unresolved findings remain even if independent components were repaired.</td>
-</tr>
-</tbody>
-</table>
-<p><code>complete</code> describes whether classification/verification finished; a complete
-audit with repairable records returns exit 2 and performs no mutations.</p>
-<p>A complete graph allows independent proven repairs while unknown components
-remain untouched. Unresolvable ownership prevents safe apply. Read the counts,
-classifications and reasons; an empty assembly is not proof of recovery.</p>
-<p>After successful store repair, <strong>restart assembly and the other writers through
-the normal operational procedure</strong> so stale in-memory state cannot survive.
-Then resume the FSM and verify a fresh valid mining candidate and the next tip
-transition. <code>restart_required</code> is explicit after mutations, including interrupted
-attempts. The CLI finishes store verification while IDLE; it cannot prove those
-later runtime observations and never resumes the node itself.</p>
-<p>The restart step above refers to assembly and the other application writers.
-The recovery backend currently uses generation-guarded Aerospike deletes without
-<code>DurableDelete</code>. On persistent namespaces, an Aerospike cold restart can resurrect
-older deleted record versions. Durable deletes prevent that using tombstones,
-but Community Edition rejects that policy, so it is not enabled unconditionally.
-Keep the mutation journal and backups. After an Aerospike cold restart, keep
-writers isolated and run a fresh audit in a new work directory before resuming;
-a completed journal cannot certify newly resurrected records. See
-<a href="https://aerospike.com/docs/database/learn/architecture/durable-deletes">Aerospike durable deletes</a>
-and <a href="https://aerospike.com/docs/database/manage/database/cold-start">cold restart behavior</a>.</p>
+<h2 id="when-a-breaking-change-lands">When a breaking change lands<a class="headerlink" href="#when-a-breaking-change-lands" title="Permanent link">&para;</a></h2>
+<ol>
+<li>Decide the coexistence question first -- it decides the layout:</li>
+<li><strong>Cutover</strong> (every caller upgrades atomically, no mixed-version window):
+     rename the package in place (<code>blockchain_api</code> → <code>blockchain_api.v2</code>),
+     update the comment, regenerate (<code>make gen</code>).</li>
+<li>
+<p><strong>Side by side</strong> (the common case -- Teranode is a multi-node network with
+     independently upgraded services, so a breaking wire-format change
+     generally can't assume every peer/service upgrades atomically): do <strong>not</strong>
+     rename in place, since that removes the v1 service entirely and leaves
+     nothing for old peers to talk to. Instead add a new <code>.proto</code> in its own
+     directory with its own package and <code>go_package</code>
+     (e.g. <code>services/blockchain/blockchain_api/v2/blockchain_api.proto</code>,
+     <code>package blockchain_api.v2;</code>), give it its own <code>make gen</code> stanza, and
+     register both services on the server so <code>v1</code> and <code>v2</code> are both reachable
+     during the rollout window. A distinct <code>go_package</code> is required --
+     <code>--go_opt=paths=source_relative</code> emits next to the source file, so two
+     versions sharing a directory and Go package name would redeclare every
+     generated symbol.</p>
+<p>See how <code>validator_txmeta_wireFormat</code> lets two Kafka tx-meta batch formats
+ (<code>v1</code>/<code>v2</code>) coexist on the same topic during a rollout
+ (<a href="../kafkaMessageFormat/">kafkaMessageFormat.md</a>), and how the P2P/legacy
+ admin gRPC auth gate (<code>authProtectedMethods()</code> in
+ <code>services/p2p/Server.go</code>, the <code>protectedMethods</code> map in
+ <code>services/legacy/Server.go</code>) was rolled out method-by-method rather than
+ as an atomic cutover -- the same "old and new must coexist mid-rollout"
+ concern applies to a versioned proto package.</p>
+</li>
+<li>
+<p>Sweep for hardcoded fully-qualified names that a package rename or addition
+   doesn't update automatically:</p>
+</li>
+<li>The admin-auth allowlists -- <code>authProtectedMethods()</code> in
+     <code>services/p2p/Server.go</code> and the <code>protectedMethods</code> map in
+     <code>services/legacy/Server.go</code> -- key on literal method path strings
+     (<code>"/p2p_api.PeerService/BanPeer"</code>). <code>util/grpc_helper.go</code>'s
+     <code>CreateAuthInterceptor</code> <strong>fails open</strong>: a method path not present in the
+     map bypasses authentication entirely. Under a side-by-side <code>v2</code>, the new
+     package's method paths need their own entries or the <code>v2</code> RPCs ship
+     unauthenticated. P2P has <code>TestAuthProtectedMethodsCoverAllRPCs</code>
+     (<code>services/p2p/server_auth_test.go</code>) deriving expected paths from
+     <code>ServiceDesc.Methods</code> to catch omissions; the legacy map has no equivalent
+     coverage test today -- add one if you touch that map.</li>
+<li><code>grpcurl</code>/tooling invocations that hardcode the qualified service name,
+     e.g. <code>scripts/docker_host_fire_run_event.sh</code>.</li>
+<li>Qualified type references in other <code>.proto</code> files, and in non-Go
+     deployment config that names generated types by qualified name, e.g.
+     <code>deploy/docker/base/kafka-console-config.yml</code>'s <code>kafkamessage.*</code> entries.</li>
+<li>Only remove the old version's code path once the rollout window has closed
+   and no node in the network can still be sending the old format.</li>
+</ol>
+<p>Today, detecting that a change is breaking is left to reviewer attention --
+there's no <code>buf.yaml</code> or equivalent compatibility gate in this repo, and
+<code>make gen</code> invokes <code>protoc</code> directly with no schema-diff check. The <code>reserved</code>
+blocks above are evidence that breaks do land; until an automated gate exists,
+treat this policy as review discipline, not an enforced rule.</p>
+<h2 id="scope">Scope<a class="headerlink" href="#scope" title="Permanent link">&para;</a></h2>
+<p>This policy covers any <code>.proto</code> whose messages cross a process boundary:</p>
+<ul>
+<li>the service contracts in <code>services/*/*_api/*.proto</code> and
+  <code>services/pruner/pruner_api/pruner_api.proto</code>;</li>
+<li><code>model/model.proto</code> and <code>errors/error.proto</code> -- these are wire-facing, not
+  internal-only: <code>model.MiningCandidate</code> is the return type of
+  <code>blockassembly_api.GetMiningCandidate</code>, and <code>errors.TError</code> is a response
+  field in <code>propagation_api.ProcessTransactionBatchResponse</code> / <code>validator_api</code> batch responses,
+  so a breaking change to either breaks the API that embeds it;</li>
+<li><code>util/kafka/kafka_message/kafka_messages.proto</code> (<code>package kafkamessage</code>) --
+  cross-node Kafka payloads referenced by qualified name in
+  <code>deploy/docker/base/kafka-console-config.yml</code>; see
+  <a href="../kafkaMessageFormat/">kafkaMessageFormat.md</a> for how its <code>v1</code>/<code>v2</code> tx-meta
+  formats already coexist on one topic.</li>
+</ul>
+<p>It does not cover <code>.proto</code> files that never leave the process
+(e.g. <code>stores/utxo/status.proto</code>).</p>
 
 
 
@@ -6866,6 +7007,44 @@ and <a href="https://aerospike.com/docs/database/manage/database/cold-start">col
         <footer class="md-footer">
   
     
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../kafkaMessageFormat/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Kafka Message Format">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Kafka Message Format
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../networkConsensusRules/" class="md-footer__link md-footer__link--next" aria-label="Next: Network Consensus Rules">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Network Consensus Rules
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
   
   <div class="md-footer-meta md-typeset">
     <div class="md-footer-meta__inner md-grid">
@@ -6887,10 +7066,10 @@ and <a href="https://aerospike.com/docs/database/manage/database/cold-start">col
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.path", "navigation.indexes", "navigation.top", "navigation.instant", "navigation.footer", "search.suggest", "search.highlight", "search.share", "toc.follow", "content.code.copy", "content.code.annotate", "content.tabs.link"], "search": "../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.path", "navigation.indexes", "navigation.top", "navigation.instant", "navigation.footer", "search.suggest", "search.highlight", "search.share", "toc.follow", "content.code.copy", "content.code.annotate", "content.tabs.link"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
       
     
   </body>
