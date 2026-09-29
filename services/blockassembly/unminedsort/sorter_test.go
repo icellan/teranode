@@ -617,6 +617,41 @@ func TestFileSource_ChecksHeaderCount(t *testing.T) {
 	require.ErrorContains(t, err, "ended after 0 of 1000 records")
 }
 
+// A run holding more records than its header says is corrupt too.
+func TestFileSource_RejectsRecordsBeyondHeaderCount(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := New(Options{Dirs: []string{dir}, BufferRecords: 1000})
+	require.NoError(t, err)
+
+	defer s.Close()
+
+	addAll(t, s, makeInputs(1000, false), false)
+	require.NoError(t, s.waitSpill())
+	require.Len(t, s.runs, 1)
+
+	f, err := os.OpenFile(s.runs[0], os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt(binary.LittleEndian.AppendUint64(nil, 999), 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	fs, err := openFileSource(s.runs[0], false)
+	require.NoError(t, err)
+
+	defer fs.close()
+
+	for i := 0; i < 999; i++ {
+		ok, err := fs.next()
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+
+	ok, err := fs.next()
+	require.False(t, ok)
+	require.ErrorContains(t, err, "holds more than its 999 records")
+}
+
 // Drain checks it emitted every added transaction, whatever lost one.
 func TestSorter_DrainFailsWhenCountDiffers(t *testing.T) {
 	s, err := New(Options{BufferRecords: 1 << 20})
