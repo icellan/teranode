@@ -25,8 +25,13 @@ import (
 // holds; the disk maps hold theirs in the page cache instead. At these sizes
 // the disk tables stay page-cache resident, so the disk variants measure the
 // table code and its locking, not device I/O.
+//
+// Known bias: each memory iteration builds a fresh map, so its first-touch page
+// faults are timed, while production reuses pooled, already-faulted maps. The
+// disk variants' Close (munmap) runs outside the timer. Both favour disk.
 
-var mapBenchSizes = []int{1 << 20, 1 << 24}
+// 100k is a small block, which gets the minimum segment count on disk.
+var mapBenchSizes = []int{100_000, 1 << 20, 1 << 24}
 
 var mapBenchImpls = []struct {
 	name  string

@@ -11,14 +11,20 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/bsv-blockchain/teranode/errors"
-	"golang.org/x/sys/cpu"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	minSegSlots       = 64    // smallest segment so linear probing has room
+	minSegSlots = 64 // smallest segment so linear probing has room
+	// minSeg is the fewest independently-locked segments a table gets. Below
+	// minSeg*segTarget entries the table would otherwise have fewer segments
+	// than a validation node has cores, and a block of up to ~130k txs a single
+	// segment, serialising every worker on one lock. A fixed constant rather
+	// than a core count, so the layout does not depend on the host.
+	minSeg            = 256
 	maxSeg            = 4096  // max independently-locked segments
 	segTarget         = 65536 // ~entries per segment used to pick segment count
 	defaultLoadFactor = 0.5
@@ -67,7 +73,7 @@ func computeLayout(expected uint64, loadFactor float64) layout {
 	if !(loadFactor > 0 && loadFactor <= 1) {
 		loadFactor = defaultLoadFactor
 	}
-	numSeg := clampU64(nextPow2(expected/segTarget), 1, maxSeg)
+	numSeg := clampU64(nextPow2(expected/segTarget), minSeg, maxSeg)
 	// slots needed across all segments to hold expected at loadFactor
 	needed := uint64(float64(expected)/loadFactor) + 1
 	perSeg := nextPow2((needed + numSeg - 1) / numSeg)
@@ -88,13 +94,17 @@ type Options struct {
 }
 
 // seg is one independently-locked segment. count is its entry count, written
-// under mu and read by Len without it. The padding keeps each segment's lock on
-// its own cache line, so cores working different segments never share one.
+// under mu and read by Len without it. Each seg is padded to segSize bytes so
+// no two segments' locks share a cache line, including the 128-byte line pairs
+// that adjacent-line prefetch on x86 and the 128-byte lines on Apple silicon
+// move together.
 type seg struct {
 	mu    sync.RWMutex
 	count atomic.Int64
-	_     cpu.CacheLinePad
+	_     [segSize - unsafe.Sizeof(sync.RWMutex{}) - unsafe.Sizeof(atomic.Int64{})]byte
 }
+
+const segSize = 128
 
 // maxTotalSlots is an arithmetic sanity guard on a grown table, NOT the real
 // capacity ceiling. A grow doubles slotsPerSeg; if the new total would exceed
@@ -251,13 +261,14 @@ func (t *Table) Len() int64 {
 	return n
 }
 
-// Keys are uniformly-random hash output, so raw bytes are used as the hash.
-// The segment uses key[8:16] and the in-segment start bucket key[0:8]; the
-// disk-backed map wrappers route across disks using a further-disjoint window
-// (key[16:18]) so disk selection does not correlate with intra-table placement.
-
 // segOf returns the key's segment index. segMask never changes, so no lock is
 // needed.
+//
+// Keys are uniformly-random hash output, so raw bytes are used as the hash.
+// The segment uses key[8:16] and the in-segment start bucket key[0:8] (see
+// bucketOf); the disk-backed map wrappers route across disks using a
+// further-disjoint window (key[16:18]) so disk selection does not correlate
+// with intra-table placement.
 func (t *Table) segOf(key []byte) uint64 {
 	return binary.LittleEndian.Uint64(key[8:16]) & t.segMask
 }
@@ -374,6 +385,13 @@ func (t *Table) Lookup(key []byte) (uint64, bool, error) {
 // caller simply retries into the larger table (avoids redundant doublings under
 // a thundering herd).
 func (t *Table) grow(observedGen uint64) error {
+	// Cheap early out for a caller that queued behind another grow, so it does
+	// not sweep every segment lock just to find the table already grown. The
+	// check under the locks below is the one that counts.
+	if t.gen.Load() != observedGen {
+		return nil
+	}
+
 	for i := range t.segs {
 		t.segs[i].mu.Lock()
 	}
