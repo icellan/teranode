@@ -1623,8 +1623,8 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	// Drain it log-only - it belongs to a generation that no longer exists,
 	// not to this reset - and clear any pending reset request: re-requesting
 	// here would request a reset FROM WITHIN a reset that just ran, looping
-	// forever on a persistent fault the rotation itself cannot fix (finding
-	// P1-1/P2-3). The reload immediately below can still create its own
+	// forever on a persistent fault the rotation itself cannot fix. The
+	// reload immediately below can still create its own
 	// phantom against the fresh generation; AddDirectlyReportOnly/
 	// AddNodesDirectlyReportOnly/FlushDiskTxMapForLoad(isReload=true) each
 	// request a reset for that independently, and are deliberately left
@@ -3986,7 +3986,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	defer stp.finishReorgDiskTxMaps()
 
 	// A failed reorg must never leave its own disk tx map errors pending for
-	// whatever succeeds next to have them misattributed (finding 2).
+	// whatever succeeds next to have them misattributed.
 	defer stp.joinDiskTxMapErrOnFailure(&err)
 
 	if moveBackBlocks == nil {
@@ -5710,7 +5710,7 @@ func (stp *SubtreeProcessor) finalizeBlockProcessing(ctx context.Context, block 
 func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.Block, skipNotification bool,
 	processedConflictingHashesMap map[chainhash.Hash]struct{}, skipDequeue bool, createProperlySizedSubtrees bool) (transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, err error) {
 	// A failed call must never leave its own disk tx map errors pending for
-	// whatever succeeds next to have them misattributed (finding 2).
+	// whatever succeeds next to have them misattributed.
 	// Registered before the nil-block guard so even that early return drains.
 	defer stp.joinDiskTxMapErrOnFailure(&err)
 

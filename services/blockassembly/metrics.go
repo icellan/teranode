@@ -579,7 +579,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "blockassembly",
 			Name:      "disk_tx_map_degraded",
-			Help:      "1 while auto-reset on a disk tx map storage error is suspended after too many consecutive storage-triggered resets (a persistent disk fault), 0 otherwise.",
+			Help:      "1 while auto-reset on a disk tx map storage error is suspended because a storage-triggered reset hit a storage error again (a disk fault a rotation can't cure), 0 otherwise. Any reset that completes without a storage error clears it.",
 		},
 	)
 

@@ -23,8 +23,8 @@ import (
 // reset has no rollback: by the time its postProcess callback runs, reset has
 // already committed (header at the target tip, currentTxMap cleared). A disk
 // tx map error surfacing during the reload inside postProcess must therefore
-// be logged and counted, not fail reset - the binding decision forbids
-// returning a post-commit error. This is what BlockAssembler.loadUnminedTransactions
+// be logged and counted, not fail reset: failing it would tell the caller
+// nothing changed when the new state is already committed. This is what BlockAssembler.loadUnminedTransactions
 // achieves in production by calling AddNodesDirectlyReportOnly/AddDirectlyReportOnly
 // instead of AddNodesDirectly/AddDirectly when isReload is true; this test
 // exercises the same contract directly against SubtreeProcessor.reset.
@@ -98,7 +98,7 @@ func TestReset_PostProcessReportOnlyMapErrorDoesNotFailReset(t *testing.T) {
 // not survive to request a (redundant) reset once reset itself succeeds.
 // Without this, a stale pending error - or a prior reset's own unconsumed
 // request - makes every subsequent clean reset immediately request another
-// one, looping (finding P1-1/P2-3).
+// one, looping.
 func TestReset_StaleErrorBeforeResetDoesNotRequestReset(t *testing.T) {
 	stp := newSubtreeProcessorWithTxMapDirs(t, []string{t.TempDir()})
 
@@ -119,7 +119,7 @@ func TestReset_StaleErrorBeforeResetDoesNotRequestReset(t *testing.T) {
 }
 
 // reset's currentTxMap.Clear() + Length()==0 check runs before
-// closeChainedSubtrees and before currentSubtree is replaced (F3): a failed
+// closeChainedSubtrees and before currentSubtree is replaced: a failed
 // rotation must leave STP fully intact - still on the pre-reset header,
 // chainedSubtrees and currentSubtree - rather than committed to an empty
 // template on top of a still-populated, stale map.

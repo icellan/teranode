@@ -98,8 +98,8 @@ func newMoveForwardCommitBoundaryProcessor(t *testing.T) (*SubtreeProcessor, *mo
 // A disk tx map error recorded before moveForwardBlock's commit point
 // (clearCurrentTxMapShadow) must fail the call and leave the processor's
 // in-memory state exactly as it was, so a retry of the same block succeeds -
-// per the user's decision, map errors fail the operation only where the
-// existing rollback path can still run. Goes through the public MoveForwardBlock
+// map errors fail the operation only where the existing rollback path can
+// still run. Goes through the public MoveForwardBlock
 // entry point (started processor, dispatcher goroutine) so this exercises the
 // real production rollback() closure in SubtreeProcessor.go's
 // moveForwardBlockChan handler, not a hand-rolled stand-in for it: a

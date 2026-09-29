@@ -509,6 +509,9 @@ func (m *DiskTxMap) Delete(hash chainhash.Hash) bool {
 	diskIdx := m.diskOf(hash)
 	m.flushDisk(diskIdx)
 
+	// A failed delete leaves the value readable through Get, which skips the
+	// filter. The recorded error requests a reset (diskTxMapErr), which
+	// rebuilds the map.
 	if err := m.disks[diskIdx].store.Delete(hash[:]); err != nil {
 		m.recordErr(errors.NewStorageError("disk tx map: deleting %s on disk %d", hash, diskIdx, err))
 	}
@@ -666,13 +669,18 @@ func (m *DiskTxMap) Close() error {
 	for i := range m.disks {
 		<-m.disks[i].done
 	}
-	var lastErr error
+	// Collect only non-nil errors: teranode errors.Join panics on a nil
+	// argument after a non-nil first one.
+	var errs []error
 	for i := range m.disks {
 		if err := m.disks[i].store.Close(); err != nil {
-			lastErr = err
+			errs = append(errs, err)
 		}
 	}
-	return lastErr
+	if len(errs) == 0 {
+		return nil
+	}
+	return errors.Join(errs...)
 }
 
 // UpdateSubtreeIndex updates the SubtreeIndex for a hash in the correct disk shard.

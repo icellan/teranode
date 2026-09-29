@@ -75,7 +75,7 @@ func TestDiskTxMap_ReadErrorIsReported(t *testing.T) {
 	require.Error(t, m.TakeErr())
 }
 
-// Documents today's behaviour (round-2 finding 7, unchanged on purpose): a
+// Documents today's behaviour, unchanged on purpose: a
 // read error on SetIfNotExists' slow path is indistinguishable from
 // not-found, so the hash is (re-)inserted as if new - a duplicate entry, not
 // merely a missed dedup. The error is still recorded (via getFromStore), so
@@ -117,7 +117,7 @@ func TestDiskTxMap_DeleteErrorIsReported(t *testing.T) {
 
 // After a flush failure, the writer must recover by cancelling the broken
 // batch and installing a fresh one, so a transient error does not fail every
-// write until the next Clear rotation happens to succeed (finding 5).
+// write until the next Clear rotation happens to succeed.
 func TestDiskTxMap_WriterRecoversAfterFlushFailure(t *testing.T) {
 	m := newErrTestDiskTxMap(t)
 	defer m.Close()
@@ -144,7 +144,7 @@ func TestDiskTxMap_WriterRecoversAfterFlushFailure(t *testing.T) {
 
 // AddDirectly is a load path like AddNodesDirectly and gets the same
 // end-of-operation boundary: a pending map error fails an otherwise
-// successful call (finding 6).
+// successful call.
 func TestAddDirectly_ReportsDiskTxMapErrorOnce(t *testing.T) {
 	stp, cleanup := newAddNodesBenchProcessor(t, 64, WithTxMapDirs([]string{t.TempDir()}))
 	defer cleanup()
@@ -438,7 +438,7 @@ func TestDiskTxMap_GetWithErr_DoesNotRecordOnMap(t *testing.T) {
 // to roll back to - so its recorded error and any Close failure must be
 // logged and counted, not fed back into the surviving map's recordErr, which
 // would let it resurface later misattributed to whatever operation next
-// checks the map's pending error (finding 4).
+// checks the map's pending error.
 func TestCloseRetiredDiskTxMaps_ReportsRetiredMapError(t *testing.T) {
 	stp := newSubtreeProcessorWithTxMapDirs(t, []string{t.TempDir()})
 
@@ -462,7 +462,7 @@ func TestCloseRetiredDiskTxMaps_ReportsRetiredMapError(t *testing.T) {
 }
 
 // Stop's pending-error drain must go through the same counted path as every
-// other boundary, not a bare logger.Errorf call (finding F).
+// other boundary, not a bare logger.Errorf call.
 // A post-commit disk tx map error is not unique to moveForwardBlock: any
 // operation that reports rather than fails (removeTx here; dequeue,
 // reorgBlocks and reset's own reload share the same drainAndLogDiskTxMapErr/
