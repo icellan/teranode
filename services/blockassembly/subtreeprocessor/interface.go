@@ -204,12 +204,6 @@ type Interface interface {
 	// or Stop) can be the one that observes the error.
 	TakeResetRequested() bool
 
-	// LastResetStorageFailed reports whether the most recent reset hit a disk
-	// tx map storage error itself (its rotation failed, or its reload raised a
-	// new reset request), without consuming that request. BlockAssembler uses
-	// it to decide whether a storage-triggered reset cured the map.
-	LastResetStorageFailed() bool
-
 	// Remove removes a specific transaction from the processor by its hash.
 	// This is used when transactions become invalid or need to be excluded.
 	//

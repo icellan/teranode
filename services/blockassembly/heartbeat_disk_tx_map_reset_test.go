@@ -15,24 +15,34 @@ import (
 
 // resetTestMock wires a mock subtree processor for the heartbeat reset tests.
 // onReset runs inside every Reset call, where the real subtree processor's
-// reset would run its reload; it can raise a new request or mark the reset as
-// having hit a storage error, exactly as the reload would.
-func resetTestMock(onReset func(m *subtreeprocessor.MockSubtreeProcessor)) (*subtreeprocessor.MockSubtreeProcessor, *atomic.Int32) {
+// reset would run its reload, and returns that reset's response; it can also
+// raise a new request, exactly as the reload would. waitResults, if given, are
+// the results of the first WaitForPendingBlocks calls in order, the first
+// being Start's own (every later call succeeds): a failure there ends
+// BlockAssembler.reset before it reaches the subtree processor, so before the
+// rotation.
+func resetTestMock(onReset func(m *subtreeprocessor.MockSubtreeProcessor) subtreeprocessor.ResetResponse,
+	waitResults ...error) (*subtreeprocessor.MockSubtreeProcessor, *atomic.Int32) {
 	resets := &atomic.Int32{}
 	m := &subtreeprocessor.MockSubtreeProcessor{}
 
 	m.On("Start", mock.Anything).Return()
+
+	for _, waitErr := range waitResults {
+		m.On("WaitForPendingBlocks", mock.Anything).Return(waitErr).Once()
+	}
+
 	m.On("WaitForPendingBlocks", mock.Anything).Return(nil)
 	m.On("Reset", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
-		Run(func(mock.Arguments) {
-			m.ResetStorageFailed.Store(false)
+		Return(func() subtreeprocessor.ResetResponse {
 			resets.Add(1)
 
 			if onReset != nil {
-				onReset(m)
+				return onReset(m)
 			}
-		}).
-		Return(subtreeprocessor.ResetResponse{})
+
+			return subtreeprocessor.ResetResponse{Rotated: true}
+		})
 	m.On("GetCurrentBlockHeader").Return(model.GenesisBlockHeader)
 	m.On("InitCurrentBlockHeader", mock.Anything).Return()
 	m.On("FlushDiskTxMapForLoad", mock.Anything, mock.Anything).Return(nil)
@@ -40,16 +50,26 @@ func resetTestMock(onReset func(m *subtreeprocessor.MockSubtreeProcessor)) (*sub
 	return m, resets
 }
 
-func startWithMock(t *testing.T, m *subtreeprocessor.MockSubtreeProcessor) *baTestItems {
+func initDegradedGauge(t *testing.T) {
 	t.Helper()
 
 	initPrometheusMetrics()
 	prometheusBlockAssemblyDiskTxMapDegraded.Set(0)
 	t.Cleanup(func() { prometheusBlockAssemblyDiskTxMapDegraded.Set(0) })
+}
+
+func startWithMock(t *testing.T, m *subtreeprocessor.MockSubtreeProcessor, before ...func(items *baTestItems)) *baTestItems {
+	t.Helper()
+
+	initDegradedGauge(t)
 
 	items := setupBlockAssemblyTest(t)
 	items.blockAssembler.heartbeatInterval = 10 * time.Millisecond
 	injectMockStp(t, items, m)
+
+	for _, fn := range before {
+		fn(items)
+	}
 
 	require.NoError(t, items.blockAssembler.Start(t.Context()))
 
@@ -78,9 +98,9 @@ func TestBlockAssembler_HeartbeatActsOnDiskTxMapResetRequest(t *testing.T) {
 // error again. There must be exactly one such reset, after which the node is
 // degraded and stops auto-resetting instead of looping full reloads.
 func TestBlockAssembler_PersistentDiskTxMapFault_OneResetThenDegraded(t *testing.T) {
-	m, resets := resetTestMock(func(m *subtreeprocessor.MockSubtreeProcessor) {
-		m.ResetStorageFailed.Store(true)
+	m, resets := resetTestMock(func(m *subtreeprocessor.MockSubtreeProcessor) subtreeprocessor.ResetResponse {
 		m.ResetRequested.Store(true) // the reload left a phantom again
+		return subtreeprocessor.ResetResponse{Rotated: true, StorageFailed: true}
 	})
 	m.ResetRequested.Store(true)
 
@@ -95,13 +115,16 @@ func TestBlockAssembler_PersistentDiskTxMapFault_OneResetThenDegraded(t *testing
 // A phantom left by a manual reset's reload is still escalated: the request it
 // raises is picked up by the heartbeat and causes a storage-triggered reset.
 func TestBlockAssembler_PhantomFromManualResetIsEscalated(t *testing.T) {
-	var call atomic.Int32
+	var calls atomic.Int32
 
-	m, resets := resetTestMock(func(m *subtreeprocessor.MockSubtreeProcessor) {
-		if call.Add(1) == 1 {
-			m.ResetStorageFailed.Store(true)
-			m.ResetRequested.Store(true)
+	m, resets := resetTestMock(func(m *subtreeprocessor.MockSubtreeProcessor) subtreeprocessor.ResetResponse {
+		if calls.Add(1) > 1 {
+			return subtreeprocessor.ResetResponse{Rotated: true}
 		}
+
+		m.ResetRequested.Store(true)
+
+		return subtreeprocessor.ResetResponse{Rotated: true, StorageFailed: true}
 	})
 
 	items := startWithMock(t, m)
@@ -113,11 +136,127 @@ func TestBlockAssembler_PhantomFromManualResetIsEscalated(t *testing.T) {
 	require.Zero(t, degradedGauge(), "the storage-triggered reset completed clean")
 }
 
-// onResetDone decides the degraded state from how a reset ended; every reset
-// completion path (the resetCh handler and the reorg fallbacks) goes through it.
+// A storage-triggered reset that fails before reaching the subtree processor
+// (WaitForPendingBlocks here) says nothing about the disk: it must not be
+// judged by the storage outcome of the reset before it, and since the
+// rotation never ran, the phantom is still there, so it is retried.
+func TestBlockAssembler_PreRotationFailureIsRetriedNotDegraded(t *testing.T) {
+	var calls atomic.Int32
+
+	m, resets := resetTestMock(func(m *subtreeprocessor.MockSubtreeProcessor) subtreeprocessor.ResetResponse {
+		if calls.Add(1) == 1 {
+			// The manual reset's reload leaves a phantom.
+			m.ResetRequested.Store(true)
+			return subtreeprocessor.ResetResponse{Rotated: true, StorageFailed: true}
+		}
+
+		return subtreeprocessor.ResetResponse{Rotated: true}
+	}, nil, nil, errors.NewServiceError("block validation unavailable")) // Start, the manual reset, the storage-triggered reset
+
+	items := startWithMock(t, m)
+	items.blockAssembler.Reset(false)
+
+	require.Eventually(t, func() bool { return resets.Load() == 2 }, 2*time.Second, 5*time.Millisecond,
+		"manual reset, then the retry of the storage-triggered reset that failed before the rotation")
+	require.Never(t, func() bool { return resets.Load() > 2 }, 200*time.Millisecond, 10*time.Millisecond)
+	require.Zero(t, degradedGauge(), "a failure before the rotation is not a storage failure")
+}
+
+// A storage-triggered reset that fails after the rotation for a non-storage
+// reason is not retried: the rotation discarded the phantom it was for.
+func TestBlockAssembler_PostRotationFailureIsNotRetried(t *testing.T) {
+	m, resets := resetTestMock(func(*subtreeprocessor.MockSubtreeProcessor) subtreeprocessor.ResetResponse {
+		return subtreeprocessor.ResetResponse{Err: errors.NewServiceError("utxo store unavailable"), Rotated: true}
+	})
+	m.ResetRequested.Store(true)
+
+	startWithMock(t, m)
+
+	require.Eventually(t, func() bool { return resets.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
+	require.Never(t, func() bool { return resets.Load() > 1 }, 200*time.Millisecond, 10*time.Millisecond)
+	require.Zero(t, degradedGauge())
+}
+
+// A storage-triggered request queued behind another reset is drained, not run;
+// the reset that ran stands in for it, so that reset is judged as
+// storage-triggered.
+func TestBlockAssembler_DrainedStorageTriggeredRequestCounts(t *testing.T) {
+	m, resets := resetTestMock(func(*subtreeprocessor.MockSubtreeProcessor) subtreeprocessor.ResetResponse {
+		return subtreeprocessor.ResetResponse{Err: errors.NewProcessingError("tx map rotation failed"), StorageFailed: true}
+	})
+
+	startWithMock(t, m, func(items *baTestItems) {
+		items.blockAssembler.resetCh <- resetRequest{ErrCh: make(chan error, 1)}
+		items.blockAssembler.resetCh <- resetRequest{ErrCh: make(chan error, 1), StorageTriggered: true}
+	})
+
+	require.Eventually(t, func() bool { return degradedGauge() == 1 }, 2*time.Second, 5*time.Millisecond)
+	require.Equal(t, int32(1), resets.Load(), "the queued storage-triggered request is drained, not run")
+}
+
+// The reorg paths that fall back to a reset go through the same outcome
+// handling: a clean fallback reset clears degraded.
+func TestBlockAssembler_ReorgFallbackResetClearsDegraded(t *testing.T) {
+	t.Run("large reorg", func(t *testing.T) {
+		initDegradedGauge(t)
+
+		items := setupBlockAssemblyTest(t)
+		genesis := genesisHeader(t, items)
+
+		a1 := buildChain(genesis, 1, 610)[0]
+		b1 := buildChain(genesis, 1, 710)[0]
+		require.NoError(t, items.addBlock(t.Context(), a1))
+		require.NoError(t, items.addBlock(t.Context(), b1))
+
+		m, resets := resetTestMock(nil)
+		injectMockStp(t, items, m)
+
+		b := items.blockAssembler
+		b.diskTxMapDegraded = true
+		prometheusBlockAssemblyDiskTxMapDegraded.Set(1)
+		b.setBestBlockHeader(a1, 1001) // arms the large-reorg guard
+
+		err := b.handleReorg(t.Context(), b1, 1)
+		require.True(t, errors.Is(err, errors.ErrBlockAssemblyReset), "got: %v", err)
+
+		require.Equal(t, int32(1), resets.Load())
+		require.False(t, b.diskTxMapDegraded)
+		require.Zero(t, degradedGauge())
+	})
+
+	t.Run("failed reorg", func(t *testing.T) {
+		initDegradedGauge(t)
+
+		items := setupBlockAssemblyTest(t)
+		genesis := genesisHeader(t, items)
+
+		a1 := buildChain(genesis, 1, 620)[0]
+		fork := buildChain(genesis, 2, 720)
+		require.NoError(t, items.addBlock(t.Context(), a1))
+		addChain(t, items, fork) // longer, so it becomes best
+
+		m, resets := resetTestMock(nil)
+		m.On("Reorg", mock.Anything, mock.Anything).Return(errors.NewProcessingError("reorg failed"))
+		injectMockStp(t, items, m)
+
+		b := items.blockAssembler
+		b.diskTxMapDegraded = true
+		prometheusBlockAssemblyDiskTxMapDegraded.Set(1)
+		b.setBestBlockHeader(a1, 1)
+
+		err := b.handleReorg(t.Context(), fork[1], 2)
+		require.True(t, errors.Is(err, errors.ErrBlockAssemblyReset), "got: %v", err)
+
+		require.Equal(t, int32(1), resets.Load())
+		require.False(t, b.diskTxMapDegraded)
+		require.Zero(t, degradedGauge())
+	})
+}
+
+// onResetDone decides the degraded state, and whether to retry, from how a
+// reset ended.
 func TestBlockAssembler_OnResetDone(t *testing.T) {
-	initPrometheusMetrics()
-	t.Cleanup(func() { prometheusBlockAssemblyDiskTxMapDegraded.Set(0) })
+	initDegradedGauge(t)
 
 	storageErr := errors.NewStorageError("rotation failed")
 	otherErr := errors.NewServiceError("blockchain unavailable")
@@ -125,35 +264,34 @@ func TestBlockAssembler_OnResetDone(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
 		storageTriggered bool
+		resp             subtreeprocessor.ResetResponse
 		resetErr         error
-		storageFailed    bool
 		degradedBefore   bool
 		degradedAfter    bool
+		retry            bool
 	}{
-		{name: "storage-triggered reset fails on storage", storageTriggered: true, storageFailed: true, degradedAfter: true},
-		{name: "storage-triggered rotation failure", storageTriggered: true, resetErr: storageErr, storageFailed: true, degradedAfter: true},
-		{name: "storage-triggered reset clean", storageTriggered: true},
-		{name: "clean storage-triggered reset clears degraded", storageTriggered: true, degradedBefore: true},
-		{name: "clean manual or reorg reset clears degraded", degradedBefore: true},
-		{name: "manual reset leaving a phantom does not degrade", storageFailed: true},
-		{name: "non-storage failure does not degrade", storageTriggered: true, resetErr: otherErr},
+		{name: "storage-triggered reset fails on storage", storageTriggered: true, resp: subtreeprocessor.ResetResponse{Rotated: true, StorageFailed: true}, degradedAfter: true},
+		{name: "storage-triggered rotation failure", storageTriggered: true, resp: subtreeprocessor.ResetResponse{StorageFailed: true}, resetErr: storageErr, degradedAfter: true},
+		{name: "storage-triggered reset clean", storageTriggered: true, resp: subtreeprocessor.ResetResponse{Rotated: true}},
+		{name: "clean storage-triggered reset clears degraded", storageTriggered: true, resp: subtreeprocessor.ResetResponse{Rotated: true}, degradedBefore: true},
+		{name: "clean manual or reorg reset clears degraded", resp: subtreeprocessor.ResetResponse{Rotated: true}, degradedBefore: true},
+		{name: "manual reset leaving a phantom does not degrade", resp: subtreeprocessor.ResetResponse{Rotated: true, StorageFailed: true}},
+		{name: "storage-triggered failure before the rotation is retried", storageTriggered: true, resetErr: otherErr, retry: true},
+		{name: "storage-triggered failure after the rotation is not retried", storageTriggered: true, resp: subtreeprocessor.ResetResponse{Rotated: true}, resetErr: otherErr},
+		{name: "manual failure before the rotation is not retried", resetErr: otherErr},
 		{name: "non-storage failure keeps degraded", resetErr: otherErr, degradedBefore: true, degradedAfter: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			m := &subtreeprocessor.MockSubtreeProcessor{}
-			m.On("Stop", mock.Anything).Return().Maybe() // the test setup's cleanup stops it
-			m.ResetStorageFailed.Store(tc.storageFailed)
-
 			items := setupBlockAssemblyTest(t)
 			b := items.blockAssembler
-			b.subtreeProcessor = m
 			b.diskTxMapDegraded = tc.degradedBefore
 			prometheusBlockAssemblyDiskTxMapDegraded.Set(map[bool]float64{false: 0, true: 1}[tc.degradedBefore])
 
-			b.onResetDone(tc.storageTriggered, tc.resetErr)
+			b.onResetDone(tc.storageTriggered, tc.resp, tc.resetErr)
 
 			require.Equal(t, tc.degradedAfter, b.diskTxMapDegraded)
 			require.Equal(t, map[bool]float64{false: 0, true: 1}[tc.degradedAfter], degradedGauge())
+			require.Equal(t, tc.retry, b.diskTxMapResetRetry)
 		})
 	}
 }

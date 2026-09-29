@@ -11,10 +11,12 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	blob_memory "github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -176,8 +178,11 @@ func TestReset_FailedTxMapClearLeavesSTPFullyIntact(t *testing.T) {
 
 	before := testutil.ToFloat64(prometheusSubtreeProcessorDiskTxMapErrors.WithLabelValues("reset_rotation_failed"))
 
-	resetErr := stp.reset(targetHeader, nil, nil, false, nil)
+	resp := stp.runReset(&resetBlocks{blockHeader: targetHeader})
+	resetErr := resp.Err
 	require.Error(t, resetErr, "a failed tx map rotation must fail reset")
+	require.False(t, resp.Rotated)
+	require.True(t, resp.StorageFailed, "a failed rotation is the reset's own storage failure")
 	require.ErrorContains(t, resetErr, "tx map still holds")
 
 	// A rotation failure dead-ends the usual post-commit escalation (reset
@@ -205,38 +210,79 @@ func resetTestHeader(nonce uint32) *model.BlockHeader {
 	}
 }
 
-// LastResetStorageFailed reports whether the most recent reset itself hit a
-// disk tx map storage error (its rotation failed, or its reload raised a new
-// reset request). BlockAssembler uses it to decide whether a storage-triggered
-// reset cured the map, without consuming the request.
-func TestReset_LastResetStorageFailed(t *testing.T) {
+// runReset reports, for the reset that just ran, whether it rotated the tx map
+// and whether it hit a disk tx map storage error itself (its rotation failed,
+// its reload raised a new reset request, or a map error was joined into its
+// failure). BlockAssembler decides the degraded state and the pre-rotation
+// retry from this response, never from state a previous reset left behind.
+func TestRunReset_StorageOutcome(t *testing.T) {
+	clean := func() error { return nil }
+
 	t.Run("clean reset", func(t *testing.T) {
 		stp := newSubtreeProcessorWithTxMapDirs(t, []string{t.TempDir()})
 
-		require.NoError(t, stp.reset(resetTestHeader(9301), nil, nil, false, func() error { return nil }))
-		require.False(t, stp.LastResetStorageFailed())
+		resp := stp.runReset(&resetBlocks{blockHeader: resetTestHeader(9301), postProcess: clean})
+		require.NoError(t, resp.Err)
+		require.True(t, resp.Rotated)
+		require.False(t, resp.StorageFailed)
 	})
 
 	t.Run("reload raises a new request", func(t *testing.T) {
 		stp := newSubtreeProcessorWithTxMapDirs(t, []string{t.TempDir()})
 
-		require.NoError(t, stp.reset(resetTestHeader(9302), nil, nil, false, func() error {
+		resp := stp.runReset(&resetBlocks{blockHeader: resetTestHeader(9302), postProcess: func() error {
 			stp.requestReset("test_reload")
 			return nil
-		}))
-		require.True(t, stp.LastResetStorageFailed())
+		}})
+		require.NoError(t, resp.Err)
+		require.True(t, resp.StorageFailed)
 		require.True(t, stp.TakeResetRequested(), "the reload's request stays pending for the heartbeat")
 
-		// The next clean reset clears it.
-		require.NoError(t, stp.reset(resetTestHeader(9303), nil, nil, false, func() error { return nil }))
-		require.False(t, stp.LastResetStorageFailed())
+		// The next reset reports its own outcome, not the previous one's.
+		resp = stp.runReset(&resetBlocks{blockHeader: resetTestHeader(9303), postProcess: clean})
+		require.False(t, resp.StorageFailed)
 	})
 
 	t.Run("a request raised before the rotation does not count", func(t *testing.T) {
 		stp := newSubtreeProcessorWithTxMapDirs(t, []string{t.TempDir()})
 		stp.requestReset("before_reset")
 
-		require.NoError(t, stp.reset(resetTestHeader(9304), nil, nil, false, func() error { return nil }))
-		require.False(t, stp.LastResetStorageFailed())
+		resp := stp.runReset(&resetBlocks{blockHeader: resetTestHeader(9304), postProcess: clean})
+		require.NoError(t, resp.Err)
+		require.False(t, resp.StorageFailed)
+	})
+
+	t.Run("a map error joined into a failed reload counts", func(t *testing.T) {
+		stp := newSubtreeProcessorWithTxMapDirs(t, []string{t.TempDir()})
+
+		resp := stp.runReset(&resetBlocks{blockHeader: resetTestHeader(9305), postProcess: func() error {
+			stp.diskTxMap.recordErr(errors.NewStorageError("badger write failed"))
+			return errors.NewProcessingError("utxo store unavailable")
+		}})
+		require.Error(t, resp.Err)
+		require.True(t, resp.Rotated)
+		require.True(t, resp.StorageFailed, "the reload's map error is joined into the failure, not requested, but it is still this reset's storage error")
+	})
+
+	t.Run("a failure before the rotation with a request pending", func(t *testing.T) {
+		stp := newSubtreeProcessorWithTxMapDirs(t, []string{t.TempDir()})
+
+		// An assembly tx makes reset call markNotOnLongestChain, which fails
+		// before the rotation.
+		node := &subtreepkg.Node{Hash: chainhash.HashH([]byte("pre-rotation-tx")), Fee: 1, SizeInBytes: 100}
+		require.NoError(t, stp.AddDirectly(node, &subtreepkg.TxInpoints{}, true))
+
+		failing := &utxo.MockUtxostore{}
+		failing.On("MarkTransactionsOnLongestChain", mock.Anything, mock.Anything, false).
+			Return(errors.NewStorageError("utxo store unavailable"))
+		stp.utxoStore = failing
+
+		stp.requestReset("before_reset")
+
+		resp := stp.runReset(&resetBlocks{blockHeader: resetTestHeader(9306), postProcess: clean})
+		require.Error(t, resp.Err)
+		require.False(t, resp.Rotated)
+		require.False(t, resp.StorageFailed, "a UTXO store failure before the rotation is not a disk tx map storage failure")
+		require.True(t, stp.TakeResetRequested(), "the rotation never ran, so the earlier request is still pending")
 	})
 }

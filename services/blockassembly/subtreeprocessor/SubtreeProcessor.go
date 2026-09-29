@@ -139,6 +139,15 @@ type resetBlocks struct {
 type ResetResponse struct {
 	// Err contains any error encountered during the reset operation
 	Err error
+
+	// Rotated reports that this reset rotated the tx map, discarding any
+	// phantom a storage error left in it before the reset started.
+	Rotated bool
+
+	// StorageFailed reports that this reset hit a disk tx map storage error
+	// itself: its rotation failed, or after the rotation its reload raised a
+	// new reset request or had a map error joined into its failure.
+	StorageFailed bool
 }
 
 // PrecomputedMiningData holds pre-computed data for mining candidate generation.
@@ -410,9 +419,10 @@ type SubtreeProcessor struct {
 	// reset rather than storming.
 	diskTxMapResetRequested atomic.Bool
 
-	// lastResetStorageFailed is true when the most recent reset hit a disk tx
-	// map storage error itself (see reset). Read by LastResetStorageFailed.
+	// lastResetStorageFailed and lastResetRotated record the storage outcome
+	// of the reset running now, for runReset to return with it (see reset).
 	lastResetStorageFailed atomic.Bool
+	lastResetRotated       atomic.Bool
 
 	// txMapPool is a reusable transactionMap built in CreateTransactionMap.
 	// Allocated lazily on the first call (sized for that block) and Clear()ed
@@ -1019,14 +1029,10 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					stp.setCurrentRunningState(StateRunning)
 
 				case resetBlocksMsg := <-stp.resetCh:
-					resetErr := stp.runHandlerWithRecover("reset", func() error {
-						stp.setCurrentRunningState(StateResetBlocks)
-						return stp.reset(resetBlocksMsg.blockHeader, resetBlocksMsg.moveBackBlocks, resetBlocksMsg.moveForwardBlocks,
-							resetBlocksMsg.useFastForwardReset, resetBlocksMsg.postProcess)
-					})
+					resp := stp.runReset(resetBlocksMsg)
 
 					if resetBlocksMsg.responseCh != nil {
-						resetBlocksMsg.responseCh <- ResetResponse{Err: resetErr}
+						resetBlocksMsg.responseCh <- resp
 					}
 
 					stp.setCurrentRunningState(StateRunning)
@@ -1460,6 +1466,24 @@ func (stp *SubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlock
 	}
 }
 
+// runReset runs one reset request and returns its response, carrying the
+// storage outcome of that reset (never of an earlier one).
+func (stp *SubtreeProcessor) runReset(msg *resetBlocks) ResetResponse {
+	stp.lastResetStorageFailed.Store(false)
+	stp.lastResetRotated.Store(false)
+
+	err := stp.runHandlerWithRecover("reset", func() error {
+		stp.setCurrentRunningState(StateResetBlocks)
+		return stp.reset(msg.blockHeader, msg.moveBackBlocks, msg.moveForwardBlocks, msg.useFastForwardReset, msg.postProcess)
+	})
+
+	return ResetResponse{
+		Err:           err,
+		Rotated:       stp.lastResetRotated.Load(),
+		StorageFailed: stp.lastResetStorageFailed.Load(),
+	}
+}
+
 func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlocks []*model.Block, moveForwardBlocks []*model.Block,
 	useFastForwardReset bool, postProcess func() error) (err error) {
 	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(context.Background(), "reset",
@@ -1480,19 +1504,22 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	// lastResetStorageFailed records whether this reset itself hit a disk tx
 	// map storage error, so BlockAssembler can tell whether a
 	// storage-triggered reset cured the map without consuming the reset
-	// request (only its heartbeat does that). The rotation below clears any
-	// earlier request, so a request still pending when reset returns was
-	// raised by this reset's own reload or its final report. Registered
-	// before the report so it runs after it.
+	// request (only its heartbeat does that). Only what happens after the
+	// rotation counts: the rotation clears any earlier error and request, so
+	// a map error joined into the failure, or a request still pending, when
+	// reset returns was this reset's own. Before the rotation both are left
+	// over from before the reset, and a request stays pending for the
+	// heartbeat.
 	stp.lastResetStorageFailed.Store(false)
+	stp.lastResetRotated.Store(false)
 
 	defer func() {
-		if stp.diskTxMapResetRequested.Load() {
+		joined := stp.reportOrJoinDiskTxMapErr("reset", &err)
+
+		if stp.lastResetRotated.Load() && (joined || stp.diskTxMapResetRequested.Load()) {
 			stp.lastResetStorageFailed.Store(true)
 		}
 	}()
-
-	defer stp.reportOrJoinDiskTxMapErr("reset", &err)
 
 	ctx := context.Background()
 
@@ -1592,6 +1619,7 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	}
 
 	stp.diskTxMapResetRequested.Store(false)
+	stp.lastResetRotated.Store(true)
 
 	stp.closeChainedSubtrees()
 
@@ -3121,20 +3149,23 @@ func (stp *SubtreeProcessor) joinDiskTxMapErrOnFailure(errPtr *error) {
 //     caller that treats an error as "not applied". Log and count it instead.
 //
 // where identifies the call site for the log line and the
-// prometheusSubtreeProcessorDiskTxMapErrors counter.
-func (stp *SubtreeProcessor) reportOrJoinDiskTxMapErr(where string, errPtr *error) {
+// prometheusSubtreeProcessorDiskTxMapErrors counter. joined reports that a map
+// error was folded into the failure.
+func (stp *SubtreeProcessor) reportOrJoinDiskTxMapErr(where string, errPtr *error) (joined bool) {
 	mapErr := stp.diskTxMapErr()
 	if mapErr == nil {
-		return
+		return false
 	}
 
 	if *errPtr != nil {
 		*errPtr = errors.Join(*errPtr, mapErr)
-		return
+		return true
 	}
 
 	stp.logDiskTxMapErr(where, mapErr)
 	stp.requestReset(where)
+
+	return false
 }
 
 // logDiskTxMapErr logs and counts a disk tx map error observed after its
@@ -3179,13 +3210,6 @@ func (stp *SubtreeProcessor) requestReset(where string) {
 // own reset (BlockAssembler.Reset), which reloads unmined transactions from
 // the UTXO store - the source of truth - curing any phantom the storage error
 // left behind.
-// LastResetStorageFailed reports whether the most recent reset hit a disk tx
-// map storage error itself: its rotation failed, or its reload raised a new
-// reset request. It does not consume that request.
-func (stp *SubtreeProcessor) LastResetStorageFailed() bool {
-	return stp.lastResetStorageFailed.Load()
-}
-
 func (stp *SubtreeProcessor) TakeResetRequested() bool {
 	return stp.diskTxMapResetRequested.CompareAndSwap(true, false)
 }

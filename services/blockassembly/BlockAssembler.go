@@ -185,6 +185,12 @@ type BlockAssembler struct {
 	// the main loop goroutine.
 	diskTxMapDegraded bool
 
+	// diskTxMapResetRetry is set when a storage-triggered reset failed before
+	// the tx map rotation, so the phantom it was for is still there; the next
+	// heartbeat retries it (onResetDone). Touched only by the main loop
+	// goroutine.
+	diskTxMapResetRetry bool
+
 	// reconcileCh signals the channel listener to reconcile BA's tip with the
 	// blockchain service's tip via processNewBlockAnnouncement. Buffered cap 1
 	// so multiple triggers coalesce into a single reconciliation pass.
@@ -518,7 +524,15 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 				// storage error itself, the node is degraded and requests are
 				// consumed without resetting again, so a persistent disk fault
 				// can't loop full reloads. A clean reset of any kind clears it.
-				if b.subtreeProcessor.TakeResetRequested() {
+				// A storage-triggered reset that failed before the tx map
+				// rotation left its phantom in place and is retried here too.
+				requested := b.subtreeProcessor.TakeResetRequested()
+				if b.diskTxMapResetRetry {
+					b.diskTxMapResetRetry = false
+					requested = true
+				}
+
+				if requested {
 					if b.diskTxMapDegraded {
 						b.logger.Debugf("[BlockAssembler] disk tx map degraded; not resetting for another post-commit storage error")
 					} else {
@@ -537,9 +551,7 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 					}
 				}
 
-				err := b.reset(ctx, resetReq.ValidateInputs)
-
-				b.onResetDone(resetReq.StorageTriggered, err)
+				resp, err := b.resetWithResponse(ctx, resetReq.ValidateInputs)
 
 				// The Reset path replays moveForward blocks through the same
 				// conflict resolution, so it can queue refusals too. Unlike the
@@ -547,13 +559,21 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 				// so nothing else would drain them until the next block arrives.
 				b.drainPendingInvalidations(ctx)
 
-				// empty out the reset channel
+				// empty out the reset channel. The reset that ran stands in for
+				// every drained request, so it counts as storage-triggered if
+				// any of them was.
+				storageTriggered := resetReq.StorageTriggered
+
 				for len(b.resetCh) > 0 {
 					bufferedCh := <-b.resetCh
+					storageTriggered = storageTriggered || bufferedCh.StorageTriggered
+
 					if bufferedCh.ErrCh != nil {
 						bufferedCh.ErrCh <- nil
 					}
 				}
+
+				b.onResetDone(storageTriggered, resp, err)
 
 				if resetReq.ErrCh != nil {
 					resetReq.ErrCh <- err
@@ -624,9 +644,19 @@ func (b *BlockAssembler) triggerReconcile() {
 // Returns:
 //   - error: Any error encountered during reset
 func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) error {
+	_, err := b.resetWithResponse(ctx, validateInputs...)
+	return err
+}
+
+// resetWithResponse is reset, also returning the subtree processor's reset
+// response for onResetDone: the zero value when reset failed before reaching
+// the subtree processor, so before the tx map rotation.
+func (b *BlockAssembler) resetWithResponse(ctx context.Context, validateInputs ...bool) (subtreeprocessor.ResetResponse, error) {
+	var resp subtreeprocessor.ResetResponse
+
 	bestBlockchainBlockHeader, meta, err := b.blockchainClient.GetBestBlockHeader(ctx)
 	if err != nil {
-		return errors.NewProcessingError("[Reset] error getting best block header", err)
+		return resp, errors.NewProcessingError("[Reset] error getting best block header", err)
 	}
 
 	// reset the block assembly
@@ -635,7 +665,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 
 	moveBackBlocksWithMeta, moveForwardBlocksWithMeta, err := b.getReorgBlocks(ctx, bestBlockchainBlockHeader, meta.Height)
 	if err != nil {
-		return errors.NewProcessingError("[Reset] error getting reorg blocks", err)
+		return resp, errors.NewProcessingError("[Reset] error getting reorg blocks", err)
 	}
 
 	// Fast-forward reset is safe when the whole forward range is at/below the
@@ -675,7 +705,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 
 	// make sure we have processed all pending blocks before resetting
 	if err = b.subtreeProcessor.WaitForPendingBlocks(ctx); err != nil {
-		return errors.NewProcessingError("[Reset] error waiting for pending blocks", err)
+		return resp, errors.NewProcessingError("[Reset] error waiting for pending blocks", err)
 	}
 
 	// Best-effort wait for BlockValidation to finish processing any invalid moveBack blocks.
@@ -692,7 +722,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 			b.logger.Infof("[BlockAssembler][Reset] waiting for invalid block %s to be processed by BlockValidation", blockHash.String())
 			if waitErr := b.waitForBlockMinedSet(ctx, blockHash); waitErr != nil {
 				if ctx.Err() != nil {
-					return errors.NewProcessingError("[Reset] context cancelled while waiting for invalid block mined_set", waitErr)
+					return resp, errors.NewProcessingError("[Reset] context cancelled while waiting for invalid block mined_set", waitErr)
 				}
 				b.logger.Warnf("[BlockAssembler][Reset] gave up waiting for invalid block %s mined_set: %v (proceeding anyway — txs may be recovered on next reset)", blockHash.String(), waitErr)
 			}
@@ -845,8 +875,9 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 	// does not depend on a lookup that can itself fail. See resetBlockHeights.
 	resetHeights := resetBlockHeights(bestBlockchainBlockHeader, currentHeight, moveBackBlocksWithMeta, moveForwardBlocksWithMeta)
 
-	if response := b.subtreeProcessor.Reset(baBestBlockHeader, moveBackBlocks, moveForwardBlocks, useFastForwardReset, postProcessFn); response.Err != nil {
-		b.logger.Errorf("[BlockAssembler][Reset] resetting error resetting subtree processor: %v", response.Err)
+	resp = b.subtreeProcessor.Reset(baBestBlockHeader, moveBackBlocks, moveForwardBlocks, useFastForwardReset, postProcessFn)
+	if resp.Err != nil {
+		b.logger.Errorf("[BlockAssembler][Reset] resetting error resetting subtree processor: %v", resp.Err)
 		// something went wrong, we need to set the best block header in the block assembly to be the
 		// same as the subtree processor's best block header
 		stpHeader := b.subtreeProcessor.GetCurrentBlockHeader()
@@ -854,7 +885,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 			// Nothing to realign to at all. Restore the pre-reset tip for the
 			// same reason as the unresolvable-height branch below.
 			b.setBestBlockHeader(baBestBlockHeader, baHeight)
-			return errors.NewProcessingError("[Reset] subtree processor has no current block header after a failed reset", response.Err)
+			return resp, errors.NewProcessingError("[Reset] subtree processor has no current block header after a failed reset", resp.Err)
 		}
 
 		// Resolve the height locally first. Every entry in resetHeights came from
@@ -886,7 +917,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 				// with nothing left to trigger a retry. Being behind is
 				// recoverable; being wrongly level is not.
 				b.setBestBlockHeader(baBestBlockHeader, baHeight)
-				return errors.NewProcessingError("[Reset] error getting best block header meta", err)
+				return resp, errors.NewProcessingError("[Reset] error getting best block header meta", err)
 			}
 
 			stpHeight = stpHeaderMeta.Height
@@ -906,13 +937,13 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 		// return value and the Errorf above agree with each other. The two
 		// branches above already return without persisting state for the same
 		// reason.
-		return errors.NewProcessingError("[Reset] subtree processor reset failed; block assembly realigned to %s at height %d", stpHeader.Hash().String(), currentHeight, response.Err)
+		return resp, errors.NewProcessingError("[Reset] subtree processor reset failed; block assembly realigned to %s at height %d", stpHeader.Hash().String(), currentHeight, resp.Err)
 	}
 
 	b.setBestBlockHeader(bestBlockchainBlockHeader, currentHeight)
 
 	if err = b.SetState(ctx); err != nil {
-		return errors.NewProcessingError("[Reset] error setting state", err)
+		return resp, errors.NewProcessingError("[Reset] error setting state", err)
 	}
 
 	_, height := b.CurrentBlock()
@@ -920,7 +951,7 @@ func (b *BlockAssembler) reset(ctx context.Context, validateInputs ...bool) erro
 
 	b.logger.Warnf("[BlockAssembler][Reset] resetting block assembler DONE")
 
-	return nil
+	return resp, nil
 }
 
 // resetBlockHeights maps the hash of every block a reset can leave the subtree
@@ -1841,32 +1872,44 @@ func (b *BlockAssembler) resetStorageTriggered() {
 	}()
 }
 
-// onResetDone updates the disk tx map degraded state once a reset has run,
-// from how it ended (every reset completion path calls it): a reset that
-// completed without a storage error clears degraded; a storage-triggered
-// reset that hit a storage error itself (SubtreeProcessor.
-// LastResetStorageFailed) sets it. Anything else - a reset failing for a
-// non-storage reason, or a manual/reorg reset whose reload left a phantom
-// (that raises its own request, which the heartbeat acts on) - leaves it as
-// it is.
-func (b *BlockAssembler) onResetDone(storageTriggered bool, resetErr error) {
-	storageFailed := b.subtreeProcessor.LastResetStorageFailed()
+// resetAndRecord runs a reset that is not storage-triggered (the reorg
+// fallbacks) and records its outcome like the resetCh handler does.
+func (b *BlockAssembler) resetAndRecord(ctx context.Context, validateInputs bool) error {
+	resp, err := b.resetWithResponse(ctx, validateInputs)
+	b.onResetDone(false, resp, err)
 
+	return err
+}
+
+// onResetDone updates the disk tx map degraded state once a reset has run,
+// from how that reset ended (every reset completion path calls it):
+//   - completed without a storage error: clears degraded;
+//   - storage-triggered and hit a storage error itself (resp.StorageFailed):
+//     sets degraded;
+//   - storage-triggered and failed before the tx map rotation: the phantom it
+//     was for is still there, so the next heartbeat retries it;
+//   - anything else (a non-storage failure after the rotation, which
+//     discarded the phantom, or a manual/reorg reset whose reload left one,
+//     which raises its own request): unchanged.
+func (b *BlockAssembler) onResetDone(storageTriggered bool, resp subtreeprocessor.ResetResponse, resetErr error) {
 	switch {
-	case resetErr == nil && !storageFailed:
+	case resetErr == nil && !resp.StorageFailed:
 		if b.diskTxMapDegraded {
 			b.logger.Infof("[BlockAssembler] reset completed without a disk tx map storage error; no longer degraded")
 		}
 
 		b.diskTxMapDegraded = false
 		prometheusBlockAssemblyDiskTxMapDegraded.Set(0)
-	case storageTriggered && storageFailed:
+	case storageTriggered && resp.StorageFailed:
 		if !b.diskTxMapDegraded {
 			b.logger.Errorf("[BlockAssembler] reset for a disk tx map storage error hit a storage error again (reset error: %v); degraded, not resetting again until a reset completes clean", resetErr)
 		}
 
 		b.diskTxMapDegraded = true
 		prometheusBlockAssemblyDiskTxMapDegraded.Set(1)
+	case storageTriggered && resetErr != nil && !resp.Rotated:
+		b.logger.Warnf("[BlockAssembler] reset for a disk tx map storage error failed before the tx map rotation; retrying on the next heartbeat: %v", resetErr)
+		b.diskTxMapResetRetry = true
 	}
 }
 
@@ -2142,8 +2185,7 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 		// make sure we wait for the reset to complete
 		// validateInputs=true: getConflictingNodes() may miss conflicts not stored in subtree
 		// files; validateUnminedTxInputs() independently catches them via SpendingData.
-		err = b.reset(ctx, true)
-		b.onResetDone(false, err)
+		err = b.resetAndRecord(ctx, true)
 
 		if err != nil {
 			b.logger.Errorf("[BlockAssembler] error resetting after large reorg: %v", err)
@@ -2191,8 +2233,7 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 		// already detected by reorgBlocks; re-running validateInputs here is redundant
 		// and currently broken (fields.Inputs alone does not populate data.Tx in the
 		// SQL store, so validateUnminedTxInputs always returns false).
-		err = b.reset(ctx, reorgFailed)
-		b.onResetDone(false, err)
+		err = b.resetAndRecord(ctx, reorgFailed)
 
 		if err != nil {
 			return errors.NewProcessingError("error resetting block assembly after reorg with invalid block", err)
