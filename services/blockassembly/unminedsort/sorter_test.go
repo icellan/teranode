@@ -562,3 +562,141 @@ func TestSorter_CorruptInpoints(t *testing.T) {
 	err = s.Drain(context.Background(), 10, func([]*utxo.UnminedTransaction) error { return nil })
 	require.Error(t, err)
 }
+
+// A run that ends cleanly at a record boundary but holds fewer records than
+// were written to it (cut to nothing, or to its header) must fail the drain:
+// a silently dropped parent leaves an orphan child in the template.
+func TestSorter_RunCutAtRecordBoundary(t *testing.T) {
+	for _, withInpoints := range []bool{false, true} {
+		for _, keep := range []int64{0, runHeaderSize} {
+			t.Run(map[bool]string{false: "no inpoints", true: "inpoints"}[withInpoints]+map[int64]string{0: " empty", runHeaderSize: " header only"}[keep], func(t *testing.T) {
+				dir := t.TempDir()
+				in := makeInputs(3000, withInpoints)
+
+				s, err := New(Options{Dirs: []string{dir}, BufferRecords: 1000, WithInpoints: withInpoints})
+				require.NoError(t, err)
+
+				defer s.Close()
+
+				addAll(t, s, in, withInpoints)
+				require.NoError(t, s.waitSpill())
+				require.NotEmpty(t, s.runs)
+
+				require.NoError(t, os.Truncate(s.runs[0], keep))
+
+				err = s.Drain(context.Background(), 500, func([]*utxo.UnminedTransaction) error { return nil })
+				require.Error(t, err)
+			})
+		}
+	}
+}
+
+// A run's reader checks the record count in its header, so a run cut at a
+// record boundary is an error at the reader, not a clean end.
+func TestFileSource_ChecksHeaderCount(t *testing.T) {
+	dir := t.TempDir()
+
+	s, err := New(Options{Dirs: []string{dir}, BufferRecords: 1000})
+	require.NoError(t, err)
+
+	defer s.Close()
+
+	addAll(t, s, makeInputs(1000, false), false)
+	require.NoError(t, s.waitSpill())
+	require.Len(t, s.runs, 1)
+
+	require.NoError(t, os.Truncate(s.runs[0], runHeaderSize))
+
+	fs, err := openFileSource(s.runs[0], false)
+	require.NoError(t, err)
+
+	defer fs.close()
+
+	ok, err := fs.next()
+	require.False(t, ok)
+	require.ErrorContains(t, err, "ended after 0 of 1000 records")
+}
+
+// Drain checks it emitted every added transaction, whatever lost one.
+func TestSorter_DrainFailsWhenCountDiffers(t *testing.T) {
+	s, err := New(Options{BufferRecords: 1 << 20})
+	require.NoError(t, err)
+
+	defer s.Close()
+
+	addAll(t, s, makeInputs(10, false), false)
+	s.spilledCount++ // one transaction that no source holds
+
+	err = s.Drain(context.Background(), 10, func([]*utxo.UnminedTransaction) error { return nil })
+	require.Error(t, err)
+}
+
+// A failed spill poisons the sorter: its run is incomplete, so every later Add
+// and Drain fails, even once the directory is writable again.
+func TestSorter_SpillErrorIsSticky(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+
+	dir := t.TempDir()
+
+	s, err := New(Options{Dirs: []string{dir}, BufferRecords: 100})
+	require.NoError(t, err)
+
+	defer s.Close()
+
+	for _, d := range s.dirs {
+		require.NoError(t, os.Chmod(d, 0o500))
+	}
+
+	in := makeInputs(1000, false)
+
+	var addErr error
+
+	next := 0
+	for ; next < len(in) && addErr == nil; next++ {
+		addErr = s.Add(in[next].createdAt, in[next].node, nil)
+	}
+
+	require.Error(t, addErr, "the second spill surfaces the first one's failure")
+
+	for _, d := range s.dirs {
+		require.NoError(t, os.Chmod(d, 0o755))
+	}
+
+	require.Error(t, s.Add(in[next].createdAt, in[next].node, nil), "an Add after a failed spill fails too")
+	require.Error(t, s.Drain(context.Background(), 100, func([]*utxo.UnminedTransaction) error { return nil }))
+}
+
+// Inpoints are buffered too, so a buffer also spills once its bytes reach what
+// BufferRecords records alone would take; otherwise consolidation-heavy input
+// grows it far past the documented size. The output is still complete and in
+// order.
+func TestSorter_SpillsOnBytesWithLargeInpoints(t *testing.T) {
+	dir := t.TempDir()
+	in := makeInputs(200, false)
+
+	parents := make([]chainhash.Hash, 50)
+	idxs := make([]uint32, 0, 2*len(parents))
+
+	for i := range parents {
+		parents[i] = hashOf(10_000 + i)
+		idxs = append(idxs, 1, uint32(i)) //nolint:gosec // test data
+	}
+
+	for i := range in {
+		in[i].inpoints = subtreepkg.NewTxInpointsFromPacked(parents, idxs)
+	}
+
+	s, err := New(Options{Dirs: []string{dir}, BufferRecords: 1000, WithInpoints: true})
+	require.NoError(t, err)
+
+	defer s.Close()
+
+	addAll(t, s, in, true)
+	require.NoError(t, s.waitSpill())
+	require.NotEmpty(t, s.runs, "200 records are under BufferRecords, but their inpoints exceed the byte budget")
+
+	out, _ := drainAll(t, s, 50)
+	requireOrder(t, in, out, true)
+}

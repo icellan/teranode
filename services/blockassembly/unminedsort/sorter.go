@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unsafe"
 
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -35,7 +36,15 @@ const (
 	// minChunk is the smallest slice of the buffer worth sorting on its own
 	// goroutine.
 	minChunk = 64 * 1024
+
+	// runHeaderSize is the fixed header of a run file: its record count, as a
+	// little-endian uint64. Reading a run checks it, so a run cut short at a
+	// record boundary fails instead of ending early.
+	runHeaderSize = 8
 )
+
+// recordSize is the buffered size of one record, before its inpoints.
+var recordSize = int(unsafe.Sizeof(record{}))
 
 // Options configures a Sorter.
 type Options struct {
@@ -82,6 +91,11 @@ func (b *batchBuf) reset(withInpoints bool) {
 	}
 }
 
+// bytes is the memory the buffered records and their inpoints take.
+func (b *batchBuf) bytes() int {
+	return len(b.recs)*recordSize + len(b.arena) + len(b.offs)*8
+}
+
 func (b *batchBuf) inpoints(seq uint32) []byte {
 	return b.arena[b.offs[seq]:b.offs[seq+1]]
 }
@@ -91,18 +105,25 @@ func (b *batchBuf) inpoints(seq uint32) []byte {
 // concurrent use.
 //
 // A full buffer is sorted and written in the background while Add fills a
-// second buffer, so the sorter holds up to two buffers of BufferRecords.
+// second buffer, so the sorter holds up to two buffers. A buffer is full at
+// BufferRecords records or, with inpoints, once its records and inpoints take
+// what BufferRecords records alone would (bufferBytes).
 type Sorter struct {
-	opts Options
-	dirs []string
+	opts        Options
+	dirs        []string
+	bufferBytes int
 
 	cur   *batchBuf
 	spare *batchBuf
 
 	// spillDone is closed when the in-flight spill finishes; spillErr and the
-	// returned spare buffer are only read after receiving from it.
+	// returned spare buffer are only read after receiving from it. failed
+	// keeps the first spill error: that run is incomplete, so every later
+	// spill (the unspilled buffer stays full, so every Add attempts one) and
+	// Drain fails with it.
 	spillDone chan struct{}
 	spillErr  error
+	failed    error
 
 	runs         []string
 	spilledCount int
@@ -120,7 +141,7 @@ func New(opts Options) (*Sorter, error) {
 		opts.SortWorkers = runtime.GOMAXPROCS(0)
 	}
 
-	s := &Sorter{opts: opts, cur: &batchBuf{}}
+	s := &Sorter{opts: opts, cur: &batchBuf{}, bufferBytes: opts.BufferRecords * recordSize}
 
 	bases, err := uniqueDirs(opts.Dirs)
 	if err != nil {
@@ -244,7 +265,7 @@ func (s *Sorter) Add(createdAt int64, node subtreepkg.Node, inpoints *subtreepkg
 		b.offs = append(b.offs, uint64(len(b.arena)))
 	}
 
-	if len(s.dirs) > 0 && len(b.recs) >= s.opts.BufferRecords {
+	if len(s.dirs) > 0 && (len(b.recs) >= s.opts.BufferRecords || b.bytes() >= s.bufferBytes) {
 		return s.startSpill()
 	}
 
@@ -284,16 +305,19 @@ func (s *Sorter) startSpill() error {
 	return nil
 }
 
-// waitSpill waits for the in-flight spill, if any, and returns its error.
+// waitSpill waits for the in-flight spill, if any, and returns the first spill
+// error the sorter has seen.
 func (s *Sorter) waitSpill() error {
-	if s.spillDone == nil {
-		return nil
+	if s.spillDone != nil {
+		<-s.spillDone
+		s.spillDone = nil
+
+		if s.spillErr != nil && s.failed == nil {
+			s.failed = s.spillErr
+		}
 	}
 
-	<-s.spillDone
-	s.spillDone = nil
-
-	return s.spillErr
+	return s.failed
 }
 
 // sortedChunks sorts the buffer in parallel as contiguous chunks and returns
@@ -356,6 +380,11 @@ func (s *Sorter) writeRun(b *batchBuf, path string) error {
 		prev    int64
 		scratch []byte
 	)
+
+	if _, err = w.Write(binary.LittleEndian.AppendUint64(nil, uint64(len(b.recs)))); err != nil {
+		_ = f.Close()
+		return errors.NewStorageError("unminedsort: writing run %s", path, err)
+	}
 
 	for {
 		cur, ok := m.pop()
@@ -473,6 +502,10 @@ type fileSource struct {
 	prev  int64
 	inp   []byte
 	withI bool
+
+	// want is the record count from the run's header; read counts the
+	// records read so far.
+	want, read uint64
 }
 
 func openFileSource(path string, withInpoints bool) (*fileSource, error) {
@@ -481,13 +514,31 @@ func openFileSource(path string, withInpoints bool) (*fileSource, error) {
 		return nil, errors.NewStorageError("unminedsort: opening run %s", path, err)
 	}
 
-	return &fileSource{f: f, r: bufio.NewReaderSize(f, ioBufferSize), withI: withInpoints}, nil
+	fs := &fileSource{f: f, r: bufio.NewReaderSize(f, ioBufferSize), withI: withInpoints}
+
+	var header [runHeaderSize]byte
+	if _, err = io.ReadFull(fs.r, header[:]); err != nil {
+		_ = f.Close()
+		return nil, fs.readErr(err)
+	}
+
+	fs.want = binary.LittleEndian.Uint64(header[:])
+
+	return fs, nil
 }
 
 func (fs *fileSource) next() (bool, error) {
 	delta, err := binary.ReadVarint(fs.r)
 	if err == io.EOF {
+		if fs.read != fs.want {
+			return false, errors.NewStorageError("unminedsort: run %s ended after %d of %d records", fs.f.Name(), fs.read, fs.want)
+		}
+
 		return false, nil
+	}
+
+	if err == nil && fs.read == fs.want {
+		return false, errors.NewStorageError("unminedsort: run %s holds more than its %d records", fs.f.Name(), fs.want)
 	}
 
 	if err != nil {
@@ -526,6 +577,8 @@ func (fs *fileSource) next() (bool, error) {
 			fs.cur.inpoints = fs.inp
 		}
 	}
+
+	fs.read++
 
 	return true, nil
 }
@@ -666,6 +719,7 @@ func (s *Sorter) Drain(ctx context.Context, batchSize int, fn func(batch []*utxo
 
 	pairs := make([]txPair, 0, batchSize)
 	ptrs := make([]*utxo.UnminedTransaction, 0, batchSize)
+	emitted := 0
 
 	flush := func() error {
 		if err := ctx.Err(); err != nil {
@@ -706,6 +760,8 @@ func (s *Sorter) Drain(ctx context.Context, batchSize int, fn func(batch []*utxo
 			}
 		}
 
+		emitted++
+
 		pairs = append(pairs, txPair{
 			tx: utxo.UnminedTransaction{
 				TxInpoints: inpoints,
@@ -724,6 +780,12 @@ func (s *Sorter) Drain(ctx context.Context, batchSize int, fn func(batch []*utxo
 		} else {
 			heap.Pop(rm)
 		}
+	}
+
+	// Every source ended cleanly; check nothing went missing between Add and
+	// here before the last batch goes out.
+	if emitted != s.Len() {
+		return errors.NewProcessingError("unminedsort: drained %d of %d transactions", emitted, s.Len())
 	}
 
 	if len(pairs) > 0 {
