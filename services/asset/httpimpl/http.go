@@ -287,7 +287,7 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 		// A catching-up peer fans out many concurrent, typically tier-unverified,
 		// requests at once, so the catchup-route burst floors at the larger of its
 		// two catchup fan-outs (see catchupFanOut).
-		heavyBurst, _ := resolveHeavyBurst(logger, tSettings.Asset.HTTPHeavyRateBurst, catchupFanOut(tSettings), tSettings.SubtreeValidation.GetMissingTransactions, tSettings.Asset.HTTPHeavyRateLimit)
+		heavyBurst, _ := catchupHeavyBurst(logger, tSettings)
 
 		// heavy_catchup is a distinct metric label from heavy so the two
 		// independent buckets are distinguishable on teranode_asset_http_rate_limited_total.

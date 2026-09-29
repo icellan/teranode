@@ -423,3 +423,32 @@ func TestCatchupFanOut(t *testing.T) {
 		})
 	}
 }
+
+// TestCatchupHeavyBurst pins the wiring New uses: the fan-out floor comes from
+// both catchup settings and only the missing-transactions fan-out decides WARN.
+// Passing catchupFanOut as the warn floor would WARN on every stock node.
+func TestCatchupHeavyBurst(t *testing.T) {
+	stock := func() *settings.Settings {
+		s := &settings.Settings{}
+		s.Asset.HTTPHeavyRateLimit = 10
+		s.SubtreeValidation.GetMissingTransactions = 32
+		s.BlockValidation.SubtreeFetchConcurrency = 32
+
+		return s
+	}
+
+	t.Run("stock defaults clamp 64 to 40 without warning", func(t *testing.T) {
+		burst, warned := catchupHeavyBurst(ulogger.NewVerboseTestLogger(t), stock())
+		require.Equal(t, 40, burst)
+		require.False(t, warned)
+	})
+
+	t.Run("a missing-transactions fan-out above the clamp warns", func(t *testing.T) {
+		s := stock()
+		s.SubtreeValidation.GetMissingTransactions = 48
+
+		burst, warned := catchupHeavyBurst(ulogger.NewVerboseTestLogger(t), s)
+		require.Equal(t, 40, burst)
+		require.True(t, warned)
+	})
+}
