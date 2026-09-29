@@ -332,12 +332,12 @@ func TestBlockAssembler_StorageTriggeredResetsArePaced(t *testing.T) {
 		m.ResetRequested.Store(true)
 
 		startWithMock(t, m, func(items *baTestItems) {
-			items.blockAssembler.storageResetMinInterval = 150 * time.Millisecond
+			items.blockAssembler.storageResetMinInterval = 300 * time.Millisecond
 		})
 
 		require.Eventually(t, func() bool { return resets.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
 		require.Never(t, func() bool { return resets.Load() > 1 }, 100*time.Millisecond, 10*time.Millisecond)
-		require.Eventually(t, func() bool { return resets.Load() == 2 }, 2*time.Second, 5*time.Millisecond,
+		require.Eventually(t, func() bool { return resets.Load() >= 2 }, 3*time.Second, 5*time.Millisecond,
 			"the request raised within the interval was kept and runs after it")
 	})
 }

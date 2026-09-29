@@ -1629,7 +1629,7 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	// AddNodesDirectlyReportOnly/FlushDiskTxMapForLoad(isReload=true) each
 	// request a reset for that independently, and are deliberately left
 	// untouched by this drain.
-	if staleErr := stp.diskTxMapErr(); staleErr != nil {
+	if staleErr := stp.takeDiskTxMapErrs(); staleErr != nil {
 		stp.logDiskTxMapErr("reset_rotation_stale", staleErr)
 	}
 
@@ -3107,8 +3107,8 @@ func (stp *SubtreeProcessor) flushDiskTxMapWriters() {
 // can't tell whether the error came from the draining operation's own writes
 // (which its rollback undoes) or from an earlier write that never reached
 // disk, whose phantom survives any rollback and would fail every retry; only
-// a reset cures that. reset's post-rotation stale drain is the one exception
-// and clears the request itself.
+// a reset cures that. reset's post-rotation stale drain is the one exception:
+// it uses takeDiskTxMapErrs.
 //
 // Also checks diskTxMapAnchor: during a multi-block reorg (disableCurrentTxMapPool),
 // resetSubtreeState pins the map reorgBlocks captured for rollback there
@@ -3120,6 +3120,16 @@ func (stp *SubtreeProcessor) flushDiskTxMapWriters() {
 // the very end - well past the point where failing (and rolling back) would
 // still have been correct.
 func (stp *SubtreeProcessor) diskTxMapErr() error {
+	err := stp.takeDiskTxMapErrs()
+	if err != nil {
+		stp.requestReset("disk_tx_map_err")
+	}
+
+	return err
+}
+
+// takeDiskTxMapErrs is diskTxMapErr without the reset request.
+func (stp *SubtreeProcessor) takeDiskTxMapErrs() error {
 	var errs []error
 
 	if stp.diskTxMap != nil {
@@ -3143,8 +3153,6 @@ func (stp *SubtreeProcessor) diskTxMapErr() error {
 	if len(errs) == 0 {
 		return nil
 	}
-
-	stp.requestReset("disk_tx_map_err")
 
 	return errors.Join(errs...)
 }
@@ -3226,7 +3234,7 @@ func (stp *SubtreeProcessor) drainAndLogDiskTxMapErr(where string) {
 // queues at most one reset instead of storming BlockAssembler.Reset.
 func (stp *SubtreeProcessor) requestReset(where string) {
 	if stp.diskTxMapResetRequested.CompareAndSwap(false, true) {
-		stp.logger.Warnf("[SubtreeProcessor][%s] post-commit disk tx map storage error may have left phantom entries; requesting a block assembly reset", where)
+		stp.logger.Warnf("[SubtreeProcessor][%s] disk tx map storage error may have left phantom entries; requesting a block assembly reset", where)
 	}
 }
 

@@ -197,7 +197,8 @@ type BlockAssembler struct {
 	// storage-triggered reset and the start of the next (zero means
 	// defaultStorageResetMinInterval), so a fault that each reset cures but
 	// that comes back straight after can't run a full unmined reload every
-	// heartbeat. lastStorageResetDone is when the last one finished. Touched
+	// heartbeat. lastStorageResetDone is when the last one was queued, then
+	// again when it finished. Touched
 	// only by the main loop goroutine.
 	storageResetMinInterval time.Duration
 	lastStorageResetDone    time.Time
@@ -552,7 +553,11 @@ func (b *BlockAssembler) startChannelListeners(ctx context.Context) (err error) 
 					case time.Since(b.lastStorageResetDone) < b.storageResetInterval():
 						b.diskTxMapResetPending = true
 					default:
-						b.logger.Warnf("[BlockAssembler] disk tx map reported a post-commit storage error; resetting block assembly")
+						b.logger.Warnf("[BlockAssembler] disk tx map reported a storage error; resetting block assembly")
+
+						// Stamped when queued too, so a tick before the reset
+						// is picked up can't queue a second one.
+						b.lastStorageResetDone = time.Now()
 						b.resetStorageTriggered()
 					}
 				}
@@ -1946,7 +1951,7 @@ func (b *BlockAssembler) onResetDone(storageTriggered bool, resp subtreeprocesso
 		b.diskTxMapDegraded = true
 		prometheusBlockAssemblyDiskTxMapDegraded.Set(1)
 	case storageTriggered && resetErr != nil && !resp.Rotated:
-		b.logger.Warnf("[BlockAssembler] reset for a disk tx map storage error failed before the tx map rotation; retrying on the next heartbeat: %v", resetErr)
+		b.logger.Warnf("[BlockAssembler] reset for a disk tx map storage error failed before the tx map rotation; retrying once storageResetMinInterval allows: %v", resetErr)
 		b.diskTxMapResetPending = true
 	}
 }
