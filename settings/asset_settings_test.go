@@ -207,15 +207,18 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 }
 
 // TestAssetSettings_ConcurrencyGetLegacyBlockReaderPeer covers the peer-pool
-// counterpart to asset_concurrency_get_legacy_block_reader: same default (-1 =
-// NumCPU) and independently settable, so the anonymous and internal legacy-peer
-// pools can be sized separately.
+// counterpart to asset_concurrency_get_legacy_block_reader: same default and
+// independently settable, so the anonymous and internal legacy-peer pools can be
+// sized separately. Both default to 0 (unlimited): the permit is held for the
+// whole stream, so a NumCPU default would make a stock node serving IBD to more
+// SV peers than it has cores fail block requests, which the pre-hardening code
+// never did. The cap is opt-in.
 func TestAssetSettings_ConcurrencyGetLegacyBlockReaderPeer(t *testing.T) {
-	t.Run("defaults to -1 (NumCPU), same as the anonymous pool", func(t *testing.T) {
+	t.Run("defaults to 0 (unlimited, opt-in cap) for both pools", func(t *testing.T) {
 		s := NewSettings()
 
-		require.Equal(t, -1, s.Asset.ConcurrencyGetLegacyBlockReader)
-		require.Equal(t, -1, s.Asset.ConcurrencyGetLegacyBlockReaderPeer)
+		require.Equal(t, 0, s.Asset.ConcurrencyGetLegacyBlockReader)
+		require.Equal(t, 0, s.Asset.ConcurrencyGetLegacyBlockReaderPeer)
 	})
 
 	t.Run("is settable independently of the anonymous pool", func(t *testing.T) {
@@ -225,7 +228,7 @@ func TestAssetSettings_ConcurrencyGetLegacyBlockReaderPeer(t *testing.T) {
 		s := NewSettings()
 
 		require.Equal(t, 8, s.Asset.ConcurrencyGetLegacyBlockReaderPeer)
-		require.Equal(t, -1, s.Asset.ConcurrencyGetLegacyBlockReader)
+		require.Equal(t, 0, s.Asset.ConcurrencyGetLegacyBlockReader)
 	})
 }
 

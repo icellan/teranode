@@ -30,7 +30,7 @@
 | ConcurrencyGetSubtreeExists | int | 0 | asset_concurrency_get_subtree_exists | Rate limit for GetSubtreeExists |
 | ConcurrencyGetSubtreeHead | int | 0 | asset_concurrency_get_subtree_head | Rate limit for GetSubtreeHead |
 | ConcurrencyGetUtxo | int | 0 | asset_concurrency_get_utxo | Rate limit for GetUtxo |
-| ConcurrencyGetLegacyBlockReader | int | -1 | asset_concurrency_get_legacy_block_reader | Rate limit for GetLegacyBlockReader (default: NumCPU) |
+| ConcurrencyGetLegacyBlockReader | int | 0 | asset_concurrency_get_legacy_block_reader | Concurrent legacy block streams for anonymous callers (default: unlimited; the cap is opt-in because the permit is held for the whole stream) |
 | SubtreeDataStreamingChunkSize | int | 10000 | asset_subtreeDataStreamingChunkSize | Records per subtree data streaming chunk |
 | SubtreeDataStreamingConcurrency | int | 2 | asset_subtreeDataStreamingConcurrency | Parallel workers for subtree data streaming |
 

@@ -235,8 +235,8 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ConcurrencyGetSubtreeExists:         getInt("asset_concurrency_get_subtree_exists", 0, alternativeContext...),
 			ConcurrencyGetSubtreeHead:           getInt("asset_concurrency_get_subtree_head", 0, alternativeContext...),
 			ConcurrencyGetUtxo:                  getInt("asset_concurrency_get_utxo", 0, alternativeContext...),
-			ConcurrencyGetLegacyBlockReader:     getInt("asset_concurrency_get_legacy_block_reader", -1, alternativeContext...),      // -1 = NumCPU()
-			ConcurrencyGetLegacyBlockReaderPeer: getInt("asset_concurrency_get_legacy_block_reader_peer", -1, alternativeContext...), // -1 = NumCPU()
+			ConcurrencyGetLegacyBlockReader:     getInt("asset_concurrency_get_legacy_block_reader", 0, alternativeContext...),      // 0 = unlimited (opt-in cap)
+			ConcurrencyGetLegacyBlockReaderPeer: getInt("asset_concurrency_get_legacy_block_reader_peer", 0, alternativeContext...), // 0 = unlimited (opt-in cap)
 
 			// Streaming configuration
 			LegacyPeerPoolToken:             getString("asset_legacyPeerPoolToken", "", alternativeContext...),
