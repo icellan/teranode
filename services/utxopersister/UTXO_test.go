@@ -137,3 +137,42 @@ func TestNewUTXOWrapperFromBytes_ScriptIsExactlySized(t *testing.T) {
 	require.Equal(t, script, out.UTXOs[0].Script)
 	require.Equal(t, len(script), cap(out.UTXOs[0].Script))
 }
+
+// A script cut short inside the exact-size read must fail, not be returned
+// zero-padded: the record's claimed length is trusted up to the bound only
+// for the allocation, never for the content.
+func TestNewUTXOWrapperFromBytes_TruncatedSmallScriptFails(t *testing.T) {
+	in := &UTXOWrapper{
+		TxID:   chainhash.HashH([]byte("truncated-script")),
+		Height: 7,
+		UTXOs:  []*UTXO{{Index: 0, Value: 42, Script: make([]byte, 25)}},
+	}
+
+	b := in.Bytes()
+
+	_, err := NewUTXOWrapperFromBytes(b[:len(b)-10]) // drop the last 10 script bytes
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to read utxo script (25 bytes)")
+}
+
+// Scripts on either side of maxExactScriptAlloc take different read paths and
+// must decode to the same bytes.
+func TestNewUTXOWrapperFromBytes_ScriptAtExactAllocBoundary(t *testing.T) {
+	for _, size := range []int{maxExactScriptAlloc, maxExactScriptAlloc + 1} {
+		script := make([]byte, size)
+		for i := range script {
+			script[i] = byte(i)
+		}
+
+		in := &UTXOWrapper{
+			TxID:   chainhash.HashH([]byte("boundary-script")),
+			Height: 7,
+			UTXOs:  []*UTXO{{Index: 0, Value: 42, Script: script}},
+		}
+
+		out, err := NewUTXOWrapperFromBytes(in.Bytes())
+		require.NoError(t, err, "size %d", size)
+		require.Len(t, out.UTXOs, 1)
+		require.Equal(t, script, out.UTXOs[0].Script, "size %d", size)
+	}
+}
