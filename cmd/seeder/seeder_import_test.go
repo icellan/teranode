@@ -188,6 +188,43 @@ func TestImportUTXOSet_MultiRecordTxsDoNotStallSingleRecordTxs(t *testing.T) {
 	require.NoError(t, importUTXOSet(ctx, ulogger.TestLogger{}, store, path, testImportOptions()))
 }
 
+// blockSingleFailMultiStore blocks every single-record create until its
+// context is cancelled, and fails every multi-record create.
+type blockSingleFailMultiStore struct {
+	utxo.Store
+}
+
+func (blockSingleFailMultiStore) SpendAndCreate(ctx context.Context, tx *bt.Tx, _ uint32, _ ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
+	if len(tx.Outputs) > 128 {
+		return nil, nil, errors.NewStorageError("simulated multi-record failure")
+	}
+
+	<-ctx.Done()
+
+	return nil, nil, ctx.Err()
+}
+
+// The passes share one errgroup so a failure in either stops the other. Here
+// the single-record pass can only finish by being cancelled; if the multi-record
+// failure did not reach it, the import would hang.
+func TestImportUTXOSet_FailureInOnePassStopsTheOther(t *testing.T) {
+	path := writeCompleteSnapshotFile(t, benchWrappers("cross", 5_000, 50))
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- importUTXOSet(context.Background(), ulogger.TestLogger{}, blockSingleFailMultiStore{}, path, testImportOptions())
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "simulated multi-record failure")
+	case <-time.After(10 * time.Second):
+		t.Fatal("a failing multi-record pass did not stop the single-record pass")
+	}
+}
+
 // failingMultiRecordStore fails every multi-record create.
 type failingMultiRecordStore struct {
 	utxo.Store

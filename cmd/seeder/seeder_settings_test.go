@@ -84,3 +84,20 @@ func TestSeedingExternalStoreURL(t *testing.T) {
 		require.Error(t, err)
 	})
 }
+
+// resumeUnsafeAfterHostCrash drives the startup warning: only a file:// external
+// store whose effective fsyncMode is none can keep partial blobs across a host
+// crash that a re-run would then accept.
+func TestResumeUnsafeAfterHostCrash(t *testing.T) {
+	for in, want := range map[string]bool{
+		"aerospike://h/test?externalStore=file%3A%2F%2F%2Fd%3FfsyncMode%3Dnone": true,
+		"aerospike://h/test?externalStore=file%3A%2F%2F%2Fd%3FfsyncMode%3Ddata": false,
+		"aerospike://h/test?externalStore=file:///d":                            false,
+		"aerospike://h/test?externalStore=s3://bucket/x":                        false,
+		"sqlitememory:///utxo": false,
+	} {
+		u, err := url.Parse(in)
+		require.NoError(t, err)
+		require.Equal(t, want, resumeUnsafeAfterHostCrash(u), in)
+	}
+}

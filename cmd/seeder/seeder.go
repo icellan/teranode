@@ -470,6 +470,10 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 
 	appSettings.UtxoStore.UtxoStore = storeURL
 
+	if resumeUnsafeAfterHostCrash(storeURL) {
+		logger.Warnf("External store fsyncMode is none: if the host crashes during this seed, wipe the UTXO store and re-seed; a plain re-run can keep partially written blobs")
+	}
+
 	externalStoreConcurrency, _ := gocore.Config().GetInt("seeder_externalStoreConcurrency", 256)
 	appSettings.UtxoStore.ExternalStoreConcurrency = externalStoreConcurrency
 
@@ -480,6 +484,15 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 	utxoStore, err = utxofactory.NewStore(ctx, logger, appSettings, "seeder", false)
 	if err != nil {
 		return nil, errors.NewStorageError("failed to create utxostore", err)
+	}
+
+	// Probe the final sync now (the store has created its directory), so an
+	// unsupported platform or an unusable path fails before hours of import
+	// rather than just before lastProcessed.dat.
+	if syncPath != "" {
+		if err = syncFilesystem(syncPath); err != nil {
+			return nil, errors.NewStorageError("cannot sync the external store filesystem at %s", syncPath, err)
+		}
 	}
 
 	// Recover the authoritative coinbase transactions from the V2 utxo-headers
@@ -689,6 +702,18 @@ func openUTXOSetFile(utxoFile string) (*os.File, *bufio.Reader, chainhash.Hash, 
 	height = binary.LittleEndian.Uint32(preamble[32:36])
 
 	return f, reader, hash, height, nil
+}
+
+// resumeUnsafeAfterHostCrash reports whether utxoStoreURL has a file:// external
+// store with fsyncMode=none. Such a store can keep a zero-length or partial
+// blob across a host crash, and a re-run treats it as already written.
+func resumeUnsafeAfterHostCrash(utxoStoreURL *url.URL) bool {
+	externalURL, err := url.Parse(utxoStoreURL.Query().Get("externalStore"))
+	if err != nil || externalURL.Scheme != "file" {
+		return false
+	}
+
+	return externalURL.Query().Get("fsyncMode") == "none"
 }
 
 // seedingExternalStoreURL returns utxoStoreURL with its external blob store
