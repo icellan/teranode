@@ -116,3 +116,24 @@ func TestTxWithOnlyOutputs(t *testing.T) {
 
 	assert.Equal(t, 476, count)
 }
+
+// A decoded script must be backed by an exactly-sized slice: the seeder decodes
+// hundreds of millions of ~25-byte scripts, and an over-allocated backing array
+// (the old bytes.Buffer growth) costs ~1.5 KB of garbage per UTXO and retains
+// ~1 KB per script.
+func TestNewUTXOWrapperFromBytes_ScriptIsExactlySized(t *testing.T) {
+	script := []byte{0x76, 0xa9, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 0x88, 0xac}
+
+	in := &UTXOWrapper{
+		TxID:   chainhash.HashH([]byte("exact-script")),
+		Height: 7,
+		UTXOs:  []*UTXO{{Index: 3, Value: 42, Script: script}},
+	}
+
+	out, err := NewUTXOWrapperFromBytes(in.Bytes())
+	require.NoError(t, err)
+	require.Len(t, out.UTXOs, 1)
+
+	require.Equal(t, script, out.UTXOs[0].Script)
+	require.Equal(t, len(script), cap(out.UTXOs[0].Script))
+}

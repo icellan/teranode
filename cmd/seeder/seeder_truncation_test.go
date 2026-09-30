@@ -69,7 +69,7 @@ func buildSnapshotWrappers(t *testing.T) (metadata []byte, wrapperBytes [][]byte
 // openForReading opens path and positions a bufio.Reader past the per-file
 // header/hash/height/prevHash metadata, exactly as processUTXOs does before
 // handing off to readUTXOWrapperFile.
-func openForReading(t *testing.T, path string) (*os.File, *bufio.Reader) {
+func openForReading(t testing.TB, path string) (*os.File, *bufio.Reader) {
 	t.Helper()
 
 	f, err := os.Open(path)
@@ -130,7 +130,7 @@ func TestReadUTXOWrapperFile_CompleteFile_Succeeds(t *testing.T) {
 		}
 	}()
 
-	err := readUTXOWrapperFile(context.Background(), ulogger.TestLogger{}, f, reader, utxoWrapperCh)
+	err := readUTXOWrapperFile(context.Background(), ulogger.TestLogger{}, f, reader, utxoWrapperCh, "all", nil)
 	<-done
 
 	require.NoError(t, err, "a complete, well-formed snapshot file must not be rejected")
@@ -175,6 +175,6 @@ func TestReadUTXOWrapperFile_TruncatedFile_ReturnsError(t *testing.T) {
 		}
 	}()
 
-	err := readUTXOWrapperFile(context.Background(), ulogger.TestLogger{}, f, reader, utxoWrapperCh)
+	err := readUTXOWrapperFile(context.Background(), ulogger.TestLogger{}, f, reader, utxoWrapperCh, "all", nil)
 	require.Error(t, err, "a truncated snapshot file must not be reported as a successful import")
 }

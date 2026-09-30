@@ -27,6 +27,7 @@ import (
 	"io"
 	"net/http"
 	_ "net/http/pprof" //nolint:gosec // This is used for internal profiling
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -454,7 +455,25 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 		}
 	}
 
-	logger.Infof("Using utxostore at %s", appSettings.UtxoStore.UtxoStore)
+	// Seeding-only store tuning. The default "data" still fsyncs each external
+	// blob's content but skips the per-blob directory fsync: after a host crash
+	// a blob is either complete or its name is gone, and a re-run rewrites the
+	// missing ones. One syncfs of the external store before lastProcessed.dat is
+	// written makes the directory entries of the completed seed durable. See
+	// seedingExternalStoreURL for what is (not) changed.
+	fsyncMode, _ := gocore.Config().Get("seeder_externalStoreFsyncMode", "data")
+
+	storeURL, syncPath, err := seedingExternalStoreURL(appSettings.UtxoStore.UtxoStore, fsyncMode)
+	if err != nil {
+		return nil, err
+	}
+
+	appSettings.UtxoStore.UtxoStore = storeURL
+
+	externalStoreConcurrency, _ := gocore.Config().GetInt("seeder_externalStoreConcurrency", 256)
+	appSettings.UtxoStore.ExternalStoreConcurrency = externalStoreConcurrency
+
+	logger.Infof("Using utxostore at %s with external store concurrency %d", appSettings.UtxoStore.UtxoStore, externalStoreConcurrency)
 
 	var utxoStore utxo.Store
 
@@ -477,77 +496,62 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 
 	logger.Infof("[processUTXOs] loaded %s coinbase transactions for input restoration", formatNumber(uint64(len(coinbaseTxs))))
 
+	// Read the tip this UTXO set is complete at. importUTXOSet re-opens the
+	// file for each of its passes.
+	var (
+		hash   chainhash.Hash
+		height uint32
+	)
+
+	if err = func() error {
+		f, _, tipHash, tipHeight, openErr := openUTXOSetFile(utxoFile)
+		if openErr != nil {
+			return openErr
+		}
+
+		hash, height = tipHash, tipHeight
+
+		return f.Close()
+	}(); err != nil {
+		return nil, err
+	}
+
+	// Multi-record txs go through a much slower create path, so they get their
+	// own pass (see importUTXOSet). Their workers only wait on the external
+	// store semaphore beyond its size, so the default matches it.
+	defaultMultiRecordWorkers := externalStoreConcurrency
+	if defaultMultiRecordWorkers <= 0 {
+		defaultMultiRecordWorkers = 1024
+	}
+
 	channelSize, _ := gocore.Config().GetInt("channelSize", 1000)
+	// Each worker blocks until its create has been written, so workerCount is
+	// the number of txs in flight. It must comfortably exceed the store batch
+	// size (utxostore_storeBatcherSize) for batches to fill instead of flushing
+	// on the batch timer; 16384 was the measured knee against Aerospike.
+	workerCount, _ := gocore.Config().GetInt("workerCount", 16384)
+	multiRecordWorkerCount, _ := gocore.Config().GetInt("multiRecordWorkerCount", defaultMultiRecordWorkers)
 
-	logger.Infof("Using channel size of %d", channelSize)
-	utxoWrapperCh := make(chan *utxopersister.UTXOWrapper, channelSize)
-
-	g, gCtx := errgroup.WithContext(ctx)
-
-	workerCount, _ := gocore.Config().GetInt("workerCount", 500)
-	logger.Infof("Starting %d workers", workerCount)
-
-	for i := 0; i < workerCount; i++ {
-		workerID := i
-
-		g.Go(func() error {
-			return worker(gCtx, logger, utxoStore, workerID, utxoWrapperCh, coinbaseTxs)
-		})
+	opts := importOptions{
+		workerCount:            workerCount,
+		multiRecordWorkerCount: multiRecordWorkerCount,
+		channelSize:            channelSize,
+		utxoBatchSize:          appSettings.UtxoStore.UtxoBatchSize,
+		skipStore:              gocore.Config().GetBool("skipStore", false),
+		coinbaseTxs:            coinbaseTxs,
 	}
 
-	var f *os.File
-
-	// Read the UTXO data from the store
-	f, err = os.Open(utxoFile)
-	if err != nil {
-		return nil, errors.NewStorageError("failed to open file", err)
+	if err = importUTXOSet(ctx, logger, utxoStore, utxoFile, opts); err != nil {
+		return nil, err
 	}
 
-	defer func() {
-		_ = f.Close()
-	}()
+	if syncPath != "" {
+		logger.Infof("Syncing the external store filesystem at %s so it is durable before marking the seed complete", syncPath)
 
-	reader := bufio.NewReader(f)
-
-	var header fileformat.Header
-
-	header, err = fileformat.ReadHeader(reader)
-	if err != nil {
-		return nil, errors.NewProcessingError(errMsgFailedToReadUTXO, err)
+		if err = syncFilesystem(syncPath); err != nil {
+			return nil, errors.NewStorageError("failed to sync external store filesystem", err)
+		}
 	}
-
-	if header.FileType() != fileformat.FileTypeUtxoSet {
-		return nil, errors.NewProcessingError("invalid file type: %s", header.FileType)
-	}
-
-	var hash chainhash.Hash
-
-	if err = binary.Read(reader, binary.LittleEndian, &hash); err != nil {
-		return nil, errors.NewProcessingError(errMsgFailedToReadUTXO, err)
-	}
-
-	var height uint32
-	if err = binary.Read(reader, binary.LittleEndian, &height); err != nil {
-		return nil, errors.NewProcessingError(errMsgFailedToReadUTXO, err)
-	}
-
-	// With UTXOSets, we also read the previous block hash before we start reading the UTXOs
-	var previousBlockHash [32]byte
-
-	_, err = reader.Read(previousBlockHash[:])
-	if err != nil {
-		return nil, errors.NewProcessingError("couldn't read previous block hash from file", err)
-	}
-
-	g.Go(func() error {
-		return readUTXOWrapperFile(gCtx, logger, f, reader, utxoWrapperCh)
-	})
-
-	if err = g.Wait(); err != nil {
-		return nil, errors.NewProcessingError("error in worker", err)
-	}
-
-	logger.Infof("All workers finished successfully")
 
 	heightStr := fmt.Sprintf("%d\n", height)
 
@@ -556,6 +560,187 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 	}
 
 	return &utxoSetTip{hash: hash, height: height}, nil
+}
+
+// importOptions configures importUTXOSet.
+type importOptions struct {
+	workerCount            int // workers for the single-record pass
+	multiRecordWorkerCount int // workers for the multi-record pass
+	channelSize            int
+	utxoBatchSize          int // store outputs-per-record limit; <= 0 imports in one pass
+	skipStore              bool
+	coinbaseTxs            map[chainhash.Hash]*bt.Tx
+}
+
+// importUTXOSet imports every record of the .utxo-set file at utxoFile into
+// store, returning once all are stored or the first error occurred.
+//
+// Txs that span multiple store records take a much slower create path (lock
+// record, external blob, several round trips each). Sharing one worker pool
+// with them lets the pool fill up with slow multi-record creates and starves
+// the fast path, so the file is read in two concurrent, independent passes:
+// one creating only single-record txs, one only multi-record txs. Each pass has
+// its own reader, channel and workers, so neither can block the other, and the
+// import takes as long as the slower pass. Both run in one errgroup: the first
+// error in either cancels both, and the seed is then re-run from the start.
+func importUTXOSet(ctx context.Context, logger ulogger.Logger, store utxo.Store, utxoFile string, opts importOptions) error {
+	if opts.workerCount < 1 || opts.multiRecordWorkerCount < 1 {
+		return errors.NewConfigurationError("workerCount (%d) and multiRecordWorkerCount (%d) must both be at least 1", opts.workerCount, opts.multiRecordWorkerCount)
+	}
+
+	g, gCtx := errgroup.WithContext(ctx)
+
+	startPass := func(name string, workerCount int, accept func(*utxopersister.UTXOWrapper) bool) {
+		g.Go(func() error {
+			f, reader, _, _, err := openUTXOSetFile(utxoFile)
+			if err != nil {
+				return err
+			}
+
+			defer func() {
+				_ = f.Close()
+			}()
+
+			logger.Infof("[%s pass] starting %d workers, channel size %d", name, workerCount, opts.channelSize)
+
+			utxoWrapperCh := make(chan *utxopersister.UTXOWrapper, opts.channelSize)
+
+			pg, pCtx := errgroup.WithContext(gCtx)
+
+			for i := 0; i < workerCount; i++ {
+				workerID := i
+
+				pg.Go(func() error {
+					return worker(pCtx, logger, store, workerID, utxoWrapperCh, opts.coinbaseTxs, opts.skipStore)
+				})
+			}
+
+			pg.Go(func() error {
+				return readUTXOWrapperFile(pCtx, logger, f, reader, utxoWrapperCh, name, accept)
+			})
+
+			return pg.Wait()
+		})
+	}
+
+	if opts.utxoBatchSize > 0 {
+		startPass("single-record", opts.workerCount, func(w *utxopersister.UTXOWrapper) bool {
+			return !spansMultipleRecords(w, opts.utxoBatchSize)
+		})
+		startPass("multi-record", opts.multiRecordWorkerCount, func(w *utxopersister.UTXOWrapper) bool {
+			return spansMultipleRecords(w, opts.utxoBatchSize)
+		})
+	} else {
+		startPass("all", opts.workerCount, nil)
+	}
+
+	if err := g.Wait(); err != nil {
+		return errors.NewProcessingError("error in worker", err)
+	}
+
+	// Workers stop on cancellation without an error, possibly after the
+	// readers finished cleanly, so buffered records may have been dropped.
+	if err := ctx.Err(); err != nil {
+		return errors.NewProcessingError("UTXO import cancelled", err)
+	}
+
+	logger.Infof("All workers finished successfully")
+
+	return nil
+}
+
+// openUTXOSetFile opens a .utxo-set file, validates its header and returns a
+// reader positioned at the first record, plus the block hash and height the
+// set is complete at.
+func openUTXOSetFile(utxoFile string) (*os.File, *bufio.Reader, chainhash.Hash, uint32, error) {
+	var (
+		hash   chainhash.Hash
+		height uint32
+	)
+
+	f, err := os.Open(utxoFile)
+	if err != nil {
+		return nil, nil, hash, 0, errors.NewStorageError("failed to open file", err)
+	}
+
+	fail := func(err error) (*os.File, *bufio.Reader, chainhash.Hash, uint32, error) {
+		_ = f.Close()
+		return nil, nil, hash, 0, err
+	}
+
+	reader := bufio.NewReader(f)
+
+	header, err := fileformat.ReadHeader(reader)
+	if err != nil {
+		return fail(errors.NewProcessingError(errMsgFailedToReadUTXO, err))
+	}
+
+	if header.FileType() != fileformat.FileTypeUtxoSet {
+		return fail(errors.NewProcessingError("invalid file type: %s", header.FileType()))
+	}
+
+	// block hash (32) + height (4) + previous block hash (32)
+	var preamble [68]byte
+	if _, err = io.ReadFull(reader, preamble[:]); err != nil {
+		return fail(errors.NewProcessingError(errMsgFailedToReadUTXO, err))
+	}
+
+	copy(hash[:], preamble[:32])
+	height = binary.LittleEndian.Uint32(preamble[32:36])
+
+	return f, reader, hash, height, nil
+}
+
+// seedingExternalStoreURL returns utxoStoreURL with its external blob store
+// switched to fsyncMode when that store is a file store whose fsyncMode the
+// operator has not set; any other URL is returned unchanged. syncPath is the
+// external store's directory when its effective fsync mode is weaker than
+// "full" (the caller must sync that filesystem before declaring the seed
+// done), and "" otherwise. The input URL is never mutated.
+func seedingExternalStoreURL(utxoStoreURL *url.URL, fsyncMode string) (*url.URL, string, error) {
+	switch fsyncMode {
+	case "", "full", "data", "none":
+	default:
+		return nil, "", errors.NewConfigurationError("invalid seeder_externalStoreFsyncMode %q (must be full|data|none)", fsyncMode)
+	}
+
+	out := *utxoStoreURL
+
+	q := out.Query()
+
+	raw := q.Get("externalStore")
+	if raw == "" {
+		return &out, "", nil
+	}
+
+	externalURL, err := url.Parse(raw)
+	if err != nil {
+		return nil, "", errors.NewConfigurationError("invalid externalStore URL %q", raw, err)
+	}
+
+	if externalURL.Scheme != "file" {
+		return &out, "", nil
+	}
+
+	eq := externalURL.Query()
+
+	if eq.Get("fsyncMode") == "" && fsyncMode != "" && fsyncMode != "full" {
+		eq.Set("fsyncMode", fsyncMode)
+		externalURL.RawQuery = eq.Encode()
+		q.Set("externalStore", externalURL.String())
+		out.RawQuery = q.Encode()
+	}
+
+	if effective := externalURL.Query().Get("fsyncMode"); effective == "" || effective == "full" {
+		return &out, "", nil
+	}
+
+	// Resolve the directory the same way the file blob store does.
+	if externalURL.Host == "." {
+		return &out, strings.TrimPrefix(externalURL.Path, "/"), nil
+	}
+
+	return &out, externalURL.Path, nil
 }
 
 // readUTXOWrapperFile reads UTXOWrapper records from reader (backed by f) and
@@ -573,12 +758,18 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 // with; once the read loop ends for any reason, that footer is compared
 // against what was actually processed, and a mismatch is reported as an
 // error instead of silently treated as success.
-func readUTXOWrapperFile(ctx context.Context, logger ulogger.Logger, f *os.File, reader *bufio.Reader, utxoWrapperCh chan<- *utxopersister.UTXOWrapper) error {
+//
+// Only records for which accept returns true (all, when accept is nil) are
+// sent; every record is still read and counted, so each pass validates the
+// whole file against the footer. pass names the pass in log lines.
+func readUTXOWrapperFile(ctx context.Context, logger ulogger.Logger, f *os.File, reader *bufio.Reader, utxoWrapperCh chan<- *utxopersister.UTXOWrapper,
+	pass string, accept func(*utxopersister.UTXOWrapper) bool) error {
 	defer close(utxoWrapperCh)
 
 	var (
 		txProcessed    uint64
 		utxosProcessed uint64
+		txsSent        uint64
 		err            error
 	)
 
@@ -603,18 +794,24 @@ OUTER:
 				return errors.NewProcessingError("failed to read UTXO", err)
 			}
 
+			txProcessed++
+			utxosProcessed += uint64(len(utxoWrapper.UTXOs))
+
+			if txProcessed%1_000_000 == 0 {
+				logger.Infof("[%s pass] read %16s transactions with %16s utxos, %s sent to workers", pass, formatNumber(txProcessed), formatNumber(utxosProcessed), formatNumber(txsSent))
+			}
+
+			if accept != nil && !accept(utxoWrapper) {
+				continue
+			}
+
 			select {
 			case <-ctx.Done():
 				logger.Infof("Context cancelled while sending UTXO to channel, stopping UTXO processing")
 				return ctx.Err()
 
 			case utxoWrapperCh <- utxoWrapper:
-				txProcessed++
-				utxosProcessed += uint64(len(utxoWrapper.UTXOs))
-
-				if txProcessed%1_000_000 == 0 {
-					logger.Infof("Processed %16s transactions with %16s utxos", formatNumber(txProcessed), formatNumber(utxosProcessed))
-				}
+				txsSent++
 			}
 		}
 	}
@@ -635,45 +832,64 @@ OUTER:
 			expectedTxCount, expectedUTXOCount, txProcessed, utxosProcessed)
 	}
 
-	logger.Infof("FINISHED  %16s transactions with %16s utxos", formatNumber(txProcessed), formatNumber(utxosProcessed))
+	logger.Infof("[%s pass] FINISHED %16s transactions with %16s utxos, %s sent to workers", pass, formatNumber(txProcessed), formatNumber(utxosProcessed), formatNumber(txsSent))
 
 	return nil
 }
 
-// worker processes UTXOWrapper messages from the channel and stores them in the UTXO store.
-func worker(ctx context.Context, logger ulogger.Logger, store utxo.Store,
-	id int, utxoWrapperCh <-chan *utxopersister.UTXOWrapper, coinbaseTxs map[chainhash.Hash]*bt.Tx) error {
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Infof("Worker %d received stop signal: %v", id, ctx.Err())
-			return nil
+// spansMultipleRecords reports whether the UTXO store will split this tx over
+// more than one record. The split is by padded output count (highest unspent
+// index + 1), matching PadUTXOsWithNil, not by the number of unspent outputs.
+func spansMultipleRecords(w *utxopersister.UTXOWrapper, utxoBatchSize int) bool {
+	if utxoBatchSize <= 0 {
+		return false
+	}
 
-		case utxoWrapper, ok := <-utxoWrapperCh:
-			if !ok {
-				// Channel closed, stop the worker
-				return nil
-			}
-
-			if err := processUTXO(ctx, store, utxoWrapper, coinbaseTxs); err != nil {
-				logger.Errorf("Worker %d failed to process UTXO: %v", id, err)
-				return err
-			}
+	for _, u := range w.UTXOs {
+		if u != nil && int64(u.Index) >= int64(utxoBatchSize) {
+			return true
 		}
 	}
+
+	return false
+}
+
+// worker processes UTXOWrapper messages from the channel and stores them in the UTXO store.
+func worker(ctx context.Context, logger ulogger.Logger, store utxo.Store,
+	id int, utxoWrapperCh <-chan *utxopersister.UTXOWrapper, coinbaseTxs map[chainhash.Hash]*bt.Tx, skipStore bool) error {
+	// A plain receive rather than a select on ctx.Done(): with thousands of
+	// workers, locking the shared Done channel on every item dominated CPU. The
+	// reader closes utxoWrapperCh when it finishes or ctx is cancelled, which
+	// wakes idle workers. A worker that stops on cancellation drops the
+	// remaining buffered records; importUTXOSet reports that as an error.
+	for utxoWrapper := range utxoWrapperCh {
+		if ctx.Err() != nil {
+			logger.Infof("Worker %d received stop signal: %v", id, ctx.Err())
+			return nil
+		}
+
+		if err := processUTXO(ctx, store, utxoWrapper, coinbaseTxs, skipStore); err != nil {
+			logger.Errorf("Worker %d failed to process UTXO: %v", id, err)
+			return err
+		}
+	}
+
+	return nil
 }
 
 // processUTXO processes a single UTXOWrapper and stores it in the UTXO store.
 // coinbaseTxs maps coinbase txid to the authoritative coinbase transaction
-// recovered from the V2 utxo-headers file; it may be empty.
-func processUTXO(ctx context.Context, store utxo.Store, utxoWrapper *utxopersister.UTXOWrapper, coinbaseTxs map[chainhash.Hash]*bt.Tx) error {
+// recovered from the V2 utxo-headers file; it may be empty. skipStore builds the
+// transaction but does not write it (a debugging knob, read once by the caller
+// because gocore config lookups are too expensive to run per transaction).
+func processUTXO(ctx context.Context, store utxo.Store, utxoWrapper *utxopersister.UTXOWrapper, coinbaseTxs map[chainhash.Hash]*bt.Tx, skipStore bool) error {
 	if utxoWrapper == nil {
 		return nil
 	}
 
-	tx := &bt.Tx{}
-
 	padded := utxopersister.PadUTXOsWithNil(utxoWrapper.UTXOs)
+
+	tx := &bt.Tx{Outputs: make([]*bt.Output, 0, len(padded))}
 
 	for _, u := range padded {
 		var output *bt.Output
@@ -694,7 +910,7 @@ func processUTXO(ctx context.Context, store utxo.Store, utxoWrapper *utxopersist
 		restoreCoinbaseInput(tx, coinbaseTxs[utxoWrapper.TxID], &utxoWrapper.TxID)
 	}
 
-	if gocore.Config().GetBool("skipStore", false) {
+	if skipStore {
 		return nil
 	}
 

@@ -24,7 +24,7 @@ import (
 // reuses the same per-record encoding (UTXOWrapper.Bytes()) that the real
 // persister writes, so the file the seeder reads back is byte-identical to
 // what production would have produced for these records.
-func writeCompleteSnapshotFile(t *testing.T, wrappers []*utxopersister.UTXOWrapper) string {
+func writeCompleteSnapshotFile(t testing.TB, wrappers []*utxopersister.UTXOWrapper) string {
 	t.Helper()
 
 	var blockHash chainhash.Hash
@@ -78,13 +78,13 @@ func importSnapshotFile(t *testing.T, path string, store *utxosql.Store) error {
 	readErrCh := make(chan error, 1)
 
 	go func() {
-		readErrCh <- readUTXOWrapperFile(context.Background(), ulogger.TestLogger{}, f, reader, utxoWrapperCh)
+		readErrCh <- readUTXOWrapperFile(context.Background(), ulogger.TestLogger{}, f, reader, utxoWrapperCh, "all", nil)
 	}()
 
 	var processErr error
 
 	for w := range utxoWrapperCh {
-		if err := processUTXO(context.Background(), store, w, nil); err != nil && processErr == nil {
+		if err := processUTXO(context.Background(), store, w, nil, false); err != nil && processErr == nil {
 			processErr = err
 		}
 	}
