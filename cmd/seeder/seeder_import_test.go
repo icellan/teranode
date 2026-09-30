@@ -88,7 +88,7 @@ func TestImportUTXOSet_CancelAfterReaderFinishedIsNotSuccess(t *testing.T) {
 // Zero workers would leave the reader blocked forever on a full channel, and an
 // absurd count (a typo'd extra digit) would spawn millions of goroutines whose
 // stacks the GC then scans on every cycle.
-func TestImportUTXOSet_RejectsNonPositiveWorkerCounts(t *testing.T) {
+func TestImportUTXOSet_RejectsOutOfRangeWorkerCounts(t *testing.T) {
 	path := writeCompleteSnapshotFile(t, benchWrappers("zero", 10, 0))
 
 	for _, mutate := range []func(*importOptions){
