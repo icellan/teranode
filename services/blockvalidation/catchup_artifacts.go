@@ -1,6 +1,7 @@
 package blockvalidation
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,14 @@ type catchupArtifact struct {
 	mu      sync.Mutex
 	created bool
 	corrupt bool
+	// bound is set when this attempt stored a node list that its transactions
+	// matched. Any tree level hashes to the subtree root, so only the
+	// transactions bind a node list to its hash. leaves is that list's length.
+	bound  bool
+	leaves int
+	// unbound is set when this attempt stored the file although its
+	// transactions could not bind it (see isMerkleNodeSized).
+	unbound bool
 }
 
 // catchupArtifacts tracks ownership of pending files created by one catchup
@@ -52,25 +61,120 @@ func catchupArtifactError(ctx context.Context, hash chainhash.Hash, kind filefor
 		return invalid
 	}
 	if ctx.Err() != nil {
-		return errors.NewServiceError("reading catchup artifact was canceled", errors.NewStorageError("artifact read canceled", ctx.Err()))
+		return canceledArtifactError(ctx)
 	}
-	s.mu.Lock()
-	key := catchupArtifactKey{hash: hash, kind: kind}
-	entry := s.files[key]
-	if entry == nil {
-		entry = &catchupArtifact{}
-		s.files[key] = entry
-	}
-	s.mu.Unlock()
+	entry := s.entry(catchupArtifactKey{hash: hash, kind: kind})
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 	if entry.created {
 		return invalid
 	}
 	entry.corrupt = true
-	// Do not wrap ErrBlockInvalid: callers must neither penalize the current
-	// peer nor fall back into UTXO mutation using these cached bytes. Eviction
-	// happens after all attempt workers join, so the next attempt can refetch.
+	return corruptArtifactError(hash, kind, invalid)
+}
+
+// storeBoundSubtreeFile stores a subtree file whose transactions matched its
+// node list. When bound, that content is the only one for its hash, so it
+// replaces any stored file, including a collapsed node list. Unbound content
+// (data that could be a collapsed level) replaces files too, but no verdict
+// may rest on it. A file that did not exist is owned by this attempt;
+// identical bytes are left untouched.
+func (u *Server) storeBoundSubtreeFile(ctx context.Context, hash *chainhash.Hash, kind fileformat.FileType, value []byte, dah uint32, leaves int, bound bool) error {
+	s, ok := ctx.Value(catchupArtifactsKey{}).(*catchupArtifacts)
+	if !ok {
+		return u.subtreeStore.Set(ctx, hash[:], kind, value, options.WithAllowOverwrite(true), options.WithDeleteAt(dah))
+	}
+	entry := s.entry(catchupArtifactKey{hash: *hash, kind: kind})
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	exists, err := s.Store.Exists(ctx, hash[:], kind)
+	if err != nil {
+		return err
+	}
+	same := false
+	if exists && kind == fileformat.FileTypeSubtreeToCheck {
+		stored, err := s.Store.Get(ctx, hash[:], kind)
+		if err != nil {
+			return err
+		}
+		same = bytes.Equal(stored, value)
+	}
+	if !same {
+		if err = s.Store.Set(ctx, hash[:], kind, value, options.WithAllowOverwrite(true), options.WithDeleteAt(dah)); err != nil {
+			return err
+		}
+	}
+	if !exists {
+		entry.created = true
+	}
+	entry.corrupt = false
+	entry.bound = bound
+	entry.unbound = !bound
+	entry.leaves = leaves
+	return nil
+}
+
+// boundCatchupArtifact reports whether this attempt bound the node list for
+// hash, and its length. Outside catchup nothing is tracked.
+func boundCatchupArtifact(ctx context.Context, hash chainhash.Hash) (tracked, bound bool, leaves int) {
+	s, ok := ctx.Value(catchupArtifactsKey{}).(*catchupArtifacts)
+	if !ok {
+		return false, false, 0
+	}
+	entry := s.entry(catchupArtifactKey{hash: hash, kind: fileformat.FileTypeSubtreeToCheck})
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	return true, entry.bound, entry.leaves
+}
+
+// unboundCatchupArtifactsError attributes a body-level failure. A verdict is
+// the peer's only when every pending node list it rests on was bound to its
+// transactions in this attempt. Otherwise the unbound lists are evicted and
+// the next attempt, which binds them while fetching, decides.
+func unboundCatchupArtifactsError(ctx context.Context, unbound []catchupArtifactKey, invalid error) error {
+	s, ok := ctx.Value(catchupArtifactsKey{}).(*catchupArtifacts)
+	if !ok || len(unbound) == 0 {
+		return invalid
+	}
+	if ctx.Err() != nil {
+		return canceledArtifactError(ctx)
+	}
+	for _, key := range unbound {
+		entry := s.entry(key)
+		entry.mu.Lock()
+		entry.corrupt = true
+		entry.mu.Unlock()
+		// Data this attempt stored without binding its list goes with it.
+		// Other stored data authenticates itself when it is next used.
+		data := s.entry(catchupArtifactKey{hash: key.hash, kind: fileformat.FileTypeSubtreeData})
+		data.mu.Lock()
+		if data.unbound {
+			data.corrupt = true
+		}
+		data.mu.Unlock()
+	}
+	return corruptArtifactError(unbound[0].hash, unbound[0].kind, invalid)
+}
+
+func (s *catchupArtifacts) entry(key catchupArtifactKey) *catchupArtifact {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.files[key]
+	if entry == nil {
+		entry = &catchupArtifact{}
+		s.files[key] = entry
+	}
+	return entry
+}
+
+func canceledArtifactError(ctx context.Context) error {
+	return errors.NewServiceError("reading catchup artifact was canceled", errors.NewStorageError("artifact read canceled", ctx.Err()))
+}
+
+// Do not wrap ErrBlockInvalid: callers must neither penalize the current peer
+// nor fall back into UTXO mutation using these cached bytes. Eviction happens
+// after all attempt workers join, so the next attempt can refetch.
+func corruptArtifactError(hash chainhash.Hash, kind fileformat.FileType, invalid error) error {
 	return errors.NewServiceError("corrupt cached catchup artifact", errors.NewStorageError("%s %s: %s", hash.String(), kind, invalid.Error()))
 }
 

@@ -82,6 +82,20 @@ func TestCatchupArtifacts_CachedCorruptionRecoversWithoutBlamingPeer(t *testing.
 						useQuickValidation: true, highestCheckpointHeight: 1})
 				}
 				err = attempt()
+				switch kind {
+				case fileformat.FileTypeSubtreeToCheck:
+					// Stored transaction data authenticates itself, so a corrupt
+					// pending node list is rebuilt from it without any peer.
+					require.NoError(t, err)
+					require.Zero(t, fetched.Load())
+					return
+				case fileformat.FileTypeSubtreeData:
+					// Data that does not authenticate is fetched again, with the
+					// peer's node list, in the same attempt.
+					require.NoError(t, err)
+					require.EqualValues(t, 2, fetched.Load())
+					return
+				}
 				require.Error(t, err)
 				require.False(t, isUnvalidatablePeerError(err), "cached bytes are not evidence against this peer: %v", err)
 				require.ErrorIs(t, err, errors.ErrServiceError, "local cache failure must bypass peer penalties")
@@ -101,7 +115,7 @@ func TestCatchupArtifacts_CachedCorruptionRecoversWithoutBlamingPeer(t *testing.
 					}
 				}
 				require.NoError(t, attempt(), "a healthy peer must be able to repair the cache on retry")
-				require.EqualValues(t, 1, fetched.Load(), "only the identified corrupt file needs refetching")
+				require.Zero(t, fetched.Load(), "the node list is rebuilt from the stored transaction data")
 			})
 		}
 	}
@@ -344,7 +358,8 @@ func testCatchupArtifactsRetry(t *testing.T, invalidBody bool) {
 			require.NoError(t, err)
 			expected := i == 2
 			if !invalidBody {
-				expected = i != 1 || kind == fileformat.FileTypeSubtreeToCheck
+				// A node list is kept only with the transactions that bind it.
+				expected = i != 1
 			}
 			require.Equal(t, expected, exists, "invalid bodies discard their files; transient failures retain progress")
 		}
@@ -354,7 +369,7 @@ func testCatchupArtifactsRetry(t *testing.T, invalidBody bool) {
 	if invalidBody {
 		require.EqualValues(t, 8, fetched.Load(), "the next peer must refetch files discarded with the invalid body")
 	} else {
-		require.EqualValues(t, 5, fetched.Load(), "only the missing transaction data should be fetched on retry")
+		require.EqualValues(t, 6, fetched.Load(), "only the subtree whose data failed should be fetched on retry")
 	}
 	stored, err := bv.blockchainClient.GetBlock(ctx, block.Hash())
 	require.NoError(t, err)

@@ -501,12 +501,45 @@ Transactions in standard Bitcoin format are extended in-memory for validation:
 
 **Merkle Root Verification:**
 
-Before processing can mutate UTXOs, `authenticateQuickBlockBody` recomputes
-subtree roots from their nodes and checks them against both the stored root and
-the requested subtree hash. It then checks the block merkle root, subtree
-partitioning, duplicate transactions and declared transaction count, and parses
-every transaction body. This authenticates the supplied bytes against the
-checkpoint-proven header before quick processing starts.
+A subtree node list must hash to the requested subtree hash, have no zero
+leaves, and must not end any level of four or more entries with two equal
+entries. That rules out a repeated tail or zero padding, which reproduce the
+root of a shorter list. Other equal siblings are genuinely duplicate
+transactions, and the block checks reject them. The node check still does not
+tie a list to its hash, because any level of the merkle tree, including the
+root itself as a single leaf, hashes to the same root. Only the transactions
+bind a node list to its hash.
+
+Catchup therefore stores a node list only together with transaction data that
+matches it:
+
+- Stored transaction data authenticates itself. Its transaction IDs must form
+  the canonical leaves of the subtree hash (the first subtree of a block keeps
+  its coinbase placeholder). When it does, the node list is derived from it,
+  whatever node file is stored, and no peer is contacted. Stored data that fails
+  this check is fetched again.
+- Otherwise the node list and the data come from the same peer and are checked
+  against each other in memory. A mismatch is that peer's fault. It is charged
+  and the next peer is tried, and nothing is stored. A pending node file is not
+  reused for this, because it cannot show which of the two files is wrong.
+- A matched node list is the only list for its hash, so it replaces any stored
+  file. The exception is data in which every transaction outside the coinbase
+  slot is exactly 64 bytes. A 64-byte transaction can serialize as two merkle
+  children, so its txid may be an internal node, and such data may be a whole
+  collapsed tree level. Its node list is never treated as bound, the data is
+  not reused from the store, and when a body check fails on it both files are
+  evicted.
+- A validated `.subtree` replaces a pending node list stored next to it.
+
+Before processing can mutate UTXOs, `authenticateQuickBlockBody` runs the
+node-list check against both the stored root and the requested subtree hash. It
+then checks the block merkle root, subtree partitioning, duplicate transactions
+and declared transaction count, and parses every transaction body. This
+authenticates the supplied bytes against the checkpoint-proven header before
+quick processing starts. A body-level failure convicts the peer only if every
+pending node file it relies on was bound in this attempt and still has the
+bound length. Otherwise the unbound files are evicted, and the next attempt
+decides.
 
 **Error Handling:**
 
@@ -517,7 +550,8 @@ mutating UTXOs. Error handling depends on what failed:
   fallback or wholesale deletion of shared `.subtree` files. After all readers
   and writers finish, cleanup removes pending files created by this attempt,
   preserving files that already existed and data for promoted subtrees.
-- Corrupt cached subtree nodes or transaction data are local storage failures,
+- Corrupt cached subtree nodes (including node lists that do not match their
+  hash) or transaction data are local storage failures,
   not evidence against the current peer. Catchup aborts without penalizing that
   peer or entering normal validation. After workers finish, the identified
   corrupt files are removed so a later attempt can fetch fresh copies. Pending

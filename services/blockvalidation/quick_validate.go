@@ -1629,6 +1629,10 @@ func (u *BlockValidation) authenticateQuickBlockBody(ctx context.Context, block 
 	g, gCtx := errgroup.WithContext(ctx)
 	util.SafeSetLimit(g, concurrency)
 	sizes := make([]uint64, len(body.Subtrees))
+	// A pending node file is bound to its hash only by matching transactions:
+	// a collapsed tree level passes the node check. Body-level failures that
+	// rest on a node file this attempt did not bind must not convict the peer.
+	unbound := make([]bool, len(body.Subtrees))
 	for i, hash := range body.Subtrees {
 		g.Go(func() error {
 			// Use a separate read view: its slices are empty, so this read owns
@@ -1640,6 +1644,11 @@ func (u *BlockValidation) authenticateQuickBlockBody(ctx context.Context, block 
 			}
 			st := result.subtree
 			body.SubtreeSlices[i] = st
+			if result.localFileType == fileformat.FileTypeSubtreeToCheck {
+				// The length check catches a file replaced after it was bound.
+				tracked, bound, leaves := boundCatchupArtifact(gCtx, *hash)
+				unbound[i] = tracked && (!bound || leaves != st.Length())
+			}
 			if len(st.Nodes) == 0 {
 				return catchupArtifactError(gCtx, *hash, result.localFileType,
 					errors.NewBlockInvalidError("[quickValidateBlock][%s] subtree must not be empty", block.Hash().String()))
@@ -1647,15 +1656,24 @@ func (u *BlockValidation) authenticateQuickBlockBody(ctx context.Context, block 
 			// Deserialization reads a cached root from the file. Recompute it
 			// from nodes instead of trusting that cache or the blob-store key.
 			// No node is being replaced: avoid copying mmap-backed nodes to heap.
-			merkles, err := subtreepkg.BuildMerkleTreeStoreFromBytes(st.Nodes)
-			if err != nil || merkles == nil || len(*merkles) == 0 || !(*merkles)[len(*merkles)-1].IsEqual(hash) || !st.RootHash().IsEqual(hash) {
+			// A root-consistent but non-canonical list is equally a property of
+			// the stored file, not of the block body.
+			err := verifySubtreeNodes(st.Nodes, hash)
+			if err == nil && !st.RootHash().IsEqual(hash) {
+				err = errors.NewProcessingError("serialized root does not match %s", hash.String())
+			}
+			if err != nil {
 				return catchupArtifactError(gCtx, *hash, result.localFileType,
-					errors.NewBlockInvalidError("[quickValidateBlock][%s] subtree %s nodes do not match its root", block.Hash().String(), hash.String()))
+					errors.NewBlockInvalidError("[quickValidateBlock][%s] subtree %s nodes do not match its root", block.Hash().String(), hash.String(), err))
 			}
 			// Once the stored nodes match their key, their position in the body
 			// is the announcing peer's responsibility, not a cache corruption.
 			if i == 0 && !st.Nodes[0].Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				return errors.NewBlockInvalidError("[quickValidateBlock][%s] first subtree must start with the coinbase placeholder", block.Hash().String())
+				invalid := errors.NewBlockInvalidError("[quickValidateBlock][%s] first subtree must start with the coinbase placeholder", block.Hash().String())
+				if unbound[i] {
+					return unboundCatchupArtifactsError(gCtx, []catchupArtifactKey{{hash: *hash, kind: result.localFileType}}, invalid)
+				}
+				return invalid
 			}
 			return nil
 		})
@@ -1663,11 +1681,18 @@ func (u *BlockValidation) authenticateQuickBlockBody(ctx context.Context, block 
 	if err := g.Wait(); err != nil {
 		return cleanup, err
 	}
+	var unboundFiles []catchupArtifactKey
+	for i, hash := range body.Subtrees {
+		if unbound[i] {
+			unboundFiles = append(unboundFiles, catchupArtifactKey{hash: *hash, kind: fileformat.FileTypeSubtreeToCheck})
+		}
+	}
 	if err := model.CheckSubtreeSlicesForDuplicateTxs(body.SubtreeSlices); err != nil {
-		return cleanup, err
+		return cleanup, unboundCatchupArtifactsError(ctx, unboundFiles, err)
 	}
 	if err := body.CheckMerkleRoot(ctx); err != nil {
-		return cleanup, errors.NewBlockInvalidError("[quickValidateBlock][%s] body does not match header merkle root", block.Hash().String(), err)
+		return cleanup, unboundCatchupArtifactsError(ctx, unboundFiles,
+			errors.NewBlockInvalidError("[quickValidateBlock][%s] body does not match header merkle root", block.Hash().String(), err))
 	}
 	var authenticatedCount uint64
 	// CheckMerkleRoot above already enforces subtree lengths and partitioning.
@@ -1678,7 +1703,8 @@ func (u *BlockValidation) authenticateQuickBlockBody(ctx context.Context, block 
 		authenticatedCount = 1
 	}
 	if block.TransactionCount != authenticatedCount {
-		return cleanup, errors.NewBlockInvalidError("[quickValidateBlock][%s] transaction count %d does not match authenticated body count %d", block.Hash().String(), block.TransactionCount, authenticatedCount)
+		return cleanup, unboundCatchupArtifactsError(ctx, unboundFiles,
+			errors.NewBlockInvalidError("[quickValidateBlock][%s] transaction count %d does not match authenticated body count %d", block.Hash().String(), block.TransactionCount, authenticatedCount))
 	}
 	// With node structure and header commitments established, parse all bodies
 	// in parallel before permitting the first UTXO operation.
