@@ -195,7 +195,8 @@ type: Opaque
 stringData:
   blockchain_store: "postgres://POSTGRES_EXAMPLE_URI_CHANGE_ME"
   utxostore: "aerospike://AEROSPIKE_EXAMPLE_URI_CHANGE_ME"
-  # Required. Authenticates the state-mutating P2P PeerService RPCs.
+  # Required. Blockchain refuses to start without it. Every service and CLI client
+  # uses it to call Blockchain and the protected P2P/Legacy RPCs.
   # Generate with: openssl rand -hex 32
   grpc_admin_api_key: "" # REQUIRED: paste the generated shared secret before applying
 ```

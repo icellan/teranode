@@ -9,8 +9,9 @@ configuration trim surrounding whitespace before validation. Use a random secret
 All BlockchainAPI and PeerRegistryService RPCs require `x-api-key`, including reads
 and the Subscribe stream. The only anonymous RPC is HealthGRPC. HTTP `/health` is
 also anonymous; `/invalidate/:hash` and `/revalidate/:hash` accept authenticated POST
-requests only. Existing GET-based admin scripts must be updated. Health checks do
-not prove that a client's credential matches: verify a protected operation too.
+requests only. Existing GET-based admin scripts must be updated. HealthGRPC and
+`/health` are anonymous, so they don't prove a caller's key matches. The Blockchain
+client's own readiness check does; see [Upgrade order](#upgrade-order).
 
 ## Deployment and development
 
