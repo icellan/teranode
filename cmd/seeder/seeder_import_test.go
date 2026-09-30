@@ -177,7 +177,7 @@ func TestImportUTXOSet_MultiRecordTxsDoNotStallSingleRecordTxs(t *testing.T) {
 	store := &gatedStore{release: make(chan struct{})}
 
 	for _, w := range wrappers {
-		if !spansMultipleRecords(w, 128) {
+		if !spansMultipleRecords(maxIndexOf(w), 128) {
 			store.singleRemaining.Add(1)
 		}
 	}
@@ -251,19 +251,77 @@ func TestImportUTXOSet_MultiRecordFailureStopsImport(t *testing.T) {
 // The Aerospike store splits a tx into multiple records by its padded output
 // count (highest unspent index + 1), not by how many outputs are unspent.
 func TestSpansMultipleRecords(t *testing.T) {
-	w := func(indices ...uint32) *utxopersister.UTXOWrapper {
-		uw := &utxopersister.UTXOWrapper{}
-		for _, i := range indices {
-			uw.UTXOs = append(uw.UTXOs, &utxopersister.UTXO{Index: i})
-		}
+	require.False(t, spansMultipleRecords(2, 128))
+	require.False(t, spansMultipleRecords(127, 128), "index 127 still fits the first record")
+	require.True(t, spansMultipleRecords(128, 128), "a single unspent output at index 128 needs a second record")
+	require.True(t, spansMultipleRecords(5000, 128))
+	require.False(t, spansMultipleRecords(5000, 0), "threshold 0 disables the check")
+	require.False(t, spansMultipleRecords(0, 128), "a record without utxos reports max index 0")
+}
 
-		return uw
+// maxIndexOf is the highest output index in w, as ReadUTXOWrapperFrame reports it.
+func maxIndexOf(w *utxopersister.UTXOWrapper) uint32 {
+	var m uint32
+	for _, u := range w.UTXOs {
+		m = max(m, u.Index)
 	}
 
-	require.False(t, spansMultipleRecords(w(0, 1, 2), 128))
-	require.False(t, spansMultipleRecords(w(127), 128), "index 127 still fits the first record")
-	require.True(t, spansMultipleRecords(w(128), 128), "a single unspent output at index 128 needs a second record")
-	require.True(t, spansMultipleRecords(w(5000, 3), 128))
-	require.False(t, spansMultipleRecords(w(5000), 0), "threshold 0 disables the check")
-	require.False(t, spansMultipleRecords(w(), 128))
+	return m
+}
+
+// capturingStore records the transaction passed to SpendAndCreate.
+type capturingStore struct {
+	utxo.Store
+	tx *bt.Tx
+}
+
+func (s *capturingStore) SpendAndCreate(_ context.Context, tx *bt.Tx, _ uint32, _ ...utxo.CreateOption) (*meta.Data, []*utxo.Spend, error) {
+	s.tx = tx
+
+	return nil, nil, nil
+}
+
+// processUTXO places each unspent output at its own index and leaves spent
+// positions nil, the layout PadUTXOsWithNil defines and the store keys by.
+func TestProcessUTXO_OutputLayout(t *testing.T) {
+	cases := map[string]struct {
+		utxos []*utxopersister.UTXO
+		want  []*utxopersister.UTXO // by output index, nil = spent
+	}{
+		"no utxos gives one nil output": {
+			utxos: nil,
+			want:  []*utxopersister.UTXO{nil},
+		},
+		"holes stay nil, order in the record does not matter": {
+			utxos: []*utxopersister.UTXO{{Index: 3, Value: 30, Script: []byte{0x53}}, {Index: 0, Value: 10, Script: []byte{0x51}}},
+			want:  []*utxopersister.UTXO{{Value: 10, Script: []byte{0x51}}, nil, nil, {Value: 30, Script: []byte{0x53}}},
+		},
+		"empty script": {
+			utxos: []*utxopersister.UTXO{{Index: 1, Value: 5, Script: []byte{}}},
+			want:  []*utxopersister.UTXO{nil, {Value: 5, Script: []byte{}}},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := &capturingStore{}
+			w := &utxopersister.UTXOWrapper{TxID: chainhash.HashH([]byte(name)), Height: 9, UTXOs: tc.utxos}
+
+			require.NoError(t, processUTXO(context.Background(), store, w, nil, false))
+			require.NotNil(t, store.tx)
+			require.Len(t, store.tx.Outputs, len(tc.want))
+
+			for i, want := range tc.want {
+				got := store.tx.Outputs[i]
+				if want == nil {
+					require.Nil(t, got, "output %d", i)
+					continue
+				}
+
+				require.NotNil(t, got, "output %d", i)
+				require.Equal(t, want.Value, got.Satoshis, "output %d", i)
+				require.Equal(t, want.Script, []byte(*got.LockingScript), "output %d", i)
+			}
+		})
+	}
 }

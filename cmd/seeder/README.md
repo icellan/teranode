@@ -23,7 +23,9 @@ file's actual content, the seeder refuses to import it rather than silently
 seeding from a corrupted snapshot. If no sidecar is present at all, the import
 proceeds with a warning — older snapshots, or ones from a source that never
 produced a sidecar, are not blocked. This check is unauthenticated (it catches
-corruption/transfer errors, not tampering) and cannot be disabled.
+corruption/transfer errors, not tampering). Pass `-skipChecksum` only when
+the caller has already verified the same files (as a fetch script does after
+download); verification reads each file in full.
 
 ### Tuning (UTXO import)
 

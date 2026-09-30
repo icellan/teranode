@@ -186,6 +186,9 @@ func BenchmarkSeederUTXOImportNoopStore(b *testing.B) {
 		b.Run(fmt.Sprintf("workers=%d", workerCount), func(b *testing.B) {
 			path := writeCompleteSnapshotFile(b, benchWrappers("noop", txCount, 500))
 
+			b.ReportAllocs()
+			b.ResetTimer() // exclude building the snapshot from time and allocations
+
 			for i := 0; i < b.N; i++ {
 				start := time.Now()
 				require.NoError(b, importUTXOSet(context.Background(), ulogger.TestLogger{}, noopCreateStore{}, path, importOptions{

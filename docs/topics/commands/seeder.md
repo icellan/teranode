@@ -137,7 +137,7 @@ The service reads these structures from input files and converts them to the for
 To run the Seeder command, use the following command:
 
 ```shell
-teranode-cli seeder -inputDir <folder> -hash <hash> [-skipHeaders] [-skipUTXOs]
+teranode-cli seeder -inputDir <folder> -hash <hash> [-skipHeaders] [-skipUTXOs] [-force] [-skipChecksum]
 ```
 
 Options:
@@ -146,6 +146,8 @@ Options:
 - `-hash`: Hash of the UTXO set / headers to process.
 - `-skipHeaders`: (Optional) Skip processing of headers.
 - `-skipUTXOs`: (Optional) Skip processing of UTXOs.
+- `-force`: (Optional) Process even if `lastProcessed.dat` or BlockAssembler state already exists.
+- `-skipChecksum`: (Optional) Skip checksum verification (see below). Only for callers that have already verified the files against their sidecars.
 
 ### Checksum verification
 
@@ -168,6 +170,14 @@ This applies to the headers file even when `-skipHeaders` is set: the UTXO
 pass still reads the headers file back to recover coinbase inputs, so it is
 verified whenever it will be consumed, not only when the header-import pass
 itself runs.
+
+Verification reads each file in full (7m38s for a 569 GB mainnet UTXO set).
+A caller that has already verified the same files, such as a fetch script
+that checks the sidecars after download, can pass `-skipChecksum` to avoid
+reading them twice; the seeder logs a warning when it does. Checking during
+the import instead is not offered: a mismatch found partway through would
+leave corrupt records in the UTXO store that a re-run keeps as already
+present.
 
 This check is a defense against transfer/storage corruption, not tampering:
 the sidecar itself is unauthenticated, so it cannot detect a snapshot and its

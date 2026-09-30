@@ -18,6 +18,7 @@ package seeder
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -106,7 +107,7 @@ func usage(msg string) {
 //
 //nolint:gocognit // Requires refactoring to reduce cognitive complexity
 func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir string, hash string,
-	skipHeaders bool, skipUTXOs bool, force bool) error {
+	skipHeaders bool, skipUTXOs bool, force bool, skipChecksum bool) error {
 	profilerAddr := appSettings.ProfilerAddr
 	if profilerAddr != "" {
 		go func() {
@@ -145,10 +146,12 @@ func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir stri
 			usage(fmt.Sprintf("Headers file %s does not exist", headerFile))
 		}
 
-		if err := verifyChecksum(logger, headerFile); err != nil {
-			return errors.NewProcessingError("checksum verification failed for headers file %s", headerFile, err)
+		if !skipChecksum {
+			if err := verifyChecksum(logger, headerFile); err != nil {
+				return errors.NewProcessingError("checksum verification failed for headers file %s", headerFile, err)
+			}
 		}
-	} else if !skipUTXOs {
+	} else if !skipUTXOs && !skipChecksum {
 		// The header pass itself is skipped, but processUTXOs still reads
 		// headerFile back (via loadCoinbaseTxs) to recover coinbase inputs, so a
 		// corrupted headers file must not be silently consumed just because
@@ -167,9 +170,15 @@ func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir stri
 			usage(fmt.Sprintf("UTXO file %s does not exist", utxoFile))
 		}
 
-		if err := verifyChecksum(logger, utxoFile); err != nil {
-			return errors.NewProcessingError("checksum verification failed for UTXO file %s", utxoFile, err)
+		if !skipChecksum {
+			if err := verifyChecksum(logger, utxoFile); err != nil {
+				return errors.NewProcessingError("checksum verification failed for UTXO file %s", utxoFile, err)
+			}
 		}
+	}
+
+	if skipChecksum {
+		logger.Warnf("-skipChecksum set: not verifying %s / %s against their checksum sidecars; the caller must have verified them", headerFile, utxoFile)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -603,7 +612,7 @@ func importUTXOSet(ctx context.Context, logger ulogger.Logger, store utxo.Store,
 
 	g, gCtx := errgroup.WithContext(ctx)
 
-	startPass := func(name string, workerCount int, accept func(*utxopersister.UTXOWrapper) bool) {
+	startPass := func(name string, workerCount int, accept func(maxIndex uint32) bool) {
 		g.Go(func() error {
 			f, reader, _, _, err := openUTXOSetFile(utxoFile)
 			if err != nil {
@@ -616,7 +625,7 @@ func importUTXOSet(ctx context.Context, logger ulogger.Logger, store utxo.Store,
 
 			logger.Infof("[%s pass] starting %d workers, channel size %d", name, workerCount, opts.channelSize)
 
-			utxoWrapperCh := make(chan *utxopersister.UTXOWrapper, opts.channelSize)
+			frameCh := make(chan []byte, opts.channelSize)
 
 			pg, pCtx := errgroup.WithContext(gCtx)
 
@@ -624,12 +633,12 @@ func importUTXOSet(ctx context.Context, logger ulogger.Logger, store utxo.Store,
 				workerID := i
 
 				pg.Go(func() error {
-					return worker(pCtx, logger, store, workerID, utxoWrapperCh, opts.coinbaseTxs, opts.skipStore)
+					return worker(pCtx, logger, store, workerID, frameCh, opts.coinbaseTxs, opts.skipStore)
 				})
 			}
 
 			pg.Go(func() error {
-				return readUTXOWrapperFile(pCtx, logger, f, reader, utxoWrapperCh, name, accept)
+				return readUTXOFrames(pCtx, logger, f, reader, frameCh, name, accept)
 			})
 
 			return pg.Wait()
@@ -637,11 +646,11 @@ func importUTXOSet(ctx context.Context, logger ulogger.Logger, store utxo.Store,
 	}
 
 	if opts.utxoBatchSize > 0 {
-		startPass("single-record", opts.workerCount, func(w *utxopersister.UTXOWrapper) bool {
-			return !spansMultipleRecords(w, opts.utxoBatchSize)
+		startPass("single-record", opts.workerCount, func(maxIndex uint32) bool {
+			return !spansMultipleRecords(maxIndex, opts.utxoBatchSize)
 		})
-		startPass("multi-record", opts.multiRecordWorkerCount, func(w *utxopersister.UTXOWrapper) bool {
-			return spansMultipleRecords(w, opts.utxoBatchSize)
+		startPass("multi-record", opts.multiRecordWorkerCount, func(maxIndex uint32) bool {
+			return spansMultipleRecords(maxIndex, opts.utxoBatchSize)
 		})
 	} else {
 		startPass("all", opts.workerCount, nil)
@@ -771,76 +780,77 @@ func seedingExternalStoreURL(utxoStoreURL *url.URL, fsyncMode string) (*url.URL,
 	return &out, externalURL.Path, nil
 }
 
-// readUTXOWrapperFile reads UTXOWrapper records from reader (backed by f) and
-// sends them to utxoWrapperCh until the record stream is exhausted, then
-// closes the channel.
+// readUTXOFrames cuts the UTXOWrapper records from reader (backed by f) into
+// raw frames (utxopersister.ReadUTXOWrapperFrame) and sends them to frameCh
+// until the record stream is exhausted, then closes the channel. Decoding is
+// left to the workers: with a single reader decoding every record, the reader
+// was the import's ceiling.
 //
-// The underlying UTXOWrapperFromReader/errors.Is(err, io.EOF) EOF detection
-// cannot tell a clean end-of-records boundary apart from a file truncated
-// mid-record: both surface as an error whose message contains "EOF" (a real
-// truncation trips io.ErrUnexpectedEOF, whose message "unexpected EOF"
-// contains "EOF" as a substring), so errors.Is treats them identically via
-// this package's substring-matching Is fallback. To make truncation
-// detection exact, every snapshot file carries a trailing 16-byte footer
-// (utxopersister.GetFooter) recording the txCount/utxoCount it was written
-// with; once the read loop ends for any reason, that footer is compared
-// against what was actually processed, and a mismatch is reported as an
-// error instead of silently treated as success.
+// The EOF detection (errors.Is(err, io.EOF)) cannot tell a clean
+// end-of-records boundary apart from a file truncated mid-record: both surface
+// as an error whose message contains "EOF" (a real truncation trips
+// io.ErrUnexpectedEOF, whose message "unexpected EOF" contains "EOF" as a
+// substring), so errors.Is treats them identically via this package's
+// substring-matching Is fallback. To make truncation detection exact, every
+// snapshot file carries a trailing 16-byte footer (utxopersister.GetFooter)
+// recording the txCount/utxoCount it was written with; once the read loop ends
+// for any reason, that footer is compared against what was actually read, and
+// a mismatch is reported as an error instead of silently treated as success.
 //
-// Only records for which accept returns true (all, when accept is nil) are
-// sent; every record is still read and counted, so each pass validates the
-// whole file against the footer. pass names the pass in log lines.
-func readUTXOWrapperFile(ctx context.Context, logger ulogger.Logger, f *os.File, reader *bufio.Reader, utxoWrapperCh chan<- *utxopersister.UTXOWrapper,
-	pass string, accept func(*utxopersister.UTXOWrapper) bool) error {
-	defer close(utxoWrapperCh)
+// Only frames for which accept returns true (all, when accept is nil) are
+// sent; accept gets the record's highest output index. Every record is still
+// read and counted, so each pass validates the whole file against the footer.
+// pass names the pass in log lines.
+func readUTXOFrames(ctx context.Context, logger ulogger.Logger, f *os.File, reader *bufio.Reader, frameCh chan<- []byte,
+	pass string, accept func(maxIndex uint32) bool) error {
+	defer close(frameCh)
 
 	var (
 		txProcessed    uint64
 		utxosProcessed uint64
 		txsSent        uint64
-		err            error
+		scratch        []byte
 	)
 
-OUTER:
 	for {
+		if err := ctx.Err(); err != nil {
+			logger.Infof("Context cancelled, stopping reading UTXOWrapper")
+			return err
+		}
+
+		// Read into a reused buffer; only records this pass sends get their own
+		// exactly-sized copy, so skipped records cost no allocation.
+		frame, maxIndex, err := utxopersister.ReadUTXOWrapperFrame(reader, scratch)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+
+			logger.Errorf("Failed to read UTXO: %v", err)
+
+			return errors.NewProcessingError("failed to read UTXO", err)
+		}
+
+		scratch = frame
+
+		txProcessed++
+		utxosProcessed += uint64(utxopersister.FrameUTXOCount(frame))
+
+		if txProcessed%1_000_000 == 0 {
+			logger.Infof("[%s pass] read %16s transactions with %16s utxos, %s sent to workers", pass, formatNumber(txProcessed), formatNumber(utxosProcessed), formatNumber(txsSent))
+		}
+
+		if accept != nil && !accept(maxIndex) {
+			continue
+		}
+
 		select {
 		case <-ctx.Done():
-			// Context canceled, stop reading lines
-			logger.Infof("Context cancelled, stopping reading UTXOWrapper")
+			logger.Infof("Context cancelled while sending UTXO to channel, stopping UTXO processing")
 			return ctx.Err()
 
-		default:
-			var utxoWrapper *utxopersister.UTXOWrapper
-
-			utxoWrapper, err = utxopersister.NewUTXOWrapperFromReader(ctx, reader)
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break OUTER
-				}
-
-				logger.Errorf("Failed to read UTXO: %v", err)
-				return errors.NewProcessingError("failed to read UTXO", err)
-			}
-
-			txProcessed++
-			utxosProcessed += uint64(len(utxoWrapper.UTXOs))
-
-			if txProcessed%1_000_000 == 0 {
-				logger.Infof("[%s pass] read %16s transactions with %16s utxos, %s sent to workers", pass, formatNumber(txProcessed), formatNumber(utxosProcessed), formatNumber(txsSent))
-			}
-
-			if accept != nil && !accept(utxoWrapper) {
-				continue
-			}
-
-			select {
-			case <-ctx.Done():
-				logger.Infof("Context cancelled while sending UTXO to channel, stopping UTXO processing")
-				return ctx.Err()
-
-			case utxoWrapperCh <- utxoWrapper:
-				txsSent++
-			}
+		case frameCh <- bytes.Clone(frame):
+			txsSent++
 		}
 	}
 
@@ -865,44 +875,55 @@ OUTER:
 	return nil
 }
 
-// spansMultipleRecords reports whether the UTXO store will split this tx over
-// more than one record. The split is by padded output count (highest unspent
-// index + 1), matching PadUTXOsWithNil, not by the number of unspent outputs.
-func spansMultipleRecords(w *utxopersister.UTXOWrapper, utxoBatchSize int) bool {
-	if utxoBatchSize <= 0 {
-		return false
-	}
-
-	for _, u := range w.UTXOs {
-		if u != nil && int64(u.Index) >= int64(utxoBatchSize) {
-			return true
-		}
-	}
-
-	return false
+// spansMultipleRecords reports whether the UTXO store will split a tx whose
+// highest unspent output index is maxIndex over more than one record. The
+// split is by padded output count (highest unspent index + 1), matching
+// PadUTXOsWithNil, not by the number of unspent outputs.
+func spansMultipleRecords(maxIndex uint32, utxoBatchSize int) bool {
+	return utxoBatchSize > 0 && int64(maxIndex) >= int64(utxoBatchSize)
 }
 
-// worker processes UTXOWrapper messages from the channel and stores them in the UTXO store.
+// worker decodes the frames from the channel and stores them in the UTXO store.
 func worker(ctx context.Context, logger ulogger.Logger, store utxo.Store,
-	id int, utxoWrapperCh <-chan *utxopersister.UTXOWrapper, coinbaseTxs map[chainhash.Hash]*bt.Tx, skipStore bool) error {
+	id int, frameCh <-chan []byte, coinbaseTxs map[chainhash.Hash]*bt.Tx, skipStore bool) error {
 	// A plain receive rather than a select on ctx.Done(): with thousands of
 	// workers, locking the shared Done channel on every item dominated CPU. The
-	// reader closes utxoWrapperCh when it finishes or ctx is cancelled, which
-	// wakes idle workers. A worker that stops on cancellation drops the
-	// remaining buffered records; importUTXOSet reports that as an error.
-	for utxoWrapper := range utxoWrapperCh {
+	// reader closes frameCh when it finishes or ctx is cancelled, which wakes
+	// idle workers. A worker that stops on cancellation drops the remaining
+	// buffered records; importUTXOSet reports that as an error.
+	for frame := range frameCh {
 		if ctx.Err() != nil {
 			logger.Infof("Worker %d received stop signal: %v", id, ctx.Err())
 			return nil
 		}
 
-		if err := processUTXO(ctx, store, utxoWrapper, coinbaseTxs, skipStore); err != nil {
+		utxoWrapper, err := utxopersister.DecodeUTXOWrapperFrame(frame)
+		if err != nil {
+			logger.Errorf("Worker %d failed to decode UTXO: %v", id, err)
+			return errors.NewProcessingError("failed to decode UTXO", err)
+		}
+
+		if err = processUTXO(ctx, store, utxoWrapper, coinbaseTxs, skipStore); err != nil {
 			logger.Errorf("Worker %d failed to process UTXO: %v", id, err)
 			return err
 		}
 	}
 
 	return nil
+}
+
+// The two WithSetCoinbase options, built once instead of a closure per tx.
+var (
+	setCoinbaseTrue  = utxo.WithSetCoinbase(true)
+	setCoinbaseFalse = utxo.WithSetCoinbase(false)
+)
+
+func setCoinbaseOption(coinbase bool) utxo.CreateOption {
+	if coinbase {
+		return setCoinbaseTrue
+	}
+
+	return setCoinbaseFalse
 }
 
 // processUTXO processes a single UTXOWrapper and stores it in the UTXO store.
@@ -915,19 +936,23 @@ func processUTXO(ctx context.Context, store utxo.Store, utxoWrapper *utxopersist
 		return nil
 	}
 
-	padded := utxopersister.PadUTXOsWithNil(utxoWrapper.UTXOs)
+	// Same layout as utxopersister.PadUTXOsWithNil (each unspent output at its
+	// index, spent positions nil), but the outputs and their scripts come from
+	// one array each instead of two allocations per output: at mainnet scale
+	// these allocations drove GC to half the process.
+	var maxIndex uint32
+	for _, u := range utxoWrapper.UTXOs {
+		maxIndex = max(maxIndex, u.Index)
+	}
 
-	tx := &bt.Tx{Outputs: make([]*bt.Output, 0, len(padded))}
+	outputs := make([]bt.Output, len(utxoWrapper.UTXOs))
+	scripts := make([]bscript.Script, len(utxoWrapper.UTXOs))
+	tx := &bt.Tx{Outputs: make([]*bt.Output, maxIndex+1)}
 
-	for _, u := range padded {
-		var output *bt.Output
-		if u != nil {
-			output = &bt.Output{}
-			output.Satoshis = u.Value
-			output.LockingScript = bscript.NewFromBytes(u.Script)
-		}
-
-		tx.Outputs = append(tx.Outputs, output)
+	for i, u := range utxoWrapper.UTXOs {
+		scripts[i] = bscript.Script(u.Script)
+		outputs[i] = bt.Output{Satoshis: u.Value, LockingScript: &scripts[i]}
+		tx.Outputs[u.Index] = &outputs[i]
 	}
 
 	// A coinbase rebuilt from the UTXO set alone has no input (the coinbase
@@ -948,7 +973,7 @@ func processUTXO(ctx context.Context, store utxo.Store, utxoWrapper *utxopersist
 		utxoWrapper.Height,
 		utxo.WithCreateOnly(),
 		utxo.WithTXID(&utxoWrapper.TxID),
-		utxo.WithSetCoinbase(utxoWrapper.Coinbase),
+		setCoinbaseOption(utxoWrapper.Coinbase),
 		utxo.WithMinedBlockInfo(utxo.MinedBlockInfo{BlockID: 0, BlockHeight: utxoWrapper.Height, SubtreeIdx: 0}),
 	); err != nil {
 		if errors.Is(err, errors.ErrTxExists) {
