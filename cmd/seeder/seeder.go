@@ -833,6 +833,10 @@ func readUTXOFrames(ctx context.Context, logger ulogger.Logger, f *os.File, read
 
 		scratch = frame
 
+		if err = checkOutputIndex(maxIndex); err != nil {
+			return errors.NewProcessingError("invalid UTXO record %d", txProcessed+1, err)
+		}
+
 		txProcessed++
 		utxosProcessed += uint64(utxopersister.FrameUTXOCount(frame))
 
@@ -871,6 +875,24 @@ func readUTXOFrames(ctx context.Context, logger ulogger.Logger, f *os.File, read
 	}
 
 	logger.Infof("[%s pass] FINISHED %16s transactions with %16s utxos, %s sent to workers", pass, formatNumber(txProcessed), formatNumber(utxosProcessed), formatNumber(txsSent))
+
+	return nil
+}
+
+// maxOutputIndex is the highest output index a consensus-valid transaction can
+// have: 1,000,000,000 bytes (MAX_TX_SIZE_CONSENSUS_AFTER_GENESIS, see
+// model/block_coinbase_common_rules.go) divided by the 9-byte minimum output
+// (8-byte value, 1-byte script length), minus one.
+const maxOutputIndex = 1_000_000_000/9 - 1
+
+// checkOutputIndex rejects an output index from the (untrusted) snapshot file
+// that no valid transaction can have. processUTXO sizes a tx's outputs by it,
+// so an unchecked 0xFFFFFFFF would wrap to an empty slice and panic, and one
+// just below would attempt a ~32 GiB allocation.
+func checkOutputIndex(maxIndex uint32) error {
+	if maxIndex > maxOutputIndex {
+		return errors.NewProcessingError("output index %d exceeds the maximum %d a valid transaction can have", maxIndex, maxOutputIndex)
+	}
 
 	return nil
 }
@@ -947,7 +969,7 @@ func processUTXO(ctx context.Context, store utxo.Store, utxoWrapper *utxopersist
 
 	outputs := make([]bt.Output, len(utxoWrapper.UTXOs))
 	scripts := make([]bscript.Script, len(utxoWrapper.UTXOs))
-	tx := &bt.Tx{Outputs: make([]*bt.Output, maxIndex+1)}
+	tx := &bt.Tx{Outputs: make([]*bt.Output, int(maxIndex)+1)}
 
 	for i, u := range utxoWrapper.UTXOs {
 		scripts[i] = bscript.Script(u.Script)

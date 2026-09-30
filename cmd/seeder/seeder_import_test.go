@@ -325,3 +325,28 @@ func TestProcessUTXO_OutputLayout(t *testing.T) {
 		})
 	}
 }
+
+// An output index no consensus-valid tx can have must fail the import with an
+// error, not crash a worker (0xFFFFFFFF wrapped maxIndex+1 to 0 and panicked)
+// or attempt a multi-GiB outputs slice.
+func TestImportUTXOSet_RejectsImpossibleOutputIndex(t *testing.T) {
+	for _, index := range []uint32{maxOutputIndex + 1, 0xFFFFFFFE, 0xFFFFFFFF} {
+		wrappers := benchWrappers("bad-index", 10, 0)
+		wrappers[5].UTXOs[0].Index = index
+
+		path := writeCompleteSnapshotFile(t, wrappers)
+
+		err := importUTXOSet(context.Background(), ulogger.TestLogger{}, noopCreateStore{}, path, testImportOptions())
+		require.Error(t, err, "index %d", index)
+		require.Contains(t, err.Error(), "output index", "index %d", index)
+	}
+}
+
+// The largest index a consensus-valid tx can have is still accepted. Checked on
+// the bound directly: importing it would build an ~888 MB outputs slice.
+func TestCheckOutputIndex(t *testing.T) {
+	require.NoError(t, checkOutputIndex(0))
+	require.NoError(t, checkOutputIndex(maxOutputIndex))
+	require.Error(t, checkOutputIndex(maxOutputIndex+1))
+	require.Error(t, checkOutputIndex(0xFFFFFFFF))
+}
