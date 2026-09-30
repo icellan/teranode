@@ -584,6 +584,11 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 	return &utxoSetTip{hash: hash, height: height}, nil
 }
 
+// maxWorkerCount caps each pass's worker goroutines. Far above any useful
+// value (16384 was the measured knee), it only catches a mistyped setting that
+// would spawn millions of goroutines whose stacks the GC scans every cycle.
+const maxWorkerCount = 1 << 20
+
 // importOptions configures importUTXOSet.
 type importOptions struct {
 	workerCount            int // workers for the single-record pass
@@ -606,8 +611,8 @@ type importOptions struct {
 // import takes as long as the slower pass. Both run in one errgroup: the first
 // error in either cancels both, and the seed is then re-run from the start.
 func importUTXOSet(ctx context.Context, logger ulogger.Logger, store utxo.Store, utxoFile string, opts importOptions) error {
-	if opts.workerCount < 1 || opts.multiRecordWorkerCount < 1 {
-		return errors.NewConfigurationError("workerCount (%d) and multiRecordWorkerCount (%d) must both be at least 1", opts.workerCount, opts.multiRecordWorkerCount)
+	if opts.workerCount < 1 || opts.multiRecordWorkerCount < 1 || opts.workerCount > maxWorkerCount || opts.multiRecordWorkerCount > maxWorkerCount {
+		return errors.NewConfigurationError("workerCount (%d) and multiRecordWorkerCount (%d) must both be between 1 and %d", opts.workerCount, opts.multiRecordWorkerCount, maxWorkerCount)
 	}
 
 	g, gCtx := errgroup.WithContext(ctx)
@@ -879,19 +884,13 @@ func readUTXOFrames(ctx context.Context, logger ulogger.Logger, f *os.File, read
 	return nil
 }
 
-// maxOutputIndex is the highest output index a consensus-valid transaction can
-// have: 1,000,000,000 bytes (MAX_TX_SIZE_CONSENSUS_AFTER_GENESIS, see
-// model/block_coinbase_common_rules.go) divided by the 9-byte minimum output
-// (8-byte value, 1-byte script length), minus one.
-const maxOutputIndex = 1_000_000_000/9 - 1
-
 // checkOutputIndex rejects an output index from the (untrusted) snapshot file
 // that no valid transaction can have. processUTXO sizes a tx's outputs by it,
 // so an unchecked 0xFFFFFFFF would wrap to an empty slice and panic, and one
 // just below would attempt a ~32 GiB allocation.
 func checkOutputIndex(maxIndex uint32) error {
-	if maxIndex > maxOutputIndex {
-		return errors.NewProcessingError("output index %d exceeds the maximum %d a valid transaction can have", maxIndex, maxOutputIndex)
+	if maxIndex > utxopersister.MaxOutputIndex {
+		return errors.NewProcessingError("output index %d exceeds the maximum %d a valid transaction can have", maxIndex, utxopersister.MaxOutputIndex)
 	}
 
 	return nil
@@ -965,6 +964,12 @@ func processUTXO(ctx context.Context, store utxo.Store, utxoWrapper *utxopersist
 	var maxIndex uint32
 	for _, u := range utxoWrapper.UTXOs {
 		maxIndex = max(maxIndex, u.Index)
+	}
+
+	// The reader already rejects such records; checked here too because this
+	// function sizes the outputs from maxIndex and must be safe on its own.
+	if err := checkOutputIndex(maxIndex); err != nil {
+		return err
 	}
 
 	outputs := make([]bt.Output, len(utxoWrapper.UTXOs))

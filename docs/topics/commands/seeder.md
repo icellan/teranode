@@ -199,10 +199,10 @@ The Seeder uses various configuration options, which can be set through a config
 - `blockchain_store`: URL for the blockchain store.
 - `utxostore`: URL for the UTXO store.
 - `channelSize`: Buffer between each pass's reader and its workers (default: 1000).
-- `workerCount`: Worker goroutines in the single-record pass (default: 16384). Each
+- `workerCount`: Worker goroutines in the single-record pass (default: 16384, range 1 to 1,048,576). Each
   blocks until its create is written, so this is the number of transactions in
   flight; it must comfortably exceed `utxostore_storeBatcherSize`.
-- `multiRecordWorkerCount`: Worker goroutines in the multi-record pass (default:
+- `multiRecordWorkerCount`: Worker goroutines in the multi-record pass (range 1 to 1,048,576; default:
   `seeder_externalStoreConcurrency`, or 1024 when that is 0 or less).
 - `seeder_externalStoreConcurrency`: Replaces `utxostore_externalStoreConcurrency`
   for the seeder run (default: 256; 0 or less means unlimited).

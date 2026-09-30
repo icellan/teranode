@@ -265,3 +265,28 @@ func BenchmarkSeederReaderPerRecord(b *testing.B) {
 		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/record")
 	})
 }
+
+// A script length just over maxExactScriptAlloc with no bytes behind it must
+// cost only a bounded chunk, on both decoders. This pins the bound itself: the
+// hostile-size test above uses a 32 MiB claim with a 4 MB ceiling, so any bound
+// up to 32 MiB would slip past it.
+func TestScriptLengthOverExactAllocBound_AllocatesOnlyAChunk(t *testing.T) {
+	const (
+		claim   = 1 << 20           // 1 MiB claimed, nothing present
+		ceiling = uint64(256 << 10) // well above one 64 KiB chunk, well below the claim
+	)
+
+	data := wrapperWithScriptLen(1, claim)
+
+	for name, decode := range map[string]func() error{
+		"NewUTXOWrapperFromBytes": func() error { _, err := NewUTXOWrapperFromBytes(data); return err },
+		"ReadUTXOWrapperFrame":    func() error { _, _, err := ReadUTXOWrapperFrame(bytes.NewReader(data), nil); return err },
+	} {
+		var err error
+
+		alloc := totalAllocDelta(func() { err = decode() })
+
+		require.Error(t, err, name)
+		require.Less(t, alloc, ceiling, "%s allocated %d bytes for a %d-byte input claiming a %d-byte script", name, alloc, len(data), claim)
+	}
+}

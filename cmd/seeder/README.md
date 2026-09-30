@@ -33,8 +33,8 @@ The UTXO set is imported in two concurrent passes over the same file: one for tr
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `workerCount` | 16384 | Concurrent creates in the single-record pass (at least 1). Must comfortably exceed `utxostore_storeBatcherSize` so store batches fill. |
-| `multiRecordWorkerCount` | `seeder_externalStoreConcurrency` | Concurrent creates in the multi-record pass (at least 1). |
+| `workerCount` | 16384 | Concurrent creates in the single-record pass (1 to 1,048,576). Must comfortably exceed `utxostore_storeBatcherSize` so store batches fill. |
+| `multiRecordWorkerCount` | `seeder_externalStoreConcurrency` | Concurrent creates in the multi-record pass (1 to 1,048,576). |
 | `channelSize` | 1000 | Buffer between each pass's reader and its workers. |
 | `seeder_externalStoreConcurrency` | 256 | Replaces `utxostore_externalStoreConcurrency` for the seeder run, even when that is set explicitly. `0` or less means unlimited, as for `utxostore_externalStoreConcurrency`; `multiRecordWorkerCount` then defaults to 1024. |
 | `seeder_externalStoreFsyncMode` | `data` | fsync mode for a `file://` external store whose URL does not set `fsyncMode`. `data` fsyncs each blob but not its directory entry, so a re-run after a host crash rewrites any blob whose name was lost. When weaker than `full`, the seeder runs syncfs on the external store before writing `lastProcessed.dat`. `none` is faster but not safe to resume after a host crash (not a process crash): wipe and re-seed instead; the seeder logs a warning at start when the effective mode is `none`. An unsupported platform or unusable store path fails before the import starts. |

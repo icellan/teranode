@@ -101,7 +101,8 @@ func TestTxWithOnlyOutputs(t *testing.T) {
 
 	assert.Equal(t, 476, len(uw.UTXOs))
 
-	utxos := PadUTXOsWithNil(uw.UTXOs)
+	utxos, err := PadUTXOsWithNil(uw.UTXOs)
+	require.NoError(t, err)
 	assert.NotNil(t, utxos)
 	assert.Equal(t, 1000, len(utxos))
 
@@ -175,4 +176,18 @@ func TestNewUTXOWrapperFromBytes_ScriptAtExactAllocBoundary(t *testing.T) {
 		require.Len(t, out.UTXOs, 1)
 		require.Equal(t, script, out.UTXOs[0].Script, "size %d", size)
 	}
+}
+
+// An output index no valid transaction can have must be rejected, not padded:
+// 0xFFFFFFFF wrapped maxIndex+1 to an empty slice and panicked on the first
+// placement, and an index just below it asked for a ~32 GiB slice.
+func TestPadUTXOsWithNil_RejectsImpossibleIndex(t *testing.T) {
+	for _, index := range []uint32{MaxOutputIndex + 1, 0xFFFFFFFE, 0xFFFFFFFF} {
+		_, err := PadUTXOsWithNil([]*UTXO{{Index: 0}, {Index: index}})
+		require.Error(t, err, "index %d", index)
+	}
+
+	padded, err := PadUTXOsWithNil([]*UTXO{{Index: 2}})
+	require.NoError(t, err)
+	require.Len(t, padded, 3)
 }

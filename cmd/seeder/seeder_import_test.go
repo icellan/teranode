@@ -85,13 +85,17 @@ func TestImportUTXOSet_CancelAfterReaderFinishedIsNotSuccess(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 }
 
-// Zero workers would leave the reader blocked forever on a full channel.
+// Zero workers would leave the reader blocked forever on a full channel, and an
+// absurd count (a typo'd extra digit) would spawn millions of goroutines whose
+// stacks the GC then scans on every cycle.
 func TestImportUTXOSet_RejectsNonPositiveWorkerCounts(t *testing.T) {
 	path := writeCompleteSnapshotFile(t, benchWrappers("zero", 10, 0))
 
 	for _, mutate := range []func(*importOptions){
 		func(o *importOptions) { o.workerCount = 0 },
 		func(o *importOptions) { o.multiRecordWorkerCount = 0 },
+		func(o *importOptions) { o.workerCount = maxWorkerCount + 1 },
+		func(o *importOptions) { o.multiRecordWorkerCount = maxWorkerCount + 1 },
 	} {
 		opts := testImportOptions()
 		mutate(&opts)
@@ -330,7 +334,7 @@ func TestProcessUTXO_OutputLayout(t *testing.T) {
 // error, not crash a worker (0xFFFFFFFF wrapped maxIndex+1 to 0 and panicked)
 // or attempt a multi-GiB outputs slice.
 func TestImportUTXOSet_RejectsImpossibleOutputIndex(t *testing.T) {
-	for _, index := range []uint32{maxOutputIndex + 1, 0xFFFFFFFE, 0xFFFFFFFF} {
+	for _, index := range []uint32{utxopersister.MaxOutputIndex + 1, 0xFFFFFFFE, 0xFFFFFFFF} {
 		wrappers := benchWrappers("bad-index", 10, 0)
 		wrappers[5].UTXOs[0].Index = index
 
@@ -346,7 +350,24 @@ func TestImportUTXOSet_RejectsImpossibleOutputIndex(t *testing.T) {
 // the bound directly: importing it would build an ~888 MB outputs slice.
 func TestCheckOutputIndex(t *testing.T) {
 	require.NoError(t, checkOutputIndex(0))
-	require.NoError(t, checkOutputIndex(maxOutputIndex))
-	require.Error(t, checkOutputIndex(maxOutputIndex+1))
+	require.NoError(t, checkOutputIndex(utxopersister.MaxOutputIndex))
+	require.Error(t, checkOutputIndex(utxopersister.MaxOutputIndex+1))
 	require.Error(t, checkOutputIndex(0xFFFFFFFF))
+}
+
+// processUTXO sizes the outputs from the highest index itself, so it must
+// reject an impossible index on its own, not rely on the reader having checked.
+func TestProcessUTXO_RejectsImpossibleOutputIndex(t *testing.T) {
+	w := &utxopersister.UTXOWrapper{
+		TxID:   chainhash.HashH([]byte("impossible-index")),
+		Height: 1,
+		UTXOs:  []*utxopersister.UTXO{{Index: 0xFFFFFFFF, Value: 1, Script: []byte{0x51}}},
+	}
+
+	store := &capturingStore{}
+
+	err := processUTXO(context.Background(), store, w, nil, false)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "output index")
+	require.Nil(t, store.tx, "nothing must reach the store")
 }
