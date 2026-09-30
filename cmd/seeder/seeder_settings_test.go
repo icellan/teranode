@@ -79,6 +79,17 @@ func TestSeedingExternalStoreURL(t *testing.T) {
 		require.Equal(t, "sqlitememory:///utxo", out.String())
 	})
 
+	t.Run("modes are case-insensitive, like the file blob store", func(t *testing.T) {
+		out, syncPath, err := seedingExternalStoreURL(parse("aerospike://h/test?externalStore=file:///d"), "Data")
+		require.NoError(t, err)
+		require.Equal(t, "/d", syncPath)
+		require.Equal(t, "file:///d?fsyncMode=data", externalOf(out))
+
+		_, syncPath, err = seedingExternalStoreURL(parse("aerospike://h/test?externalStore=file%3A%2F%2F%2Fd%3FfsyncMode%3DFULL"), "data")
+		require.NoError(t, err)
+		require.Empty(t, syncPath, "an operator-set FULL is full")
+	})
+
 	t.Run("an invalid seeding mode is rejected", func(t *testing.T) {
 		_, _, err := seedingExternalStoreURL(parse("aerospike://h/test?externalStore=file:///d"), "sometimes")
 		require.Error(t, err)
@@ -91,6 +102,7 @@ func TestSeedingExternalStoreURL(t *testing.T) {
 func TestResumeUnsafeAfterHostCrash(t *testing.T) {
 	for in, want := range map[string]bool{
 		"aerospike://h/test?externalStore=file%3A%2F%2F%2Fd%3FfsyncMode%3Dnone": true,
+		"aerospike://h/test?externalStore=file%3A%2F%2F%2Fd%3FfsyncMode%3DNONE": true, // file store parses case-insensitively
 		"aerospike://h/test?externalStore=file%3A%2F%2F%2Fd%3FfsyncMode%3Ddata": false,
 		"aerospike://h/test?externalStore=file:///d":                            false,
 		"aerospike://h/test?externalStore=s3://bucket/x":                        false,

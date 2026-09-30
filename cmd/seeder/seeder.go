@@ -713,7 +713,7 @@ func resumeUnsafeAfterHostCrash(utxoStoreURL *url.URL) bool {
 		return false
 	}
 
-	return externalURL.Query().Get("fsyncMode") == "none"
+	return strings.ToLower(externalURL.Query().Get("fsyncMode")) == "none"
 }
 
 // seedingExternalStoreURL returns utxoStoreURL with its external blob store
@@ -723,6 +723,9 @@ func resumeUnsafeAfterHostCrash(utxoStoreURL *url.URL) bool {
 // "full" (the caller must sync that filesystem before declaring the seed
 // done), and "" otherwise. The input URL is never mutated.
 func seedingExternalStoreURL(utxoStoreURL *url.URL, fsyncMode string) (*url.URL, string, error) {
+	// Case-insensitive, like the file blob store's own parseFsyncMode.
+	fsyncMode = strings.ToLower(fsyncMode)
+
 	switch fsyncMode {
 	case "", "full", "data", "none":
 	default:
@@ -756,7 +759,7 @@ func seedingExternalStoreURL(utxoStoreURL *url.URL, fsyncMode string) (*url.URL,
 		out.RawQuery = q.Encode()
 	}
 
-	if effective := externalURL.Query().Get("fsyncMode"); effective == "" || effective == "full" {
+	if effective := strings.ToLower(externalURL.Query().Get("fsyncMode")); effective == "" || effective == "full" {
 		return &out, "", nil
 	}
 
