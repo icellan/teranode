@@ -709,7 +709,16 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 
 	if err != nil {
 		if v.rejectedTxKafkaProducerClient != nil { // tests may not set this
-			// TODO should this also announce transactions with missing parents etc.?
+			// Deliberately does not cover ErrTxMissingParent. This message carries
+			// an empty peer_id, and p2p's rejectedTxHandler re-broadcasts exactly
+			// those to the whole network, so announcing a missing parent would
+			// gossip "rejected" for a transaction that is valid and will succeed
+			// once its parent lands - at a rate proportional to the out-of-order
+			// delivery the 32-partition validatortxs topic produces by design.
+			// The drop is counted instead, on the Kafka intake path in Server.go
+			// (prometheusMissingParentTransactions). The real fix - an orphan pool
+			// like services/legacy/netsync already has, so the child is retried
+			// once its parent lands - remains deferred.
 			if errors.Is(err, errors.ErrTxInvalid) {
 				if v.blockchainClient != nil {
 					var (
@@ -914,6 +923,29 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 	// HighestCheckpointHeight so the bound cannot drift.
 	if validationOptions.OutpointOnlySpend && blockHeight > blockchain.HighestCheckpointHeight(v.settings.ChainCfgParams.Checkpoints) {
 		err = errors.NewProcessingError("[Validate][%s] OutpointOnlySpend must not be used above the highest checkpoint (height %d)", txID, blockHeight)
+		span.RecordError(err)
+
+		return nil, err
+	}
+
+	// The guard above bounds the height the CALLER asserted; an attacker simply asserts a low
+	// one. This bounds the height the NODE'S OWN CHAIN has reached. It is a TIP-derived bound,
+	// not a proof that validation has replayed through that height: GetBlockState reads the UTXO
+	// store snapshot, which production initialises from blockchainClient.GetBestHeightAndTime and
+	// refreshes on each Block notification (stores/utxo/factory/utxo.go). It holds because legacy
+	// netsync validates block H's transactions inside prepareSubtrees BEFORE the block is added,
+	// and blockHandler consumes blockQueue on a single goroutine, so the tip cannot reach H while
+	// H is validating. Same `>` boundary as above, so the block AT checkpoint height C (tip C-1)
+	// still qualifies. A lagging snapshot is fail-open (more permissive, never a false rejection);
+	// a tip genuinely past the checkpoint while below-checkpoint work is in flight is a genuine
+	// rejection whose remedy is to turn the fast path off
+	// (blockvalidation_outpoint_only_below_checkpoint=false), which is also the default.
+	// The condition is `>`, mirroring the caller-asserted guard immediately above it, so it also
+	// admits a tip exactly at the highest checkpoint — a case for which the paragraph above claims
+	// no legitimate producer.
+	// Issue 4840, finding B-022.
+	if validationOptions.OutpointOnlySpend && blockState.Height > blockchain.HighestCheckpointHeight(v.settings.ChainCfgParams.Checkpoints) {
+		err = errors.NewProcessingError("[Validate][%s] OutpointOnlySpend must not be used once the node's chain tip is past the highest checkpoint (tip height %d)", txID, blockState.Height)
 		span.RecordError(err)
 
 		return nil, err
