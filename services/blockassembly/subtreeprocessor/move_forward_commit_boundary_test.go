@@ -194,11 +194,9 @@ func TestMoveForwardBlock_DequeueOwnWriteFailure_LogsCountsRequestsResetButSucce
 
 	// resetSubtreeState swaps diskTxMap <-> diskTxMapShadow, so the pre-swap
 	// shadow becomes the new current map that the dequeued write above lands
-	// in. Installed on every disk shard, not just disk 0, so the test does
-	// not depend on which disk queuedTxHash happens to shard to.
-	for i := range stp.diskTxMapShadow.disks {
-		stp.diskTxMapShadow.disks[i].batch = &failingBatch{flushErr: errors.NewStorageError("flush failed")}
-	}
+	// in. Installed on every log segment, so the test does not depend on
+	// which segment queuedTxHash happens to shard to.
+	failDiskTxMapLogs(stp.diskTxMapShadow, alwaysFailWrites, nil)
 
 	originalCurrentTxMap := stp.currentTxMap
 
@@ -314,18 +312,16 @@ func TestMoveForwardBlock_RemainderCheckBeforeDequeue_QueueUntouchedOnFailure(t 
 
 	// resetSubtreeState swaps diskTxMap <-> diskTxMapShadow, so the pre-swap
 	// shadow becomes the new current map that processRemainderTxHashes' write
-	// (re-adding remainderNode) lands in. Installed on every disk shard,
+	// (re-adding remainderNode) lands in. Installed on every log segment,
 	// since which one remainderNode's hash shards to is not under this test's
 	// control.
-	for i := range stp.diskTxMapShadow.disks {
-		stp.diskTxMapShadow.disks[i].batch = &failingBatch{flushErr: errors.NewStorageError("flush failed")}
-	}
+	failDiskTxMapLogs(stp.diskTxMapShadow, alwaysFailWrites, nil)
 
 	processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 	_, _, err := stp.moveForwardBlock(context.Background(), block, false, processedConflictingHashesMap, false, true)
 	require.Error(t, err, "a remainder-pass write flush failure must fail the call before dequeue runs")
 	require.ErrorContains(t, err, "disk tx map storage error before dequeue", "must be this check's own error, not some unrelated failure")
-	require.ErrorContains(t, err, "flush failed", "and must actually be the flush failure")
+	require.ErrorContains(t, err, "write failed", "and must actually be the write failure")
 
 	require.Equal(t, int64(1), stp.queue.length(), "dequeueDuringBlockMovement must never have run: the queue is untouched")
 }

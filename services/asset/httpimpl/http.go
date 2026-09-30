@@ -355,11 +355,20 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	apiGroup.GET("/headers/:hash/hex", h.GetBlockHeaders(HEX))
 	apiGroup.GET("/headers/:hash/json", h.GetBlockHeaders(JSON))
 
+	// Heavy: each request resolves a common ancestor and can return up to 10,000 headers.
+	// Per-request cost is bounded for main-chain targets; a fork or stale target still
+	// recurses over its whole ancestry in the store, so price these like the block and
+	// subtree routes below.
+	//
 	// this needs to be removed in the future, after all clients have migrated to the new endpoint
-	apiGroup.GET("/headers_to_common_ancestor/:hash", h.GetBlockHeadersToCommonAncestor(BINARY_STREAM))
-	apiGroup.GET("/headers_to_common_ancestor/:hash/hex", h.GetBlockHeadersToCommonAncestor(HEX))
-	apiGroup.GET("/headers_to_common_ancestor/:hash/json", h.GetBlockHeadersToCommonAncestor(JSON))
+	apiGroup.GET("/headers_to_common_ancestor/:hash", h.GetBlockHeadersToCommonAncestor(BINARY_STREAM), heavyMW()...)
+	apiGroup.GET("/headers_to_common_ancestor/:hash/hex", h.GetBlockHeadersToCommonAncestor(HEX), heavyMW()...)
+	apiGroup.GET("/headers_to_common_ancestor/:hash/json", h.GetBlockHeadersToCommonAncestor(JSON), heavyMW()...)
 
+	// Deliberately NOT heavy: peer catch-up calls this route every iteration, and the
+	// heavy bucket is shared with the /blocks and /subtree fetches that follow in the
+	// same round, so charging it here starves them and fails catch-up against healthy
+	// peers. This route has always resolved its ancestor with an indexed lookup.
 	apiGroup.GET("/headers_from_common_ancestor/:hash", h.GetBlockHeadersFromCommonAncestor(BINARY_STREAM))
 	apiGroup.GET("/headers_from_common_ancestor/:hash/hex", h.GetBlockHeadersFromCommonAncestor(HEX))
 	apiGroup.GET("/headers_from_common_ancestor/:hash/json", h.GetBlockHeadersFromCommonAncestor(JSON))

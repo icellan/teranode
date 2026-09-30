@@ -407,14 +407,14 @@ type SubtreeProcessor struct {
 	// diskTxMapRetired holds disk maps displaced by the fresh-allocation path
 	// (multi-block reorgs, where disableCurrentTxMapPool forbids the swap because
 	// rollback must keep the pre-reorg pointer valid across the whole loop).
-	// Unlike in-memory maps these own Badger directories, so they cannot simply
+	// Unlike in-memory maps these own log directories, so they cannot simply
 	// be dropped for the GC — reorgBlocks closes them once the reorg commits or
 	// rolls back and the surviving map is known.
 	diskTxMapRetired []*DiskTxMap
 
 	// diskTxMapResetRequested is set by requestReset when a post-commit disk
 	// tx map storage error is observed: the write is already applied (its
-	// caller cannot roll back), but the filter may now claim entries whose
+	// caller cannot roll back), but the index may now claim entries whose
 	// inpoints never reached disk (a "phantom"), so the map is no longer
 	// trustworthy. BlockAssembler polls TakeResetRequested and, on true,
 	// requests a full reset, which reloads from the UTXO store - the source
@@ -712,8 +712,6 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 	// moveForwardBlock's "captured map stays readable until commit" contract,
 	// and fails on the first block that carries non-coinbase transactions.
 	if len(stp.txMapDirs) > 0 {
-		capacity := uint(initialItemsPerFile * ExpectedNumberOfSubtrees)
-
 		// Left by a previous run that exited without closing its maps.
 		removed, sweepErr := removeStaleDiskTxMapDirs(stp.txMapDirs)
 		if len(removed) > 0 {
@@ -724,11 +722,11 @@ func NewSubtreeProcessor(_ context.Context, logger ulogger.Logger, tSettings *se
 			logger.Warnf("[SubtreeProcessor] error removing stale disk tx map dirs, their disk space stays in use: %v", sweepErr)
 		}
 
-		diskMap, diskErr := stp.newDiskTxMap("ba-txmap", capacity)
+		diskMap, diskErr := stp.newDiskTxMap("ba-txmap")
 		if diskErr != nil {
 			logger.Warnf("DiskTxMap creation failed, using in-memory map: %v", diskErr)
 		} else {
-			shadowMap, shadowErr := stp.newDiskTxMap("ba-txmap-shadow", capacity)
+			shadowMap, shadowErr := stp.newDiskTxMap("ba-txmap-shadow")
 			if shadowErr != nil {
 				_ = diskMap.Close()
 				logger.Warnf("DiskTxMap shadow creation failed, using in-memory map: %v", shadowErr)
@@ -1617,8 +1615,8 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 
 	// The rotation above is itself the cure for any disk tx map error already
 	// pending, or already requesting a reset, before this point (a stale error
-	// from before reset started, or Clear's own pre-rotation flushAllDisks):
-	// every disk now has a fresh Badger generation, so nothing recorded
+	// from before reset started):
+	// every disk now has a fresh generation of log files, so nothing recorded
 	// against the discarded one is still true of the map's current content.
 	// Drain it log-only - it belongs to a generation that no longer exists,
 	// not to this reset - and clear any pending reset request: re-requesting
@@ -3072,34 +3070,33 @@ func (stp *SubtreeProcessor) addNodesDirectly(txs []*utxostore.UnminedTransactio
 	return nil
 }
 
-// flushDiskTxMapWriters flushes stp.diskTxMap's writer so a pre-commit
-// diskTxMapErr() check can see failures for writes this operation itself just
-// made. Writes are batched and only flushed at writerFlushThreshold or on an
-// explicit flush (see disk_tx_map.go); below that threshold they sit
-// unflushed, so a naked diskTxMapErr() call cannot see a flush failure for
-// them. Without this, an operation can commit while some of its own entries
-// silently never reached disk - the filter still claims they exist, but every
-// later Get for them misses.
+// flushDiskTxMapWriters writes out the disk tx maps' buffered payloads so a
+// pre-commit diskTxMapErr() check can see failures for writes this operation
+// itself just made. Payloads are buffered per log segment and only written
+// when a buffer fills or on an explicit flush (see disk_tx_map.go), so a
+// naked diskTxMapErr() call cannot see a write failure for them. Without
+// this, an operation can commit while some of its own entries silently never
+// reached disk - the index still claims they exist, but every later Get for
+// them fails.
 //
-// Only diskTxMap is flushed here: it is the map this operation writes into
-// (after any resetSubtreeState swap/allocation). diskTxMapShadow is read-only
-// during the operation. diskTxMapAnchor is NOT read-only in general -
+// diskTxMap is the map this operation writes into (after any
+// resetSubtreeState swap/allocation). diskTxMapAnchor is written too:
 // moveBackBlockBulkBuild writes moved-back transactions into what becomes the
-// anchor during a multi-block reorg - but it is still covered without an
-// explicit flush here: every read (including the remainder pass that follows
-// moveBack) goes through getFromStoreOrErr, which flushes the target disk
-// synchronously before reading, and any resulting error lands in diskTxMapErr
-// via diskTxMapAnchor. Both halves also have nothing pending that a flush
-// would surface sooner than that synchronous per-read flush already does.
+// anchor during a multi-block reorg. diskTxMapShadow is read-only during the
+// operation.
 func (stp *SubtreeProcessor) flushDiskTxMapWriters() {
 	if stp.diskTxMap != nil {
 		_ = stp.diskTxMap.Flush()
+	}
+
+	if stp.diskTxMapAnchor != nil && stp.diskTxMapAnchor != stp.diskTxMap {
+		_ = stp.diskTxMapAnchor.Flush()
 	}
 }
 
 // diskTxMapErr returns, and clears, the storage errors the disk-backed tx maps
 // recorded since the last call. Map operations have no error return and
-// writes are asynchronous, so operations check this when they finish: a
+// payload writes are buffered, so operations check this when they finish: a
 // failure fails the operation that observes it and the processor keeps
 // running.
 //
@@ -3291,7 +3288,7 @@ func (stp *SubtreeProcessor) failOrJoinDiskTxMapErrForLoad(where string, errPtr 
 // finished (loadUnminedTransactions, loadUnminedTransactionsWithDiskSort),
 // not per AddDirectly/AddNodesDirectly call: those calls' own deferred
 // boundary check only sees errors an earlier automatic flush (at
-// writerFlushThreshold) already surfaced, so the writes below that
+// logBufferSize) already surfaced, so the writes below that
 // threshold - which every load's tail leaves unflushed, and which the
 // disk-sort path (one AddDirectly per tx) leaves unflushed after every
 // single call - are otherwise never checked. Flushing here once, after the
@@ -3990,7 +3987,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	defer func() { stp.disableCurrentTxMapPool = false }()
 
 	// With DiskTxMap the fresh-allocation path leaves the displaced maps holding
-	// Badger directories that only Close() removes.
+	// log directories that only Close() removes.
 	defer stp.finishReorgDiskTxMaps()
 
 	// A failed reorg must never leave its own disk tx map errors pending for
@@ -4366,7 +4363,7 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	// while rollback is still correct.
 	//
 	// Flush first: the moveBack loop's own writes (and any of the last
-	// moveForward iteration's writes below writerFlushThreshold) may still be
+	// moveForward iteration's writes below logBufferSize) may still be
 	// unflushed - see flushDiskTxMapWriters.
 	stp.flushDiskTxMapWriters()
 
@@ -5307,13 +5304,12 @@ func (stp *SubtreeProcessor) processConflictingTransactions(ctx context.Context,
 // Clear()ed at moveForwardBlock commit, after readers are guaranteed to have
 // finished — see swapCurrentTxMapBack for the rollback inverse.
 // newDiskTxMap builds one half of the disk-backed currentTxMap over the
-// configured txMapDirs. Each call creates its own Badger generation per disk,
+// configured txMapDirs. Each call creates its own generation of log files per disk,
 // named "<prefix>-disk<N>-<UnixNano>-<pid>", so halves never share storage.
-func (stp *SubtreeProcessor) newDiskTxMap(prefix string, capacity uint) (*DiskTxMap, error) {
+func (stp *SubtreeProcessor) newDiskTxMap(prefix string) (*DiskTxMap, error) {
 	return NewDiskTxMap(DiskTxMapOptions{
-		BasePaths:      stp.txMapDirs,
-		Prefix:         prefix,
-		FilterCapacity: capacity,
+		BasePaths: stp.txMapDirs,
+		Prefix:    prefix,
 	})
 }
 
@@ -5329,8 +5325,8 @@ func (stp *SubtreeProcessor) finishReorgDiskTxMaps() {
 	// exactly one of them is what currentTxMap now points at: the anchor if the
 	// reorg rolled back, the last map if it committed. Retire both and let the
 	// survivor filter in closeRetiredDiskTxMaps keep the right one — otherwise
-	// the loser is in neither list and is closed by nobody, leaving its writer
-	// goroutines parked on writeCh and its Badger directories on disk.
+	// the loser is in neither list and is closed by nobody, leaving its log
+	// files and directories on disk.
 	stp.diskTxMapRetired = append(stp.diskTxMapRetired, stp.diskTxMap)
 
 	if stp.diskTxMapAnchor != nil {
@@ -5345,18 +5341,17 @@ func (stp *SubtreeProcessor) finishReorgDiskTxMaps() {
 	stp.closeRetiredDiskTxMaps()
 }
 
-// diskTxMapStats combines the gauges for the whole double buffer. Both halves
-// are allocated at full capacity and both stay resident for the process
-// lifetime, so reporting the active half alone understates filter memory — the
-// number operators size the pod from — by half. Entries come from the active
-// half only: the shadow is empty by invariant, and double-counting it would
-// make the entry gauge meaningless.
+// diskTxMapStats combines the gauges for the whole double buffer: index memory
+// and bytes written are summed over both halves, since a half that still holds
+// the previous block (until the commit point clears it) holds its RAM too.
+// Entries come from the active half only: the shadow is empty by invariant,
+// and double-counting it would make the entry gauge meaningless.
 func (stp *SubtreeProcessor) diskTxMapStats() DiskMapStats {
 	stats := stp.diskTxMap.Stats()
 
 	if stp.diskTxMapShadow != nil {
 		shadow := stp.diskTxMapShadow.Stats()
-		stats.FilterMemBytes += shadow.FilterMemBytes
+		stats.IndexMemBytes += shadow.IndexMemBytes
 		stats.DiskBytesWritten += shadow.DiskBytesWritten
 	}
 
@@ -5364,11 +5359,11 @@ func (stp *SubtreeProcessor) diskTxMapStats() DiskMapStats {
 }
 
 // closeRetiredDiskTxMaps closes and forgets every disk map displaced by the
-// fresh-allocation path, releasing their Badger directories. Safe to call when
+// fresh-allocation path, releasing their log directories. Safe to call when
 // none are outstanding.
 //
 // A retired map is being discarded either way, so any error it recorded (or
-// hits during its final Close flush) cannot be undone by failing this call -
+// hits during Close) cannot be undone by failing this call -
 // there is nothing left to roll back to. Log and count it instead of
 // recordErr-ing it onto the surviving map, which would let it resurface later
 // misattributed to whatever operation next checks the map's pending error.
@@ -5379,7 +5374,7 @@ func (stp *SubtreeProcessor) closeRetiredDiskTxMaps() {
 		}
 
 		closeErr := retired.Close()
-		takeErr := retired.TakeErr() // after Close, so a final-flush error is included
+		takeErr := retired.TakeErr()
 
 		// errors.Join here (not a []error slice) so build the argument list
 		// ourselves, skipping nils: teranode/errors.Join calls Error() on
@@ -5426,7 +5421,7 @@ func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool)
 			// which a two-buffer swap cannot promise across more than one
 			// iteration. Allocate a fresh map and retire the displaced one for
 			// reorgBlocks to close once it knows which map survives.
-			freshMap, freshErr := stp.newDiskTxMap("ba-txmap-reorg", stp.diskTxMap.capacity)
+			freshMap, freshErr := stp.newDiskTxMap("ba-txmap-reorg")
 			if freshErr != nil {
 				return errors.NewProcessingError("[resetSubtreeState] error creating disk tx map for reorg", freshErr)
 			}
@@ -5446,7 +5441,7 @@ func (stp *SubtreeProcessor) resetSubtreeState(createProperlySizedSubtrees bool)
 		} else {
 			// The incoming half is emptied at the previous block's commit point,
 			// but DiskTxMap.Clear is best-effort: when it cannot open a fresh
-			// Badger generation it leaves the map populated rather than
+			// generation of log files it leaves the map populated rather than
 			// half-rotated. Verify instead of assuming — a populated half
 			// installed as "fresh" answers Get with the previous block's
 			// inpoints, which is silent corruption rather than a visible error.
@@ -5580,7 +5575,7 @@ func (stp *SubtreeProcessor) processRemainderTransactionsAndDequeue(ctx context.
 		// into the new one, so rollback here is fully safe and there is no
 		// #852 queue-drain exposure to narrow around. This check is therefore
 		// still pre-commit, not post-dequeue - flush this block's own writes
-		// (which may still be below writerFlushThreshold) and fail so the
+		// (which may still be below logBufferSize) and fail so the
 		// caller's rollback restores the pre-reset state and can retry, the
 		// same as the foreign-block pre-dequeue check above.
 		stp.flushDiskTxMapWriters()
@@ -5835,7 +5830,7 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 	// nothing is pending by the time this runs - it is a no-op for that path.
 	//
 	// Flush first: dequeueDuringBlockMovement's own SetIfNotExists calls are
-	// batched and may still be below writerFlushThreshold, so a pending flush
+	// batched and may still be below logBufferSize, so a pending flush
 	// failure for them would otherwise stay invisible here and
 	// commit anyway - see flushDiskTxMapWriters.
 	stp.flushDiskTxMapWriters()
@@ -5942,8 +5937,8 @@ func (stp *SubtreeProcessor) clearCurrentTxMapShadow() {
 		// Multi-block reorg: resetSubtreeState allocated a fresh map instead of
 		// swapping, so there is no shadow to empty — but this is still the point
 		// at which the map this block captured becomes unread, and for the disk
-		// path that map is a retired one holding a full set of cuckoo filters, a
-		// write channel and one Badger instance per disk. Release it now rather
+		// path that map is a retired one holding a full RAM index and a set of
+		// log files per disk. Release it now rather
 		// than letting one accumulate per moved-forward block until reorgBlocks
 		// returns; the anchor is pinned separately and survives.
 		if stp.diskTxMap != nil {
@@ -5954,7 +5949,7 @@ func (stp *SubtreeProcessor) clearCurrentTxMapShadow() {
 	}
 
 	if stp.diskTxMap != nil {
-		// Rotates the retired half to a fresh Badger generation and closes the
+		// Rotates the retired half to a fresh generation of log files and closes the
 		// old one, so the volume returns to holding a single populated map.
 		stp.diskTxMapShadow.Clear()
 		stp.reportDiskTxMapCloseWarn(stp.diskTxMapShadow, "clearCurrentTxMapShadow_clear")
@@ -6825,6 +6820,12 @@ func (stp *SubtreeProcessor) legacyParallelGetAndSetIfNotExists(
 		batchSize = 1
 	}
 
+	// Between two disk maps the stored bytes are copied as they are, in one
+	// grouped MoveFrom per worker, instead of decoded by Get and re-encoded by
+	// SetIfNotExists per node.
+	srcDisk, _ := currentTxMap.(*DiskTxMap)
+	dstDisk, _ := stp.currentTxMap.(*DiskTxMap)
+
 	g, _ := errgroup.WithContext(context.Background())
 
 	for i := 0; i < len(nodes); i += batchSize {
@@ -6835,6 +6836,16 @@ func (stp *SubtreeProcessor) legacyParallelGetAndSetIfNotExists(
 		}
 
 		g.Go(func() error {
+			var (
+				moveHashes []chainhash.Hash
+				moveIdxs   []int
+			)
+
+			if srcDisk != nil && dstDisk != nil {
+				moveHashes = make([]chainhash.Hash, 0, end-start)
+				moveIdxs = make([]int, 0, end-start)
+			}
+
 			for idx := start; idx < end; idx++ {
 				node := nodes[idx]
 
@@ -6853,6 +6864,14 @@ func (stp *SubtreeProcessor) legacyParallelGetAndSetIfNotExists(
 					continue
 				}
 
+				if srcDisk != nil && dstDisk != nil {
+					// Moved below in one grouped pass.
+					moveHashes = append(moveHashes, node.Hash)
+					moveIdxs = append(moveIdxs, idx)
+
+					continue
+				}
+
 				nodeParents, found := currentTxMap.Get(node.Hash)
 				if !found {
 					return errors.NewProcessingError("node %s not found in currentTxMap", node.Hash.String())
@@ -6863,6 +6882,27 @@ func (stp *SubtreeProcessor) legacyParallelGetAndSetIfNotExists(
 
 				if !wasSet {
 					stp.logger.Debugf("duplicate transaction ignored: %s", node.Hash.String())
+				}
+			}
+
+			if len(moveHashes) == 0 {
+				return nil
+			}
+
+			moved := make([]bool, len(moveHashes))
+			if missing, moveErr := dstDisk.MoveFrom(srcDisk, moveHashes, moved); missing >= 0 {
+				if moveErr != nil {
+					return errors.NewProcessingError("error reading node %s from currentTxMap", moveHashes[missing].String(), moveErr)
+				}
+
+				return errors.NewProcessingError("node %s not found in currentTxMap", moveHashes[missing].String())
+			}
+
+			for j, idx := range moveIdxs {
+				wasInserted[idx] = moved[j]
+
+				if !moved[j] {
+					stp.logger.Debugf("duplicate transaction ignored: %s", moveHashes[j].String())
 				}
 			}
 
@@ -7475,7 +7515,7 @@ func (stp *SubtreeProcessor) Stop(ctx context.Context) {
 		if cs := stp.currentSubtree.Load(); cs != nil {
 			cs.Close()
 		}
-		// Clean up DiskTxMap. Both halves of the double buffer own Badger
+		// Clean up DiskTxMap. Both halves of the double buffer own log
 		// directories, as does anything still retired from an interrupted reorg,
 		// and only Close() removes them — see closeRetiredDiskTxMaps.
 		if stp.diskTxMap != nil {
