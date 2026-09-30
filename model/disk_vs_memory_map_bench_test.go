@@ -30,8 +30,17 @@ import (
 // faults are timed, while production reuses pooled, already-faulted maps. The
 // disk variants' Close (munmap) runs outside the timer. Both favour disk.
 
-// 100k is a small block, which gets the minimum segment count on disk.
-var mapBenchSizes = []int{100_000, 1 << 20, 1 << 24}
+// mapBenchSizes are the block sizes to run. 100k is a small block, which gets
+// the minimum segment count on disk. -short, as the CI benchmark comparison
+// runs, keeps only that one: the larger sizes take minutes per iteration once
+// a runner's page cache cannot hold the disk tables.
+func mapBenchSizes() []int {
+	if testing.Short() {
+		return []int{100_000}
+	}
+
+	return []int{100_000, 1 << 20, 1 << 24}
+}
 
 var mapBenchImpls = []struct {
 	name  string
@@ -155,7 +164,7 @@ func reportPerKey(b *testing.B, keysPerOp int) {
 // BenchmarkTxMapPut_MemoryVsDisk is the checkDuplicateTransactions write
 // phase: one Put per transaction into a fresh map.
 func BenchmarkTxMapPut_MemoryVsDisk(b *testing.B) {
-	for _, n := range mapBenchSizes {
+	for _, n := range mapBenchSizes() {
 		hashes := mapBenchHashes(n, 1)
 
 		for _, impl := range mapBenchImpls {
@@ -165,7 +174,12 @@ func BenchmarkTxMapPut_MemoryVsDisk(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					b.StopTimer()
 
-					before := heapInUse()
+					// heapInUse forces a GC; measuring once keeps the
+					// untimed cost of a run bounded.
+					var before uint64
+					if i == 0 {
+						before = heapInUse()
+					}
 					m, closeFn := newBenchTxMap(b, n, impl.disks)
 
 					b.StartTimer()
@@ -176,7 +190,9 @@ func BenchmarkTxMapPut_MemoryVsDisk(b *testing.B) {
 
 					b.StopTimer()
 
-					heapMB = heapGrowthMB(before)
+					if i == 0 {
+						heapMB = heapGrowthMB(before)
+					}
 
 					runtime.KeepAlive(m)
 					closeFn()
@@ -194,7 +210,7 @@ func BenchmarkTxMapPut_MemoryVsDisk(b *testing.B) {
 // on the frozen txMap: "hit" is the per-transaction lookup, "miss" the lookup
 // of a parent that is not in the block.
 func BenchmarkTxMapGetFrozen_MemoryVsDisk(b *testing.B) {
-	for _, n := range mapBenchSizes {
+	for _, n := range mapBenchSizes() {
 		hashes := mapBenchHashes(n, 1)
 		misses := mapBenchHashes(n, 2)
 
@@ -243,7 +259,7 @@ func BenchmarkTxMapGetFrozen_MemoryVsDisk(b *testing.B) {
 // map, at two inputs per transaction (the block_parentSpendsCapacityMultiplier
 // default the map is sized with).
 func BenchmarkParentSpendsSetIfNotExists_MemoryVsDisk(b *testing.B) {
-	for _, txs := range mapBenchSizes {
+	for _, txs := range mapBenchSizes() {
 		n := 2 * txs
 		parents := mapBenchHashes(txs, 3)
 
@@ -259,7 +275,12 @@ func BenchmarkParentSpendsSetIfNotExists_MemoryVsDisk(b *testing.B) {
 				for i := 0; i < b.N; i++ {
 					b.StopTimer()
 
-					before := heapInUse()
+					// heapInUse forces a GC; measuring once keeps the
+					// untimed cost of a run bounded.
+					var before uint64
+					if i == 0 {
+						before = heapInUse()
+					}
 					m, closeFn := newBenchParentSpendsMap(b, n, impl.disks)
 
 					b.StartTimer()
@@ -284,7 +305,9 @@ func BenchmarkParentSpendsSetIfNotExists_MemoryVsDisk(b *testing.B) {
 
 					b.StopTimer()
 
-					heapMB = heapGrowthMB(before)
+					if i == 0 {
+						heapMB = heapGrowthMB(before)
+					}
 
 					runtime.KeepAlive(m)
 					closeFn()
