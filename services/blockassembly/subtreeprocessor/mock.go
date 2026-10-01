@@ -210,6 +210,12 @@ func (m *MockSubtreeProcessor) GetIncompleteSubtreeMiningData(_ context.Context)
 	return args.Get(0).(*PrecomputedMiningData)
 }
 
+// DrainingAfterBlock implements Interface.DrainingAfterBlock. The mock never
+// defers a drain, so it is never draining.
+func (m *MockSubtreeProcessor) DrainingAfterBlock() bool {
+	return false
+}
+
 // AddBatch implements Interface.AddBatch
 func (m *MockSubtreeProcessor) AddBatch(nodes []subtree.Node, txInpoints []*subtree.TxInpoints) {
 	m.Called(nodes, txInpoints)

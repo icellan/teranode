@@ -3722,6 +3722,12 @@ func (stp *SubtreeProcessor) GetPrecomputedMiningData() *PrecomputedMiningData {
 	return stp.precomputedMiningData.Load()
 }
 
+// DrainingAfterBlock reports whether the work deferred past the last
+// MoveForwardBlock response is still running (see deferredBlockDrain).
+func (stp *SubtreeProcessor) DrainingAfterBlock() bool {
+	return stp.drainingAfterBlock.Load()
+}
+
 // GetIncompleteSubtreeMiningData requests a snapshot of the incomplete subtree from
 // the processing goroutine. Called on-demand by GetMiningCandidate when no complete
 // subtrees exist, avoiding the cost of snapshotting on every transaction.
@@ -6149,51 +6155,56 @@ func (stp *SubtreeProcessor) DrainQueue(dropHashes map[chainhash.Hash]struct{}) 
 // Returns:
 //   - error: Any error encountered during processing
 func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, conflictingHashes map[chainhash.Hash]struct{}, skipNotification bool) (err error) {
-	for _, batch := range stp.takeDrainBatches() {
-		// Process all transactions in this batch
-		for i, node := range batch.nodes {
-			txInpoints := batch.txInpoints[i]
+	return stp.forEachDrainChunk(1, func(batches []*TxBatch) error {
+		for _, batch := range batches {
+			// Process all transactions in this batch
+			for i, node := range batch.nodes {
+				txInpoints := batch.txInpoints[i]
 
-			if transactionMap != nil && transactionMap.Exists(node.Hash) {
-				continue
-			}
-			if losingTxHashesMap != nil && losingTxHashesMap.Exists(node.Hash) {
-				continue
-			}
-
-			if len(conflictingHashes) > 0 {
-				if _, ok := conflictingHashes[node.Hash]; ok {
+				if transactionMap != nil && transactionMap.Exists(node.Hash) {
 					continue
 				}
-				if txInpoints != nil {
-					matched := false
-					for _, parent := range txInpoints.ParentTxHashes {
-						if _, ok := conflictingHashes[parent]; ok {
-							matched = true
-							break
-						}
-					}
-					if matched {
-						conflictingHashes[node.Hash] = struct{}{}
+				if losingTxHashesMap != nil && losingTxHashesMap.Exists(node.Hash) {
+					continue
+				}
+
+				if len(conflictingHashes) > 0 {
+					if _, ok := conflictingHashes[node.Hash]; ok {
 						continue
 					}
+					if txInpoints != nil {
+						matched := false
+						for _, parent := range txInpoints.ParentTxHashes {
+							if _, ok := conflictingHashes[parent]; ok {
+								matched = true
+								break
+							}
+						}
+						if matched {
+							conflictingHashes[node.Hash] = struct{}{}
+							continue
+						}
+					}
+				}
+
+				if addErr := stp.addNode(node, txInpoints, skipNotification); addErr != nil {
+					stp.logger.Errorf("[SubtreeProcessor] error adding node %s during sequential remainder processing: %v", node.Hash.String(), addErr)
 				}
 			}
 
-			if addErr := stp.addNode(node, txInpoints, skipNotification); addErr != nil {
-				stp.logger.Errorf("[SubtreeProcessor] error adding node %s during sequential remainder processing: %v", node.Hash.String(), addErr)
-			}
+			prometheusSubtreeProcessorDequeuedTxs.Add(float64(len(batch.nodes)))
 		}
 
-		prometheusSubtreeProcessorDequeuedTxs.Add(float64(len(batch.nodes)))
-	}
-
-	return nil
+		return nil
+	})
 }
 
-// takeDrainBatches dequeues the batches a drain during or after block
-// movement covers.
-func (stp *SubtreeProcessor) takeDrainBatches() []*TxBatch {
+// forEachDrainChunk dequeues the batches a drain during or after block
+// movement covers and hands them to fn in queue order, at most maxItems txs
+// at a time (but always at least one batch). Dequeuing as it goes keeps the
+// queue length, and the backpressure that reads it, honest during the
+// drain, and bounds what a failure part-way through can lose.
+func (stp *SubtreeProcessor) forEachDrainChunk(maxItems int, fn func(batches []*TxBatch) error) error {
 	// Bound the drain by two complementary cutoffs:
 	//
 	//  1. Time: validFromMillis = clock.Now() at function entry (or
@@ -6222,34 +6233,50 @@ func (stp *SubtreeProcessor) takeDrainBatches() []*TxBatch {
 	// batches. With ~1k items/batch and ingest at line-rate, neither bound
 	// fired — the scaling-2 pod sat for 35+ minutes at 558 GB RSS inside
 	// this loop.
-	var batches []*TxBatch
-
 	queueLength := stp.queue.length()
-	if queueLength > 0 {
-		itemsProcessed := int64(0)
-		// Take a single clock sample so both the zero-window and
-		// non-zero-window branches anchor on the same moment — the
-		// "function entry" semantic the docstring describes. Calling
-		// stp.clock.Now() twice would let the second call admit batches
-		// enqueued in the gap between the two samples.
-		now := stp.clock.Now()
-		validFromMillis := now.UnixMilli()
-		if stp.settings.BlockAssembly.DoubleSpendWindow > 0 {
-			validFromMillis = now.Add(-stp.settings.BlockAssembly.DoubleSpendWindow).UnixMilli()
+	if queueLength == 0 {
+		return nil
+	}
+
+	// Take a single clock sample so both the zero-window and
+	// non-zero-window branches anchor on the same moment — the
+	// "function entry" semantic the docstring describes. Calling
+	// stp.clock.Now() twice would let the second call admit batches
+	// enqueued in the gap between the two samples.
+	now := stp.clock.Now()
+	validFromMillis := now.UnixMilli()
+	if stp.settings.BlockAssembly.DoubleSpendWindow > 0 {
+		validFromMillis = now.Add(-stp.settings.BlockAssembly.DoubleSpendWindow).UnixMilli()
+	}
+
+	itemsProcessed := int64(0)
+	chunk := make([]*TxBatch, 0, 1)
+	chunkItems := 0
+
+	for itemsProcessed < queueLength {
+		batch, found := stp.queue.dequeueBatch(validFromMillis)
+		if !found {
+			break
 		}
 
-		for itemsProcessed < queueLength {
-			batch, found := stp.queue.dequeueBatch(validFromMillis)
-			if !found {
-				break
+		chunk = append(chunk, batch)
+		chunkItems += len(batch.nodes)
+		itemsProcessed += int64(len(batch.nodes))
+
+		if chunkItems >= maxItems {
+			if err := fn(chunk); err != nil {
+				return err
 			}
 
-			batches = append(batches, batch)
-			itemsProcessed += int64(len(batch.nodes))
+			chunk, chunkItems = chunk[:0], 0
 		}
 	}
 
-	return batches
+	if len(chunk) > 0 {
+		return fn(chunk)
+	}
+
+	return nil
 }
 
 // processCoinbaseUtxos processes UTXOs from coinbase transactions.
@@ -6653,6 +6680,23 @@ func (stp *SubtreeProcessor) parallelBuildRemainderSubtrees(ctx context.Context,
 		return err
 	}
 
+	// Install the open subtree as the new currentSubtree. If every chunk
+	// completed (the kept-count was an exact multiple of leafCount minus the
+	// first chunk's free slots), allocate a fresh empty subtree so the
+	// post-moveForward code path always has somewhere to add new tx. Done
+	// before the side-effect pass, so a failure part-way through it cannot
+	// leave currentSubtree pointing at a subtree already appended to
+	// chainedSubtrees: the deferred drain after a block has no rollback.
+	if fullCount < len(chunks) {
+		stp.currentSubtree.Store(chunks[fullCount].subtree)
+	} else {
+		newST, err := stp.newSubtree(leafCount)
+		if err != nil {
+			return errors.NewProcessingError("[parallelBuildRemainderSubtrees] error allocating trailing open subtree", err)
+		}
+		stp.currentSubtree.Store(newST)
+	}
+
 	// Sequential side-effect pass, one per completed subtree, in input order.
 	// Mirrors processCompleteSubtree minus the inline newSubtree allocation
 	// (already done above when the chunk was created) and minus the inline
@@ -6716,20 +6760,6 @@ func (stp *SubtreeProcessor) parallelBuildRemainderSubtrees(ctx context.Context,
 		}
 
 		stp.updatePrecomputedMiningData()
-	}
-
-	// Install the open subtree as the new currentSubtree. If every chunk
-	// completed (the kept-count was an exact multiple of leafCount minus the
-	// first chunk's free slots), allocate a fresh empty subtree so the
-	// post-moveForward code path always has somewhere to add new tx.
-	if fullCount < len(chunks) {
-		stp.currentSubtree.Store(chunks[fullCount].subtree)
-	} else {
-		newST, err := stp.newSubtree(leafCount)
-		if err != nil {
-			return errors.NewProcessingError("[parallelBuildRemainderSubtrees] error allocating trailing open subtree", err)
-		}
-		stp.currentSubtree.Store(newST)
 	}
 
 	return nil

@@ -77,15 +77,22 @@ func (stp *SubtreeProcessor) drainQueueAfterBlock(ctx context.Context, drain *de
 		return stp.dequeueDuringBlockMovement(drain.transactionMap, drain.losingTxHashesMap, drain.conflictingHashes, false)
 	}
 
-	batches := stp.takeDrainBatches()
+	return stp.forEachDrainChunk(drainChunkItems, func(batches []*TxBatch) error {
+		return stp.addDrainedBatches(ctx, batches, drain)
+	})
+}
 
+// drainChunkItems is about how many txs drainQueueAfterBlock takes off the
+// queue at a time: enough to keep every core busy, few enough that the queue
+// length stays close to the truth while a large backlog drains.
+var drainChunkItems = 1 << 20 // a var so tests can make the drain cross chunks
+
+// addDrainedBatches adds one chunk of drained batches, in parallel unless a
+// tx in it has no inpoints.
+func (stp *SubtreeProcessor) addDrainedBatches(ctx context.Context, batches []*TxBatch, drain *deferredBlockDrain) error {
 	total := 0
 	for _, batch := range batches {
 		total += len(batch.nodes)
-	}
-
-	if total == 0 {
-		return nil
 	}
 
 	nodes := make([]subtreepkg.Node, 0, total)

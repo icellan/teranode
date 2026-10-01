@@ -435,6 +435,12 @@ type Interface interface {
 	// The context is used for cancellation/timeout to prevent blocking indefinitely.
 	GetIncompleteSubtreeMiningData(ctx context.Context) *PrecomputedMiningData
 
+	// DrainingAfterBlock reports whether the processor is still running the
+	// work it deferred past a MoveForwardBlock response: the drain of the
+	// queue that built up while the block was applied. Mining data taken
+	// while it is true misses those transactions.
+	DrainingAfterBlock() bool
+
 	// WaitForPendingBlocks waits for any pending block operations to complete.
 	// This ensures that all block-related processing is finalized before proceeding.
 	//

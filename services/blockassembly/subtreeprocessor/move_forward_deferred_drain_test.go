@@ -177,6 +177,8 @@ func TestHandleMoveForwardRequest_RespondsBeforeQueueDrain(t *testing.T) {
 
 	handlerDone.Wait()
 
+	require.False(t, stp.DrainingAfterBlock(), "the drain flag must be cleared once the deferred work is done")
+
 	hashes := subtreeHashes(stp)
 
 	_, found := hashes[*inBlock]
@@ -350,10 +352,145 @@ func TestDrainQueueAfterBlock_MatchesSequentialDrain(t *testing.T) {
 		return drainOrder(t, stp)
 	}
 
+	// Small chunks, so the parallel drain crosses several of them.
+	defer func(n int) { drainChunkItems = n }(drainChunkItems)
+	drainChunkItems = 7
+
 	wantLeaves, wantParents := run(false)
 	gotLeaves, gotParents := run(true)
 
 	require.Greater(t, len(wantLeaves), 8, "the drain must cross several 4-leaf subtrees")
 	require.Equal(t, wantLeaves, gotLeaves, "same txs in the same order")
 	require.Equal(t, wantParents, gotParents, "same inpoints for every tx (the first queued copy wins)")
+}
+
+// enqueueDrainTest queues one 1-tx batch per hash, each with the given
+// parent, and waits until the drain will take them.
+func enqueueDrainTest(stp *SubtreeProcessor, parent chainhash.Hash, hashes ...chainhash.Hash) {
+	for _, h := range hashes {
+		stp.AddBatch([]subtreepkg.Node{{Hash: h, Fee: 1, SizeInBytes: 250}}, []*subtreepkg.TxInpoints{{ParentTxHashes: []chainhash.Hash{parent}}})
+	}
+
+	time.Sleep(10 * time.Millisecond)
+}
+
+func emptyBlockTxMap() *SplitSwissMap {
+	m := NewSplitSwissMap(4, 1)
+	m.Freeze()
+
+	return m
+}
+
+// TestForEachDrainChunk_DequeuesAsItGoes pins that the drain takes batches
+// off the queue chunk by chunk, so the queue length (which backpressure
+// reads) keeps counting what is still waiting.
+func TestForEachDrainChunk_DequeuesAsItGoes(t *testing.T) {
+	stp, _, _ := newDeferredDrainProcessor(t, nil)
+
+	for i := 0; i < 6; i++ {
+		enqueueDrainTest(stp, chainhash.Hash{}, chainhash.HashH([]byte{byte(i), 'c'}))
+	}
+
+	var seen []int64
+
+	require.NoError(t, stp.forEachDrainChunk(2, func(batches []*TxBatch) error {
+		seen = append(seen, stp.queue.length())
+		return nil
+	}))
+
+	require.Equal(t, []int64{4, 2, 0}, seen, "each chunk must leave the rest in the queue")
+}
+
+// TestDrainQueueAfterBlock_ConflictingHashesFallBackToSequential pins the
+// fallback: with conflicting hashes, a queued child of a conflicting parent
+// is dropped, as dequeueDuringBlockMovement does.
+func TestDrainQueueAfterBlock_ConflictingHashesFallBackToSequential(t *testing.T) {
+	stp, _, newSubtreeChan := newDeferredDrainProcessor(t, nil)
+	t.Cleanup(func() { close(newSubtreeChan) })
+
+	go func() {
+		for req := range newSubtreeChan {
+			if req.ErrChan != nil {
+				req.ErrChan <- nil
+			}
+		}
+	}()
+
+	conflicting := chainhash.HashH([]byte("conflicting-parent"))
+	child := chainhash.HashH([]byte("child-of-conflicting"))
+	other := chainhash.HashH([]byte("unrelated"))
+
+	enqueueDrainTest(stp, conflicting, child)
+	enqueueDrainTest(stp, chainhash.HashH([]byte("fine-parent")), other)
+
+	require.NoError(t, stp.drainQueueAfterBlock(context.Background(), &deferredBlockDrain{
+		drainQueue:        true,
+		transactionMap:    emptyBlockTxMap(),
+		conflictingHashes: map[chainhash.Hash]struct{}{conflicting: {}},
+	}))
+
+	hashes := subtreeHashes(stp)
+
+	_, found := hashes[child]
+	require.False(t, found, "a child of a conflicting parent must be dropped")
+
+	_, found = hashes[other]
+	require.True(t, found, "an unrelated tx must be added")
+}
+
+// TestDrainQueueAfterBlock_NilInpointsFallBackToSequential pins the other
+// fallback: a queued tx without inpoints is added only if the tx map already
+// holds it, as addNode requires, and the rest of the chunk is still added.
+func TestDrainQueueAfterBlock_NilInpointsFallBackToSequential(t *testing.T) {
+	stp, _, newSubtreeChan := newDeferredDrainProcessor(t, nil)
+	t.Cleanup(func() { close(newSubtreeChan) })
+
+	go func() {
+		for req := range newSubtreeChan {
+			if req.ErrChan != nil {
+				req.ErrChan <- nil
+			}
+		}
+	}()
+
+	known := chainhash.HashH([]byte("known-nil-inpoints"))
+	unknown := chainhash.HashH([]byte("unknown-nil-inpoints"))
+	regular := chainhash.HashH([]byte("regular"))
+
+	stp.currentTxMap.SetIfNotExists(known, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{{1}}})
+
+	stp.AddBatch([]subtreepkg.Node{{Hash: known, Fee: 1, SizeInBytes: 250}, {Hash: unknown, Fee: 1, SizeInBytes: 250}}, []*subtreepkg.TxInpoints{nil, nil})
+	enqueueDrainTest(stp, chainhash.Hash{2}, regular)
+
+	require.NoError(t, stp.drainQueueAfterBlock(context.Background(), &deferredBlockDrain{
+		drainQueue:     true,
+		transactionMap: emptyBlockTxMap(),
+	}))
+
+	hashes := subtreeHashes(stp)
+
+	for h, want := range map[chainhash.Hash]bool{known: true, unknown: false, regular: true} {
+		_, found := hashes[h]
+		require.Equal(t, want, found, "tx %s", h)
+	}
+}
+
+// TestRunDeferredBlockDrain_FailureRequestsReset pins that a failure in the
+// deferred drain, which has no rollback, asks block assembly for a reset and
+// still clears the retired tx map half.
+func TestRunDeferredBlockDrain_FailureRequestsReset(t *testing.T) {
+	stp, block, _ := newDeferredDrainProcessor(t, nil)
+
+	enqueueDrainTest(stp, chainhash.Hash{3}, chainhash.HashH([]byte("queued-before-failure")))
+
+	stp.currentTxMapShadow.SetIfNotExists(chainhash.HashH([]byte("retired")), &subtreepkg.TxInpoints{})
+
+	// A cancelled context (shutdown) makes parallelBuildRemainderSubtrees fail.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	stp.runDeferredBlockDrain(ctx, block, &deferredBlockDrain{drainQueue: true, transactionMap: emptyBlockTxMap()})
+
+	require.True(t, stp.TakeResetRequested(), "a failed deferred drain must request a reset")
+	require.Zero(t, stp.currentTxMapShadow.Length(), "the retired half must still be cleared")
 }

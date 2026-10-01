@@ -38,7 +38,9 @@ func BenchmarkDrainQueueAfterBlock(b *testing.B) {
 				inpoints := make([]*subtreepkg.TxInpoints, total)
 
 				for i := range inpoints {
-					inpoints[i] = &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{hashes[(i+1)%total]}}
+					// One parent, vout 0: inpoints the disk map can serialize.
+					ip := subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{hashes[(i+1)%total]}, []uint32{1, 0})
+					inpoints[i] = &ip
 				}
 
 				transactionMap := NewSplitSwissMap(1024, 1)
@@ -70,6 +72,10 @@ func BenchmarkDrainQueueAfterBlock(b *testing.B) {
 					}
 
 					stp.flushDiskTxMapWriters()
+
+					b.StopTimer()
+					require.NoError(b, stp.diskTxMapErr(), "the drain must not take a storage error path")
+					b.StartTimer()
 				}
 
 				b.ReportMetric(float64(total)*float64(b.N)/b.Elapsed().Seconds(), "tx/s")
