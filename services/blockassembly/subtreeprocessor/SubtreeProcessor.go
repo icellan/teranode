@@ -3774,7 +3774,15 @@ func (stp *SubtreeProcessor) updatePrecomputedMiningData() {
 
 // handleMoveForwardRequest applies one block from moveForwardBlockChan and
 // reports the result on the request's errChan. It runs on the Start goroutine.
+//
+// The queue drain and the retired tx map clear are deferred until after the
+// response: block assembly only reports the new tip, and serves mining
+// candidates with transactions again, once MoveForwardBlock returns. They
+// still run before this goroutine takes the next request, so no other block,
+// reorg or reset sees them half done.
 func (stp *SubtreeProcessor) handleMoveForwardRequest(processorCtx context.Context, moveForwardReq moveBlockRequest) {
+	var drain *deferredBlockDrain
+
 	moveForwardReq.errChan <- stp.runHandlerWithRecover("moveForwardBlock", func() error {
 		stp.setCurrentRunningState(StateMoveForwardBlock)
 
@@ -3818,8 +3826,11 @@ func (stp *SubtreeProcessor) handleMoveForwardRequest(processorCtx context.Conte
 		// create empty map for processed conflicting hashes
 		processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 
-		_, _, mfErr := stp.moveForwardBlock(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, false, true)
+		var mfErr error
+
+		_, _, drain, mfErr = stp.moveForwardBlockDeferringDrain(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, false, true, true)
 		if mfErr != nil {
+			drain = nil
 			rollback()
 			return mfErr
 		}
@@ -3840,7 +3851,50 @@ func (stp *SubtreeProcessor) handleMoveForwardRequest(processorCtx context.Conte
 	})
 
 	stp.logger.Infof("[SubtreeProcessor][%s] moveForwardBlock subtree processor DONE", moveForwardReq.block.String())
+
+	if drain != nil {
+		stp.setCurrentRunningState(StateDequeue)
+		stp.runDeferredBlockDrain(moveForwardReq.block, drain)
+	}
+
 	stp.setCurrentRunningState(StateRunning)
+}
+
+// runDeferredBlockDrain runs the end of a moveForwardBlock that
+// handleMoveForwardRequest deferred past its response. The block is already
+// applied and reported, so nothing here can be rolled back: a failure is
+// logged and requests a block assembly reset, which reloads the unmined
+// transactions from the UTXO store, as for any other post-commit error.
+func (stp *SubtreeProcessor) runDeferredBlockDrain(block *model.Block, drain *deferredBlockDrain) {
+	if drain.drainQueue {
+		if err := stp.runHandlerWithRecover("deferredBlockDrain", func() error {
+			return stp.dequeueDuringBlockMovement(drain.transactionMap, drain.losingTxHashesMap, drain.conflictingHashes, false)
+		}); err != nil {
+			stp.logger.Errorf("[SubtreeProcessor][%s] error draining the queue after moveForwardBlock, requesting a block assembly reset: %v", block.String(), err)
+			stp.requestReset("deferredBlockDrain")
+		}
+
+		// addNode does not count what it adds; finalizeBlockProcessing's
+		// recount ran before this drain, so count again.
+		stp.setTxCountFromSubtrees()
+
+		// The drain's own SetIfNotExists calls may still be below
+		// logBufferSize; flush so a failure among them is seen here.
+		stp.flushDiskTxMapWriters()
+		stp.drainAndLogDiskTxMapErr("moveForwardBlock_postDequeue")
+	}
+
+	if err := stp.runHandlerWithRecover("clearCurrentTxMapShadow", func() error {
+		stp.clearCurrentTxMapShadow()
+		return nil
+	}); err != nil {
+		stp.logger.Errorf("[SubtreeProcessor][%s] error clearing the retired tx map after moveForwardBlock, requesting a block assembly reset: %v", block.String(), err)
+		stp.requestReset("deferredBlockDrain")
+	}
+
+	// The clear is moveForwardBlock's commit point, so a storage error from it
+	// keeps the label it had when the clear ran inside moveForwardBlock.
+	stp.drainAndLogDiskTxMapErr("moveForwardBlock_commit")
 }
 
 // runHandlerWithRecover invokes the supplied handler and converts any
@@ -5718,13 +5772,41 @@ func (stp *SubtreeProcessor) finalizeBlockProcessing(ctx context.Context, block 
 // given. It is akin to moving up the blockchain to the next block.
 func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.Block, skipNotification bool,
 	processedConflictingHashesMap map[chainhash.Hash]struct{}, skipDequeue bool, createProperlySizedSubtrees bool) (transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, err error) {
+	transactionMap, losingTxHashesMap, _, err = stp.moveForwardBlockDeferringDrain(ctx, block, skipNotification,
+		processedConflictingHashesMap, skipDequeue, createProperlySizedSubtrees, false)
+
+	return transactionMap, losingTxHashesMap, err
+}
+
+// deferredBlockDrain is the end of a moveForwardBlock that the caller runs
+// after it has reported the block as applied: the drain of the queue that
+// built up while the block was applied (filtered against the block, as
+// dequeueDuringBlockMovement does) and the clear of the retired tx map half.
+// Neither changes what the block itself did, and both used to sit between the
+// block being applied and MoveForwardBlock returning - seconds on a large
+// block, during which block assembly kept serving empty mining candidates.
+type deferredBlockDrain struct {
+	drainQueue        bool // false on the own-block path, which never drains
+	transactionMap    *SplitSwissMap
+	losingTxHashesMap txmap.TxMap
+	conflictingHashes map[chainhash.Hash]struct{}
+}
+
+// moveForwardBlockDeferringDrain is moveForwardBlock that, when deferDrain is
+// set, skips the queue drain and the retired tx map clear and returns them as
+// a deferredBlockDrain for the caller to run with runDeferredBlockDrain. The
+// drain then runs after the commit point, so a failure applying the block can
+// no longer leave drained batches behind (#852).
+func (stp *SubtreeProcessor) moveForwardBlockDeferringDrain(ctx context.Context, block *model.Block, skipNotification bool,
+	processedConflictingHashesMap map[chainhash.Hash]struct{}, skipDequeue bool, createProperlySizedSubtrees bool,
+	deferDrain bool) (transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, drain *deferredBlockDrain, err error) {
 	// A failed call must never leave its own disk tx map errors pending for
 	// whatever succeeds next to have them misattributed.
 	// Registered before the nil-block guard so even that early return drains.
 	defer stp.joinDiskTxMapErrOnFailure(&err)
 
 	if block == nil {
-		return nil, nil, errors.NewProcessingError("[moveForwardBlock] you must pass in a block to moveForwardBlock")
+		return nil, nil, nil, errors.NewProcessingError("[moveForwardBlock] you must pass in a block to moveForwardBlock")
 	}
 
 	_, _, deferFn := tracing.Tracer("subtreeprocessor").Start(ctx, "moveForwardBlock",
@@ -5741,7 +5823,7 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 
 	currentBlockHeader := stp.currentBlockHeader.Load()
 	if !block.Header.HashPrevBlock.IsEqual(currentBlockHeader.Hash()) {
-		return nil, nil, errors.NewProcessingError("the block passed in does not match the current block header: [%s] - [%s]", block.Header.StringDump(), currentBlockHeader.StringDump())
+		return nil, nil, nil, errors.NewProcessingError("the block passed in does not match the current block header: [%s] - [%s]", block.Header.StringDump(), currentBlockHeader.StringDump())
 	}
 
 	if len(block.Subtrees) == 0 {
@@ -5750,10 +5832,10 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 
 		// create the coinbase after processing all other transaction operations
 		if err = stp.processCoinbaseUtxos(ctx, block); err != nil {
-			return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing coinbase utxos", block.String(), err)
+			return nil, nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing coinbase utxos", block.String(), err)
 		}
 
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	stp.logger.Debugf("[moveForwardBlock][%s] resetting subtrees: %v", block.String(), block.Subtrees)
@@ -5766,14 +5848,14 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 	// Create transaction map from remaining block subtrees
 	transactionMap, conflictingNodes, err = stp.createTransactionMapIfNeeded(ctx, block, blockSubtreesMap)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// Process conflicting transactions
 	var conflictingHashes map[chainhash.Hash]struct{}
 	losingTxHashesMap, conflictingHashes, err = stp.processConflictingTransactions(ctx, block, conflictingNodes, processedConflictingHashesMap)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	originalCurrentSubtree := stp.currentSubtree.Load()
@@ -5785,7 +5867,7 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 	// fails, we must swap them back so callers see the pre-reset state and
 	// the double-buffer invariant (current=active, shadow=empty) is restored.
 	if err = stp.resetSubtreeState(createProperlySizedSubtrees); err != nil {
-		return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error resetting subtree state", block.String(), err)
+		return nil, nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error resetting subtree state", block.String(), err)
 	}
 
 	// From this point the double-buffer swap has happened. Any error return
@@ -5805,16 +5887,16 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 		LosingTxHashesMap: losingTxHashesMap,
 		ConflictingHashes: conflictingHashes,
 		CurrentTxMap:      originalCurrentTxMap,
-		SkipDequeue:       skipDequeue,
+		SkipDequeue:       skipDequeue || deferDrain,
 		SkipNotification:  skipNotification,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// create the coinbase after processing all other transaction operations
 	if err = stp.processCoinbaseUtxos(ctx, block); err != nil {
-		return nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing coinbase utxos", block.String(), err)
+		return nil, nil, nil, errors.NewProcessingError("[moveForwardBlock][%s] error processing coinbase utxos", block.String(), err)
 	}
 
 	// On the foreign-block path (the `if` branch above), this point is
@@ -5845,8 +5927,18 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 	// Commit point of moveForwardBlock: any captured pointer to the old
 	// currentTxMap (now in currentTxMapShadow) is guaranteed unused. Empty
 	// the shadow in place so the next resetSubtreeState swap exposes a
-	// clean slate.
-	stp.clearCurrentTxMapShadow()
+	// clean slate - or, when deferring, hand that and the queue drain to the
+	// caller, which runs them after it has answered (see deferredBlockDrain).
+	if deferDrain {
+		drain = &deferredBlockDrain{
+			drainQueue:        transactionMap != nil && transactionMap.Length() > 0,
+			transactionMap:    transactionMap,
+			losingTxHashesMap: losingTxHashesMap,
+			conflictingHashes: conflictingHashes,
+		}
+	} else {
+		stp.clearCurrentTxMapShadow()
+	}
 
 	// Log memory stats after block processing if debug logging is enabled
 	if stp.logger.LogLevel() <= 0 { // 0 is DEBUG level
@@ -5866,7 +5958,7 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 		}
 	}
 
-	return transactionMap, losingTxHashesMap, nil
+	return transactionMap, losingTxHashesMap, drain, nil
 }
 
 // swapCurrentTxMapBack restores currentTxMap to the value it held before
