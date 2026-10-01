@@ -296,3 +296,35 @@ func TestDiskTxMap_ExistenceLayerThroughput(t *testing.T) {
 	require.Greaterf(t, opsPerSec, floorOpsPerSec,
 		"existence layer throughput collapsed: %.0f ops/sec is below the %.0f floor (target %.0f); this indicates an order-of-magnitude regression, not runner noise", opsPerSec, floorOpsPerSec, targetOpsPerSec)
 }
+
+// BenchmarkDiskTxMap_Clear measures Clear on a map whose index has held size
+// entries. Clear keeps every shard's capacity, so its cost follows the
+// largest size the map has reached, not the entries it holds now: the map is
+// filled once and then cleared repeatedly, as every block does.
+func BenchmarkDiskTxMap_Clear(b *testing.B) {
+	for _, size := range []int{1 << 20, 32 << 20} {
+		b.Run(fmt.Sprintf("%dM", size>>20), func(b *testing.B) {
+			m, err := NewDiskTxMap(DiskTxMapOptions{BasePath: b.TempDir(), Prefix: "bench"})
+			require.NoError(b, err)
+
+			defer m.Close()
+
+			ip := subtreepkg.NewTxInpoints()
+
+			for _, h := range genBenchHashes(size, 1) {
+				m.Set(h, &ip)
+			}
+
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				m.Clear()
+			}
+
+			b.StopTimer()
+
+			require.NoError(b, m.TakeErr())
+			require.Zero(b, m.Length())
+		})
+	}
+}

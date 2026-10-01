@@ -1078,12 +1078,27 @@ func (m *DiskTxMap) Clear() {
 func (m *DiskTxMap) retire(old, next *generation) {
 	// clear keeps each map's capacity: the next block refills it to a similar
 	// size, and regrowing 4096 maps from empty every block costs more than
-	// holding the memory.
-	for i := range m.shards {
-		m.shards[i].mu.Lock()
-		clear(m.shards[i].index)
-		m.shards[i].mu.Unlock()
+	// holding the memory. Clearing costs the capacity, not the entries, so
+	// with hundreds of millions of retained slots one goroutine takes
+	// seconds; the shards are independent, so they are cleared in parallel.
+	workers := min(runtime.GOMAXPROCS(0), numIndexShards)
+	perWorker := (numIndexShards + workers - 1) / workers
+
+	var wg sync.WaitGroup
+
+	for start := 0; start < numIndexShards; start += perWorker {
+		shards := m.shards[start:min(start+perWorker, numIndexShards)]
+
+		wg.Go(func() {
+			for i := range shards {
+				shards[i].mu.Lock()
+				clear(shards[i].index)
+				shards[i].mu.Unlock()
+			}
+		})
 	}
+
+	wg.Wait()
 
 	m.gen.Store(next)
 	m.waitForReaders(old.parity)
