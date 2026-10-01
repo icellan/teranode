@@ -403,14 +403,16 @@ func TestResolveHeavyBurst(t *testing.T) {
 // GET /subtree then GET /subtree_data.
 func TestCatchupFanOut(t *testing.T) {
 	tests := []struct {
-		name                   string
-		getMissingTransactions int
-		subtreeFetchConcurrent int
-		want                   int
+		name                         string
+		getMissingTransactions       int
+		subtreeFetchConcurrent       int
+		checkBlockSubtreesConcurrent int
+		want                         int
 	}{
-		{"missing-transactions fan-out is larger", 32, 8, 32},
-		{"block catchup is larger, two requests per goroutine", 32, 32, 64},
-		{"block catchup unset", 6, 0, 6},
+		{"missing-transactions fan-out is larger", 32, 8, 0, 32},
+		{"block catchup is larger, two requests per goroutine", 32, 32, 0, 64},
+		{"block catchup unset", 6, 0, 0, 6},
+		{"check-block-subtrees fan-out alone is larger, two requests per worker", 6, 4, 32, 64},
 	}
 
 	for _, tt := range tests {
@@ -418,6 +420,7 @@ func TestCatchupFanOut(t *testing.T) {
 			s := &settings.Settings{}
 			s.SubtreeValidation.GetMissingTransactions = tt.getMissingTransactions
 			s.BlockValidation.SubtreeFetchConcurrency = tt.subtreeFetchConcurrent
+			s.SubtreeValidation.CheckBlockSubtreesConcurrency = tt.checkBlockSubtreesConcurrent
 
 			require.Equal(t, tt.want, catchupFanOut(s))
 		})

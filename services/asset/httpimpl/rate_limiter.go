@@ -210,14 +210,20 @@ func (rl *tieredRateLimiter) burstFor(ratePerSec int) int {
 const maxHeavyBurstRateMultiple = 4
 
 // catchupFanOut is how many heavy requests one catching-up peer can aim at this
-// node at once, per block being fetched: the larger of the missing-transactions
-// POSTs it runs in parallel (subtreevalidation_getMissingTransactions) and block
+// node at once, per block being fetched: the largest of the missing-transactions
+// POSTs it runs in parallel (subtreevalidation_getMissingTransactions), block
 // catchup, which runs blockvalidation_subtree_fetch_concurrency goroutines that
-// each send GET /subtree and then GET /subtree_data. Blocks prewarmed in parallel
+// each send GET /subtree and then GET /subtree_data, and subtree-validation's
+// own check_block_subtrees_concurrency workers, which each do the same GET
+// /subtree then GET /subtree_data pair. Blocks prewarmed in parallel
 // (blockvalidation_fetch_num_workers) multiply this; the 4x-rate clamp in
 // resolveHeavyBurst bounds the burst regardless.
 func catchupFanOut(tSettings *settings.Settings) int {
-	return max(tSettings.SubtreeValidation.GetMissingTransactions, 2*tSettings.BlockValidation.SubtreeFetchConcurrency)
+	return max(
+		tSettings.SubtreeValidation.GetMissingTransactions,
+		2*tSettings.BlockValidation.SubtreeFetchConcurrency,
+		2*tSettings.SubtreeValidation.CheckBlockSubtreesConcurrency,
+	)
 }
 
 // catchupHeavyBurst resolves the catchup-route heavy burst from settings: the
