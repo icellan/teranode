@@ -1076,11 +1076,19 @@ func (m *DiskTxMap) Clear() {
 // waits for every read that pinned old. Every shard is emptied before the
 // swap, so no read can pair an old entry with the next generation.
 func (m *DiskTxMap) retire(old, next *generation) {
-	// clear keeps each map's capacity: the next block refills it to a similar
-	// size, and regrowing 4096 maps from empty every block costs more than
-	// holding the memory. Clearing costs the capacity, not the entries, so
-	// with hundreds of millions of retained slots one goroutine takes
-	// seconds; the shards are independent, so they are cleared in parallel.
+	m.clearIndex()
+
+	m.gen.Store(next)
+	m.waitForReaders(old.parity)
+}
+
+// clearIndex empties every index shard. clear keeps each map's capacity: the
+// next block refills it to a similar size, and regrowing 4096 maps from empty
+// every block costs more than holding the memory. Clearing a full shard costs
+// its capacity, so with hundreds of millions of entries one goroutine takes
+// seconds; the shards are independent, so they are cleared in parallel. Every
+// shard is empty when it returns.
+func (m *DiskTxMap) clearIndex() {
 	workers := min(runtime.GOMAXPROCS(0), numIndexShards)
 	perWorker := (numIndexShards + workers - 1) / workers
 
@@ -1099,9 +1107,6 @@ func (m *DiskTxMap) retire(old, next *generation) {
 	}
 
 	wg.Wait()
-
-	m.gen.Store(next)
-	m.waitForReaders(old.parity)
 }
 
 // mapWindowsLocked maps windows until they cover every written byte. A
