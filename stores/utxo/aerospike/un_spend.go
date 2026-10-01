@@ -129,6 +129,12 @@ func (s *Store) Unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked 
 // error, so the partial-spend rollback can count dangling refs rather than failed
 // calls — the sql store's counter of the same name is a ref count, and a fleet
 // dashboard summing the two must not mix units.
+// failed counts SPENDS that could not be reverted, not errors. The two differ on
+// the ctx.Done arm, which abandons every spend from the abort index onward after
+// appending a single marker error: those spends are still applied, so counting
+// errors there under-reports dangling refs by the whole remainder — in exactly the
+// deadline-truncation case this counter exists to measure. The marker itself is
+// not a spend, so len(errs) is wrong in the other direction too.
 func (s *Store) unspend(ctx context.Context, spends []*utxo.Spend, flagAsLocked ...bool) (failed int, err error) {
 	var errs []error
 
@@ -146,6 +152,9 @@ loop:
 				errs = append(errs, errors.NewStorageError("context cancelled un-spending %d of %d utxos, aborting remaining unspends early", i, len(spends)))
 			}
 
+			// Everything from here on is never attempted, so it stays applied.
+			failed += len(spends) - i
+
 			break loop
 		default:
 			if spend != nil {
@@ -160,6 +169,8 @@ loop:
 				s.logger.Debugf("un-spending utxo %s of tx %s:%d, spending data: %v", spend.UTXOHash.String(), spend.TxID.String(), spend.Vout, spend.SpendingData)
 
 				if err = s.unspendLua(ctx, spend); err != nil {
+					failed++
+
 					errs = append(errs, err)
 				}
 			}
@@ -175,7 +186,7 @@ loop:
 	// failed index is exactly the dangling "ghost spender" reference this
 	// rollback exists to unwind. Aggregate with a hard cap so a mass failure
 	// on a wide transaction doesn't build an O(N^2) error chain.
-	return len(errs), errors.NewStorageError("error un-spending %d of %d utxos", len(errs), len(spends), errors.JoinCapped(maxAggregatedSpendErrs, errs...))
+	return failed, errors.NewStorageError("error un-spending %d of %d utxos", failed, len(spends), errors.JoinCapped(maxAggregatedSpendErrs, errs...))
 }
 
 // unspendLua executes the Lua script for a single UTXO unspend.

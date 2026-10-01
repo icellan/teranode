@@ -129,3 +129,33 @@ func TestRollbackDecisionLabels(t *testing.T) {
 		[]string{"fired", "spender_exists", "indeterminate", "transient_lock", "transient_creating"},
 		utxo.RollbackOutcomes)
 }
+
+// TestUnspendCountsNeverAttemptedSpends pins the ref count on the one path it was
+// added to measure: deadline truncation.
+//
+// unspend stops early on ctx.Done, so every spend from the abort index onward is
+// never attempted and therefore still applied. Counting errors instead of spends
+// reported 1 for a 500-spend rollback that left 500 dangling, which made the
+// Aerospike counter mean something different from the sql one — sql derives its
+// count from the chunks that actually committed. Note the abort marker in errs is
+// not a spend, so len(errs) is not the answer either.
+//
+// No server needed: an already-cancelled context aborts before the first Lua call.
+func TestUnspendCountsNeverAttemptedSpends(t *testing.T) {
+	store := &Store{logger: ulogger.TestLogger{}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	const total = 500
+
+	spends := make([]*utxo.Spend, total)
+	for i := range spends {
+		spends[i] = &utxo.Spend{TxID: &chainhash.Hash{}, Vout: uint32(i)} // nolint:gosec
+	}
+
+	failed, err := store.unspend(ctx, spends)
+	require.Error(t, err, "a cancelled context must surface as an error")
+	require.Equal(t, total, failed,
+		"every spend from the abort index onward is still applied and must be counted as dangling")
+}
