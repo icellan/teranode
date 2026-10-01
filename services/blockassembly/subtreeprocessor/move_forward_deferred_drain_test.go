@@ -11,6 +11,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	txmap "github.com/bsv-blockchain/go-tx-map"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
@@ -214,4 +215,136 @@ func TestHandleMoveForwardRequest_FailedBlockLeavesQueueUntouched(t *testing.T) 
 
 	_, found := subtreeHashes(stp)[queued]
 	require.False(t, found, "the queued tx must still be waiting in the queue, not in a subtree")
+}
+
+// drainOrder returns the processor's leaves in order and, for every leaf,
+// the parent the tx map holds for it.
+func drainOrder(t *testing.T, stp *SubtreeProcessor) ([]chainhash.Hash, map[chainhash.Hash]chainhash.Hash) {
+	t.Helper()
+
+	var leaves []chainhash.Hash
+
+	for _, st := range stp.chainedSubtrees {
+		for _, n := range st.Nodes {
+			leaves = append(leaves, n.Hash)
+		}
+	}
+
+	for _, n := range stp.currentSubtree.Load().Nodes {
+		leaves = append(leaves, n.Hash)
+	}
+
+	parents := make(map[chainhash.Hash]chainhash.Hash, len(leaves))
+
+	for _, h := range leaves {
+		if h.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+			continue
+		}
+
+		ip, ok := stp.currentTxMap.Get(h)
+		require.True(t, ok, "leaf %s has no tx map entry", h)
+		require.Len(t, ip.ParentTxHashes, 1)
+
+		parents[h] = ip.ParentTxHashes[0]
+	}
+
+	return leaves, parents
+}
+
+// TestDrainQueueAfterBlock_MatchesSequentialDrain pins that the parallel drain
+// adds exactly what dequeueDuringBlockMovement adds, in the same order and with
+// the same inpoints: txs in the block or on the losing side are skipped, and of
+// a tx queued twice only the first copy is added, as SetIfNotExists does one
+// tx at a time. A 4-leaf subtree size makes the drain cross several subtrees.
+func TestDrainQueueAfterBlock_MatchesSequentialDrain(t *testing.T) {
+	inBlock := make([]chainhash.Hash, 0, 8)
+	for i := 0; i < 8; i++ {
+		inBlock = append(inBlock, chainhash.HashH([]byte{byte(i), 'b'}))
+	}
+
+	losing := chainhash.HashH([]byte("losing"))
+
+	type queued struct {
+		hash   chainhash.Hash
+		parent chainhash.Hash
+	}
+
+	var queue []queued
+
+	for i := 0; i < 40; i++ {
+		queue = append(queue, queued{hash: chainhash.HashH([]byte{byte(i), 'q'}), parent: chainhash.HashH([]byte{byte(i), 'p'})})
+
+		switch i % 7 {
+		case 2:
+			queue = append(queue, queued{hash: inBlock[i%len(inBlock)], parent: chainhash.HashH([]byte{byte(i), 'x'})})
+		case 4:
+			// A second copy of an earlier tx, with different inpoints: the
+			// first copy must win.
+			queue = append(queue, queued{hash: chainhash.HashH([]byte{byte(i / 2), 'q'}), parent: chainhash.HashH([]byte{byte(i), 'd'})})
+		case 6:
+			queue = append(queue, queued{hash: losing, parent: chainhash.HashH([]byte{byte(i), 'l'})})
+		}
+	}
+
+	transactionMap := NewSplitSwissMap(4, len(inBlock))
+	for _, h := range inBlock {
+		require.NoError(t, transactionMap.Put(h))
+	}
+
+	transactionMap.Freeze()
+
+	losingMap := txmap.NewSplitSwissMap(4)
+	require.NoError(t, losingMap.Put(losing, 0))
+
+	run := func(parallel bool) ([]chainhash.Hash, map[chainhash.Hash]chainhash.Hash) {
+		stp, _, newSubtreeChan := newDeferredDrainProcessor(t, nil)
+
+		go func() {
+			for req := range newSubtreeChan {
+				if req.ErrChan != nil {
+					req.ErrChan <- nil
+				}
+			}
+		}()
+		t.Cleanup(func() { close(newSubtreeChan) })
+
+		// Several batches, as the queue holds them.
+		for start := 0; start < len(queue); start += 5 {
+			end := min(start+5, len(queue))
+
+			nodes := make([]subtreepkg.Node, 0, end-start)
+			inpoints := make([]*subtreepkg.TxInpoints, 0, end-start)
+
+			for _, q := range queue[start:end] {
+				nodes = append(nodes, subtreepkg.Node{Hash: q.hash, Fee: 1, SizeInBytes: 250})
+				inpoints = append(inpoints, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{q.parent}})
+			}
+
+			stp.AddBatch(nodes, inpoints)
+		}
+
+		// The drain only takes batches enqueued before it starts.
+		time.Sleep(10 * time.Millisecond)
+
+		if parallel {
+			require.NoError(t, stp.drainQueueAfterBlock(context.Background(), &deferredBlockDrain{
+				drainQueue:        true,
+				transactionMap:    transactionMap,
+				losingTxHashesMap: losingMap,
+			}))
+		} else {
+			require.NoError(t, stp.dequeueDuringBlockMovement(transactionMap, losingMap, nil, false))
+		}
+
+		require.Zero(t, stp.queue.length())
+
+		return drainOrder(t, stp)
+	}
+
+	wantLeaves, wantParents := run(false)
+	gotLeaves, gotParents := run(true)
+
+	require.Greater(t, len(wantLeaves), 8, "the drain must cross several 4-leaf subtrees")
+	require.Equal(t, wantLeaves, gotLeaves, "same txs in the same order")
+	require.Equal(t, wantParents, gotParents, "same inpoints for every tx (the first queued copy wins)")
 }

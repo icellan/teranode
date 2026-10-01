@@ -3854,47 +3854,10 @@ func (stp *SubtreeProcessor) handleMoveForwardRequest(processorCtx context.Conte
 
 	if drain != nil {
 		stp.setCurrentRunningState(StateDequeue)
-		stp.runDeferredBlockDrain(moveForwardReq.block, drain)
+		stp.runDeferredBlockDrain(processorCtx, moveForwardReq.block, drain)
 	}
 
 	stp.setCurrentRunningState(StateRunning)
-}
-
-// runDeferredBlockDrain runs the end of a moveForwardBlock that
-// handleMoveForwardRequest deferred past its response. The block is already
-// applied and reported, so nothing here can be rolled back: a failure is
-// logged and requests a block assembly reset, which reloads the unmined
-// transactions from the UTXO store, as for any other post-commit error.
-func (stp *SubtreeProcessor) runDeferredBlockDrain(block *model.Block, drain *deferredBlockDrain) {
-	if drain.drainQueue {
-		if err := stp.runHandlerWithRecover("deferredBlockDrain", func() error {
-			return stp.dequeueDuringBlockMovement(drain.transactionMap, drain.losingTxHashesMap, drain.conflictingHashes, false)
-		}); err != nil {
-			stp.logger.Errorf("[SubtreeProcessor][%s] error draining the queue after moveForwardBlock, requesting a block assembly reset: %v", block.String(), err)
-			stp.requestReset("deferredBlockDrain")
-		}
-
-		// addNode does not count what it adds; finalizeBlockProcessing's
-		// recount ran before this drain, so count again.
-		stp.setTxCountFromSubtrees()
-
-		// The drain's own SetIfNotExists calls may still be below
-		// logBufferSize; flush so a failure among them is seen here.
-		stp.flushDiskTxMapWriters()
-		stp.drainAndLogDiskTxMapErr("moveForwardBlock_postDequeue")
-	}
-
-	if err := stp.runHandlerWithRecover("clearCurrentTxMapShadow", func() error {
-		stp.clearCurrentTxMapShadow()
-		return nil
-	}); err != nil {
-		stp.logger.Errorf("[SubtreeProcessor][%s] error clearing the retired tx map after moveForwardBlock, requesting a block assembly reset: %v", block.String(), err)
-		stp.requestReset("deferredBlockDrain")
-	}
-
-	// The clear is moveForwardBlock's commit point, so a storage error from it
-	// keeps the label it had when the clear ran inside moveForwardBlock.
-	stp.drainAndLogDiskTxMapErr("moveForwardBlock_commit")
 }
 
 // runHandlerWithRecover invokes the supplied handler and converts any
@@ -5778,20 +5741,6 @@ func (stp *SubtreeProcessor) moveForwardBlock(ctx context.Context, block *model.
 	return transactionMap, losingTxHashesMap, err
 }
 
-// deferredBlockDrain is the end of a moveForwardBlock that the caller runs
-// after it has reported the block as applied: the drain of the queue that
-// built up while the block was applied (filtered against the block, as
-// dequeueDuringBlockMovement does) and the clear of the retired tx map half.
-// Neither changes what the block itself did, and both used to sit between the
-// block being applied and MoveForwardBlock returning - seconds on a large
-// block, during which block assembly kept serving empty mining candidates.
-type deferredBlockDrain struct {
-	drainQueue        bool // false on the own-block path, which never drains
-	transactionMap    *SplitSwissMap
-	losingTxHashesMap txmap.TxMap
-	conflictingHashes map[chainhash.Hash]struct{}
-}
-
 // moveForwardBlockDeferringDrain is moveForwardBlock that, when deferDrain is
 // set, skips the queue drain and the retired tx map clear and returns them as
 // a deferredBlockDrain for the caller to run with runDeferredBlockDrain. The
@@ -6179,6 +6128,51 @@ func (stp *SubtreeProcessor) DrainQueue(dropHashes map[chainhash.Hash]struct{}) 
 // Returns:
 //   - error: Any error encountered during processing
 func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap *SplitSwissMap, losingTxHashesMap txmap.TxMap, conflictingHashes map[chainhash.Hash]struct{}, skipNotification bool) (err error) {
+	for _, batch := range stp.takeDrainBatches() {
+		// Process all transactions in this batch
+		for i, node := range batch.nodes {
+			txInpoints := batch.txInpoints[i]
+
+			if transactionMap != nil && transactionMap.Exists(node.Hash) {
+				continue
+			}
+			if losingTxHashesMap != nil && losingTxHashesMap.Exists(node.Hash) {
+				continue
+			}
+
+			if len(conflictingHashes) > 0 {
+				if _, ok := conflictingHashes[node.Hash]; ok {
+					continue
+				}
+				if txInpoints != nil {
+					matched := false
+					for _, parent := range txInpoints.ParentTxHashes {
+						if _, ok := conflictingHashes[parent]; ok {
+							matched = true
+							break
+						}
+					}
+					if matched {
+						conflictingHashes[node.Hash] = struct{}{}
+						continue
+					}
+				}
+			}
+
+			if addErr := stp.addNode(node, txInpoints, skipNotification); addErr != nil {
+				stp.logger.Errorf("[SubtreeProcessor] error adding node %s during sequential remainder processing: %v", node.Hash.String(), addErr)
+			}
+		}
+
+		prometheusSubtreeProcessorDequeuedTxs.Add(float64(len(batch.nodes)))
+	}
+
+	return nil
+}
+
+// takeDrainBatches dequeues the batches a drain during or after block
+// movement covers.
+func (stp *SubtreeProcessor) takeDrainBatches() []*TxBatch {
 	// Bound the drain by two complementary cutoffs:
 	//
 	//  1. Time: validFromMillis = clock.Now() at function entry (or
@@ -6207,6 +6201,8 @@ func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap *SplitSwi
 	// batches. With ~1k items/batch and ingest at line-rate, neither bound
 	// fired — the scaling-2 pod sat for 35+ minutes at 558 GB RSS inside
 	// this loop.
+	var batches []*TxBatch
+
 	queueLength := stp.queue.length()
 	if queueLength > 0 {
 		itemsProcessed := int64(0)
@@ -6227,47 +6223,12 @@ func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap *SplitSwi
 				break
 			}
 
-			// Process all transactions in this batch
-			for i, node := range batch.nodes {
-				txInpoints := batch.txInpoints[i]
-
-				if transactionMap != nil && transactionMap.Exists(node.Hash) {
-					continue
-				}
-				if losingTxHashesMap != nil && losingTxHashesMap.Exists(node.Hash) {
-					continue
-				}
-
-				if len(conflictingHashes) > 0 {
-					if _, ok := conflictingHashes[node.Hash]; ok {
-						continue
-					}
-					if txInpoints != nil {
-						matched := false
-						for _, parent := range txInpoints.ParentTxHashes {
-							if _, ok := conflictingHashes[parent]; ok {
-								matched = true
-								break
-							}
-						}
-						if matched {
-							conflictingHashes[node.Hash] = struct{}{}
-							continue
-						}
-					}
-				}
-
-				if addErr := stp.addNode(node, txInpoints, skipNotification); addErr != nil {
-					stp.logger.Errorf("[SubtreeProcessor] error adding node %s during sequential remainder processing: %v", node.Hash.String(), addErr)
-				}
-			}
-
+			batches = append(batches, batch)
 			itemsProcessed += int64(len(batch.nodes))
-			prometheusSubtreeProcessorDequeuedTxs.Add(float64(len(batch.nodes)))
 		}
 	}
 
-	return nil
+	return batches
 }
 
 // processCoinbaseUtxos processes UTXOs from coinbase transactions.
