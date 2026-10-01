@@ -45,8 +45,9 @@ const freshnessWindowSeconds = 10
 // [ts-freshnessWindowSeconds, ts+freshnessWindowSeconds+1) (the +1 covers
 // second truncation), which is 2*freshnessWindowSeconds+1 seconds wide. A
 // claim taken at the earliest accepted instant (t0 = ts-freshnessWindowSeconds)
-// must still be live at the latest accepted instant (ts+freshnessWindowSeconds),
-// so the TTL must cover the full span plus one more second of margin: at least
+// must still be live at the latest accepted instant, which is just under
+// ts+freshnessWindowSeconds+1 (the second truncation noted above), so the TTL
+// must cover the full span plus one more second of margin: at least
 // 2*freshnessWindowSeconds+2 seconds. Anything shorter lets a captured
 // signature be replayed after its cache entry expires while its timestamp is
 // still within the freshness window.
@@ -437,7 +438,10 @@ func (v *peerAuthVerifier) verifySignedRequest(c echo.Context) (peer.ID, string,
 
 	actualDigest, err := v.digestRequestBody(req)
 	if err != nil {
-		if errors.Is(err, errSignedBodyTooLarge) {
+		//nolint:errorlint // identity: digestRequestBody returns this sentinel unwrapped; errors.Is
+		// matches on the error code and would also catch a future InvalidArgument error from the
+		// read path, silently misclassifying it as body_too_large.
+		if err == errSignedBodyTooLarge {
 			return peerID, peerAuthResultBodyTooLarge, true
 		}
 

@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/p2p"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
@@ -341,15 +342,45 @@ func TestPeerAuthMiddleware_ReplayBlocked(t *testing.T) {
 // timestamp anywhere in [ts-freshnessWindowSeconds, ts+freshnessWindowSeconds+1),
 // a span of 2*freshnessWindowSeconds+1 seconds (the +1 covers second
 // truncation). A replay claim taken at the earliest accepted instant must
-// still be live at the latest accepted instant, so the cache TTL must be at
-// least that span plus one second of margin. A TTL that only exceeds
-// freshnessWindowSeconds (e.g. 15s against a 10s window) lets an attacker
-// replay a captured signature after the cache entry expires but while the
-// timestamp is still fresh.
+// still be live at the latest accepted instant — just under
+// ts+freshnessWindowSeconds+1 — so the cache TTL must be at least that span
+// plus one second of margin. A TTL that only exceeds freshnessWindowSeconds
+// (e.g. 15s against a 10s window) lets an attacker replay a captured
+// signature after the cache entry expires but while the timestamp is still
+// fresh.
 func TestReplayCacheTTL_CoversFullFreshnessSpan(t *testing.T) {
 	minRequiredTTL := time.Duration(2*freshnessWindowSeconds+1) * time.Second
 	require.GreaterOrEqual(t, replayCacheTTL, minRequiredTTL+time.Second,
 		"replayCacheTTL must cover the whole accepted freshness span plus a second of margin")
+}
+
+// TestReplayCacheTTL_CoversFreshnessWindow_ViaCheckFreshness ties the TTL
+// directly to checkFreshness's actual acceptance boundary, rather than
+// restating the formula: the earliest timestamp checkFreshness still accepts
+// (relative to "now") must remain within the replay cache's TTL for the
+// entire span up to the latest timestamp it still accepts.
+func TestReplayCacheTTL_CoversFreshnessWindow_ViaCheckFreshness(t *testing.T) {
+	now := time.Now().Unix()
+
+	earliestAccepted := now
+	for ts := now - freshnessWindowSeconds - 2; ts <= now; ts++ {
+		if checkFreshness(strconv.FormatInt(ts, 10)) {
+			earliestAccepted = ts
+			break
+		}
+	}
+
+	latestAccepted := now
+	for ts := now + freshnessWindowSeconds + 2; ts >= now; ts-- {
+		if checkFreshness(strconv.FormatInt(ts, 10)) {
+			latestAccepted = ts
+			break
+		}
+	}
+
+	span := time.Duration(latestAccepted-earliestAccepted) * time.Second
+	require.Greater(t, replayCacheTTL, span,
+		"replayCacheTTL must outlast the full span checkFreshness actually accepts")
 }
 
 // TestPeerAuthMiddleware_AllowlistEmpty_NoElevation — a valid, fresh, non-replayed
@@ -782,8 +813,96 @@ func TestPeerAuthMiddleware_BadSignatureBodyNotRead(t *testing.T) {
 }
 
 // TestPeerAuthMiddleware_OversizedSignedBodyRejected — a signed body above
-// maxSignedBodyBytes is refused outright rather than buffered.
+// maxSignedBodyBytes is refused outright rather than buffered, both when the
+// request declares its length up front and when it streams (chunked, with no
+// declared Content-Length) and crosses the cap during the read.
 func TestPeerAuthMiddleware_OversizedSignedBodyRejected(t *testing.T) {
+	initPrometheusMetrics()
+
+	t.Run("declared length", func(t *testing.T) {
+		privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+		require.NoError(t, err)
+		peerID, err := peer.IDFromPublicKey(privKey.GetPublic())
+		require.NoError(t, err)
+
+		cache := &peerTierCache{tiers: map[peer.ID]peerTier{peerID: tierMiner}, logger: ulogger.TestLogger{}}
+
+		logger := ulogger.TestLogger{}
+		e := echo.New()
+		handlerCalled := false
+		e.Use(newPeerAuthVerifier(logger, cache, allowAll(cache)).Middleware())
+		e.POST("/test", func(c echo.Context) error {
+			handlerCalled = true
+			return c.NoContent(http.StatusOK)
+		})
+
+		body := bytes.Repeat([]byte("q"), defaultMaxSignedBodyBytes+1)
+		req := httptest.NewRequest(http.MethodPost, "/test", bytes.NewReader(body))
+		signTestRequest(t, req, privKey)
+
+		counter := &countingBody{r: bytes.NewReader(body)}
+		req.Body = counter
+		req.ContentLength = int64(len(body))
+
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+
+		require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+		require.False(t, handlerCalled, "oversized signed request must not reach the handler")
+		require.Zero(t, counter.read.Load(), "oversized signed body must be rejected on the declared length, not buffered")
+	})
+
+	t.Run("streamed, no declared length", func(t *testing.T) {
+		privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
+		require.NoError(t, err)
+		peerID, err := peer.IDFromPublicKey(privKey.GetPublic())
+		require.NoError(t, err)
+
+		cache := &peerTierCache{tiers: map[peer.ID]peerTier{peerID: tierMiner}, logger: ulogger.TestLogger{}}
+
+		logger := ulogger.TestLogger{}
+		e := echo.New()
+		handlerCalled := false
+		e.Use(newPeerAuthVerifier(logger, cache, allowAll(cache)).Middleware())
+		e.POST("/test", func(c echo.Context) error {
+			handlerCalled = true
+			return c.NoContent(http.StatusOK)
+		})
+
+		body := bytes.Repeat([]byte("q"), defaultMaxSignedBodyBytes+1)
+		req := httptest.NewRequest(http.MethodPost, "/test", bytes.NewReader(body))
+		signTestRequest(t, req, privKey)
+
+		// Simulate a chunked request: no declared Content-Length, so
+		// digestRequestBody can only discover the cap is crossed by reading.
+		req.Body = io.NopCloser(bytes.NewReader(body))
+		req.ContentLength = -1
+
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+
+		require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+		require.False(t, handlerCalled, "oversized streamed signed request must not reach the handler")
+	})
+}
+
+// errInvalidArgumentBody is a request body whose Read always fails with a
+// teranode InvalidArgument error that is not errSignedBodyTooLarge. It exists
+// to prove the body-too-large branch is an identity check, not a code match:
+// an errors.Is(err, errSignedBodyTooLarge) check would match any InvalidArgument
+// error out of the read path, including this one.
+type errInvalidArgumentBody struct{}
+
+var errInjectedReadFailure = errors.NewInvalidArgumentError("injected read error")
+
+func (errInvalidArgumentBody) Read([]byte) (int, error) { return 0, errInjectedReadFailure }
+func (errInvalidArgumentBody) Close() error             { return nil }
+
+// TestPeerAuthMiddleware_InvalidArgumentReadErrorNotCountedAsBodyTooLarge — a
+// different InvalidArgument error surfacing from the body read path must fall
+// through as bad_digest (200, tierUnverified), not be mistaken for the
+// body-too-large sentinel and answered with 413.
+func TestPeerAuthMiddleware_InvalidArgumentReadErrorNotCountedAsBodyTooLarge(t *testing.T) {
 	initPrometheusMetrics()
 
 	privKey, _, err := crypto.GenerateEd25519Key(rand.Reader)
@@ -792,28 +911,17 @@ func TestPeerAuthMiddleware_OversizedSignedBodyRejected(t *testing.T) {
 	require.NoError(t, err)
 
 	cache := &peerTierCache{tiers: map[peer.ID]peerTier{peerID: tierMiner}, logger: ulogger.TestLogger{}}
+	e, captured := newAuthEcho(t, cache, allowAll(cache))
 
-	logger := ulogger.TestLogger{}
-	e := echo.New()
-	handlerCalled := false
-	e.Use(newPeerAuthVerifier(logger, cache, allowAll(cache)).Middleware())
-	e.POST("/test", func(c echo.Context) error {
-		handlerCalled = true
-		return c.NoContent(http.StatusOK)
-	})
-
-	body := bytes.Repeat([]byte("q"), defaultMaxSignedBodyBytes+1)
-	req := httptest.NewRequest(http.MethodPost, "/test", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/test", bytes.NewReader([]byte("x")))
 	signTestRequest(t, req, privKey)
 
-	counter := &countingBody{r: bytes.NewReader(body)}
-	req.Body = counter
-	req.ContentLength = int64(len(body))
+	req.Body = errInvalidArgumentBody{}
+	req.ContentLength = 1
 
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, req)
 
-	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
-	require.False(t, handlerCalled, "oversized signed request must not reach the handler")
-	require.Zero(t, counter.read.Load(), "oversized signed body must be rejected on the declared length, not buffered")
+	require.Equal(t, http.StatusOK, rec.Code, "a non-sentinel InvalidArgument read error must not be answered with 413")
+	require.Equal(t, tierUnverified, *captured)
 }
