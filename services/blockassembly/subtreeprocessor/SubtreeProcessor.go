@@ -3488,13 +3488,16 @@ func (stp *SubtreeProcessor) removeTxFromSubtrees(ctx context.Context, hash chai
 			// chained-subtree branch below) so any precomputed mining-data snapshot holding
 			// the original stays safe for concurrent reads. Further processing is not needed,
 			// as the subtrees in chainedSubtrees are older than the current subtree.
-			currentSubtree := stp.currentSubtree.Load().Duplicate()
+			originalSubtree := stp.currentSubtree.Load()
+			currentSubtree := duplicateKeepingCapacity(originalSubtree)
 
 			if err := currentSubtree.RemoveNodeAtIndex(foundIndex); err != nil {
 				return errors.NewProcessingError("[SubtreeProcessor][removeTxFromSubtrees][%s] error removing node from current subtree", hash.String(), err)
 			}
 
 			stp.currentSubtree.Store(currentSubtree)
+			// an mmap-backed original is released when the next block commits
+			stp.retireSubtrees(originalSubtree)
 
 			return nil
 		}
@@ -3505,7 +3508,10 @@ func (stp *SubtreeProcessor) removeTxFromSubtrees(ctx context.Context, hash chai
 
 		// Deep copy the subtree before mutating so that any precomputed mining data
 		// snapshot that holds a pointer to the original remains safe for concurrent reads.
-		stp.chainedSubtrees[foundSubtreeIndex] = stp.chainedSubtrees[foundSubtreeIndex].Duplicate()
+		originalChainedSubtree := stp.chainedSubtrees[foundSubtreeIndex]
+		stp.chainedSubtrees[foundSubtreeIndex] = originalChainedSubtree.Duplicate()
+		// an mmap-backed original is released when the next block commits
+		stp.retireSubtrees(originalChainedSubtree)
 
 		if err := stp.chainedSubtrees[foundSubtreeIndex].RemoveNodeAtIndex(foundIndex); err != nil {
 			return errors.NewProcessingError("[SubtreeProcessor][removeTxFromSubtrees][%s] error removing node from subtree", hash.String(), err)
@@ -3570,13 +3576,18 @@ func (stp *SubtreeProcessor) removeTxsFromSubtrees(ctx context.Context, hashes [
 				// index is rebuilt fresh on the next lookup: RemoveNodeAtIndex leaves the index
 				// map stale for nodes after the removed one, which would otherwise corrupt the
 				// index used to remove a subsequent hash from the same subtree.
-				currentSubtree := stp.currentSubtree.Load().Duplicate()
+				// a plain copy is enough: the trailing reChainSubtrees(0) rebuilds at the leaf
+				// count and retires what it replaces
+				originalSubtree := stp.currentSubtree.Load()
+				currentSubtree := originalSubtree.Duplicate()
 
 				if err := currentSubtree.RemoveNodeAtIndex(foundIndex); err != nil {
 					return errors.NewProcessingError("[SubtreeProcessor][removeTxsFromSubtrees][%s] error removing node from current subtree", hash.String(), err)
 				}
 
 				stp.currentSubtree.Store(currentSubtree)
+				// an mmap-backed original is released when the next block commits
+				stp.retireSubtrees(originalSubtree)
 
 				// the trailing reChainSubtrees(0) compacts every subtree, including the
 				// current one, after the loop completes
@@ -3589,7 +3600,10 @@ func (stp *SubtreeProcessor) removeTxsFromSubtrees(ctx context.Context, hashes [
 
 			// Deep copy the subtree before mutating so that any precomputed mining data
 			// snapshot that holds a pointer to the original remains safe for concurrent reads.
-			stp.chainedSubtrees[foundSubtreeIndex] = stp.chainedSubtrees[foundSubtreeIndex].Duplicate()
+			originalChainedSubtree := stp.chainedSubtrees[foundSubtreeIndex]
+			stp.chainedSubtrees[foundSubtreeIndex] = originalChainedSubtree.Duplicate()
+			// an mmap-backed original is released when the next block commits
+			stp.retireSubtrees(originalChainedSubtree)
 
 			if err := stp.chainedSubtrees[foundSubtreeIndex].RemoveNodeAtIndex(foundIndex); err != nil {
 				return errors.NewProcessingError("[SubtreeProcessor][removeTxsFromSubtrees][%s] error removing node from subtree", hash.String(), err)
@@ -3786,6 +3800,22 @@ func (stp *SubtreeProcessor) storeAndAnnounceChainedSubtrees(ctx context.Context
 // is not reliable for a subtree a tx was removed from; Height survives Duplicate().
 func subtreeLeafCount(st *subtreepkg.Subtree) int {
 	return 1 << st.Height
+}
+
+// duplicateKeepingCapacity copies a subtree like Duplicate(), but keeps its leaf capacity.
+// Duplicate() allocates exactly len(Nodes), and Size() and IsComplete() derive from the
+// slice capacity, so a duplicated, partly filled current subtree would complete on the
+// next add with fewer leaves than the other subtrees of the block, making it invalid.
+func duplicateKeepingCapacity(st *subtreepkg.Subtree) *subtreepkg.Subtree {
+	duplicate := st.Duplicate()
+
+	if leaves := subtreeLeafCount(st); cap(duplicate.Nodes) < leaves {
+		nodes := make([]subtreepkg.Node, len(duplicate.Nodes), leaves)
+		copy(nodes, duplicate.Nodes)
+		duplicate.Nodes = nodes
+	}
+
+	return duplicate
 }
 
 // blockMaxSizeBudget returns the byte budget for the subtrees of a block, with the same
