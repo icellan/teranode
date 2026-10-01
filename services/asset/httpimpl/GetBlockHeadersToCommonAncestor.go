@@ -134,6 +134,12 @@ func (h *HTTP) GetBlockHeadersToCommonAncestor(mode ReadMode) func(c echo.Contex
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 
+		// Asset.MaxBlockHeaders applies only to this (To) route. The From route serves
+		// peer catchup, which always asks for 10,000 and must not be tightened below it.
+		if maxHeaders := h.settings.Asset.MaxBlockHeaders; maxHeaders > 0 && numberOfHeaders > maxHeaders {
+			numberOfHeaders = maxHeaders
+		}
+
 		var (
 			headers     []*model.BlockHeader
 			headerMetas []*model.BlockHeaderMeta
@@ -191,9 +197,10 @@ func (h *HTTP) parseBlockLocatorHashes(hashesStr string) ([]*chainhash.Hash, err
 }
 
 // parseNumberOfHeaders parses and validates the 'n' parameter for number of headers.
-// The default (an absent or zero 'n') is subject to the same cap as an explicit
-// value: it is never returned before Asset.MaxBlockHeaders has had a chance to
-// tighten it.
+// It only enforces the 10,000 hard ceiling shared by every header route. It deliberately
+// does NOT apply Asset.MaxBlockHeaders: the From route (peer catchup) always asks for
+// 10,000 and must always get it, so the operator cap is applied only by the To handler,
+// after this parse.
 func (h *HTTP) parseNumberOfHeaders(nStr string) (int, error) {
 	n := 100
 
@@ -216,10 +223,6 @@ func (h *HTTP) parseNumberOfHeaders(nStr string) (int, error) {
 
 	if n > 10_000 {
 		n = 10_000
-	}
-
-	if maxHeaders := h.settings.Asset.MaxBlockHeaders; maxHeaders > 0 && n > maxHeaders {
-		n = maxHeaders
 	}
 
 	return n, nil

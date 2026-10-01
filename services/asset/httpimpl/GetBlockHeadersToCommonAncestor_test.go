@@ -77,40 +77,6 @@ func TestParseNumberOfHeaders(t *testing.T) {
 		assert.Equal(t, "INVALID_ARGUMENT (1): invalid number of headers", err.Error())
 	})
 
-	t.Run("Asset.MaxBlockHeaders tightens the cap below 10000", func(t *testing.T) {
-		httpServer, _, _, _ := GetMockHTTP(t, nil)
-		httpServer.settings.Asset.MaxBlockHeaders = 500
-
-		n, err := httpServer.parseNumberOfHeaders("10000")
-		require.NoError(t, err)
-		assert.Equal(t, 500, n)
-	})
-
-	t.Run("Asset.MaxBlockHeaders default of 0 preserves the 10000 catchup ceiling", func(t *testing.T) {
-		httpServer, _, _, _ := GetMockHTTP(t, nil)
-
-		n, err := httpServer.parseNumberOfHeaders("10000")
-		require.NoError(t, err)
-		assert.Equal(t, 10_000, n, "catchup sends n=10000 and must not be tightened by default")
-	})
-
-	t.Run("absent n is still clamped when Asset.MaxBlockHeaders is below the default", func(t *testing.T) {
-		httpServer, _, _, _ := GetMockHTTP(t, nil)
-		httpServer.settings.Asset.MaxBlockHeaders = 50
-
-		n, err := httpServer.parseNumberOfHeaders("")
-		require.NoError(t, err)
-		assert.Equal(t, 50, n, "the default must go through the cap, not bypass it")
-	})
-
-	t.Run("n=0 is still clamped when Asset.MaxBlockHeaders is below the default", func(t *testing.T) {
-		httpServer, _, _, _ := GetMockHTTP(t, nil)
-		httpServer.settings.Asset.MaxBlockHeaders = 50
-
-		n, err := httpServer.parseNumberOfHeaders("0")
-		require.NoError(t, err)
-		assert.Equal(t, 50, n, "the default must go through the cap, not bypass it")
-	})
 }
 
 func TestGetBlockHeadersToCommonAncestor(t *testing.T) {
@@ -155,6 +121,27 @@ func TestGetBlockHeadersToCommonAncestor(t *testing.T) {
 		httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
 
 		mockRepo.On("GetBlockHeadersToCommonAncestor", mock.Anything, mock.Anything, uint32(10_000)).Return([]*model.BlockHeader{testBlockHeader}, []*model.BlockHeaderMeta{testBlockHeaderMeta}, nil)
+
+		echoContext.SetPath("/block/headersToCommonAncestor/:hash")
+		echoContext.SetParamNames("hash")
+		echoContext.SetParamValues("9d45ad79ad3c6baecae872c0e35022d60c3bbbd024ccce06690321ece15ea995")
+		echoContext.QueryParams().Set("block_locator_hashes", "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+		echoContext.QueryParams().Set("n", "10000")
+
+		err := httpServer.GetBlockHeadersToCommonAncestor(JSON)(echoContext)
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusOK, responseRecorder.Code)
+
+		mockRepo.AssertExpectations(t)
+	})
+
+	t.Run("Asset.MaxBlockHeaders clamps the To route", func(t *testing.T) {
+		httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
+		httpServer.settings.Asset.MaxBlockHeaders = 500
+
+		// Unlike the From route (peer catchup), the To route may be tightened by the
+		// operator cap below the 10,000 hard ceiling.
+		mockRepo.On("GetBlockHeadersToCommonAncestor", mock.Anything, mock.Anything, uint32(500)).Return([]*model.BlockHeader{testBlockHeader}, []*model.BlockHeaderMeta{testBlockHeaderMeta}, nil)
 
 		echoContext.SetPath("/block/headersToCommonAncestor/:hash")
 		echoContext.SetParamNames("hash")
