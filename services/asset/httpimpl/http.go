@@ -199,12 +199,12 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	// registration would be unreachable for OPTIONS; the single config
 	// therefore carries the union of the headers, including the dashboard's
 	// X-CSRF-Token.
-	corsAllowedOrigins, err := parseCORSAllowedOrigins(tSettings.Asset.CORSAllowedOrigins)
+	corsAllowedOrigins, err := parseCORSAllowedOrigins(tSettings.Asset.CORSAllowOrigins)
 	if err != nil {
 		return nil, err
 	}
 	if len(corsAllowedOrigins) == 0 {
-		logger.Warnf("[Asset] asset_corsAllowedOrigins is empty: every browser origin is reflected and credentialed cross-origin responses are refused; list the operator origins that need cookie or Authorization access")
+		logger.Warnf("[Asset] asset_corsAllowOrigins is empty: every browser origin is reflected and credentialed cross-origin responses are refused; list the operator origins that need cookie or Authorization access")
 	}
 
 	e.Use(middleware.CORSWithConfig(assetCORSConfig(corsAllowedOrigins)))
@@ -736,11 +736,10 @@ func (h *HTTP) Sign(resp *echo.Response, hash []byte) error {
 	return nil
 }
 
-// parseCORSAllowedOrigins splits the pipe-separated asset_corsAllowedOrigins
-// list, using the same convention as asset_trustedProxyCIDRs. Each entry is
-// normalised (see normalizeCORSOrigin) and validated; a malformed entry fails
-// loudly at startup rather than being silently accepted or dropped, matching
-// how asset_trustedProxyCIDRs already treats an unparseable CIDR.
+// parseCORSAllowedOrigins splits the pipe-separated asset_corsAllowOrigins
+// list, using the same convention as asset_centrifugeAllowOrigins. Each entry
+// is normalised (see normalizeCORSOrigin) and validated; a malformed entry
+// fails loudly at startup rather than being silently accepted or dropped.
 func parseCORSAllowedOrigins(raw string) ([]string, error) {
 	var (
 		origins     []string
@@ -763,7 +762,7 @@ func parseCORSAllowedOrigins(raw string) ([]string, error) {
 
 	if len(invalidErrs) > 0 {
 		return nil, errors.NewConfigurationError(
-			"[Asset] asset_corsAllowedOrigins has invalid entries: %s",
+			"[Asset] asset_corsAllowOrigins has invalid entries: %s",
 			strings.Join(invalidErrs, ", "),
 		)
 	}
@@ -830,10 +829,16 @@ func normalizeCORSOrigin(origin string) (string, error) {
 //
 // With an explicit allowlist, only those origins are matched and credentialed
 // cross-origin responses are permitted. With an empty allowlist the legacy
-// reflect-any behaviour is kept, but without credentials: reflecting an
-// arbitrary origin *and* allowing credentials is what let a hostile same-site
-// origin ride an operator's ambient cookie into the admin routes on this
-// listener.
+// reflect-any behaviour is kept, but without credentials.
+//
+// This is not CSRF protection. Dropping credentials on the reflect-any path
+// stops a hostile origin from reading a credentialed response via the
+// browser's CORS fetch API, but a credentialed simple request (e.g. a bare
+// cross-site POST with no custom headers) still reaches the handler and
+// still carries the operator's ambient cookie; the browser only withholds
+// the response body from the attacker's script, not the request from the
+// server. Refusing cookie-authenticated simple POSTs, or checking Origin on
+// state-changing requests, is tracked separately.
 func assetCORSConfig(allowedOrigins []string) middleware.CORSConfig {
 	cfg := middleware.CORSConfig{
 		AllowMethods: []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPatch, http.MethodPost, http.MethodDelete, http.MethodOptions},

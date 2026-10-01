@@ -210,7 +210,7 @@ func TestNew(t *testing.T) {
 
 		e.ServeHTTP(optionsRec, optionsReq)
 
-		// Test CORS headers. With no asset_corsAllowedOrigins configured the
+		// Test CORS headers. With no asset_corsAllowOrigins configured the
 		// origin is still reflected, but credentials are refused: reflecting an
 		// arbitrary origin and allowing credentials is what exposed the admin
 		// routes on this listener to a hostile same-site origin. See

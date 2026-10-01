@@ -39,7 +39,7 @@ func corsProbe(t *testing.T, cfg middleware.CORSConfig, origin string) *httptest
 }
 
 // TestAssetCORSConfig_EmptyAllowlistNeverAllowsCredentials — with no
-// asset_corsAllowedOrigins the legacy reflect-any behaviour is preserved, but
+// asset_corsAllowOrigins the legacy reflect-any behaviour is preserved, but
 // credentialed cross-origin responses must be refused. Reflecting an arbitrary
 // origin *and* allowing credentials is what let a hostile same-site origin ride
 // an operator's ambient cookie into the admin routes.
@@ -199,10 +199,10 @@ func baseTestSettings() *settings.Settings {
 // TestNew_DashboardCORSUsesTheSameAllowlist — there are two CORS configs on the
 // Asset listener (the default one and the one registered in the dashboard
 // branch). Narrowing only one leaves the defect intact, so both must honour
-// asset_corsAllowedOrigins.
+// asset_corsAllowOrigins.
 func TestNew_DashboardCORSUsesTheSameAllowlist(t *testing.T) {
 	tSettings := baseTestSettings()
-	tSettings.Asset.CORSAllowedOrigins = "https://ops.example.com"
+	tSettings.Asset.CORSAllowOrigins = "https://ops.example.com"
 	tSettings.Dashboard.Enabled = true
 	tSettings.RPC = settings.RPCSettings{RPCUser: "bitcoin", RPCPass: "bitcoin"}
 
@@ -413,7 +413,7 @@ func TestNew_PreflightAdvertisesTheCSRFHeader(t *testing.T) {
 	for _, dashboardEnabled := range []bool{false, true} {
 		t.Run(fmt.Sprintf("dashboard=%v", dashboardEnabled), func(t *testing.T) {
 			tSettings := baseTestSettings()
-			tSettings.Asset.CORSAllowedOrigins = "https://ops.example.com"
+			tSettings.Asset.CORSAllowOrigins = "https://ops.example.com"
 			tSettings.Dashboard.Enabled = dashboardEnabled
 			tSettings.RPC = settings.RPCSettings{RPCUser: "bitcoin", RPCPass: "bitcoin"}
 
