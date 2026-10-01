@@ -973,72 +973,7 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 					stp.setCurrentRunningState(StateRunning)
 
 				case moveForwardReq := <-stp.moveForwardBlockChan:
-					moveForwardReq.errChan <- stp.runHandlerWithRecover("moveForwardBlock", func() error {
-						stp.setCurrentRunningState(StateMoveForwardBlock)
-
-						// Snapshot + defer registration BEFORE any user-input deref (e.g.
-						// the block.String() in the log line below) so that a panic on
-						// nil/malformed input still unwinds via the rollback defer rather
-						// than skipping past it. Cheap pointer loads, ordering matters.
-						originalChainedSubtrees := stp.chainedSubtrees
-						originalCurrentSubtree := stp.currentSubtree.Load()
-						originalCurrentTxMap := stp.currentTxMap
-						currentBlockHeader := stp.currentBlockHeader.Load()
-
-						rollback := func() {
-							stp.chainedSubtrees = originalChainedSubtrees
-							stp.currentSubtree.Store(originalCurrentSubtree)
-							stp.restoreCurrentTxMap(originalCurrentTxMap)
-							stp.currentBlockHeader.Store(currentBlockHeader)
-							stp.setTxCountFromSubtrees()
-						}
-
-						// Defer panic-aware rollback so a panic in moveForwardBlock unwinds
-						// the partial state too, not just an error return. Without this,
-						// runHandlerWithRecover surfaces "panicked" to the caller while the
-						// in-memory state stays half-mutated until BA's reset fallback fires.
-						// Finalize-time panics are intentionally NOT rolled back: by then the
-						// block has been applied (chainedSubtrees reflect it), and rewinding
-						// the 4 fields would put them out of sync with the SetBlockProcessedAt
-						// side effect that may have already committed.
-						committed := false
-						defer func() {
-							if r := recover(); r != nil {
-								if !committed {
-									rollback()
-								}
-								panic(r)
-							}
-						}()
-
-						logger.Infof("[SubtreeProcessor][%s] moveForwardBlock subtree processor", moveForwardReq.block.String())
-
-						// create empty map for processed conflicting hashes
-						processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
-
-						_, _, mfErr := stp.moveForwardBlock(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, false, true)
-						if mfErr != nil {
-							rollback()
-							return mfErr
-						}
-
-						// moveForwardBlock succeeded - past the point where rollback is correct.
-						committed = true
-
-						// Finalize block processing - sets current block header, fires SetBlockProcessedAt, etc.
-						stp.finalizeBlockProcessing(processorCtx, moveForwardReq.block)
-
-						// The block is applied and finalized: any disk tx map error from
-						// here on (or lingering from moveForwardBlock's own commit) is
-						// reported, not returned - returning it now would make the
-						// caller retry a block that already succeeded.
-						stp.drainAndLogDiskTxMapErr("moveForwardBlock_commit")
-
-						return nil
-					})
-
-					logger.Infof("[SubtreeProcessor][%s] moveForwardBlock subtree processor DONE", moveForwardReq.block.String())
-					stp.setCurrentRunningState(StateRunning)
+					stp.handleMoveForwardRequest(processorCtx, moveForwardReq)
 
 				case resetBlocksMsg := <-stp.resetCh:
 					resp := stp.runReset(resetBlocksMsg)
@@ -3835,6 +3770,77 @@ func (stp *SubtreeProcessor) updatePrecomputedMiningData() {
 		Subtrees:       subtreesCopy,
 		UpdatedAt:      time.Now(),
 	})
+}
+
+// handleMoveForwardRequest applies one block from moveForwardBlockChan and
+// reports the result on the request's errChan. It runs on the Start goroutine.
+func (stp *SubtreeProcessor) handleMoveForwardRequest(processorCtx context.Context, moveForwardReq moveBlockRequest) {
+	moveForwardReq.errChan <- stp.runHandlerWithRecover("moveForwardBlock", func() error {
+		stp.setCurrentRunningState(StateMoveForwardBlock)
+
+		// Snapshot + defer registration BEFORE any user-input deref (e.g.
+		// the block.String() in the log line below) so that a panic on
+		// nil/malformed input still unwinds via the rollback defer rather
+		// than skipping past it. Cheap pointer loads, ordering matters.
+		originalChainedSubtrees := stp.chainedSubtrees
+		originalCurrentSubtree := stp.currentSubtree.Load()
+		originalCurrentTxMap := stp.currentTxMap
+		currentBlockHeader := stp.currentBlockHeader.Load()
+
+		rollback := func() {
+			stp.chainedSubtrees = originalChainedSubtrees
+			stp.currentSubtree.Store(originalCurrentSubtree)
+			stp.restoreCurrentTxMap(originalCurrentTxMap)
+			stp.currentBlockHeader.Store(currentBlockHeader)
+			stp.setTxCountFromSubtrees()
+		}
+
+		// Defer panic-aware rollback so a panic in moveForwardBlock unwinds
+		// the partial state too, not just an error return. Without this,
+		// runHandlerWithRecover surfaces "panicked" to the caller while the
+		// in-memory state stays half-mutated until BA's reset fallback fires.
+		// Finalize-time panics are intentionally NOT rolled back: by then the
+		// block has been applied (chainedSubtrees reflect it), and rewinding
+		// the 4 fields would put them out of sync with the SetBlockProcessedAt
+		// side effect that may have already committed.
+		committed := false
+		defer func() {
+			if r := recover(); r != nil {
+				if !committed {
+					rollback()
+				}
+				panic(r)
+			}
+		}()
+
+		stp.logger.Infof("[SubtreeProcessor][%s] moveForwardBlock subtree processor", moveForwardReq.block.String())
+
+		// create empty map for processed conflicting hashes
+		processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
+
+		_, _, mfErr := stp.moveForwardBlock(processorCtx, moveForwardReq.block, false, processedConflictingHashesMap, false, true)
+		if mfErr != nil {
+			rollback()
+			return mfErr
+		}
+
+		// moveForwardBlock succeeded - past the point where rollback is correct.
+		committed = true
+
+		// Finalize block processing - sets current block header, fires SetBlockProcessedAt, etc.
+		stp.finalizeBlockProcessing(processorCtx, moveForwardReq.block)
+
+		// The block is applied and finalized: any disk tx map error from
+		// here on (or lingering from moveForwardBlock's own commit) is
+		// reported, not returned - returning it now would make the
+		// caller retry a block that already succeeded.
+		stp.drainAndLogDiskTxMapErr("moveForwardBlock_commit")
+
+		return nil
+	})
+
+	stp.logger.Infof("[SubtreeProcessor][%s] moveForwardBlock subtree processor DONE", moveForwardReq.block.String())
+	stp.setCurrentRunningState(StateRunning)
 }
 
 // runHandlerWithRecover invokes the supplied handler and converts any
