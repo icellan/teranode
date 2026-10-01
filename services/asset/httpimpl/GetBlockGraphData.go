@@ -217,7 +217,11 @@ func (h *HTTP) GetBlockGraphData(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
-	if len(dataPoints.DataPoints) > 1 {
+	// BucketSeconds is set whenever the store already aggregated the series.
+	// Re-deriving a rung from the bucketed endpoints is not always idempotent
+	// (30d buckets are not a multiple of 1w buckets), so a bucketed series is
+	// passed straight through instead of being re-aggregated here.
+	if dataPoints.BucketSeconds == 0 && len(dataPoints.DataPoints) > 1 {
 		var minTS uint32 = math.MaxUint32
 		var maxTS uint32
 		for _, dp := range dataPoints.DataPoints {
