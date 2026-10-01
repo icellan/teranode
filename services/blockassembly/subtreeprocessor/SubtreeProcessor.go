@@ -369,6 +369,12 @@ type SubtreeProcessor struct {
 	// Updated by the main goroutine, read atomically by GetMiningCandidate.
 	precomputedMiningData atomic.Pointer[PrecomputedMiningData]
 
+	// drainingAfterBlock is set while handleMoveForwardRequest runs the work
+	// it deferred past its response (see deferredBlockDrain). The processing
+	// goroutine is busy for that time, so requests that would wait on it,
+	// such as GetIncompleteSubtreeMiningData, answer at once instead.
+	drainingAfterBlock atomic.Bool
+
 	// mmapDir, when non-empty, enables mmap-backed subtree Nodes.
 	mmapDir string
 
@@ -3723,6 +3729,13 @@ func (stp *SubtreeProcessor) GetPrecomputedMiningData() *PrecomputedMiningData {
 // processing goroutine is busy (e.g., during a reorg). The caller's context
 // is also respected for earlier cancellation.
 func (stp *SubtreeProcessor) GetIncompleteSubtreeMiningData(ctx context.Context) *PrecomputedMiningData {
+	// While the work deferred after a block runs, the processing goroutine
+	// cannot answer; returning nil gives the caller an empty candidate at
+	// once, as it got while the block itself was being applied.
+	if stp.drainingAfterBlock.Load() {
+		return nil
+	}
+
 	const timeout = 5 * time.Second
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -3835,6 +3848,10 @@ func (stp *SubtreeProcessor) handleMoveForwardRequest(processorCtx context.Conte
 			return mfErr
 		}
 
+		// Set before the response goes out, so no caller that has seen the
+		// block applied can find the processor busy without knowing why.
+		stp.drainingAfterBlock.Store(drain != nil)
+
 		// moveForwardBlock succeeded - past the point where rollback is correct.
 		committed = true
 
@@ -3853,8 +3870,12 @@ func (stp *SubtreeProcessor) handleMoveForwardRequest(processorCtx context.Conte
 	stp.logger.Infof("[SubtreeProcessor][%s] moveForwardBlock subtree processor DONE", moveForwardReq.block.String())
 
 	if drain != nil {
-		stp.setCurrentRunningState(StateDequeue)
-		stp.runDeferredBlockDrain(processorCtx, moveForwardReq.block, drain)
+		func() {
+			defer stp.drainingAfterBlock.Store(false)
+
+			stp.setCurrentRunningState(StateDequeue)
+			stp.runDeferredBlockDrain(processorCtx, moveForwardReq.block, drain)
+		}()
 	}
 
 	stp.setCurrentRunningState(StateRunning)

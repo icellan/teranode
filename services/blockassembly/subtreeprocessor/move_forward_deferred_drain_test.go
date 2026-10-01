@@ -158,6 +158,15 @@ func TestHandleMoveForwardRequest_RespondsBeforeQueueDrain(t *testing.T) {
 		t.Fatal("moveForwardBlock result was held back by the queue drain")
 	}
 
+	// Block assembly now serves mining candidates on the new tip. With no
+	// complete subtree it asks this goroutine for a snapshot of the
+	// incomplete one; while the drain runs that must answer at once (empty,
+	// as it did while the block was still being applied), not wait out its
+	// 5s timeout behind the drain.
+	snapshotStart := time.Now()
+	require.Nil(t, stp.GetIncompleteSubtreeMiningData(context.Background()))
+	require.Less(t, time.Since(snapshotStart), time.Second, "the snapshot request waited behind the deferred drain")
+
 	go func() {
 		for req := range newSubtreeChan {
 			if req.ErrChan != nil {
