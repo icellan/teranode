@@ -93,12 +93,13 @@ func TestHeavyRouteAdmission_ExpensiveRoutesAreRateLimited(t *testing.T) {
 // TestHeavyRouteAdmission_CatchupHeadersFromCommonAncestorNotThrottled proves
 // that headers_from_common_ancestor — the endpoint used by peer-to-peer block
 // catchup (services/blockvalidation/catchup_get_block_headers.go) — is
-// deliberately NOT admitted to the heavy limiter. Catchup calls this endpoint
-// with a plain unauthenticated HTTP GET (no peer-auth signature), so it is
-// always charged against the tierUnverified bucket regardless of caller
-// identity; admitting it to the heavy limiter (default 10 req/s per IP) would
-// throttle legitimate inter-node catchup, which issues iterations back-to-back
-// with no client-side pacing.
+// deliberately NOT admitted to the heavy limiter. Catchup signs this GET the
+// same way it signs its subtree and block fetches, but with the default
+// asset_peerAuthAllowlist empty, a correctly signed request still stays at
+// tierUnverified and lands in the per-IP bucket; admitting this route to the
+// heavy limiter (default 10 req/s per IP) would throttle legitimate
+// inter-node catchup, which issues iterations back-to-back with no
+// client-side pacing.
 func TestHeavyRouteAdmission_CatchupHeadersFromCommonAncestorNotThrottled(t *testing.T) {
 	httpServer := newHeavyAdmissionTestServer(t)
 
