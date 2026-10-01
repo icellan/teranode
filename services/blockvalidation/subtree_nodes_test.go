@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sync/atomic"
 	"testing"
 
@@ -1049,6 +1050,66 @@ func TestCheckSubtreeDataMatchesNodes(t *testing.T) {
 				return
 			}
 			require.ErrorIs(t, err, c.err)
+		})
+	}
+}
+
+// A node payload that is not a whole number of hashes is a malformed response,
+// even if its aligned prefix hashes to the subtree.
+func TestFetchAndStoreSubtreeRejectsMisalignedNodes(t *testing.T) {
+	suite := NewCatchupTestSuite(t)
+	defer suite.Cleanup()
+	recorder := &catchupErrorRecorder{}
+	suite.Server.p2pClient = recorder
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+	h := testHashes(2)
+	hash := testNodesRoot(t, h...)
+	httpmock.RegisterResponder("GET", "http://test-peer/subtree/"+hash.String(), httpmock.NewBytesResponder(200, append(testNodeBytes(h...), 1, 2, 3)))
+
+	result, _, err := suite.Server.fetchAndStoreSubtree(suite.Ctx, &model.Block{Height: 100}, hash, "peer", "http://test-peer")
+	require.Error(t, err)
+	require.Nil(t, result)
+	require.False(t, errors.IsLocalError(err))
+	require.Equal(t, []string{"peer"}, recorder.peers)
+}
+
+// A validated subtree loaded with mmap must be released once its data has been
+// checked, on success and on failure.
+func TestFetchAndStoreSubtreeAndSubtreeData_ClosesMmapSubtree(t *testing.T) {
+	for _, dataOK := range []bool{true, false} {
+		t.Run(fmt.Sprintf("dataOK=%v", dataOK), func(t *testing.T) {
+			ctx := context.Background()
+			bv, block, _, blobs := newQuickBodyFixture(t, "async")
+			hash := block.Subtrees[1]
+			nodes, err := blobs.Get(ctx, hash[:], fileformat.FileTypeSubtreeToCheck)
+			require.NoError(t, err)
+			require.NoError(t, blobs.Set(ctx, hash[:], fileformat.FileTypeSubtree, nodes))
+			require.NoError(t, blobs.Del(ctx, hash[:], fileformat.FileTypeSubtreeToCheck))
+			data, err := blobs.Get(ctx, hash[:], fileformat.FileTypeSubtreeData)
+			require.NoError(t, err)
+			require.NoError(t, blobs.Del(ctx, hash[:], fileformat.FileTypeSubtreeData))
+			if !dataOK {
+				data = data[:len(data)-1]
+			}
+			peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/subtree_data/"+hash.String() {
+					_, _ = w.Write(data)
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer peerServer.Close()
+			mmapDir := t.TempDir()
+			cfg := *bv.settings
+			cfg.BlockValidation.SubtreeMmapDir = mmapDir
+			s := &Server{logger: ulogger.TestLogger{}, settings: &cfg, subtreeStore: blobs}
+
+			_, err = s.fetchAndStoreSubtreeAndSubtreeData(ctx, block, hash, "peer", peerServer.URL)
+			require.Equal(t, dataOK, err == nil, "%v", err)
+			files, err := os.ReadDir(mmapDir)
+			require.NoError(t, err)
+			require.Empty(t, files, "the mmap-backed subtree must be closed")
 		})
 	}
 }

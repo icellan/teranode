@@ -531,6 +531,12 @@ func (u *Server) fetchAndStoreSubtree(ctx context.Context, block *model.Block, s
 		return nil, false, errors.NewServiceError("[catchup:fetchAndStoreSubtree] Failed to fetch subtree for %s", subtreeHash.String(), subtreeErr)
 	}
 
+	// A payload that is not a whole number of hashes is malformed.
+	if len(subtreeNodeBytes)%chainhash.HashSize != 0 {
+		u.reportCatchupError(ctx, peerID, "subtree nodes are not a whole number of hashes")
+		return nil, false, errors.NewProcessingError("[catchup:fetchAndStoreSubtree] Peer %s (%s) provided %d bytes of subtree nodes for %s", peerID, baseURL, len(subtreeNodeBytes), subtreeHash.String())
+	}
+
 	// in the subtree validation, we only use the hashes of the FileTypeSubtreeToCheck, which is what is returned from the peer
 	numberOfNodes := len(subtreeNodeBytes) / chainhash.HashSize
 	subtree, err := subtreepkg.NewIncompleteTreeByLeafCount(numberOfNodes)
@@ -864,7 +870,7 @@ func (u *Server) fetchAndStoreSubtreeAndSubtreeData(ctx context.Context, block *
 	subtree, validated, err := u.fetchAndStoreSubtree(ctx, block, subtreeHash, peerID, baseURL)
 	if err == nil {
 		// Primary peer succeeded for subtree, now try subtreeData
-		if err = u.fetchAndStoreSubtreeData(ctx, block, subtreeHash, subtree, validated, peerID, baseURL); err == nil {
+		if err = u.fetchAndStoreSubtreeDataAndRelease(ctx, block, subtreeHash, subtree, validated, peerID, baseURL); err == nil {
 			return peerID, nil // Success
 		}
 		// Check if error is local (not peer-related) - don't retry with other peers
@@ -912,7 +918,7 @@ func (u *Server) fetchAndStoreSubtreeAndSubtreeData(ctx context.Context, block *
 				}
 
 				// Subtree succeeded, try subtreeData
-				if err = u.fetchAndStoreSubtreeData(ctx, block, subtreeHash, subtree, validated, altPeerID, altBaseURL); err != nil {
+				if err = u.fetchAndStoreSubtreeDataAndRelease(ctx, block, subtreeHash, subtree, validated, altPeerID, altBaseURL); err != nil {
 					u.logger.Debugf("[catchup:fetchAndStoreSubtreeAndSubtreeData] Alternative peer %s failed for subtreeData %s: %v", altPeerID, subtreeHash.String(), err)
 					lastErr = err
 					// Don't continue trying other peers if it's a local error
@@ -933,6 +939,14 @@ func (u *Server) fetchAndStoreSubtreeAndSubtreeData(ctx context.Context, block *
 	// the wrapped error, so a "%v" placeholder for lastErr would render as
 	// %!v(MISSING). The wrapped error is preserved in the chain.
 	return "", errors.NewServiceError("[catchup:fetchAndStoreSubtreeAndSubtreeData] All peers failed to fetch subtree %s", subtreeHash.String(), lastErr)
+}
+
+// fetchAndStoreSubtreeDataAndRelease is fetchAndStoreSubtreeData followed by
+// releasing subtree, which may be mmap-backed when loaded from the store.
+func (u *Server) fetchAndStoreSubtreeDataAndRelease(ctx context.Context, block *model.Block, subtreeHash *chainhash.Hash,
+	subtree *subtreepkg.Subtree, validated bool, peerID, baseURL string) error {
+	defer func() { _ = subtree.Close() }()
+	return u.fetchAndStoreSubtreeData(ctx, block, subtreeHash, subtree, validated, peerID, baseURL)
 }
 
 // fetchSubtreeFromPeer fetches subtree (for subtreeToCheck) from a peer via HTTP

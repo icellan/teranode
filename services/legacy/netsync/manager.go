@@ -2366,7 +2366,7 @@ func (sm *SyncManager) NewPeer(peer *peerpkg.Peer, done chan struct{}) {
 	// Ignore if we are shutting down.
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
 		if done != nil {
-			sendDuringShutdown(done, struct{}{}, sm.quit)
+			replyDuringShutdown(done, struct{}{}, sm.quit)
 		}
 		return
 	}
@@ -2380,7 +2380,7 @@ func (sm *SyncManager) QueueTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan str
 	// Don't accept more transactions if we're shutting down.
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
 		if done != nil {
-			sendDuringShutdown(done, struct{}{}, sm.quit)
+			replyDuringShutdown(done, struct{}{}, sm.quit)
 		}
 		return
 	}
@@ -2394,7 +2394,7 @@ func (sm *SyncManager) QueueTx(tx *bsvutil.Tx, peer *peerpkg.Peer, done chan str
 func (sm *SyncManager) QueueBlock(block *bsvutil.Block, peer *peerpkg.Peer, done chan error) {
 	// Don't accept more blocks if we're shutting down.
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
-		sendDuringShutdown[error](done, nil, sm.quit)
+		replyDuringShutdown[error](done, nil, sm.quit)
 		return
 	}
 
@@ -2417,6 +2417,24 @@ func sendDuringShutdown[T any](ch chan T, v T, quit <-chan struct{}) (sent bool)
 	case <-quit:
 		return false
 	}
+}
+
+// replyDuringShutdown delivers a completion reply. A caller may wait only on
+// its done channel, so a send that can complete must not lose to a closed
+// quit: select picks at random among ready cases.
+func replyDuringShutdown[T any](ch chan T, v T, quit <-chan struct{}) (sent bool) {
+	defer func() {
+		if recover() != nil {
+			sent = false
+		}
+	}()
+
+	select {
+	case ch <- v:
+		return true
+	default:
+	}
+	return sendDuringShutdown(ch, v, quit)
 }
 
 // QueueInv adds the passed inv message and peer to the block handling queue.
@@ -2491,7 +2509,7 @@ func (sm *SyncManager) DonePeer(peer *peerpkg.Peer, done chan struct{}) {
 	// Ignore if we are shutting down.
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
 		if done != nil {
-			sendDuringShutdown(done, struct{}{}, sm.quit)
+			replyDuringShutdown(done, struct{}{}, sm.quit)
 		}
 		return
 	}
