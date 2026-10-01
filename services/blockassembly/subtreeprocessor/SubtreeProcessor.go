@@ -375,6 +375,15 @@ type SubtreeProcessor struct {
 	// such as GetIncompleteSubtreeMiningData, answer at once instead.
 	drainingAfterBlock atomic.Bool
 
+	// afterBlockMiningData is the incomplete-subtree snapshot taken just before
+	// handleMoveForwardRequest responds, served by
+	// GetIncompleteSubtreeMiningData while drainingAfterBlock is set.
+	afterBlockMiningData atomic.Pointer[PrecomputedMiningData]
+
+	// drainResetRequested is set when the work deferred past a
+	// MoveForwardBlock response fails; see TakeDrainResetRequested.
+	drainResetRequested atomic.Bool
+
 	// mmapDir, when non-empty, enables mmap-backed subtree Nodes.
 	mmapDir string
 
@@ -906,44 +915,12 @@ func (stp *SubtreeProcessor) Start(ctx context.Context) {
 
 				case responseChan := <-stp.getIncompleteSubtreeDataChan:
 					// On-demand snapshot of incomplete subtree for mining (only when requested)
-					currentSt := stp.currentSubtree.Load()
-					if stp.chainedSubtreeCount.Load() > 0 || currentSt == nil || currentSt.Length() <= 1 {
-						responseChan <- nil
-					} else {
-						incompleteSubtree, err := stp.createIncompleteSubtreeCopy()
-						if err != nil {
-							logger.Errorf("[SubtreeProcessor] error creating incomplete subtree snapshot: %s", err.Error())
-							responseChan <- nil
-						} else {
-							// Store (and announce) the incomplete subtree so it exists in the blob store
-							// when callers read it by hash (e.g., checkTransactionsInMiningCandidate).
-							send := NewSubtreeRequest{
-								Subtree:     incompleteSubtree,
-								ParentTxMap: stp.currentTxMap,
-								ErrChan:     make(chan error),
-							}
-
-							select {
-							case stp.newSubtreeChan <- send:
-								select {
-								case <-send.ErrChan:
-									stp.resetAnnouncementTicker()
-								case <-processorCtx.Done():
-									return
-								}
-							case <-processorCtx.Done():
-								return
-							}
-
-							currentBlockHeader := stp.currentBlockHeader.Load()
-							responseChan <- &PrecomputedMiningData{
-								PreviousHeader:   currentBlockHeader,
-								Subtrees:         []*subtreepkg.Subtree{incompleteSubtree},
-								UpdatedAt:        time.Now(),
-								IsFromIncomplete: true,
-							}
-						}
+					data, cancelled := stp.incompleteSubtreeMiningData(processorCtx)
+					if cancelled {
+						return
 					}
+
+					responseChan <- data
 
 				case getTransactionHashesChan := <-stp.getTransactionHashesChan:
 					stp.setCurrentRunningState(StateGetTransactionHashes)
@@ -1290,6 +1267,50 @@ func (stp *SubtreeProcessor) resetAnnouncementTicker() {
 		// No pending tick
 	}
 	stp.announcementTicker.Reset(stp.settings.BlockAssembly.SubtreeAnnouncementInterval)
+}
+
+// incompleteSubtreeMiningData snapshots the open subtree for a mining
+// candidate when there is no complete subtree to offer, storing (and
+// announcing) the copy so it exists in the blob store when callers read it by
+// hash, e.g. checkTransactionsInMiningCandidate. It returns nil when there is
+// nothing to snapshot, and cancelled when ctx ended while the store waited.
+// It runs on the processing goroutine.
+func (stp *SubtreeProcessor) incompleteSubtreeMiningData(ctx context.Context) (data *PrecomputedMiningData, cancelled bool) {
+	currentSt := stp.currentSubtree.Load()
+	if stp.chainedSubtreeCount.Load() > 0 || currentSt == nil || currentSt.Length() <= 1 {
+		return nil, false
+	}
+
+	incompleteSubtree, err := stp.createIncompleteSubtreeCopy()
+	if err != nil {
+		stp.logger.Errorf("[SubtreeProcessor] error creating incomplete subtree snapshot: %s", err.Error())
+		return nil, false
+	}
+
+	send := NewSubtreeRequest{
+		Subtree:     incompleteSubtree,
+		ParentTxMap: stp.currentTxMap,
+		ErrChan:     make(chan error),
+	}
+
+	select {
+	case stp.newSubtreeChan <- send:
+		select {
+		case <-send.ErrChan:
+			stp.resetAnnouncementTicker()
+		case <-ctx.Done():
+			return nil, true
+		}
+	case <-ctx.Done():
+		return nil, true
+	}
+
+	return &PrecomputedMiningData{
+		PreviousHeader:   stp.currentBlockHeader.Load(),
+		Subtrees:         []*subtreepkg.Subtree{incompleteSubtree},
+		UpdatedAt:        time.Now(),
+		IsFromIncomplete: true,
+	}, false
 }
 
 // createIncompleteSubtreeCopy creates a copy of the current subtree for announcement purposes.
@@ -3188,6 +3209,12 @@ func (stp *SubtreeProcessor) TakeResetRequested() bool {
 	return stp.diskTxMapResetRequested.CompareAndSwap(true, false)
 }
 
+// TakeDrainResetRequested reports, and clears, whether the work deferred past
+// a MoveForwardBlock response failed and a reset should be requested.
+func (stp *SubtreeProcessor) TakeDrainResetRequested() bool {
+	return stp.drainResetRequested.CompareAndSwap(true, false)
+}
+
 // reportDiskTxMapCloseWarn logs and counts m's pending Close warning (see
 // DiskTxMap.TakeCloseWarn), if any. Call this right after m.Clear(): by the
 // time Clear records one, the rotation itself has already succeeded (only
@@ -3736,10 +3763,10 @@ func (stp *SubtreeProcessor) DrainingAfterBlock() bool {
 // is also respected for earlier cancellation.
 func (stp *SubtreeProcessor) GetIncompleteSubtreeMiningData(ctx context.Context) *PrecomputedMiningData {
 	// While the work deferred after a block runs, the processing goroutine
-	// cannot answer; returning nil gives the caller an empty candidate at
-	// once, as it got while the block itself was being applied.
+	// cannot answer; serve the snapshot taken just before it started instead,
+	// which holds the txs the block left in block assembly.
 	if stp.drainingAfterBlock.Load() {
-		return nil
+		return stp.afterBlockMiningData.Load()
 	}
 
 	const timeout = 5 * time.Second
@@ -3854,12 +3881,13 @@ func (stp *SubtreeProcessor) handleMoveForwardRequest(processorCtx context.Conte
 			return mfErr
 		}
 
-		// Set before the response goes out, so no caller that has seen the
-		// block applied can find the processor busy without knowing why.
-		stp.drainingAfterBlock.Store(drain != nil)
-
 		// moveForwardBlock succeeded - past the point where rollback is correct.
 		committed = true
+
+		// From here drain is set, so the deferred work runs even if
+		// finalizeBlockProcessing below panics: the block is applied and is
+		// not rolled back (see above), and the retired tx map half must still
+		// be cleared before the next block's reset swaps it back in.
 
 		// Finalize block processing - sets current block header, fires SetBlockProcessedAt, etc.
 		stp.finalizeBlockProcessing(processorCtx, moveForwardReq.block)
@@ -3870,6 +3898,16 @@ func (stp *SubtreeProcessor) handleMoveForwardRequest(processorCtx context.Conte
 		// caller retry a block that already succeeded.
 		stp.drainAndLogDiskTxMapErr("moveForwardBlock_commit")
 
+		// Set before the response goes out, so no caller that has seen the
+		// block applied can find the processor busy without knowing why, and
+		// take the snapshot of the open subtree it would otherwise have
+		// waited for: the txs the block left in block assembly.
+		if drain != nil {
+			snapshot, _ := stp.incompleteSubtreeMiningData(processorCtx)
+			stp.afterBlockMiningData.Store(snapshot)
+			stp.drainingAfterBlock.Store(true)
+		}
+
 		return nil
 	})
 
@@ -3877,7 +3915,10 @@ func (stp *SubtreeProcessor) handleMoveForwardRequest(processorCtx context.Conte
 
 	if drain != nil {
 		func() {
-			defer stp.drainingAfterBlock.Store(false)
+			defer func() {
+				stp.drainingAfterBlock.Store(false)
+				stp.afterBlockMiningData.Store(nil)
+			}()
 
 			stp.setCurrentRunningState(StateDequeue)
 			stp.runDeferredBlockDrain(processorCtx, moveForwardReq.block, drain)

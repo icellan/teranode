@@ -39,6 +39,9 @@ type MockSubtreeProcessor struct {
 	mock.Mock
 
 	// ResetRequested backs TakeResetRequested without testify expectations:
+
+	// DrainResetRequested backs TakeDrainResetRequested the same way.
+	DrainResetRequested atomic.Bool
 	// the BlockAssembler main loop polls TakeResetRequested every heartbeat,
 	// so tests set it directly. TakeResetRequested reads and clears, like the
 	// real code.
@@ -89,6 +92,11 @@ func (m *MockSubtreeProcessor) Reset(blockHeader *model.BlockHeader, moveBackBlo
 // ResetRequested.
 func (m *MockSubtreeProcessor) TakeResetRequested() bool {
 	return m.ResetRequested.Swap(false)
+}
+
+// TakeDrainResetRequested implements Interface.TakeDrainResetRequested.
+func (m *MockSubtreeProcessor) TakeDrainResetRequested() bool {
+	return m.DrainResetRequested.Swap(false)
 }
 
 func (m *MockSubtreeProcessor) GetCurrentBlockHeader() *model.BlockHeader {

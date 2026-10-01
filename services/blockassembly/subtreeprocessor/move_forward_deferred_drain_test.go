@@ -3,6 +3,7 @@ package subtreeprocessor
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"net/url"
 	"os"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
 	blob_memory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
@@ -35,7 +37,15 @@ const deferredDrainBlockHex = "000000206a21d13c3d2656557493b4652f67a763f835b86bf
 // announcement channel it reports completed subtrees on.
 //
 // wrap, when set, wraps the UTXO store the processor uses.
-func newDeferredDrainProcessor(t *testing.T, wrap func(utxostore.Store) utxostore.Store) (*SubtreeProcessor, *model.Block, chan NewSubtreeRequest) {
+func newDeferredDrainProcessor(t *testing.T, wrap func(utxostore.Store) utxostore.Store, tweaks ...func(*settings.Settings)) (*SubtreeProcessor, *model.Block, chan NewSubtreeRequest) {
+	t.Helper()
+
+	return newDeferredDrainProcessorWith(t, wrap, nil, tweaks...)
+}
+
+// newDeferredDrainProcessorWith is newDeferredDrainProcessor with processor
+// options, e.g. WithTxMapDirs for a disk-backed tx map.
+func newDeferredDrainProcessorWith(t *testing.T, wrap func(utxostore.Store) utxostore.Store, opts []Options, tweaks ...func(*settings.Settings)) (*SubtreeProcessor, *model.Block, chan NewSubtreeRequest) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -56,6 +66,10 @@ func newDeferredDrainProcessor(t *testing.T, wrap func(utxostore.Store) utxostor
 	tSettings.BlockAssembly.TxMapDirs = nil
 	tSettings.BlockAssembly.SubtreeMmapDir = ""
 
+	for _, tweak := range tweaks {
+		tweak(tSettings)
+	}
+
 	utxoStoreURL, err := url.Parse("sqlitememory:///test")
 	require.NoError(t, err)
 
@@ -72,7 +86,7 @@ func newDeferredDrainProcessor(t *testing.T, wrap func(utxostore.Store) utxostor
 
 	newSubtreeChan := make(chan NewSubtreeRequest)
 
-	stp, err := NewSubtreeProcessor(ctx, logger, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan)
+	stp, err := NewSubtreeProcessor(ctx, logger, tSettings, subtreeStore, blockchainClient, utxoStore, newSubtreeChan, opts...)
 	require.NoError(t, err)
 
 	stp.currentBlockHeader.Store(model.GenesisBlockHeader)
@@ -307,8 +321,24 @@ func TestDrainQueueAfterBlock_MatchesSequentialDrain(t *testing.T) {
 	losingMap := txmap.NewSplitSwissMap(4)
 	require.NoError(t, losingMap.Put(losing, 0))
 
-	run := func(parallel bool) ([]chainhash.Hash, map[chainhash.Hash]chainhash.Hash) {
-		stp, _, newSubtreeChan := newDeferredDrainProcessor(t, nil)
+	run := func(t *testing.T, disk, parallel bool) ([]chainhash.Hash, map[chainhash.Hash]chainhash.Hash) {
+		var opts []Options
+		if disk {
+			opts = append(opts, WithTxMapDirs([]string{t.TempDir()}))
+		}
+
+		stp, _, newSubtreeChan := newDeferredDrainProcessorWith(t, nil, opts)
+		if disk {
+			require.NotNil(t, stp.diskTxMap, "precondition: the processor uses a disk tx map")
+
+			t.Cleanup(func() {
+				for _, m := range []*DiskTxMap{stp.diskTxMap, stp.diskTxMapShadow} {
+					if m != nil {
+						_ = m.Close()
+					}
+				}
+			})
+		}
 
 		go func() {
 			for req := range newSubtreeChan {
@@ -328,7 +358,9 @@ func TestDrainQueueAfterBlock_MatchesSequentialDrain(t *testing.T) {
 
 			for _, q := range queue[start:end] {
 				nodes = append(nodes, subtreepkg.Node{Hash: q.hash, Fee: 1, SizeInBytes: 250})
-				inpoints = append(inpoints, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{q.parent}})
+				// One parent, vout 0: inpoints the disk tx map can serialize.
+				ip := subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{q.parent}, []uint32{1, 0})
+				inpoints = append(inpoints, &ip)
 			}
 
 			stp.AddBatch(nodes, inpoints)
@@ -356,12 +388,16 @@ func TestDrainQueueAfterBlock_MatchesSequentialDrain(t *testing.T) {
 	defer func(n int) { drainChunkItems = n }(drainChunkItems)
 	drainChunkItems = 7
 
-	wantLeaves, wantParents := run(false)
-	gotLeaves, gotParents := run(true)
+	for _, disk := range []bool{false, true} {
+		t.Run(fmt.Sprintf("diskTxMap=%t", disk), func(t *testing.T) {
+			wantLeaves, wantParents := run(t, disk, false)
+			gotLeaves, gotParents := run(t, disk, true)
 
-	require.Greater(t, len(wantLeaves), 8, "the drain must cross several 4-leaf subtrees")
-	require.Equal(t, wantLeaves, gotLeaves, "same txs in the same order")
-	require.Equal(t, wantParents, gotParents, "same inpoints for every tx (the first queued copy wins)")
+			require.Greater(t, len(wantLeaves), 8, "the drain must cross several 4-leaf subtrees")
+			require.Equal(t, wantLeaves, gotLeaves, "same txs in the same order")
+			require.Equal(t, wantParents, gotParents, "same inpoints for every tx (the first queued copy wins)")
+		})
+	}
 }
 
 // enqueueDrainTest queues one 1-tx batch per hash, each with the given
@@ -491,6 +527,181 @@ func TestRunDeferredBlockDrain_FailureRequestsReset(t *testing.T) {
 
 	stp.runDeferredBlockDrain(ctx, block, &deferredBlockDrain{drainQueue: true, transactionMap: emptyBlockTxMap()})
 
-	require.True(t, stp.TakeResetRequested(), "a failed deferred drain must request a reset")
+	require.True(t, stp.TakeDrainResetRequested(), "a failed deferred drain must request a reset")
+	require.False(t, stp.TakeResetRequested(), "a drain failure is not a disk tx map storage error")
 	require.Zero(t, stp.currentTxMapShadow.Length(), "the retired half must still be cleared")
+}
+
+// TestHandleMoveForwardRequest_ServesLeftoverSnapshotDuringDrain pins what a
+// mining candidate sees while the deferred drain runs: with no complete
+// subtree, block assembly asks for the incomplete one, and that must answer
+// at once with the txs the block left in it (not nil, which gave callers an
+// empty block, and not after the drain, which made them wait).
+func TestHandleMoveForwardRequest_ServesLeftoverSnapshotDuringDrain(t *testing.T) {
+	stp, block, newSubtreeChan := newDeferredDrainProcessor(t, nil)
+
+	// A tx already in block assembly and not in the block: it stays in the
+	// open subtree after the leftover pass.
+	leftover := subtreepkg.Node{Hash: chainhash.HashH([]byte("leftover")), Fee: 1, SizeInBytes: 250}
+	require.NoError(t, stp.AddDirectly(&leftover, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{{9}}}, true))
+
+	// Enough queued txs that the drain completes a subtree, whose
+	// announcement then blocks until the gate opens.
+	for i := 0; i < 5; i++ {
+		enqueueDrainTest(stp, chainhash.Hash{8}, chainhash.HashH([]byte{byte(i), 'g'}))
+	}
+
+	gate := make(chan struct{})
+
+	go func() {
+		for req := range newSubtreeChan {
+			if req.Subtree != nil && req.Subtree.IsComplete() {
+				<-gate
+			}
+
+			if req.ErrChan != nil {
+				req.ErrChan <- nil
+			}
+		}
+	}()
+	t.Cleanup(func() { close(newSubtreeChan) })
+
+	errChan := make(chan error, 1)
+
+	var handlerDone sync.WaitGroup
+
+	handlerDone.Go(func() {
+		stp.handleMoveForwardRequest(context.Background(), moveBlockRequest{block: block, errChan: errChan})
+	})
+
+	select {
+	case err := <-errChan:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("moveForwardBlock result was held back by the queue drain")
+	}
+
+	start := time.Now()
+	data := stp.GetIncompleteSubtreeMiningData(context.Background())
+	require.Less(t, time.Since(start), time.Second, "the snapshot request waited behind the deferred drain")
+	require.True(t, stp.DrainingAfterBlock(), "precondition: the drain is still running")
+
+	require.NotNil(t, data, "the leftover txs must be served while the drain runs")
+	require.Len(t, data.Subtrees, 1)
+	require.True(t, data.Subtrees[0].HasNode(leftover.Hash), "the snapshot must hold the leftover tx")
+	require.Equal(t, block.Header.Hash(), data.PreviousHeader.Hash(), "the snapshot must build on the new block")
+
+	close(gate)
+	handlerDone.Wait()
+}
+
+// TestStartLoop_NextRequestWaitsForDeferredDrain pins the ordering the
+// deferral relies on, through the real Start loop: MoveForwardBlock returns
+// before the queue drain, but the processing goroutine takes no other request
+// until the drain is done, so nothing (a reorg, a reset, a snapshot) sees it
+// half done.
+//
+// The loop is held at the snapshot store just before it answers, which is
+// when the test queues the txs; that keeps the loop's own dequeue from taking
+// them. The drain then completes two subtrees. Announcing one does not wait
+// for its acknowledgement, only for the receiver, so the reader holds the
+// first and the drain blocks sending the second. A GetCurrentLength sent
+// meanwhile must wait for it.
+func TestStartLoop_NextRequestWaitsForDeferredDrain(t *testing.T) {
+	// No periodic announcement: it would make the loop send on the held
+	// channel for a reason that has nothing to do with the drain.
+	stp, block, newSubtreeChan := newDeferredDrainProcessor(t, nil, func(s *settings.Settings) {
+		s.BlockAssembly.SubtreeAnnouncementInterval = time.Hour
+	})
+
+	leftover := subtreepkg.Node{Hash: chainhash.HashH([]byte("leftover-start")), Fee: 1, SizeInBytes: 250}
+	require.NoError(t, stp.AddDirectly(&leftover, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{{7}}}, true))
+
+	snapshotSeen, snapshotGate := make(chan struct{}), make(chan struct{})
+	drainSeen, drainGate := make(chan struct{}), make(chan struct{})
+
+	var snapshotOnce, drainOnce sync.Once
+
+	go func() {
+		for req := range newSubtreeChan {
+			if req.Subtree != nil && req.Subtree.IsComplete() {
+				drainOnce.Do(func() { close(drainSeen) })
+				<-drainGate
+			} else {
+				snapshotOnce.Do(func() { close(snapshotSeen) })
+				<-snapshotGate
+			}
+
+			if req.ErrChan != nil {
+				req.ErrChan <- nil
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	stp.Start(ctx)
+
+	moveDone := make(chan error, 1)
+	go func() { moveDone <- stp.MoveForwardBlock(block) }()
+
+	select {
+	case <-snapshotSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler never reached its pre-response snapshot")
+	}
+
+	// With the coinbase placeholder and the leftover, 9 txs fill two 4-leaf
+	// subtrees and start a third.
+	for i := 0; i < 9; i++ {
+		enqueueDrainTest(stp, chainhash.Hash{6}, chainhash.HashH([]byte{byte(i), 's'}))
+	}
+
+	close(snapshotGate)
+
+	select {
+	case err := <-moveDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("MoveForwardBlock did not return before the drain")
+	}
+
+	select {
+	case <-drainSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the deferred drain never completed a subtree")
+	}
+
+	// It is the deferred drain, not the loop's own dequeue, that holds them.
+	require.True(t, stp.DrainingAfterBlock(), "the queued txs must be drained by the deferred drain")
+
+	lengthDone := make(chan struct{})
+	go func() {
+		_ = stp.GetCurrentLength()
+		close(lengthDone)
+	}()
+
+	require.Never(t, func() bool {
+		select {
+		case <-lengthDone:
+			return true
+		default:
+			return false
+		}
+	}, 200*time.Millisecond, 10*time.Millisecond, "a request was served while the deferred drain was still running")
+
+	close(drainGate)
+
+	require.Eventually(t, func() bool {
+		select {
+		case <-lengthDone:
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond, "the request must be served once the drain is done")
+
+	require.False(t, stp.DrainingAfterBlock())
+	require.Zero(t, stp.queue.length(), "the drain took the queued txs")
 }

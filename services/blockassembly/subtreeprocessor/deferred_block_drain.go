@@ -18,6 +18,12 @@ import (
 // Neither changes what the block itself did, and both used to sit between the
 // block being applied and MoveForwardBlock returning - seconds on a large
 // block, during which block assembly kept serving empty mining candidates.
+//
+// The drain's time cutoff is sampled when the drain starts, after the
+// response, not when the block was applied. It therefore also takes the
+// batches queued while the block was being answered, and filters them against
+// the block the same way, which only drops more txs that the block already
+// holds.
 type deferredBlockDrain struct {
 	drainQueue        bool // false on the own-block path, which never drains
 	transactionMap    *SplitSwissMap
@@ -28,15 +34,16 @@ type deferredBlockDrain struct {
 // runDeferredBlockDrain runs the end of a moveForwardBlock that
 // handleMoveForwardRequest deferred past its response. The block is already
 // applied and reported, so nothing here can be rolled back: a failure is
-// logged and requests a block assembly reset, which reloads the unmined
-// transactions from the UTXO store, as for any other post-commit error.
+// logged and requests a block assembly reset (TakeDrainResetRequested), which
+// reloads the unmined transactions from the UTXO store. Storage errors seen by
+// the flush keep the disk tx map's own reset path.
 func (stp *SubtreeProcessor) runDeferredBlockDrain(ctx context.Context, block *model.Block, drain *deferredBlockDrain) {
 	if drain.drainQueue {
 		if err := stp.runHandlerWithRecover("deferredBlockDrain", func() error {
 			return stp.drainQueueAfterBlock(ctx, drain)
 		}); err != nil {
 			stp.logger.Errorf("[SubtreeProcessor][%s] error draining the queue after moveForwardBlock, requesting a block assembly reset: %v", block.String(), err)
-			stp.requestReset("deferredBlockDrain")
+			stp.drainResetRequested.Store(true)
 		}
 
 		// addNode does not count what it adds; finalizeBlockProcessing's
@@ -54,7 +61,7 @@ func (stp *SubtreeProcessor) runDeferredBlockDrain(ctx context.Context, block *m
 		return nil
 	}); err != nil {
 		stp.logger.Errorf("[SubtreeProcessor][%s] error clearing the retired tx map after moveForwardBlock, requesting a block assembly reset: %v", block.String(), err)
-		stp.requestReset("deferredBlockDrain")
+		stp.drainResetRequested.Store(true)
 	}
 
 	// The clear is moveForwardBlock's commit point, so a storage error from it
