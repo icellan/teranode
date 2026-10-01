@@ -99,7 +99,7 @@ func TestAggregateDataPoints_UnsortedInput(t *testing.T) {
 		DataPoints: []*model.DataPoint{
 			{Timestamp: base + 3600, TxCount: 7}, // second bucket, given first
 			{Timestamp: base + 300, TxCount: 5},  // first bucket
-			{Timestamp: base, TxCount: 10},        // first bucket
+			{Timestamp: base, TxCount: 10},       // first bucket
 		},
 	}
 	out := aggregateDataPoints(in, bucket1h)
@@ -278,8 +278,8 @@ func TestGetBlockGraphData(t *testing.T) {
 		mockRepo.On("GetBlockGraphData", mock.Anything, mock.Anything).Return(&model.BlockDataPoints{
 			DataPoints: []*model.DataPoint{
 				{Timestamp: base, TxCount: 10},
-				{Timestamp: base + 1800, TxCount: 5},   // same 1h bucket as base
-				{Timestamp: base + 7200, TxCount: 20},  // 2h later, different bucket
+				{Timestamp: base + 1800, TxCount: 5},    // same 1h bucket as base
+				{Timestamp: base + 7200, TxCount: 20},   // 2h later, different bucket
 				{Timestamp: base + 86400*3, TxCount: 3}, // 3 days later, different bucket
 			},
 		}, nil)
@@ -302,5 +302,70 @@ func TestGetBlockGraphData(t *testing.T) {
 		// First bucket sums base (10) + base+1800 (5) = 15.
 		dp0 := dataPoints[0].(map[string]interface{})
 		assert.Equal(t, float64(15), dp0["tx_count"])
+	})
+}
+
+func TestGetBlockGraphData_MaxBlockGraphPoints(t *testing.T) {
+	initPrometheusMetrics()
+
+	// 600 points one minute apart: a 10h span, below the 24h bucketing
+	// threshold, so without a point cap the handler returns all 600.
+	base := uint32(1700000000)
+	points := make([]*model.DataPoint, 0, 600)
+	totalTxs := uint64(0)
+
+	for i := 0; i < 600; i++ {
+		points = append(points, &model.DataPoint{Timestamp: base + uint32(i)*60, TxCount: 1}) // nolint:gosec
+		totalTxs++
+	}
+
+	t.Run("default 0 leaves the series untouched", func(t *testing.T) {
+		httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
+
+		mockRepo.On("GetBlockGraphData", mock.Anything, mock.Anything).Return(&model.BlockDataPoints{DataPoints: points}, nil)
+
+		echoContext.SetPath("/blocks/graph/:period")
+		echoContext.SetParamNames("period")
+		echoContext.SetParamValues("all")
+
+		require.NoError(t, httpServer.GetBlockGraphData(echoContext))
+		require.Equal(t, http.StatusOK, responseRecorder.Code)
+
+		var response map[string]interface{}
+		require.NoError(t, json.Unmarshal(responseRecorder.Body.Bytes(), &response))
+		require.Len(t, response["data_points"].([]interface{}), 600)
+	})
+
+	t.Run("configured limit bounds the returned series", func(t *testing.T) {
+		httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
+		httpServer.settings.Asset.MaxBlockGraphPoints = 50
+
+		mockRepo.On("GetBlockGraphData", mock.Anything, mock.Anything).Return(&model.BlockDataPoints{DataPoints: points}, nil)
+
+		echoContext.SetPath("/blocks/graph/:period")
+		echoContext.SetParamNames("period")
+		echoContext.SetParamValues("all")
+
+		require.NoError(t, httpServer.GetBlockGraphData(echoContext))
+		require.Equal(t, http.StatusOK, responseRecorder.Code)
+
+		var response struct {
+			DataPoints []struct {
+				Timestamp uint32 `json:"timestamp"`
+				TxCount   uint64 `json:"tx_count"`
+			} `json:"data_points"`
+		}
+
+		require.NoError(t, json.Unmarshal(responseRecorder.Body.Bytes(), &response))
+		require.NotEmpty(t, response.DataPoints)
+		require.LessOrEqual(t, len(response.DataPoints), 50)
+
+		// Coarsening must not lose transactions.
+		var sum uint64
+		for _, dp := range response.DataPoints {
+			sum += dp.TxCount
+		}
+
+		require.Equal(t, totalTxs, sum)
 	})
 }

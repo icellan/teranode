@@ -78,6 +78,48 @@ func aggregateDataPoints(in *model.BlockDataPoints, bucketSeconds int64) *model.
 	return out
 }
 
+// capDataPoints coarsens a series until it holds at most maxPoints points.
+// Bucket boundaries are absolute multiples of the bucket size, so a single
+// pass can still leave one point more than requested; the bucket size is then
+// doubled until the series fits. Every transaction count is carried into a
+// bucket, so no data is dropped - only resolution.
+func capDataPoints(in *model.BlockDataPoints, maxPoints int) *model.BlockDataPoints {
+	if maxPoints <= 0 || len(in.DataPoints) <= maxPoints {
+		return in
+	}
+
+	var minTS uint32 = math.MaxUint32
+
+	var maxTS uint32
+
+	for _, dp := range in.DataPoints {
+		if dp.Timestamp < minTS {
+			minTS = dp.Timestamp
+		}
+
+		if dp.Timestamp > maxTS {
+			maxTS = dp.Timestamp
+		}
+	}
+
+	// Bucket wide enough that the whole range collapses into maxPoints slots.
+	bucketSeconds := (int64(maxTS-minTS) + int64(maxPoints)) / int64(maxPoints)
+	if bucketSeconds < 1 {
+		bucketSeconds = 1
+	}
+
+	out := aggregateDataPoints(in, bucketSeconds)
+
+	// Halving the bucket count each time, this terminates well inside the
+	// iteration guard for any uint32 timestamp range.
+	for i := 0; i < 64 && len(out.DataPoints) > maxPoints; i++ {
+		bucketSeconds *= 2
+		out = aggregateDataPoints(in, bucketSeconds)
+	}
+
+	return out
+}
+
 // GetBlockGraphData retrieves time-series data points showing transaction count
 // over time. It supports various time periods for data aggregation.
 //
@@ -189,6 +231,10 @@ func (h *HTTP) GetBlockGraphData(c echo.Context) error {
 		rangeSeconds := int64(maxTS - minTS)
 		dataPoints = aggregateDataPoints(dataPoints, pickBucketSeconds(rangeSeconds))
 	}
+
+	// asset_maxBlockGraphPoints bounds the returned series. 0 (the default)
+	// leaves the response exactly as it is today.
+	dataPoints = capDataPoints(dataPoints, h.settings.Asset.MaxBlockGraphPoints)
 
 	return c.JSONPretty(200, dataPoints, "  ")
 }
