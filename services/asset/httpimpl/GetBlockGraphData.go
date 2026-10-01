@@ -67,7 +67,8 @@ func aggregateDataPoints(in *model.BlockDataPoints, bucketSeconds int64) *model.
 		buckets[b] += dp.TxCount
 	}
 	out := &model.BlockDataPoints{
-		DataPoints: make([]*model.DataPoint, 0, len(order)),
+		DataPoints:    make([]*model.DataPoint, 0, len(order)),
+		BucketSeconds: bucketSeconds,
 	}
 	for _, b := range order {
 		out.DataPoints = append(out.DataPoints, &model.DataPoint{
