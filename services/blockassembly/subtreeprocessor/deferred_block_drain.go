@@ -106,7 +106,9 @@ func (stp *SubtreeProcessor) drainQueueAfterBlock(ctx context.Context, drain *de
 
 	setIfNotExistsInOrder(stp.currentTxMap, nodes, inpoints, keep)
 
-	kept := make([]subtreepkg.Node, 0, total)
+	// Compact in place: nodes is not read again, and each write lands at or
+	// before the position being read.
+	kept := nodes[:0]
 
 	for i := range nodes {
 		if keep[i] {
