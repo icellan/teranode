@@ -112,7 +112,7 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 		require.Equal(t, 0, s.Asset.MaxNBlocks)
 		require.False(t, s.Asset.RequireAuthCredentials)
 		require.False(t, s.Asset.SecureCookies)
-		require.Equal(t, "", s.Asset.CORSAllowedOrigins)
+		require.Equal(t, "", s.Asset.CORSAllowOrigins)
 		require.False(t, s.Asset.EnforcePostAuth)
 		require.Equal(t, 0, s.Asset.MaxWebsocketConnections)
 		require.Equal(t, int64(0), s.Asset.WebsocketReadLimit)
@@ -123,7 +123,6 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 		require.True(t, s.Asset.PublicPeersDetail)
 		require.True(t, s.Asset.TxMetaRawEnabled)
 		require.Equal(t, 0, s.Asset.MaxBlockGraphPoints)
-		require.Equal(t, 0, s.Asset.MaxLocatorWalkDepth)
 	})
 
 	type kv struct {
@@ -157,8 +156,8 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 		{"asset_secureCookies", "true", func(t *testing.T, s *Settings) {
 			require.True(t, s.Asset.SecureCookies)
 		}},
-		{"asset_corsAllowedOrigins", "https://dashboard.example.com", func(t *testing.T, s *Settings) {
-			require.Equal(t, "https://dashboard.example.com", s.Asset.CORSAllowedOrigins)
+		{"asset_corsAllowOrigins", "https://dashboard.example.com", func(t *testing.T, s *Settings) {
+			require.Equal(t, "https://dashboard.example.com", s.Asset.CORSAllowOrigins)
 		}},
 		{"asset_enforcePostAuth", "true", func(t *testing.T, s *Settings) {
 			require.True(t, s.Asset.EnforcePostAuth)
@@ -189,9 +188,6 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 		}},
 		{"asset_maxBlockGraphPoints", "3000", func(t *testing.T, s *Settings) {
 			require.Equal(t, 3000, s.Asset.MaxBlockGraphPoints)
-		}},
-		{"asset_maxLocatorWalkDepth", "1500", func(t *testing.T, s *Settings) {
-			require.Equal(t, 1500, s.Asset.MaxLocatorWalkDepth)
 		}},
 	}
 

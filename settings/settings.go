@@ -258,7 +258,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			MaxNBlocks:               getInt("asset_maxNBlocks", 0, alternativeContext...),
 			RequireAuthCredentials:   getBool("asset_requireAuthCredentials", false, alternativeContext...),
 			SecureCookies:            getBool("asset_secureCookies", false, alternativeContext...),
-			CORSAllowedOrigins:       getString("asset_corsAllowedOrigins", "", alternativeContext...),
+			CORSAllowOrigins:         getString("asset_corsAllowOrigins", "", alternativeContext...),
 			EnforcePostAuth:          getBool("asset_enforcePostAuth", false, alternativeContext...),
 			MaxWebsocketConnections:  getInt("asset_maxWebsocketConnections", 0, alternativeContext...),
 			WebsocketReadLimit:       getInt64("asset_websocketReadLimit", 0, alternativeContext...),
@@ -269,7 +269,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			PublicPeersDetail:        getBool("asset_publicPeersDetail", true, alternativeContext...),
 			TxMetaRawEnabled:         getBool("asset_txMetaRawEnabled", true, alternativeContext...),
 			MaxBlockGraphPoints:      getInt("asset_maxBlockGraphPoints", 0, alternativeContext...),
-			MaxLocatorWalkDepth:      getInt("asset_maxLocatorWalkDepth", 0, alternativeContext...),
 		},
 		Block: BlockSettings{
 			MinedCacheMaxMB:                       getInt("blockMinedCacheMaxMB", 256, alternativeContext...),
