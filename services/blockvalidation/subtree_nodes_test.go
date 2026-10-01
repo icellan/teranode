@@ -927,3 +927,128 @@ func TestBindPendingToValidatedVerifiesNodes(t *testing.T) {
 	_, bound, _ := boundCatchupArtifact(actx, *hash)
 	require.False(t, bound)
 }
+
+// Data that parses against the node list without filling every slot must be a
+// peer mismatch: go-subtree leaves unfilled slots nil (an empty body fills
+// none), and a coinbase in second place overwrites slot 0.
+func TestFetchAndStoreSubtreeData_RequiresEveryNodeMatched(t *testing.T) {
+	txs := transactions.CreateTestTransactionChainWithCount(t, 4)
+	coinbase, t0, t1 := txs[0], txs[1], txs[2]
+	require.True(t, coinbase.IsCoinbase())
+	oneNode := *t0.TxIDChainHash()
+	// A missing transaction can be an honest server's aborted stream (the
+	// asset server commits a 200 before streaming), so only a transaction that
+	// contradicts its node charges the peer. Every case fails over.
+	cases := map[string]struct {
+		nodes   []chainhash.Hash
+		data    []byte
+		charged bool
+	}{
+		"empty data":             {[]chainhash.Hash{oneNode}, nil, false},
+		"coinbase second":        {[]chainhash.Hash{*t0.TxIDChainHash(), *t1.TxIDChainHash()}, append(append(t0.Bytes(), coinbase.Bytes()...), t1.Bytes()...), true},
+		"truncated after a node": {[]chainhash.Hash{*t0.TxIDChainHash(), *t1.TxIDChainHash()}, t0.Bytes(), false},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			hash := testNodesRoot(t, c.nodes...)
+			blobs := memory.New()
+			recorder := &catchupErrorRecorder{}
+			peerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/subtree/" + hash.String():
+					_, _ = w.Write(testNodeBytes(c.nodes...))
+				case "/subtree_data/" + hash.String():
+					_, _ = w.Write(c.data)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer peerServer.Close()
+			s := &Server{logger: ulogger.TestLogger{}, settings: test.CreateBaseTestSettings(t), subtreeStore: blobs, p2pClient: recorder}
+			artifacts := &catchupArtifacts{Store: blobs, files: make(map[catchupArtifactKey]*catchupArtifact)}
+			actx := context.WithValue(ctx, catchupArtifactsKey{}, artifacts)
+			block := &model.Block{Height: 1, Subtrees: []*chainhash.Hash{{1}, hash}}
+
+			subtree, validated, err := s.fetchAndStoreSubtree(actx, block, hash, "peer", peerServer.URL)
+			require.NoError(t, err)
+			require.NotPanics(t, func() {
+				err = s.fetchAndStoreSubtreeData(actx, block, hash, subtree, validated, "peer", peerServer.URL)
+			})
+			require.Error(t, err)
+			require.False(t, errors.IsLocalError(err), "a bad peer response must allow alternative peers: %v", err)
+			if c.charged {
+				require.Equal(t, []string{"peer"}, recorder.peers, "a contradicting peer is charged")
+			} else {
+				require.Empty(t, recorder.peers, "a truncated stream is not charged")
+			}
+			for _, kind := range []fileformat.FileType{fileformat.FileTypeSubtreeToCheck, fileformat.FileTypeSubtreeData} {
+				exists, err := blobs.Exists(ctx, hash[:], kind)
+				require.NoError(t, err)
+				require.False(t, exists, "nothing is stored from a mismatched response")
+			}
+		})
+	}
+}
+
+// Stored data whose transactions form a padded list reproduces the root of the
+// shorter list; the node check must reject it rather than bind it.
+func TestBindStoredSubtreeRejectsPaddedData(t *testing.T) {
+	ctx := context.Background()
+	txs := transactions.CreateTestTransactionChainWithCount(t, 5)
+	a, b, c := txs[1], txs[2], txs[3]
+	hash := testNodesRoot(t, *a.TxIDChainHash(), *b.TxIDChainHash(), *c.TxIDChainHash())
+	require.Equal(t, hash, testNodesRoot(t, *a.TxIDChainHash(), *b.TxIDChainHash(), *c.TxIDChainHash(), *c.TxIDChainHash()), "premise")
+	blobs := memory.New()
+	var data []byte
+	for _, tx := range []*bt.Tx{a, b, c, c} {
+		data = append(data, tx.Bytes()...)
+	}
+	require.NoError(t, blobs.Set(ctx, hash[:], fileformat.FileTypeSubtreeData, data))
+	s := &Server{logger: ulogger.TestLogger{}, settings: test.CreateBaseTestSettings(t), subtreeStore: blobs}
+	artifacts := &catchupArtifacts{Store: blobs, files: make(map[catchupArtifactKey]*catchupArtifact)}
+	actx := context.WithValue(ctx, catchupArtifactsKey{}, artifacts)
+	bound, err := s.bindStoredSubtree(actx, &model.Block{Height: 1, Subtrees: []*chainhash.Hash{{1}, hash}}, hash)
+	require.NoError(t, err)
+	require.False(t, bound, "padded stored data must be fetched again, not bound")
+	exists, err := blobs.Exists(ctx, hash[:], fileformat.FileTypeSubtreeToCheck)
+	require.NoError(t, err)
+	require.False(t, exists)
+}
+
+// Honest data passes the slot check, including the first subtree's coinbase
+// slot with and without the coinbase transaction.
+func TestCheckSubtreeDataMatchesNodes(t *testing.T) {
+	txs := transactions.CreateTestTransactionChainWithCount(t, 4)
+	coinbase, t0, t1 := txs[0], txs[1], txs[2]
+	first, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, first.AddCoinbaseNode())
+	require.NoError(t, first.AddNode(*t0.TxIDChainHash(), 0, 0))
+	plain, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, plain.AddNode(*t0.TxIDChainHash(), 0, 0))
+	require.NoError(t, plain.AddNode(*t1.TxIDChainHash(), 0, 0))
+	for name, c := range map[string]struct {
+		subtree *subtreepkg.Subtree
+		data    []byte
+		err     error
+	}{
+		"first with coinbase":    {first, append(coinbase.Bytes(), t0.Bytes()...), nil},
+		"first without coinbase": {first, t0.Bytes(), nil},
+		"plain":                  {plain, append(t0.Bytes(), t1.Bytes()...), nil},
+		"plain truncated":        {plain, t0.Bytes(), subtreepkg.ErrSubtreeLengthMismatch},
+		"plain coinbase second":  {plain, append(append(t0.Bytes(), coinbase.Bytes()...), t1.Bytes()...), subtreepkg.ErrTxHashMismatch},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data, err := subtreepkg.NewSubtreeDataFromReader(c.subtree, bytes.NewReader(c.data))
+			require.NoError(t, err)
+			err = checkSubtreeDataMatchesNodes(c.subtree, data)
+			if c.err == nil {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, c.err)
+		})
+	}
+}

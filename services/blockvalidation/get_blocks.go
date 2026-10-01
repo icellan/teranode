@@ -459,7 +459,10 @@ func verifySubtreeNodes(nodes []subtreepkg.Node, root *chainhash.Hash) error {
 	}
 	// A level with an even count of at least four whose last two entries are
 	// equal hashes like the same level without its last entry. With two, the
-	// shorter level would be the root itself, which differs.
+	// shorter level is a single entry, which is its own root, so the subtree
+	// hash differs. Lifting a final subtree does make [a] and [a,a] give the
+	// same block merkle root, but under different subtree hashes: that is a
+	// mutated block body, which the duplicate transaction check rejects.
 	count := len(nodes)
 	if count >= 4 && count%2 == 0 && nodes[count-1].Hash.Equal(nodes[count-2].Hash) {
 		return errors.NewProcessingError("subtree %s has equal sibling leaves at its tail", root.String())
@@ -616,6 +619,9 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 	// loading the subtree data like this will validate the data as it is read
 	// compared to the transactions in the subtree
 	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, subtreeDataBufferedReader)
+	if err == nil {
+		err = checkSubtreeDataMatchesNodes(subtree, subtreeData)
+	}
 	if err != nil {
 		if errors.Is(err, subtreepkg.ErrTxHashMismatch) || errors.Is(err, subtreepkg.ErrTxIndexOutOfBounds) {
 			u.reportCatchupError(ctx, peerID, "subtree data does not match subtree nodes")
@@ -700,6 +706,28 @@ func (u *Server) bindPendingToValidated(ctx context.Context, block *model.Block,
 	dah := block.Height + u.settings.GetSubtreeValidationBlockHeightRetention()
 	if err = u.storeBoundSubtreeFile(ctx, subtreeHash, fileformat.FileTypeSubtreeToCheck, validatedBytes, dah, validated.Length(), true); err != nil {
 		return errors.NewStorageError("[catchup:bindPendingToValidated] Failed to store subtreeToCheck for %s", subtreeHash.String(), err)
+	}
+	return nil
+}
+
+// checkSubtreeDataMatchesNodes requires a transaction matching every node.
+// go-subtree's reader stops quietly at EOF, leaving unfilled slots nil (and
+// Data.Serialize then dereferences a nil slot 0), and it places a coinbase
+// found in second position into slot 0 over the transaction already there.
+// Only the coinbase placeholder slot may be empty or hold another hash. A
+// missing transaction is reported as a length mismatch, not a hash mismatch:
+// an honest server that aborts a committed stream also ends it cleanly.
+func checkSubtreeDataMatchesNodes(subtree *subtreepkg.Subtree, data *subtreepkg.Data) error {
+	for i, node := range subtree.Nodes {
+		if i == 0 && node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			continue
+		}
+		if data.Txs[i] == nil {
+			return errors.NewProcessingError("subtree data is missing transaction %d", i, subtreepkg.ErrSubtreeLengthMismatch)
+		}
+		if !data.Txs[i].TxIDChainHash().Equal(node.Hash) {
+			return errors.NewProcessingError("subtree data transaction %d does not match its node", i, subtreepkg.ErrTxHashMismatch)
+		}
 	}
 	return nil
 }

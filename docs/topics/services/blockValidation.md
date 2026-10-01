@@ -504,8 +504,11 @@ Transactions in standard Bitcoin format are extended in-memory for validation:
 A subtree node list must hash to the requested subtree hash, have no zero
 leaves, and must not end any level of four or more entries with two equal
 entries. That rules out a repeated tail or zero padding, which reproduce the
-root of a shorter list. Other equal siblings are genuinely duplicate
-transactions, and the block checks reject them. The node check still does not
+root of a shorter list under the same subtree hash. Other equal siblings are
+genuinely duplicate transactions, and the block checks reject them. Lifting the
+final subtree makes `[a]` and `[a,a]` give the same block merkle root under
+different subtree hashes; that mutated body is rejected by the duplicate
+transaction check. The node check still does not
 tie a list to its hash, because any level of the merkle tree, including the
 root itself as a single leaf, hashes to the same root. Only the transactions
 bind a node list to its hash.
