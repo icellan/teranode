@@ -400,7 +400,8 @@ func TestGetBlockGraphData_MaxBlockGraphPoints(t *testing.T) {
 		require.Equal(t, http.StatusOK, responseRecorder.Code)
 
 		var response struct {
-			DataPoints []struct {
+			BucketSeconds int64 `json:"bucket_seconds"`
+			DataPoints    []struct {
 				Timestamp uint32 `json:"timestamp"`
 				TxCount   uint64 `json:"tx_count"`
 			} `json:"data_points"`
@@ -417,5 +418,41 @@ func TestGetBlockGraphData_MaxBlockGraphPoints(t *testing.T) {
 		}
 
 		require.Equal(t, totalTxs, sum)
+	})
+
+	// TestGetBlockGraphData_MaxBlockGraphPoints/coarsening_reports_the_effective_bucket_size
+	// guards against bucket_seconds staying at the store's original value (0,
+	// here) after capDataPoints widens the buckets: a consumer trusting the
+	// field to derive the series' resolution would otherwise be misled.
+	t.Run("coarsening reports the effective bucket size, not the store's", func(t *testing.T) {
+		httpServer, mockRepo, echoContext, responseRecorder := GetMockHTTP(t, nil)
+		httpServer.settings.Asset.MaxBlockGraphPoints = 50
+
+		// BucketSeconds is left at 0 (as if the store returned an unbucketed,
+		// per-block series), matching the mock above.
+		mockRepo.On("GetBlockGraphData", mock.Anything, mock.Anything).Return(&model.BlockDataPoints{DataPoints: points}, nil)
+
+		echoContext.SetPath("/blocks/graph/:period")
+		echoContext.SetParamNames("period")
+		echoContext.SetParamValues("all")
+
+		require.NoError(t, httpServer.GetBlockGraphData(echoContext))
+		require.Equal(t, http.StatusOK, responseRecorder.Code)
+
+		var response struct {
+			BucketSeconds int64 `json:"bucket_seconds"`
+			DataPoints    []struct {
+				Timestamp uint32 `json:"timestamp"`
+			} `json:"data_points"`
+		}
+
+		require.NoError(t, json.Unmarshal(responseRecorder.Body.Bytes(), &response))
+		require.Greater(t, response.BucketSeconds, int64(0),
+			"bucket_seconds must reflect the coarsened bucket size, not the un-bucketed store value of 0")
+
+		require.GreaterOrEqual(t, len(response.DataPoints), 2)
+		gap := int64(response.DataPoints[1].Timestamp) - int64(response.DataPoints[0].Timestamp)
+		require.Equal(t, response.BucketSeconds, gap,
+			"bucket_seconds must match the actual spacing between returned buckets")
 	})
 }
