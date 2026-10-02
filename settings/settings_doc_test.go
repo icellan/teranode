@@ -344,32 +344,6 @@ var docDefaultsExemptions = []docDefaultExemption{
 		reason:     "same runtime.NumCPU()-derived default as blockvalidation_processTxMetaUsingStore_Concurrency above",
 		unreliable: "runtime",
 	},
-	{
-		file: "global_settings.md",
-		key:  "postgres_circuitBreakerFailureThreshold",
-		reason: "PostgresSettings circuit breaker is not wired to any loader in settings.go, so the runtime value " +
-			"is always the Go zero value regardless of the struct tag; doc and tag correctly agree on the intended " +
-			"default. Temporary pending #1642, which wires this field",
-		unreliable: "runtime",
-	},
-	{
-		file:       "global_settings.md",
-		key:        "postgres_circuitBreakerHalfOpenMax",
-		reason:     "same unwired PostgresSettings circuit breaker gap as postgres_circuitBreakerFailureThreshold above. Temporary pending #1642",
-		unreliable: "runtime",
-	},
-	{
-		file:       "global_settings.md",
-		key:        "postgres_circuitBreakerCooldown",
-		reason:     "same unwired PostgresSettings circuit breaker gap as postgres_circuitBreakerFailureThreshold above. Temporary pending #1642",
-		unreliable: "runtime",
-	},
-	{
-		file:       "global_settings.md",
-		key:        "postgres_circuitBreakerFailureWindow",
-		reason:     "same unwired PostgresSettings circuit breaker gap as postgres_circuitBreakerFailureThreshold above. Temporary pending #1642",
-		unreliable: "runtime",
-	},
 }
 
 // lookupExemption returns the exemption registered for file/key, if any.
@@ -897,15 +871,15 @@ func TestSettingsTagMatchesRuntimeForAllKeys(t *testing.T) {
 // sizeInBytes, ...), not settings-package keys - there is no ExportMetadata()
 // entry to cross-check them against.
 var checkedRowsPerDoc = map[string]int{
-	"global_settings.md":            44,
+	"global_settings.md":            45,
 	"kafka_settings.md":             19,
 	"policy_settings.md":            26,
 	"alert_settings.md":             10,
 	"asset_settings.md":             35,
-	"blockassembly_settings.md":     42,
+	"blockassembly_settings.md":     43,
 	"blockchain_settings.md":        11,
-	"blockpersister_settings.md":    8,
-	"blockvalidation_settings.md":   67,
+	"blockpersister_settings.md":    9,
+	"blockvalidation_settings.md":   68,
 	"coinbase_settings.md":          21,
 	"faucet_settings.md":            1,
 	"legacy_settings.md":            28,
@@ -915,9 +889,9 @@ var checkedRowsPerDoc = map[string]int{
 	"rpc_settings.md":               11,
 	"subtreevalidation_settings.md": 25,
 	"utxopersister_settings.md":     2,
-	"validator_settings.md":         17,
+	"validator_settings.md":         18,
 	"aerospike_settings.md":         13,
-	"blob_settings.md":              0,
+	"blob_settings.md":              1,
 	"utxo_settings.md":              39,
 }
 
