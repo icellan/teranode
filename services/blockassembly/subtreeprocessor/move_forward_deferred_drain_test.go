@@ -722,10 +722,13 @@ func TestStartLoop_NextRequestWaitsForDeferredDrain(t *testing.T) {
 	require.Zero(t, stp.queue.length(), "the drain took the queued txs")
 }
 
-// TestGetIncompleteSubtreeMiningData_RetriesAbandonedSnapshotStore pins that
-// a caller who gives up while the after-block snapshot is still being stored
-// does not leave later callers without it: the store is retried.
-func TestGetIncompleteSubtreeMiningData_RetriesAbandonedSnapshotStore(t *testing.T) {
+// newAfterBlockSnapshotProcessor leaves a processor as handleMoveForwardRequest
+// does while the drain runs: an after-block snapshot holding one leftover tx,
+// not yet stored. Every store request is handed to answer, on its own
+// goroutine.
+func newAfterBlockSnapshotProcessor(t *testing.T, answer func(req NewSubtreeRequest)) (*SubtreeProcessor, *PrecomputedMiningData) {
+	t.Helper()
+
 	stp, _, newSubtreeChan := newDeferredDrainProcessor(t, nil)
 
 	leftover := subtreepkg.Node{Hash: chainhash.HashH([]byte("leftover-retry")), Fee: 1, SizeInBytes: 250}
@@ -734,24 +737,34 @@ func TestGetIncompleteSubtreeMiningData_RetriesAbandonedSnapshotStore(t *testing
 	data := stp.incompleteSubtreeSnapshot()
 	require.NotNil(t, data)
 
-	// As handleMoveForwardRequest leaves it while the drain runs.
 	stp.afterBlockMiningData.Store(&afterBlockSnapshot{data: data, parentTxMap: stp.currentTxMap})
 	stp.drainingAfterBlock.Store(true)
 
+	go func() {
+		for req := range newSubtreeChan {
+			go answer(req)
+		}
+	}()
+	t.Cleanup(func() { close(newSubtreeChan) })
+
+	return stp, data
+}
+
+// TestGetIncompleteSubtreeMiningData_WaitsOnAbandonedSnapshotStore pins that
+// a caller who gives up while the after-block snapshot is being stored does
+// not leave later callers without it, and that a later caller waits on that
+// same store instead of sending the subtree again (a second store of the
+// same hash would be announced twice).
+func TestGetIncompleteSubtreeMiningData_WaitsOnAbandonedSnapshotStore(t *testing.T) {
 	storeGate := make(chan struct{})
 
 	var stores atomic.Int32
 
-	go func() {
-		for req := range newSubtreeChan {
-			go func(req NewSubtreeRequest) {
-				stores.Add(1)
-				<-storeGate
-				req.ErrChan <- nil // buffered: never blocks, even for a caller that gave up
-			}(req)
-		}
-	}()
-	t.Cleanup(func() { close(newSubtreeChan) })
+	stp, data := newAfterBlockSnapshotProcessor(t, func(req NewSubtreeRequest) {
+		stores.Add(1)
+		<-storeGate
+		req.ErrChan <- nil // buffered: never blocks, even for a caller that gave up
+	})
 
 	shortCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -760,7 +773,26 @@ func TestGetIncompleteSubtreeMiningData_RetriesAbandonedSnapshotStore(t *testing
 
 	close(storeGate)
 
-	require.Same(t, data, stp.GetIncompleteSubtreeMiningData(context.Background()), "a later caller retries the store and gets the snapshot")
+	require.Same(t, data, stp.GetIncompleteSubtreeMiningData(context.Background()), "a later caller gets the snapshot once that store finishes")
 	require.Same(t, data, stp.GetIncompleteSubtreeMiningData(context.Background()))
-	require.Equal(t, int32(2), stores.Load(), "stored again after the abandoned attempt, and then not again")
+	require.Equal(t, int32(1), stores.Load(), "the subtree is stored once; nobody sends it again")
+}
+
+// TestGetIncompleteSubtreeMiningData_RetriesFailedSnapshotStore pins that a
+// store that fails is not taken as stored: the next caller stores again.
+func TestGetIncompleteSubtreeMiningData_RetriesFailedSnapshotStore(t *testing.T) {
+	var stores atomic.Int32
+
+	stp, data := newAfterBlockSnapshotProcessor(t, func(req NewSubtreeRequest) {
+		if stores.Add(1) == 1 {
+			req.ErrChan <- errors.NewStorageError("blob store unavailable")
+			return
+		}
+
+		req.ErrChan <- nil
+	})
+
+	require.Nil(t, stp.GetIncompleteSubtreeMiningData(context.Background()), "a failed store must not be served")
+	require.Same(t, data, stp.GetIncompleteSubtreeMiningData(context.Background()), "the next caller stores again")
+	require.Equal(t, int32(2), stores.Load())
 }

@@ -1342,14 +1342,63 @@ func (stp *SubtreeProcessor) storeIncompleteSnapshot(ctx context.Context, incomp
 // before handleMoveForwardRequest responds and served while the deferred
 // drain runs. It is stored (and announced) only when a caller first asks for
 // it, as an on-demand snapshot is, so a block that nobody asks a candidate
-// for costs no store write. A store attempt that times out or is cancelled
-// leaves it unstored for the next caller to retry.
+// for costs no store write. See storeOnce for timed-out and failed stores.
 type afterBlockSnapshot struct {
 	data        *PrecomputedMiningData
 	parentTxMap TxInpointsMap // captured on the processing goroutine
 
-	mu     sync.Mutex // serializes store attempts; a failed one is retried
-	stored bool
+	mu      sync.Mutex // guards pending and stored
+	pending chan error // ErrChan of the store request in flight, if any
+	stored  bool
+}
+
+// storeOnce stores (and announces) the snapshot unless it already is,
+// reporting whether it is stored. A store that a caller stopped waiting for
+// stays in flight: the next caller waits on that request rather than sending
+// the subtree again. A store that failed is sent again by the next caller.
+func (a *afterBlockSnapshot) storeOnce(ctx context.Context, stp *SubtreeProcessor) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.stored {
+		return true
+	}
+
+	// A caller that waited out its deadline on the lock sends nothing.
+	if ctx.Err() != nil {
+		return false
+	}
+
+	if a.pending == nil {
+		send := NewSubtreeRequest{
+			Subtree:     a.data.Subtrees[0],
+			ParentTxMap: a.parentTxMap,
+			ErrChan:     make(chan error, 1), // the worker never blocks on a caller that gave up
+		}
+
+		select {
+		case stp.newSubtreeChan <- send:
+			a.pending = send.ErrChan
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	select {
+	case err := <-a.pending:
+		a.pending = nil
+
+		if err != nil {
+			stp.logger.Warnf("[SubtreeProcessor] error storing the after-block incomplete subtree snapshot: %v", err)
+			return false
+		}
+
+		a.stored = true
+
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // createIncompleteSubtreeCopy creates a copy of the current subtree for announcement purposes.
@@ -3814,14 +3863,7 @@ func (stp *SubtreeProcessor) GetIncompleteSubtreeMiningData(ctx context.Context)
 			return nil
 		}
 
-		snapshot.mu.Lock()
-		defer snapshot.mu.Unlock()
-
-		if !snapshot.stored {
-			snapshot.stored = stp.storeIncompleteSnapshot(ctx, snapshot.data.Subtrees[0], snapshot.parentTxMap)
-		}
-
-		if !snapshot.stored {
+		if !snapshot.storeOnce(ctx, stp) {
 			return nil
 		}
 
