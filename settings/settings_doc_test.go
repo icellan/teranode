@@ -779,12 +779,11 @@ type pendingWireExemption struct {
 	reason string
 }
 
-// Note: the five postgres_circuitBreaker* keys are NOT listed here even
-// though they are the same class of gap - they are already covered by
-// docDefaultsExemptions (unreliable: "runtime", global_settings.md), and
-// runtimeUnreliableKeys() above folds those into this test's skip set too.
-// Listing them again here would make this list go stale the moment #1642
-// lands (both lists claim the mismatch, only one would still be true).
+// Empty by design. The postgres_circuitBreaker* keys were the last entries
+// here; they are wired now, so their exemptions were retired rather than
+// carried. An entry belongs here only while a key's tag genuinely disagrees
+// with its runtime value, and the staleness check below removes the
+// temptation to leave one behind once that is fixed.
 var pendingWireExemptions []pendingWireExemption
 
 // TestSettingsTagMatchesRuntimeForAllKeys is the sound version of the
