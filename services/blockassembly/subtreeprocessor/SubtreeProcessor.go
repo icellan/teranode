@@ -1282,7 +1282,7 @@ func (stp *SubtreeProcessor) incompleteSubtreeMiningData(ctx context.Context) (d
 		return nil, false
 	}
 
-	if !stp.storeIncompleteSnapshot(ctx, data.Subtrees[0]) {
+	if !stp.storeIncompleteSnapshot(ctx, data.Subtrees[0], stp.currentTxMap) {
 		return nil, true
 	}
 
@@ -1315,12 +1315,14 @@ func (stp *SubtreeProcessor) incompleteSubtreeSnapshot() *PrecomputedMiningData 
 }
 
 // storeIncompleteSnapshot stores (and announces) an incomplete subtree copy
-// and waits for the store, reporting false when ctx ended first.
-func (stp *SubtreeProcessor) storeIncompleteSnapshot(ctx context.Context, incompleteSubtree *subtreepkg.Subtree) bool {
+// and waits for the store, reporting false when ctx ended first. ErrChan is
+// buffered so the storage worker never blocks answering a caller that has
+// already given up.
+func (stp *SubtreeProcessor) storeIncompleteSnapshot(ctx context.Context, incompleteSubtree *subtreepkg.Subtree, parentTxMap TxInpointsMap) bool {
 	send := NewSubtreeRequest{
 		Subtree:     incompleteSubtree,
-		ParentTxMap: stp.currentTxMap,
-		ErrChan:     make(chan error),
+		ParentTxMap: parentTxMap,
+		ErrChan:     make(chan error, 1),
 	}
 
 	select {
@@ -1340,10 +1342,13 @@ func (stp *SubtreeProcessor) storeIncompleteSnapshot(ctx context.Context, incomp
 // before handleMoveForwardRequest responds and served while the deferred
 // drain runs. It is stored (and announced) only when a caller first asks for
 // it, as an on-demand snapshot is, so a block that nobody asks a candidate
-// for costs no store write.
+// for costs no store write. A store attempt that times out or is cancelled
+// leaves it unstored for the next caller to retry.
 type afterBlockSnapshot struct {
-	data   *PrecomputedMiningData
-	once   sync.Once
+	data        *PrecomputedMiningData
+	parentTxMap TxInpointsMap // captured on the processing goroutine
+
+	mu     sync.Mutex // serializes store attempts; a failed one is retried
 	stored bool
 }
 
@@ -3796,6 +3801,10 @@ func (stp *SubtreeProcessor) DrainingAfterBlock() bool {
 // processing goroutine is busy (e.g., during a reorg). The caller's context
 // is also respected for earlier cancellation.
 func (stp *SubtreeProcessor) GetIncompleteSubtreeMiningData(ctx context.Context) *PrecomputedMiningData {
+	const timeout = 5 * time.Second
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	// While the work deferred after a block runs, the processing goroutine
 	// cannot answer; serve the snapshot taken just before it started instead,
 	// which holds the txs the block left in block assembly.
@@ -3805,9 +3814,12 @@ func (stp *SubtreeProcessor) GetIncompleteSubtreeMiningData(ctx context.Context)
 			return nil
 		}
 
-		snapshot.once.Do(func() {
-			snapshot.stored = stp.storeIncompleteSnapshot(ctx, snapshot.data.Subtrees[0])
-		})
+		snapshot.mu.Lock()
+		defer snapshot.mu.Unlock()
+
+		if !snapshot.stored {
+			snapshot.stored = stp.storeIncompleteSnapshot(ctx, snapshot.data.Subtrees[0], snapshot.parentTxMap)
+		}
 
 		if !snapshot.stored {
 			return nil
@@ -3815,10 +3827,6 @@ func (stp *SubtreeProcessor) GetIncompleteSubtreeMiningData(ctx context.Context)
 
 		return snapshot.data
 	}
-
-	const timeout = 5 * time.Second
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	responseCh := make(chan *PrecomputedMiningData, 1)
 	select {
@@ -3953,7 +3961,7 @@ func (stp *SubtreeProcessor) handleMoveForwardRequest(processorCtx context.Conte
 		if drain != nil {
 			var snapshot *afterBlockSnapshot
 			if data := stp.incompleteSubtreeSnapshot(); data != nil {
-				snapshot = &afterBlockSnapshot{data: data}
+				snapshot = &afterBlockSnapshot{data: data, parentTxMap: stp.currentTxMap}
 			}
 
 			stp.afterBlockMiningData.Store(snapshot)

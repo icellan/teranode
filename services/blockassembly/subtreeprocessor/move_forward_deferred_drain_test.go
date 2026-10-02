@@ -721,3 +721,46 @@ func TestStartLoop_NextRequestWaitsForDeferredDrain(t *testing.T) {
 	require.False(t, stp.DrainingAfterBlock())
 	require.Zero(t, stp.queue.length(), "the drain took the queued txs")
 }
+
+// TestGetIncompleteSubtreeMiningData_RetriesAbandonedSnapshotStore pins that
+// a caller who gives up while the after-block snapshot is still being stored
+// does not leave later callers without it: the store is retried.
+func TestGetIncompleteSubtreeMiningData_RetriesAbandonedSnapshotStore(t *testing.T) {
+	stp, _, newSubtreeChan := newDeferredDrainProcessor(t, nil)
+
+	leftover := subtreepkg.Node{Hash: chainhash.HashH([]byte("leftover-retry")), Fee: 1, SizeInBytes: 250}
+	require.NoError(t, stp.AddDirectly(&leftover, &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{{5}}}, true))
+
+	data := stp.incompleteSubtreeSnapshot()
+	require.NotNil(t, data)
+
+	// As handleMoveForwardRequest leaves it while the drain runs.
+	stp.afterBlockMiningData.Store(&afterBlockSnapshot{data: data, parentTxMap: stp.currentTxMap})
+	stp.drainingAfterBlock.Store(true)
+
+	storeGate := make(chan struct{})
+
+	var stores atomic.Int32
+
+	go func() {
+		for req := range newSubtreeChan {
+			go func(req NewSubtreeRequest) {
+				stores.Add(1)
+				<-storeGate
+				req.ErrChan <- nil // buffered: never blocks, even for a caller that gave up
+			}(req)
+		}
+	}()
+	t.Cleanup(func() { close(newSubtreeChan) })
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	require.Nil(t, stp.GetIncompleteSubtreeMiningData(shortCtx), "the store did not finish within the first caller's deadline")
+
+	close(storeGate)
+
+	require.Same(t, data, stp.GetIncompleteSubtreeMiningData(context.Background()), "a later caller retries the store and gets the snapshot")
+	require.Same(t, data, stp.GetIncompleteSubtreeMiningData(context.Background()))
+	require.Equal(t, int32(2), stores.Load(), "stored again after the abandoned attempt, and then not again")
+}
