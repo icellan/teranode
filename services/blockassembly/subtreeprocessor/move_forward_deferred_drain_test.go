@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -536,7 +537,8 @@ func TestRunDeferredBlockDrain_FailureRequestsReset(t *testing.T) {
 // mining candidate sees while the deferred drain runs: with no complete
 // subtree, block assembly asks for the incomplete one, and that must answer
 // at once with the txs the block left in it (not nil, which gave callers an
-// empty block, and not after the drain, which made them wait).
+// empty block, and not after the drain, which made them wait). The copy is
+// stored, and announced, only once someone asks for it.
 func TestHandleMoveForwardRequest_ServesLeftoverSnapshotDuringDrain(t *testing.T) {
 	stp, block, newSubtreeChan := newDeferredDrainProcessor(t, nil)
 
@@ -553,10 +555,14 @@ func TestHandleMoveForwardRequest_ServesLeftoverSnapshotDuringDrain(t *testing.T
 
 	gate := make(chan struct{})
 
+	var incompleteStored atomic.Int32
+
 	go func() {
 		for req := range newSubtreeChan {
 			if req.Subtree != nil && req.Subtree.IsComplete() {
 				<-gate
+			} else {
+				incompleteStored.Add(1)
 			}
 
 			if req.ErrChan != nil {
@@ -581,6 +587,8 @@ func TestHandleMoveForwardRequest_ServesLeftoverSnapshotDuringDrain(t *testing.T
 		t.Fatal("moveForwardBlock result was held back by the queue drain")
 	}
 
+	require.Zero(t, incompleteStored.Load(), "the snapshot must not be stored until a caller asks for it")
+
 	start := time.Now()
 	data := stp.GetIncompleteSubtreeMiningData(context.Background())
 	require.Less(t, time.Since(start), time.Second, "the snapshot request waited behind the deferred drain")
@@ -590,6 +598,9 @@ func TestHandleMoveForwardRequest_ServesLeftoverSnapshotDuringDrain(t *testing.T
 	require.Len(t, data.Subtrees, 1)
 	require.True(t, data.Subtrees[0].HasNode(leftover.Hash), "the snapshot must hold the leftover tx")
 	require.Equal(t, block.Header.Hash(), data.PreviousHeader.Hash(), "the snapshot must build on the new block")
+
+	require.Same(t, data, stp.GetIncompleteSubtreeMiningData(context.Background()), "later callers get the same snapshot")
+	require.Equal(t, int32(1), incompleteStored.Load(), "the snapshot is stored once, when first asked for")
 
 	close(gate)
 	handlerDone.Wait()
@@ -601,9 +612,9 @@ func TestHandleMoveForwardRequest_ServesLeftoverSnapshotDuringDrain(t *testing.T
 // until the drain is done, so nothing (a reorg, a reset, a snapshot) sees it
 // half done.
 //
-// The loop is held at the snapshot store just before it answers, which is
-// when the test queues the txs; that keeps the loop's own dequeue from taking
-// them. The drain then completes two subtrees. Announcing one does not wait
+// The loop is first held storing an on-demand snapshot, with the
+// MoveForwardBlock request waiting behind it, which is when the test queues
+// the txs; that keeps the loop's own dequeue from taking them. The drain then completes two subtrees. Announcing one does not wait
 // for its acknowledgement, only for the receiver, so the reader holds the
 // first and the drain blocks sending the second. A GetCurrentLength sent
 // meanwhile must wait for it.
@@ -643,14 +654,19 @@ func TestStartLoop_NextRequestWaitsForDeferredDrain(t *testing.T) {
 
 	stp.Start(ctx)
 
-	moveDone := make(chan error, 1)
-	go func() { moveDone <- stp.MoveForwardBlock(block) }()
+	go func() { _ = stp.GetIncompleteSubtreeMiningData(ctx) }()
 
 	select {
 	case <-snapshotSeen:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the handler never reached its pre-response snapshot")
+		t.Fatal("the loop never started storing the on-demand snapshot")
 	}
+
+	moveDone := make(chan error, 1)
+	go func() { moveDone <- stp.MoveForwardBlock(block) }()
+
+	// Let the MoveForwardBlock request reach the loop's channel.
+	time.Sleep(50 * time.Millisecond)
 
 	// With the coinbase placeholder and the leftover, 9 txs fill two 4-leaf
 	// subtrees and start a third.

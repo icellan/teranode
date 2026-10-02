@@ -375,10 +375,11 @@ type SubtreeProcessor struct {
 	// such as GetIncompleteSubtreeMiningData, answer at once instead.
 	drainingAfterBlock atomic.Bool
 
-	// afterBlockMiningData is the incomplete-subtree snapshot taken just before
+	// afterBlockMiningData is the incomplete-subtree copy taken just before
 	// handleMoveForwardRequest responds, served by
-	// GetIncompleteSubtreeMiningData while drainingAfterBlock is set.
-	afterBlockMiningData atomic.Pointer[PrecomputedMiningData]
+	// GetIncompleteSubtreeMiningData while drainingAfterBlock is set (nil
+	// when there was nothing to copy).
+	afterBlockMiningData atomic.Pointer[afterBlockSnapshot]
 
 	// drainResetRequested is set when the work deferred past a
 	// MoveForwardBlock response fails; see TakeDrainResetRequested.
@@ -1276,17 +1277,46 @@ func (stp *SubtreeProcessor) resetAnnouncementTicker() {
 // nothing to snapshot, and cancelled when ctx ended while the store waited.
 // It runs on the processing goroutine.
 func (stp *SubtreeProcessor) incompleteSubtreeMiningData(ctx context.Context) (data *PrecomputedMiningData, cancelled bool) {
+	data = stp.incompleteSubtreeSnapshot()
+	if data == nil {
+		return nil, false
+	}
+
+	if !stp.storeIncompleteSnapshot(ctx, data.Subtrees[0]) {
+		return nil, true
+	}
+
+	stp.resetAnnouncementTicker()
+
+	return data, false
+}
+
+// incompleteSubtreeSnapshot copies the open subtree into mining data without
+// storing it, or returns nil when there is a complete subtree to offer instead
+// or nothing to snapshot. It runs on the processing goroutine.
+func (stp *SubtreeProcessor) incompleteSubtreeSnapshot() *PrecomputedMiningData {
 	currentSt := stp.currentSubtree.Load()
 	if stp.chainedSubtreeCount.Load() > 0 || currentSt == nil || currentSt.Length() <= 1 {
-		return nil, false
+		return nil
 	}
 
 	incompleteSubtree, err := stp.createIncompleteSubtreeCopy()
 	if err != nil {
 		stp.logger.Errorf("[SubtreeProcessor] error creating incomplete subtree snapshot: %s", err.Error())
-		return nil, false
+		return nil
 	}
 
+	return &PrecomputedMiningData{
+		PreviousHeader:   stp.currentBlockHeader.Load(),
+		Subtrees:         []*subtreepkg.Subtree{incompleteSubtree},
+		UpdatedAt:        time.Now(),
+		IsFromIncomplete: true,
+	}
+}
+
+// storeIncompleteSnapshot stores (and announces) an incomplete subtree copy
+// and waits for the store, reporting false when ctx ended first.
+func (stp *SubtreeProcessor) storeIncompleteSnapshot(ctx context.Context, incompleteSubtree *subtreepkg.Subtree) bool {
 	send := NewSubtreeRequest{
 		Subtree:     incompleteSubtree,
 		ParentTxMap: stp.currentTxMap,
@@ -1297,20 +1327,24 @@ func (stp *SubtreeProcessor) incompleteSubtreeMiningData(ctx context.Context) (d
 	case stp.newSubtreeChan <- send:
 		select {
 		case <-send.ErrChan:
-			stp.resetAnnouncementTicker()
+			return true
 		case <-ctx.Done():
-			return nil, true
+			return false
 		}
 	case <-ctx.Done():
-		return nil, true
+		return false
 	}
+}
 
-	return &PrecomputedMiningData{
-		PreviousHeader:   stp.currentBlockHeader.Load(),
-		Subtrees:         []*subtreepkg.Subtree{incompleteSubtree},
-		UpdatedAt:        time.Now(),
-		IsFromIncomplete: true,
-	}, false
+// afterBlockSnapshot is the open subtree as a block left it, copied just
+// before handleMoveForwardRequest responds and served while the deferred
+// drain runs. It is stored (and announced) only when a caller first asks for
+// it, as an on-demand snapshot is, so a block that nobody asks a candidate
+// for costs no store write.
+type afterBlockSnapshot struct {
+	data   *PrecomputedMiningData
+	once   sync.Once
+	stored bool
 }
 
 // createIncompleteSubtreeCopy creates a copy of the current subtree for announcement purposes.
@@ -3766,7 +3800,20 @@ func (stp *SubtreeProcessor) GetIncompleteSubtreeMiningData(ctx context.Context)
 	// cannot answer; serve the snapshot taken just before it started instead,
 	// which holds the txs the block left in block assembly.
 	if stp.drainingAfterBlock.Load() {
-		return stp.afterBlockMiningData.Load()
+		snapshot := stp.afterBlockMiningData.Load()
+		if snapshot == nil {
+			return nil
+		}
+
+		snapshot.once.Do(func() {
+			snapshot.stored = stp.storeIncompleteSnapshot(ctx, snapshot.data.Subtrees[0])
+		})
+
+		if !snapshot.stored {
+			return nil
+		}
+
+		return snapshot.data
 	}
 
 	const timeout = 5 * time.Second
@@ -3900,10 +3947,15 @@ func (stp *SubtreeProcessor) handleMoveForwardRequest(processorCtx context.Conte
 
 		// Set before the response goes out, so no caller that has seen the
 		// block applied can find the processor busy without knowing why, and
-		// take the snapshot of the open subtree it would otherwise have
-		// waited for: the txs the block left in block assembly.
+		// copy the open subtree it would otherwise have waited for: the txs
+		// the block left in block assembly. Copying is cheap; it is stored
+		// only if asked for (see afterBlockSnapshot).
 		if drain != nil {
-			snapshot, _ := stp.incompleteSubtreeMiningData(processorCtx)
+			var snapshot *afterBlockSnapshot
+			if data := stp.incompleteSubtreeSnapshot(); data != nil {
+				snapshot = &afterBlockSnapshot{data: data}
+			}
+
 			stp.afterBlockMiningData.Store(snapshot)
 			stp.drainingAfterBlock.Store(true)
 		}
