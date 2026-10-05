@@ -67,3 +67,68 @@ func TestGenerate_DifferentDevsGetDifferentPasswords(t *testing.T) {
 
 	require.NotEqual(t, pass1, pass2)
 }
+
+func TestGenerate_WritesOwnerOnlyFile(t *testing.T) {
+	projectRoot := t.TempDir()
+	cfg := &config.Config{DevName: "alice", Network: "regtest", UTXOBackend: "sqlite"}
+
+	require.NoError(t, Generate(projectRoot, cfg))
+
+	info, err := os.Stat(filepath.Join(projectRoot, settingsFile))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+}
+
+func TestGenerate_TightensExistingFileMode(t *testing.T) {
+	projectRoot := t.TempDir()
+	path := filepath.Join(projectRoot, settingsFile)
+	require.NoError(t, os.WriteFile(path, []byte("foo = bar\n"), 0o644))
+	require.NoError(t, os.Chmod(path, 0o644))
+
+	cfg := &config.Config{DevName: "alice", Network: "regtest", UTXOBackend: "sqlite"}
+	require.NoError(t, Generate(projectRoot, cfg))
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+}
+
+func TestGenerate_ReinitKeepsHandEditedRPCPassword(t *testing.T) {
+	projectRoot := t.TempDir()
+	cfg := &config.Config{DevName: "alice", Network: "regtest", UTXOBackend: "sqlite"}
+
+	require.NoError(t, Generate(projectRoot, cfg))
+
+	path := filepath.Join(projectRoot, settingsFile)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	edited := rpcPassPattern.ReplaceAllString(string(data), "rpc_pass.dev.alice=handEditedPassword\n")
+	require.NoError(t, os.WriteFile(path, []byte(edited), 0o600))
+
+	require.NoError(t, Generate(projectRoot, cfg))
+
+	data, err = os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(data), "rpc_pass.dev.alice = handEditedPassword\n")
+}
+
+func TestHasRPCCredentials(t *testing.T) {
+	projectRoot := t.TempDir()
+	cfg := &config.Config{DevName: "alice", Network: "regtest", UTXOBackend: "sqlite"}
+
+	require.False(t, HasRPCCredentials(projectRoot, "alice"), "no settings file")
+
+	require.NoError(t, Generate(projectRoot, cfg))
+	require.True(t, HasRPCCredentials(projectRoot, "alice"))
+
+	// A block written by init before credentials were generated.
+	path := filepath.Join(projectRoot, settingsFile)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	stripped := regexp.MustCompile(`(?m)^rpc_(user|pass)\.dev\.alice = .*\n`).ReplaceAllString(string(data), "")
+	require.NoError(t, os.WriteFile(path, []byte(stripped), 0o600))
+
+	require.False(t, HasRPCCredentials(projectRoot, "alice"))
+}

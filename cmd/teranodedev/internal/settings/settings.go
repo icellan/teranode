@@ -68,7 +68,13 @@ func Generate(projectRoot string, cfg *config.Config) error {
 		content += "\n" + block + "\n"
 	}
 
-	return os.WriteFile(path, []byte(content), 0644)
+	// The block carries the developer's admin RPC password, so keep the file
+	// owner-only. WriteFile leaves an existing file's mode alone, hence the Chmod.
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return err
+	}
+
+	return os.Chmod(path, 0o600)
 }
 
 // HasEntries checks if settings_local.conf has auto-generated entries for the given developer.
@@ -81,6 +87,27 @@ func HasEntries(projectRoot, devName string) bool {
 	}
 
 	return strings.Contains(string(data), markerStart(devName))
+}
+
+// HasRPCCredentials checks if the developer's auto-generated block carries an RPC
+// password. A block written by an older init has none, and the node then answers
+// teranode-dev rpc and generate with 401 until init is re-run.
+func HasRPCCredentials(projectRoot, devName string) bool {
+	data, err := os.ReadFile(filepath.Join(projectRoot, settingsFile))
+	if err != nil {
+		return false
+	}
+
+	content := string(data)
+
+	startIdx := strings.Index(content, markerStart(devName))
+	endIdx := strings.Index(content, markerEnd(devName))
+
+	if startIdx < 0 || endIdx < startIdx {
+		return false
+	}
+
+	return existingRPCPass(content[startIdx:endIdx], "dev."+devName) != ""
 }
 
 func generateBlock(cfg *config.Config, existingBlock string) (string, error) {
@@ -140,11 +167,12 @@ func existingRPCPass(block, ctx string) string {
 		return ""
 	}
 
-	prefix := fmt.Sprintf("rpc_pass.%s = ", ctx)
+	key := "rpc_pass." + ctx
 
 	for _, line := range strings.Split(block, "\n") {
-		if strings.HasPrefix(line, prefix) {
-			return strings.TrimPrefix(line, prefix)
+		k, v, ok := strings.Cut(line, "=")
+		if ok && strings.TrimSpace(k) == key {
+			return strings.TrimSpace(v)
 		}
 	}
 
