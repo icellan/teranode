@@ -149,11 +149,6 @@ type DiskTxMap struct {
 	// generations, for Stats.
 	bytesWritten atomic.Int64
 
-	// retainedEntries is the most entries any cleared generation held: clear()
-	// keeps each shard map's capacity, so the index holds at least that much
-	// RAM however few entries it has now.
-	retainedEntries atomic.Int64
-
 	// errMu guards err, the first storage error since the last TakeErr. Map
 	// operations have no error return, so failures are recorded here and
 	// surfaced by the subtree processor.
@@ -1049,10 +1044,6 @@ func (m *DiskTxMap) Clear() {
 		return
 	}
 
-	if n := int64(m.Length()); n > m.retainedEntries.Load() {
-		m.retainedEntries.Store(n)
-	}
-
 	m.retire(old, g)
 
 	// Reuse the old generation's buffers: nothing reads or writes old any
@@ -1082,12 +1073,14 @@ func (m *DiskTxMap) retire(old, next *generation) {
 	m.waitForReaders(old.parity)
 }
 
-// clearIndex empties every index shard. clear keeps each map's capacity: the
-// next block refills it to a similar size, and regrowing 4096 maps from empty
-// every block costs more than holding the memory. Clearing a full shard costs
-// its capacity, so with hundreds of millions of entries one goroutine takes
-// seconds; the shards are independent, so they are cleared in parallel. Every
-// shard is empty when it returns.
+// clearIndex empties every index shard by giving it a new map. clear() would
+// keep each map's capacity, and a cleared half of the subtree processor's
+// double buffer sits empty for a whole block interval, so a busy node held
+// twice its index RAM. Regrowing costs ~5ns per entry over the next block
+// interval, and nothing extra for the remainder MoveFrom inserts inside
+// moveForwardBlock (BenchmarkDiskTxMap_IndexRefill). The shards are
+// independent, so they are replaced in parallel. Every shard is empty when it
+// returns.
 func (m *DiskTxMap) clearIndex() {
 	workers := min(runtime.GOMAXPROCS(0), numIndexShards)
 	perWorker := (numIndexShards + workers - 1) / workers
@@ -1100,7 +1093,7 @@ func (m *DiskTxMap) clearIndex() {
 		wg.Go(func() {
 			for i := range shards {
 				shards[i].mu.Lock()
-				clear(shards[i].index)
+				shards[i].index = make(map[chainhash.Hash]uint64)
 				shards[i].mu.Unlock()
 			}
 		})
@@ -1284,7 +1277,7 @@ func (m *DiskTxMap) Stats() DiskMapStats {
 
 	return DiskMapStats{
 		Entries:          entries,
-		IndexMemBytes:    max(entries, m.retainedEntries.Load()) * indexBytesPerEntry,
+		IndexMemBytes:    entries * indexBytesPerEntry,
 		DiskBytesWritten: m.bytesWritten.Load(),
 	}
 }
