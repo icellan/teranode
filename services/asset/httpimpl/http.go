@@ -453,6 +453,10 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 	// Create auth handler for protecting admin endpoints (used regardless of dashboard state)
 	authHandler := dashboard.NewAuthHandler(h.logger, h.settings)
 
+	// The CORS allowlist also names the origins, besides the node's own, whose
+	// pages may send cookie-authenticated state-changing requests.
+	authHandler.SetTrustedOrigins(corsAllowedOrigins)
+
 	// POST credential enforcement for the API group. This used to be an
 	// apiGroup.Use inside the dashboard branch, which Echo snapshots at route
 	// registration time, so it never applied to any of the POST routes above.
@@ -838,8 +842,9 @@ func normalizeCORSOrigin(origin string) (string, error) {
 // site, which the SameSite=Strict cookie does not stop) still reaches the
 // handler and still carries the operator's ambient cookie; the browser only
 // withholds the response body from the attacker's script, not the request
-// from the server. Refusing cookie-authenticated simple POSTs, or checking
-// Origin on state-changing requests, is left to a follow-up.
+// from the server. dashboard.AuthHandler.CheckAuth closes that by refusing a
+// cookie-authenticated state-changing request from any origin other than the
+// node's own or an allowlisted one.
 func assetCORSConfig(allowedOrigins []string) middleware.CORSConfig {
 	cfg := middleware.CORSConfig{
 		AllowMethods: []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPatch, http.MethodPost, http.MethodDelete, http.MethodOptions},

@@ -1,6 +1,7 @@
 package httpimpl
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -390,6 +391,36 @@ func TestPostAuthEnforcement(t *testing.T) {
 			"enforcement is opt-in; enabling the dashboard alone must not start rejecting POSTs")
 		require.NotEqual(t, http.StatusUnauthorized, post(t, srv, catchupPath))
 	})
+}
+
+// TestPostAuthEnforcement_CookieFromForeignOriginIsRejected — the auth cookie is
+// SameSite=Strict, but a no-cors POST from another origin on the same site still
+// carries it and needs no preflight. A cookie-authenticated POST must come from the
+// node's own origin or an asset_corsAllowOrigins entry.
+func TestPostAuthEnforcement_CookieFromForeignOriginIsRejected(t *testing.T) {
+	const bulkPath = "/api/v1/utxos/json"
+
+	tSettings := baseTestSettings()
+	tSettings.Asset.EnforcePostAuth = true
+	tSettings.Asset.CORSAllowOrigins = "https://ops.example.com"
+	tSettings.RPC = settings.RPCSettings{RPCUser: "bitcoin", RPCPass: "bitcoin"}
+
+	srv := newTestServer(t, tSettings)
+
+	post := func(origin string) int {
+		req := httptest.NewRequest(http.MethodPost, "http://node.example.com"+bulkPath, nil)
+		req.AddCookie(&http.Cookie{Name: "auth", Value: "Basic " + base64.StdEncoding.EncodeToString([]byte("bitcoin:bitcoin"))})
+		req.Header.Set(echo.HeaderOrigin, origin)
+
+		rec := httptest.NewRecorder()
+		srv.e.ServeHTTP(rec, req)
+
+		return rec.Code
+	}
+
+	require.Equal(t, http.StatusUnauthorized, post("http://evil.example.com"))
+	require.NotEqual(t, http.StatusUnauthorized, post("http://node.example.com"))
+	require.NotEqual(t, http.StatusUnauthorized, post("https://ops.example.com"))
 }
 
 // TestSign_DeclaresItsScope — X-Signature covers the resource identifier only,

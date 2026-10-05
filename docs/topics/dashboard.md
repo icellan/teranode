@@ -353,7 +353,9 @@ The dashboard will be available at `http://localhost:5173` by default.
 
 The dev server sends credentialed cross-origin requests to the Asset listener on
 `:8090`. Set `asset_corsAllowOrigins = http://localhost:5173` (or the Vite port
-you use) on the node it points at, or those requests fail CORS.
+you use) on the node it points at, or those requests fail CORS, and its logged-in
+POSTs (FSM changes, block invalidation, peer actions) get 401: a cookie-authenticated
+state-changing request is accepted only from the node's own host or a listed origin.
 
 ### Production Build
 

@@ -618,3 +618,61 @@ func requireAuthCookieSecure(t *testing.T, rec *httptest.ResponseRecorder, expec
 
 	t.Fatalf("no %s cookie was set", cookieName)
 }
+
+// A cookie is ambient: the browser attaches it to a no-cors POST from any page on
+// the same site, without a preflight. CheckAuth must refuse a cookie-authenticated
+// state-changing request that the browser marks as coming from another origin.
+func TestCheckAuth_CookieRejectsForeignOrigin(t *testing.T) {
+	h := newCredentialAuthHandler(ulogger.TestLogger{}, "admin", "secret", false, false)
+	h.SetTrustedOrigins([]string{"http://localhost:5173"})
+
+	cookieReq := func(method string, headers map[string]string) *http.Request {
+		req := httptest.NewRequest(method, "http://node.example.com:8090/api/p2p/reset-reputation", nil)
+		req.AddCookie(&http.Cookie{Name: cookieName, Value: basicHeader("admin", "secret")})
+
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+
+		return req
+	}
+
+	tests := []struct {
+		name     string
+		method   string
+		headers  map[string]string
+		expected bool
+	}{
+		{name: "same origin", method: http.MethodPost, headers: map[string]string{"Origin": "http://node.example.com:8090"}, expected: true},
+		{name: "same origin, different case", method: http.MethodPost, headers: map[string]string{"Origin": "HTTP://Node.Example.com:8090"}, expected: true},
+		{name: "same host behind a TLS proxy", method: http.MethodPost, headers: map[string]string{"Origin": "https://node.example.com:8090"}, expected: true},
+		{name: "trusted origin", method: http.MethodPost, headers: map[string]string{"Origin": "http://localhost:5173"}, expected: true},
+		{name: "same-site other origin", method: http.MethodPost, headers: map[string]string{"Origin": "http://evil.example.com"}, expected: false},
+		{name: "same host other port", method: http.MethodPost, headers: map[string]string{"Origin": "http://node.example.com:9999"}, expected: false},
+		{name: "null origin", method: http.MethodPost, headers: map[string]string{"Origin": "null"}, expected: false},
+		{name: "DELETE from other origin", method: http.MethodDelete, headers: map[string]string{"Origin": "http://evil.example.com"}, expected: false},
+		{name: "no Origin, Sec-Fetch-Site same-site", method: http.MethodPost, headers: map[string]string{"Sec-Fetch-Site": "same-site"}, expected: false},
+		{name: "no Origin, Sec-Fetch-Site cross-site", method: http.MethodPost, headers: map[string]string{"Sec-Fetch-Site": "cross-site"}, expected: false},
+		{name: "no Origin, Sec-Fetch-Site same-origin", method: http.MethodPost, headers: map[string]string{"Sec-Fetch-Site": "same-origin"}, expected: true},
+		{name: "no browser headers", method: http.MethodPost, headers: nil, expected: true},
+		{name: "GET from other origin", method: http.MethodGet, headers: map[string]string{"Origin": "http://evil.example.com"}, expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.expected, h.CheckAuth(cookieReq(tt.method, tt.headers)))
+		})
+	}
+}
+
+// An Authorization header is never attached by the browser on its own, so the
+// origin check does not apply to it.
+func TestCheckAuth_AuthorizationHeaderIgnoresOrigin(t *testing.T) {
+	h := newCredentialAuthHandler(ulogger.TestLogger{}, "admin", "secret", false, false)
+
+	req := httptest.NewRequest(http.MethodPost, "http://node.example.com:8090/api/v1/fsm/state", nil)
+	req.Header.Set("Authorization", basicHeader("admin", "secret"))
+	req.Header.Set("Origin", "http://evil.example.com")
+
+	require.True(t, h.CheckAuth(req))
+}
