@@ -337,8 +337,9 @@ func isUnboundTxInvalidVerdict(err error) bool {
 // isLocalCatchupFault reports whether a catchup failure is this node's own doing
 // rather than anything the serving peer did, so no reputation charge is warranted.
 //
-// The predicate is the union of two errors-package helpers because neither covers
-// this on its own, and they are disjoint on exactly the cases that matter here.
+// The predicate is the union of two errors-package helpers and one error code. The
+// two helpers are both needed because neither covers this on its own, and they are
+// disjoint on exactly the cases that matter here; the code is explained below.
 // IsLocalError - what recordCatchupPeerFailure uses - is context errors plus
 // ErrStorageError, and misses the *Unavailable codes. IsTransientLocalError is
 // {ServiceError, StorageError, ServiceUnavailable, StorageUnavailable}, and misses

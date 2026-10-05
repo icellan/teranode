@@ -393,8 +393,8 @@ func NewServiceUnavailableError(message string, params ...interface{}) *Error {
 // This is a REMOTE admission decision: the server we called answered 429 because we
 // exceeded its rate limit. It is deliberately distinct from ERR_SERVICE_UNAVAILABLE,
 // which IsTransientLocalError treats as a fault in this node's own stack and which
-// legacy block sync uses to decide whether to keep a delivering peer. Retry with
-// backoff; do not blame the peer.
+// legacy block sync uses to decide whether to keep a delivering peer. A single 429 is
+// not the peer's fault; retry with backoff.
 func NewServiceRateLimitedError(message string, params ...interface{}) *Error {
 	return New(ERR_SERVICE_RATE_LIMITED, message, params...)
 }
