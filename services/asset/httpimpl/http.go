@@ -833,12 +833,13 @@ func normalizeCORSOrigin(origin string) (string, error) {
 //
 // This is not CSRF protection. Dropping credentials on the reflect-any path
 // stops a hostile origin from reading a credentialed response via the
-// browser's CORS fetch API, but a credentialed simple request (e.g. a bare
-// cross-site POST with no custom headers) still reaches the handler and
-// still carries the operator's ambient cookie; the browser only withholds
-// the response body from the attacker's script, not the request from the
-// server. Refusing cookie-authenticated simple POSTs, or checking Origin on
-// state-changing requests, is tracked separately.
+// browser's CORS fetch API, but a credentialed simple request (e.g. a
+// no-cors POST with no custom headers from a hostile origin on the same
+// site, which the SameSite=Strict cookie does not stop) still reaches the
+// handler and still carries the operator's ambient cookie; the browser only
+// withholds the response body from the attacker's script, not the request
+// from the server. Refusing cookie-authenticated simple POSTs, or checking
+// Origin on state-changing requests, is left to a follow-up.
 func assetCORSConfig(allowedOrigins []string) middleware.CORSConfig {
 	cfg := middleware.CORSConfig{
 		AllowMethods: []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPatch, http.MethodPost, http.MethodDelete, http.MethodOptions},
