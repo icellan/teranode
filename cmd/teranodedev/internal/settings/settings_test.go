@@ -131,6 +131,14 @@ func TestHasRPCCredentials(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte(stripped), 0o600))
 
 	require.False(t, HasRPCCredentials(projectRoot, "alice"))
+
+	// A block that kept the password but lost the user.
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+
+	noUser := regexp.MustCompile(`(?m)^rpc_user\.dev\.alice = .*\n`).ReplaceAllString(string(data), "")
+	require.NoError(t, os.WriteFile(path, []byte(noUser), 0o600))
+
+	require.False(t, HasRPCCredentials(projectRoot, "alice"))
 }
 
 func TestGenerate_EndMarkerBeforeStartMarkerDoesNotPanic(t *testing.T) {

@@ -115,7 +115,10 @@ func HasRPCCredentials(projectRoot, devName string) bool {
 		return false
 	}
 
-	return existingRPCPass(content[startIdx:endIdx], "dev."+devName) != ""
+	block := content[startIdx:endIdx]
+	ctx := "dev." + devName
+
+	return blockValue(block, "rpc_user."+ctx) != "" && existingRPCPass(block, ctx) != ""
 }
 
 func generateBlock(cfg *config.Config, existingBlock string) (string, error) {
@@ -175,8 +178,12 @@ func existingRPCPass(block, ctx string) string {
 		return ""
 	}
 
-	key := "rpc_pass." + ctx
+	return blockValue(block, "rpc_pass."+ctx)
+}
 
+// blockValue returns the value of key in a generated block, tolerating any
+// spacing around the =, or "" when the key is absent.
+func blockValue(block, key string) string {
 	for _, line := range strings.Split(block, "\n") {
 		k, v, ok := strings.Cut(line, "=")
 		if ok && strings.TrimSpace(k) == key {
