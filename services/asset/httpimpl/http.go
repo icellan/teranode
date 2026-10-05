@@ -474,7 +474,7 @@ func New(logger ulogger.Logger, tSettings *settings.Settings, repo *repository.R
 
 	if h.settings.Dashboard.Enabled {
 		// Initialize dashboard with settings
-		dashboard.InitDashboard(h.settings)
+		dashboard.InitDashboard(h.settings, corsAllowedOrigins)
 
 		// Register dashboard-compatible API routes that need auth protection
 		// The dashboard's SvelteKit +server.ts endpoints don't work in production (adapter-static)

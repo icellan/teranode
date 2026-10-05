@@ -138,6 +138,20 @@ func stripDefaultPort(host string) string {
 	return strings.TrimSuffix(strings.TrimSuffix(host, ":80"), ":443")
 }
 
+// firstHeaderValue returns the first comma-separated value of header, as a chain
+// of proxies appends its own.
+func firstHeaderValue(r *http.Request, header string) string {
+	v, _, _ := strings.Cut(r.Header.Get(header), ",")
+
+	return strings.TrimSpace(v)
+}
+
+// requestIsHTTPS reports whether the client reached the node over TLS, directly
+// or through a TLS-terminating proxy.
+func requestIsHTTPS(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(firstHeaderValue(r, "X-Forwarded-Proto"), "https")
+}
+
 // fromForeignOrigin reports whether the browser marks r as sent by a page from a
 // different origin than this node and not in trustedOrigins. The auth cookie is
 // SameSite=Strict, which stops cross-site requests but not a no-cors POST from
@@ -160,13 +174,27 @@ func (h *AuthHandler) fromForeignOrigin(r *http.Request) bool {
 		return true // "null" and malformed origins
 	}
 
-	// Same host as the request. The scheme is not compared, so the dashboard
-	// still works behind a TLS-terminating proxy that preserves Host.
-	if stripDefaultPort(u.Host) == stripDefaultPort(strings.ToLower(r.Host)) {
+	// A plain-http page must not drive an https node: an active network attacker
+	// can inject one on the node's own hostname.
+	if u.Scheme == "http" && requestIsHTTPS(r) {
+		return true
+	}
+
+	// Same host as the request, or as the public host a reverse proxy forwarded
+	// (nginx and Apache rewrite Host by default). Neither a no-cors request nor a
+	// preflighted credentialed one can carry a page-set X-Forwarded-Host, so
+	// trusting it here gives a hostile page nothing.
+	originHost := stripDefaultPort(u.Host)
+
+	if originHost == stripDefaultPort(strings.ToLower(r.Host)) {
 		return false
 	}
 
-	_, trusted := h.trustedOrigins[u.Scheme+"://"+stripDefaultPort(u.Host)]
+	if fwd := firstHeaderValue(r, "X-Forwarded-Host"); fwd != "" && originHost == stripDefaultPort(strings.ToLower(fwd)) {
+		return false
+	}
+
+	_, trusted := h.trustedOrigins[u.Scheme+"://"+originHost]
 
 	return !trusted
 }

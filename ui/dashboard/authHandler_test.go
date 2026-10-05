@@ -656,6 +656,13 @@ func TestCheckAuth_CookieRejectsForeignOrigin(t *testing.T) {
 		{name: "no Origin, Sec-Fetch-Site same-origin", method: http.MethodPost, headers: map[string]string{"Sec-Fetch-Site": "same-origin"}, expected: true},
 		{name: "no browser headers", method: http.MethodPost, headers: nil, expected: true},
 		{name: "GET from other origin", method: http.MethodGet, headers: map[string]string{"Origin": "http://evil.example.com"}, expected: true},
+		{name: "PUT from other origin", method: http.MethodPut, headers: map[string]string{"Origin": "http://evil.example.com"}, expected: false},
+		{name: "PATCH from other origin", method: http.MethodPatch, headers: map[string]string{"Origin": "http://evil.example.com"}, expected: false},
+		{name: "no Origin, Sec-Fetch-Site none", method: http.MethodPost, headers: map[string]string{"Sec-Fetch-Site": "none"}, expected: true},
+		{name: "proxy rewrote Host, X-Forwarded-Host matches", method: http.MethodPost, headers: map[string]string{"Origin": "https://public.example.com", "X-Forwarded-Host": "public.example.com"}, expected: true},
+		{name: "proxy rewrote Host, X-Forwarded-Host differs", method: http.MethodPost, headers: map[string]string{"Origin": "https://evil.example.com", "X-Forwarded-Host": "public.example.com"}, expected: false},
+		{name: "http origin on an https-proxied request", method: http.MethodPost, headers: map[string]string{"Origin": "http://node.example.com:8090", "X-Forwarded-Proto": "https"}, expected: false},
+		{name: "https origin on an https-proxied request", method: http.MethodPost, headers: map[string]string{"Origin": "https://node.example.com:8090", "X-Forwarded-Proto": "https"}, expected: true},
 	}
 
 	for _, tt := range tests {
@@ -675,4 +682,28 @@ func TestCheckAuth_AuthorizationHeaderIgnoresOrigin(t *testing.T) {
 	req.Header.Set("Origin", "http://evil.example.com")
 
 	require.True(t, h.CheckAuth(req))
+}
+
+func TestCheckAuth_CookieOriginHostForms(t *testing.T) {
+	h := newCredentialAuthHandler(ulogger.TestLogger{}, "admin", "secret", false, false)
+	h.SetTrustedOrigins([]string{"https://ops.example.com"})
+
+	check := func(target, origin string, tls bool) bool {
+		req := httptest.NewRequest(http.MethodPost, target, nil)
+		req.AddCookie(&http.Cookie{Name: cookieName, Value: basicHeader("admin", "secret")})
+		req.Header.Set("Origin", origin)
+
+		if !tls {
+			req.TLS = nil
+		}
+
+		return h.CheckAuth(req)
+	}
+
+	require.True(t, check("http://node.example.com:80/x", "http://node.example.com", false), "default port in Host")
+	require.True(t, check("http://[::1]:8090/x", "http://[::1]:8090", false), "IPv6 host")
+	require.False(t, check("http://[::1]:8090/x", "http://[::2]:8090", false), "other IPv6 host")
+	require.True(t, check("http://node.example.com/x", "https://ops.example.com:443", false), "trusted origin written with its default port")
+	require.False(t, check("https://node.example.com/x", "http://node.example.com", true), "http origin on a TLS request")
+	require.True(t, check("https://node.example.com/x", "https://node.example.com", true), "https origin on a TLS request")
 }
