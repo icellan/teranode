@@ -1076,11 +1076,11 @@ func (m *DiskTxMap) retire(old, next *generation) {
 // clearIndex empties every index shard by giving it a new map. clear() would
 // keep each map's capacity, and a cleared half of the subtree processor's
 // double buffer sits empty for a whole block interval, so a busy node held
-// twice its index RAM. Regrowing costs ~5ns per entry over the next block
-// interval, and nothing extra for the remainder MoveFrom inserts inside
-// moveForwardBlock (BenchmarkDiskTxMap_IndexRefill). The shards are
-// independent, so they are replaced in parallel. Every shard is empty when it
-// returns.
+// twice its index RAM. In BenchmarkDiskTxMap_IndexRefill (32M entries)
+// regrowing costs ~5ns per entry over the next block interval, and the
+// remainder share MoveFrom inserts inside moveForwardBlock was no slower. The
+// shards are independent, so they are replaced in parallel. Every shard is
+// empty when it returns.
 func (m *DiskTxMap) clearIndex() {
 	workers := min(runtime.GOMAXPROCS(0), numIndexShards)
 	perWorker := (numIndexShards + workers - 1) / workers
@@ -1265,7 +1265,7 @@ func (m *DiskTxMap) UpdateSubtreeIndexBatch(nodes []subtreepkg.Node, subtreeInde
 // DiskMapStats holds lightweight metrics for a disk-backed map.
 type DiskMapStats struct {
 	Entries          int64
-	IndexMemBytes    int64 // estimated RAM held by the index, including capacity kept across Clear
+	IndexMemBytes    int64 // estimated RAM held by the index entries
 	DiskBytesWritten int64 // payload bytes written over the map's life
 }
 
