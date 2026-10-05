@@ -44,7 +44,14 @@ func Generate(projectRoot string, cfg *config.Config) error {
 	end := markerEnd(cfg.DevName)
 
 	startIdx := strings.Index(content, start)
-	endIdx := strings.Index(content, end)
+	endIdx := -1
+
+	// Only an end marker after the start marker closes the block.
+	if startIdx >= 0 {
+		if rel := strings.Index(content[startIdx:], end); rel >= 0 {
+			endIdx = startIdx + rel
+		}
+	}
 
 	var existingBlock string
 	if startIdx >= 0 && endIdx >= 0 {
@@ -69,12 +76,13 @@ func Generate(projectRoot string, cfg *config.Config) error {
 	}
 
 	// The block carries the developer's admin RPC password, so keep the file
-	// owner-only. WriteFile leaves an existing file's mode alone, hence the Chmod.
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	// owner-only. WriteFile leaves an existing file's mode alone, so tighten it
+	// before the password is written.
+	if err := os.Chmod(path, 0o600); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 
-	return os.Chmod(path, 0o600)
+	return os.WriteFile(path, []byte(content), 0o600)
 }
 
 // HasEntries checks if settings_local.conf has auto-generated entries for the given developer.

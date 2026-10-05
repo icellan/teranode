@@ -515,7 +515,7 @@ For CI or scripting:
 
 Running `init` again presents your previous choices as defaults - just press enter to keep them. This is useful for changing a single setting (e.g. switching from sqlite to postgres) without re-entering everything.
 
-`init` also generates `rpc_user.dev.<name>` and `rpc_pass.dev.<name>` in `settings_local.conf`, because `settings.conf` no longer ships an RPC credential pair. If your dev block was written by an older `init`, `teranode-dev rpc` and `teranode-dev generate` get `401 Unauthorized` until you re-run `init`; `teranode-dev doctor` reports the missing pair. Re-running keeps an existing password. The generated pair overrides any `rpc_user`/`rpc_pass` you set without a context suffix, so scripts calling the node directly should use it.
+`init` also generates `rpc_user.dev.<name>` and `rpc_pass.dev.<name>` in `settings_local.conf`, because `settings.conf` no longer ships an RPC credential pair for dev contexts. If your dev block was written by an older `init`, `teranode-dev rpc` and `teranode-dev generate` get `401 Unauthorized` until you re-run `init`; `teranode-dev doctor` reports the missing pair. Re-running keeps an existing password. The generated pair overrides any `rpc_user`/`rpc_pass` you set without a context suffix, so scripts calling the node directly should use it.
 
 ## Next Steps
 

@@ -132,3 +132,13 @@ func TestHasRPCCredentials(t *testing.T) {
 
 	require.False(t, HasRPCCredentials(projectRoot, "alice"))
 }
+
+func TestGenerate_EndMarkerBeforeStartMarkerDoesNotPanic(t *testing.T) {
+	projectRoot := t.TempDir()
+	path := filepath.Join(projectRoot, settingsFile)
+	stray := markerEnd("alice") + "\n" + markerStart("alice") + "\n"
+	require.NoError(t, os.WriteFile(path, []byte(stray), 0o600))
+
+	cfg := &config.Config{DevName: "alice", Network: "regtest", UTXOBackend: "sqlite"}
+	require.NotPanics(t, func() { require.NoError(t, Generate(projectRoot, cfg)) })
+}
