@@ -594,7 +594,14 @@ func DoHTTPRequestBounded(ctx context.Context, url string, maxBytes int64, reque
 		}
 	}()
 
-	bounded := io.LimitReader(bodyReaderCloser, maxBytes+1)
+	return readBodyBounded(ctx, url, bodyReaderCloser, maxBytes)
+}
+
+// readBodyBounded reads at most maxBytes from body, failing with ErrExternal when the body is
+// longer. Shared by DoHTTPRequestBounded and DoHTTPRequestBoundedWithRetry so the two keep one
+// bound.
+func readBodyBounded(ctx context.Context, url string, body io.Reader, maxBytes int64) ([]byte, error) {
+	bounded := io.LimitReader(body, maxBytes+1)
 
 	done := make(chan struct{})
 	var blockBytes []byte
@@ -792,7 +799,7 @@ func executeHTTPRequest(ctx context.Context, cancelFn context.CancelFunc, rawURL
 // JSON body parser, fail on the binary payload, and reject the request with HTTP 400 —
 // degrading peer catchup reputation across the network.
 //
-// Kept as one function so the retry path (doHTTPRequestForStreamingWithRetryAfter) cannot
+// Kept as one function so the retry path (doHTTPRequestWithRetryAfter) cannot
 // drift from the plain path (executeHTTPRequestWithClient) on content-type or signing, the
 // way it once did: the retry path used to build its own request and sent unsigned
 // application/json bodies, undoing both the WAF fix and peer-request signing on every
@@ -939,7 +946,7 @@ const maxHTTPErrorBodyDrainBytes = 64 * 1024
 //
 //   - Connection reuse needs the body read to EOF and CLOSED *before the caller
 //     returns*. Every caller of buildHTTPError cancels its request context immediately
-//     afterwards — DoHTTPRequest defers cancelFn, doHTTPRequestForStreamingWithRetryAfter
+//     afterwards — DoHTTPRequest defers cancelFn, doHTTPRequestWithRetryAfter
 //     calls it outright — and response-body reads honour that context. So a drain that
 //     has not finished by then is killed and the connection is discarded: a purely
 //     asynchronous drain delivers no reuse at all, which is the entire point of
@@ -1146,6 +1153,35 @@ func DoHTTPRequestBodyReaderWithRetry(ctx context.Context, url string, requestBo
 }
 
 func doHTTPRequestBodyReaderWithRetry(ctx context.Context, url string, cfg retryConfig, requestBody ...[]byte) (io.ReadCloser, error) {
+	return doHTTPRequestWithRetry(ctx, url, cfg, httpStreamingTimeout, requestBody...)
+}
+
+// DoHTTPRequestBoundedWithRetry behaves like DoHTTPRequestBounded but retries HTTP 503 and
+// HTTP 429 exactly as DoHTTPRequestBodyReaderWithRetry does: same backoff, same Retry-After
+// handling, same request construction, and the final error keeps the class of the last
+// rejection. Each attempt without a caller deadline gets the plain request timeout, as
+// DoHTTPRequestBounded does. The body of the response that is finally served is capped at
+// maxBytes; an over-cap body fails with ErrExternal and is not retried.
+func DoHTTPRequestBoundedWithRetry(ctx context.Context, url string, maxBytes int64, requestBody ...[]byte) ([]byte, error) {
+	return doHTTPRequestBoundedWithRetry(ctx, url, maxBytes, defaultRetryConfig, requestBody...)
+}
+
+func doHTTPRequestBoundedWithRetry(ctx context.Context, url string, maxBytes int64, cfg retryConfig, requestBody ...[]byte) ([]byte, error) {
+	body, err := doHTTPRequestWithRetry(ctx, url, cfg, httpRequestTimeout, requestBody...)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		_ = body.Close()
+	}()
+
+	return readBodyBounded(ctx, url, body, maxBytes)
+}
+
+// doHTTPRequestWithRetry is the retry loop behind both retrying helpers. timeoutMs is the
+// per-attempt timeout applied when ctx carries no deadline.
+func doHTTPRequestWithRetry(ctx context.Context, url string, cfg retryConfig, timeoutMs int, requestBody ...[]byte) (io.ReadCloser, error) {
 	delay := cfg.initialDelay
 	var lastErr error
 	lastAttemptSecond := int64(-1)
@@ -1157,7 +1193,7 @@ func doHTTPRequestBodyReaderWithRetry(ctx context.Context, url string, cfg retry
 			}
 		}
 
-		body, retryAfter, err := doHTTPRequestForStreamingWithRetryAfter(ctx, url, requestBody...)
+		body, retryAfter, err := doHTTPRequestWithRetryAfter(ctx, timeoutMs, url, requestBody...)
 		// Read the clock after the attempt, not before it: the signer takes its
 		// timestamp while building the request, so a second that rolls over
 		// between a pre-attempt read and the signature would record S while the
@@ -1204,13 +1240,14 @@ func doHTTPRequestBodyReaderWithRetry(ctx context.Context, url string, cfg retry
 	return nil, errFn("http request [%s] still rejected after %d attempts", url, cfg.maxAttempts, lastErr)
 }
 
-// doHTTPRequestForStreamingWithRetryAfter is doHTTPRequestForStreaming + extracts
-// the Retry-After header on non-OK responses. The extraction is status-agnostic, so
-// it covers 429 as well as 503. On success returns (body, 0, nil).
-func doHTTPRequestForStreamingWithRetryAfter(ctx context.Context, rawURL string, requestBody ...[]byte) (io.ReadCloser, time.Duration, error) {
+// doHTTPRequestWithRetryAfter performs one attempt of the retry loop, applying timeoutMs
+// when ctx carries no deadline, and extracts the Retry-After header on non-OK responses.
+// The extraction is status-agnostic, so it covers 429 as well as 503. On success returns
+// (body, 0, nil).
+func doHTTPRequestWithRetryAfter(ctx context.Context, timeoutMs int, rawURL string, requestBody ...[]byte) (io.ReadCloser, time.Duration, error) {
 	cancelFn := func() {}
 	if _, ok := ctx.Deadline(); !ok {
-		ctx, cancelFn = context.WithTimeout(ctx, time.Duration(httpStreamingTimeout)*time.Millisecond)
+		ctx, cancelFn = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
 	}
 
 	if err := ValidateURL(rawURL); err != nil {

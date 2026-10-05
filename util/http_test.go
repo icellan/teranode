@@ -1837,3 +1837,114 @@ func TestWaitOutRetrySecondHonoursCancellationAndBackwardSteps(t *testing.T) {
 	require.NoError(t, waitOutRetrySecond(context.Background(), time.Now().Unix()+5))
 	require.Less(t, time.Since(start), 500*time.Millisecond, "a large backwards step must not be slept out")
 }
+
+// TestDoHTTPRequestBoundedWithRetry_RetriesOn429ThenSucceeds pins the bounded variant used by
+// the GET /subtree fetches: a peer's 429 is retried instead of failing the subtree or block.
+func TestDoHTTPRequestBoundedWithRetry_RetriesOn429ThenSucceeds(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&attempts, 1) < 3 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok-after-429"))
+	}))
+	defer server.Close()
+
+	got, err := doHTTPRequestBoundedWithRetry(context.Background(), server.URL, 1024, testRetryConfig)
+	require.NoError(t, err)
+	require.Equal(t, "ok-after-429", string(got))
+	require.Equal(t, int32(3), atomic.LoadInt32(&attempts), "exactly two retries before success")
+}
+
+func TestDoHTTPRequestBoundedWithRetry_RetriesOn503ThenSucceeds(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok-after-503"))
+	}))
+	defer server.Close()
+
+	got, err := doHTTPRequestBoundedWithRetry(context.Background(), server.URL, 1024, testRetryConfig)
+	require.NoError(t, err)
+	require.Equal(t, "ok-after-503", string(got))
+	require.Equal(t, int32(2), atomic.LoadInt32(&attempts))
+}
+
+func TestDoHTTPRequestBoundedWithRetry_ExhaustsAttemptsOnPersistent429(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	_, err := doHTTPRequestBoundedWithRetry(context.Background(), server.URL, 1024, testRetryConfig)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrServiceRateLimited),
+		"final error must stay ErrServiceRateLimited; got %v", err)
+	require.Equal(t, int32(testRetryConfig.maxAttempts), atomic.LoadInt32(&attempts))
+}
+
+// TestDoHTTPRequestBoundedWithRetry_KeepsTheSizeBound — the bound applies to the body that is
+// finally served, and an oversized body is not retried: it is the peer's answer, not a rejection.
+func TestDoHTTPRequestBoundedWithRetry_KeepsTheSizeBound(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, 65))
+	}))
+	defer server.Close()
+
+	_, err := doHTTPRequestBoundedWithRetry(context.Background(), server.URL, 64, testRetryConfig)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrExternal), "an over-cap body must fail as ErrExternal; got %v", err)
+	require.Equal(t, int32(2), atomic.LoadInt32(&attempts), "the over-cap body must not be retried")
+}
+
+func TestDoHTTPRequestBoundedWithRetry_NoRetryOn404(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	_, err := doHTTPRequestBoundedWithRetry(context.Background(), server.URL, 1024, testRetryConfig)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrNotFound), "a 404 must keep its class; got %v", err)
+	require.Equal(t, int32(1), atomic.LoadInt32(&attempts))
+}
+
+// TestDoHTTPRequestBoundedWithRetry_UsesTheRequestTimeoutPerAttempt — each attempt without a
+// caller deadline gets the plain request timeout, as DoHTTPRequestBounded does, not the much
+// longer streaming timeout the body-reader retry path uses.
+func TestDoHTTPRequestBoundedWithRetry_UsesTheRequestTimeoutPerAttempt(t *testing.T) {
+	prevRequest, prevStreaming := httpRequestTimeout, httpStreamingTimeout
+	httpRequestTimeout, httpStreamingTimeout = 100, 60_000
+	defer func() { httpRequestTimeout, httpStreamingTimeout = prevRequest, prevStreaming }()
+
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+
+	start := time.Now()
+	_, err := doHTTPRequestBoundedWithRetry(context.Background(), server.URL, 1024, testRetryConfig)
+	require.Error(t, err)
+	require.Less(t, time.Since(start), 5*time.Second, "the attempt must time out at the request timeout")
+}

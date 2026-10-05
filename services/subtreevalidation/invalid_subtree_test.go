@@ -675,6 +675,52 @@ func TestGetSubtreeTxHashes_LocalAssemblyPolicyIgnored(t *testing.T) {
 	require.Len(t, hashes, leafCount)
 }
 
+// TestGetSubtreeTxHashes_RetriesOn429 — a peer that rate-limits the GET /subtree fetch on the
+// announcement path is retried, not dropped. Before the retry, one 429 lost the subtree and
+// every descendant subtree then failed on missing parents.
+func TestGetSubtreeTxHashes_RetriesOn429(t *testing.T) {
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	subtreeHash := chainhash.HashH([]byte("test-subtree-get-429"))
+	baseURL := testPeerURL
+
+	server := &Server{
+		logger:                       ulogger.TestLogger{},
+		settings:                     tSettings,
+		subtreeStore:                 memory.New(),
+		invalidSubtreeKafkaProducer:  &mockKafkaProducer{},
+		invalidSubtreeDeDuplicateMap: expiringmap.New[string, struct{}](time.Minute * 1),
+	}
+	defer server.invalidSubtreeDeDuplicateMap.Stop()
+
+	payload := make([]byte, 2*chainhash.HashSize)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+
+	var attempts int32
+
+	subtreeURL := fmt.Sprintf("%s/subtree/%s", baseURL, subtreeHash.String())
+	httpmock.RegisterResponder("GET", subtreeURL,
+		func(req *http.Request) (*http.Response, error) {
+			if atomic.AddInt32(&attempts, 1) == 1 {
+				return httpmock.NewStringResponse(http.StatusTooManyRequests, "rate limit exceeded"), nil
+			}
+
+			return httpmock.NewBytesResponse(http.StatusOK, payload), nil
+		})
+
+	hashes, err := server.getSubtreeTxHashes(context.Background(), gocore.NewStat("test"), &subtreeHash, baseURL, "")
+	require.NoError(t, err)
+	require.Len(t, hashes, 2)
+	require.Equal(t, int32(2), atomic.LoadInt32(&attempts), "the 429 must have been retried")
+
+	kafkaProducer := server.invalidSubtreeKafkaProducer.(*mockKafkaProducer)
+	require.Empty(t, kafkaProducer.messages, "a rate-limited peer must not be reported as invalid")
+}
+
 // TestGetSubtreeTxHashes_LocalFile is a regression guard for the dual file-type
 // lookup. If the subtree is already on disk under FileTypeSubtree (the
 // "already validated" marker — written by quickValidationMode, block assembly,

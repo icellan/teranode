@@ -1090,7 +1090,9 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 
 	// TODO add the metric for how long this takes
 	// body, err := util.DoHTTPRequestBodyReader(spanCtx, url)
-	subtreeBytes, err := util.DoHTTPRequestBounded(spanCtx, url, maxSubtreeBytes)
+	// Retry a 429/503: a rate-limited GET here would otherwise drop the subtree, and every
+	// descendant subtree would then fail on missing parents. The GET is idempotent.
+	subtreeBytes, err := util.DoHTTPRequestBoundedWithRetry(spanCtx, url, maxSubtreeBytes)
 	if err != nil {
 		// check whether this is a 404 error
 		if errors.Is(err, errors.ErrNotFound) {
