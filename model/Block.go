@@ -1630,9 +1630,9 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 	// Size the disk-backed parent-spends map at transaction count * multiplier
 	// (assumed average inputs/tx, block_parentSpendsCapacityMultiplier). It
 	// grows when a block exceeds that, but a grow stalls every insert while the
-	// table rehashes. The in-memory map does not use the multiplier: it is sized
-	// from the inputs per tx the last block measured, and grows by an eighth per
-	// full bucket (inMemoryParentSpendsCapacity). 0 is treated as 1.
+	// table rehashes. The in-memory map is sized from the inputs per tx recent
+	// blocks measured, with the multiplier as its ceiling, and grows by an eighth
+	// per full bucket (inMemoryParentSpendsCapacity). 0 is treated as 1.
 	//
 	// The transaction count comes from the loaded block body, not from the
 	// peer-supplied b.TransactionCount — see txMapEntryCount for why (issue

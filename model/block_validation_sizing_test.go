@@ -379,6 +379,9 @@ func TestBlock_InMemoryParentSpendsCapacity(t *testing.T) {
 
 	block, _, _ := buildBlockForValidOrderBench(t, leaves, 2)
 
+	// Sized from the loaded body, never the peer-supplied count (issue 1501).
+	block.TransactionCount = 1 << 40
+
 	require.Equal(t, uint64(leaves), block.inMemoryParentSpendsCapacity(2), "one input per tx before anything is measured")
 
 	// Two input-heavy blocks: 3 inputs per tx.

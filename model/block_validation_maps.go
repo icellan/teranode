@@ -173,8 +173,8 @@ func sizingInpointsPerTxMilli() uint64 {
 // (observedMilli inputs per tx, x1000) it clamps that to between one input per
 // transaction, which every non-coinbase transaction has, and the configured
 // multiplier, then adds parentSpendsMeasuredMarginPct. A chain sustaining more
-// inputs per tx than the multiplier regrows its buckets every block, so raise
-// the multiplier for such a chain. Before anything has been measured it uses
+// than about multiplier x 1.03 inputs per tx regrows its buckets every block,
+// so raise the multiplier for such a chain. Before anything has been measured it uses
 // one input per transaction. Buckets that turn out short grow by an eighth.
 func inMemoryParentSpendsCapacity(entryCount, observedMilli, multiplier uint64) uint64 {
 	if observedMilli == 0 {
