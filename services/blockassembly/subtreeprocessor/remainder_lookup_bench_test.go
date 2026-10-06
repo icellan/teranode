@@ -89,6 +89,8 @@ func BenchmarkRemainderLookupPhase(b *testing.B) {
 
 func newRemainderLookupBenchProcessor(b *testing.B) *SubtreeProcessor {
 	b.Helper()
-	stp, _ := setupSubtreeProcessorForBenchB(b, 1<<20)
+	stp, cleanup := setupSubtreeProcessorForBenchB(b, 1<<20)
+	b.Cleanup(cleanup)
+
 	return stp
 }
