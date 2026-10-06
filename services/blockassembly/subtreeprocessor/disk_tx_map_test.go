@@ -99,10 +99,8 @@ func TestDiskTxMap_Clear(t *testing.T) {
 	require.Equal(t, 0, m.Length())
 }
 
-// TestDiskTxMap_ClearEmptiesEveryShardWithUnevenWorkers pins that the
-// parallel shard clear reaches every shard when GOMAXPROCS does not divide
-// the shard count, so the last worker gets a shorter run of shards, as it
-// does with 94 or 192 procs in production.
+// TestDiskTxMap_ClearEmptiesEveryShard pins that Clear empties all 4096
+// index shards, with at least one entry in each.
 func TestDiskTxMap_ClearEmptiesEveryShard(t *testing.T) {
 	m := newTestDiskTxMap(t)
 
