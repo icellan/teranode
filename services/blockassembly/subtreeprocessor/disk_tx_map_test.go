@@ -1,7 +1,6 @@
 package subtreeprocessor
 
 import (
-	"runtime"
 	"sync"
 	"testing"
 
@@ -104,9 +103,7 @@ func TestDiskTxMap_Clear(t *testing.T) {
 // parallel shard clear reaches every shard when GOMAXPROCS does not divide
 // the shard count, so the last worker gets a shorter run of shards, as it
 // does with 94 or 192 procs in production.
-func TestDiskTxMap_ClearEmptiesEveryShardWithUnevenWorkers(t *testing.T) {
-	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(7))
-
+func TestDiskTxMap_ClearEmptiesEveryShard(t *testing.T) {
 	m := newTestDiskTxMap(t)
 
 	filled := make(map[uint16]bool, numIndexShards)

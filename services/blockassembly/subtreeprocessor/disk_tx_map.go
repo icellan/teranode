@@ -1078,28 +1078,15 @@ func (m *DiskTxMap) retire(old, next *generation) {
 // double buffer sits empty for a whole block interval, so a busy node held
 // twice its index RAM. In BenchmarkDiskTxMap_IndexRefill (32M entries)
 // regrowing costs ~5ns per entry over the next block interval, and the
-// remainder share MoveFrom inserts inside moveForwardBlock was no slower. The
-// shards are independent, so they are replaced in parallel. Every shard is
-// empty when it returns.
+// remainder share MoveFrom inserts inside moveForwardBlock was no slower.
+// Replacing a map is O(1), unlike clear(), so one goroutine does all 4096.
+// Every shard is empty when it returns.
 func (m *DiskTxMap) clearIndex() {
-	workers := min(runtime.GOMAXPROCS(0), numIndexShards)
-	perWorker := (numIndexShards + workers - 1) / workers
-
-	var wg sync.WaitGroup
-
-	for start := 0; start < numIndexShards; start += perWorker {
-		shards := m.shards[start:min(start+perWorker, numIndexShards)]
-
-		wg.Go(func() {
-			for i := range shards {
-				shards[i].mu.Lock()
-				shards[i].index = make(map[chainhash.Hash]uint64)
-				shards[i].mu.Unlock()
-			}
-		})
+	for i := range m.shards {
+		m.shards[i].mu.Lock()
+		m.shards[i].index = make(map[chainhash.Hash]uint64)
+		m.shards[i].mu.Unlock()
 	}
-
-	wg.Wait()
 }
 
 // mapWindowsLocked maps windows until they cover every written byte. A
