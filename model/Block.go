@@ -1673,7 +1673,7 @@ func (b *Block) validOrderAndBlessed(ctx context.Context, logger ulogger.Logger,
 	} else {
 		// Sized from the inputs per tx recent blocks measured; allocated for this
 		// block only and dropped when it returns.
-		inMemory = newBlockParentSpendsMap(inMemoryParentSpendsCapacity(entryCount, sizingInpointsPerTxMilli(), parentSpendsCapacityMultiplier))
+		inMemory = newBlockParentSpendsMap(b.inMemoryParentSpendsCapacity(parentSpendsCapacityMultiplier))
 		psMap = inMemory
 	}
 

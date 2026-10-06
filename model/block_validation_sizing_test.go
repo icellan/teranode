@@ -196,13 +196,20 @@ func TestInMemoryParentSpendsCapacity(t *testing.T) {
 		require.Equal(t, uint64(2_575_000), inMemoryParentSpendsCapacity(1_000_000, 2_500, 3))
 	})
 
-	t.Run("clamped to the multiplier, so a measurement never sizes above the old bound", func(t *testing.T) {
-		require.Equal(t, uint64(2_000_000), inMemoryParentSpendsCapacity(1_000_000, 2_500_000, 2))
-		require.Equal(t, uint64(1_000_000), inMemoryParentSpendsCapacity(1_000_000, 2_500, 0), "a 0 multiplier means 1")
+	t.Run("the ratio is clamped to the multiplier before the margin is added", func(t *testing.T) {
+		require.Equal(t, uint64(2_060_000), inMemoryParentSpendsCapacity(1_000_000, 2_500_000, 2))
+		require.Equal(t, uint64(1_030_000), inMemoryParentSpendsCapacity(1_000_000, 2_500, 0), "a 0 multiplier means 1")
 	})
 
-	t.Run("never below one input per transaction", func(t *testing.T) {
-		require.Equal(t, uint64(1_000_000), inMemoryParentSpendsCapacity(1_000_000, 500, 2))
+	// A chain sustaining just above the multiplier must still get the margin;
+	// clamping after the margin sized it at exactly the multiplier, so every
+	// bucket regrew every block.
+	t.Run("a ratio just above the multiplier keeps its margin", func(t *testing.T) {
+		require.Equal(t, uint64(2_060_000), inMemoryParentSpendsCapacity(1_000_000, 2_050, 2))
+	})
+
+	t.Run("never below one input per transaction plus the margin", func(t *testing.T) {
+		require.Equal(t, uint64(1_030_000), inMemoryParentSpendsCapacity(1_000_000, 500, 2))
 	})
 
 	t.Run("never zero", func(t *testing.T) {
@@ -321,6 +328,67 @@ func TestValidOrderAndBlessed_RecordsMeasuredInpointsPerTx(t *testing.T) {
 	// The coinbase placeholder is not a spending transaction.
 	want := (inputs*1000 + leaves - 2) / (leaves - 1)
 	require.Equal(t, want, lastInpointsPerTx())
+}
+
+// TestValidOrderAndBlessed_FailedBlockDoesNotRecord pins that the ratio is only
+// recorded once the block validated: a block rejected part way through has put
+// a partial input count in the map, and a peer could otherwise steer the next
+// block's sizing with invalid blocks.
+func TestValidOrderAndBlessed_FailedBlockDoesNotRecord(t *testing.T) {
+	t.Cleanup(resetObservedInpoints)
+	resetObservedInpoints()
+	withMinMeasuredTxs(t, 0)
+
+	const leaves = 64
+
+	block, deps, concurrency := buildBlockForValidOrderBench(t, leaves, 2)
+
+	// The last transaction spends the anchor output node 1 already spent, so
+	// validation fails after every earlier input is in the map.
+	store, ok := deps.subtreeStore.(*mockSubtreeStore)
+	require.True(t, ok)
+
+	subtree := block.SubtreeSlices[0]
+	key := string(subtree.RootHash()[:])
+
+	meta, err := subtreepkg.NewSubtreeMetaFromBytes(subtree, store.data[key])
+	require.NoError(t, err)
+
+	anchor, err := meta.GetTxInpoints(1)
+	require.NoError(t, err)
+	require.Len(t, anchor, 1)
+	require.NoError(t, meta.SetTxInpoints(leaves-1, subtreepkg.NewTxInpointsFromPacked([]chainhash.Hash{anchor[0].Hash}, []uint32{1, anchor[0].Index})))
+
+	store.data[key], err = meta.Serialize()
+	require.NoError(t, err)
+
+	err = block.validOrderAndBlessed(context.Background(), ulogger.TestLogger{}, deps, concurrency, nil, 2)
+	require.ErrorContains(t, err, "duplicate inputs")
+	require.Equal(t, uint64(0), lastInpointsPerTx())
+}
+
+// TestBlock_InMemoryParentSpendsCapacity pins the sizing validOrderAndBlessed
+// uses: the block's own entry count, the recorded ratio and the configured
+// multiplier as its ceiling.
+func TestBlock_InMemoryParentSpendsCapacity(t *testing.T) {
+	t.Cleanup(resetObservedInpoints)
+	resetObservedInpoints()
+	withMinMeasuredTxs(t, 0)
+
+	const leaves = 64
+
+	block, _, _ := buildBlockForValidOrderBench(t, leaves, 2)
+
+	require.Equal(t, uint64(leaves), block.inMemoryParentSpendsCapacity(2), "one input per tx before anything is measured")
+
+	// Two input-heavy blocks: 3 inputs per tx.
+	recordInpointsPerTx(3_000, 1_001)
+	recordInpointsPerTx(3_000, 1_001)
+
+	// Clamped to the multiplier of 2, plus the margin: ceil(64 * 2.06).
+	require.Equal(t, uint64(132), block.inMemoryParentSpendsCapacity(2))
+	// A larger multiplier lets the measured ratio through: ceil(64 * 3.09).
+	require.Equal(t, uint64(198), block.inMemoryParentSpendsCapacity(5))
 }
 
 func TestValidOrderAndBlessed_DiskPathDoesNotRecord(t *testing.T) {

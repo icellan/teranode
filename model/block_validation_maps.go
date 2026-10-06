@@ -170,19 +170,22 @@ func sizingInpointsPerTxMilli() uint64 {
 
 // inMemoryParentSpendsCapacity is the inpoint count to size the in-memory
 // parent-spends map for, for entryCount transactions. With a measured ratio
-// (observedMilli inputs per tx, x1000) it uses that plus
-// parentSpendsMeasuredMarginPct, clamped to between one input per transaction,
-// which every non-coinbase transaction has, and the configured multiplier, so a
-// measurement can never size above what the multiplier alone used to. Before
-// anything has been measured it uses one input per transaction. Buckets that
-// turn out short grow by an eighth.
+// (observedMilli inputs per tx, x1000) it clamps that to between one input per
+// transaction, which every non-coinbase transaction has, and the configured
+// multiplier, then adds parentSpendsMeasuredMarginPct. A chain sustaining more
+// inputs per tx than the multiplier regrows its buckets every block, so raise
+// the multiplier for such a chain. Before anything has been measured it uses
+// one input per transaction. Buckets that turn out short grow by an eighth.
 func inMemoryParentSpendsCapacity(entryCount, observedMilli, multiplier uint64) uint64 {
 	if observedMilli == 0 {
 		return max(entryCount, 1)
 	}
 
-	ratio := float64(observedMilli) * (100 + parentSpendsMeasuredMarginPct) / 100_000
-	ratio = max(1, min(ratio, float64(max(multiplier, 1))))
+	// Clamp before the margin: clamping after it sizes a chain sustaining just
+	// above the multiplier at exactly the multiplier, so every bucket regrows
+	// every block.
+	ratio := max(1, min(float64(observedMilli)/1000, float64(max(multiplier, 1))))
+	ratio = ratio * (100 + parentSpendsMeasuredMarginPct) / 100
 
 	capacity := math.Ceil(float64(entryCount) * ratio)
 
@@ -194,6 +197,14 @@ func inMemoryParentSpendsCapacity(entryCount, observedMilli, multiplier uint64) 
 	default:
 		return uint64(capacity)
 	}
+}
+
+// inMemoryParentSpendsCapacity is the inpoint count validOrderAndBlessed sizes
+// this block's in-memory parent-spends map for: its loaded entry count at the
+// recorded inputs per tx, with multiplier (block_parentSpendsCapacityMultiplier)
+// as the ceiling.
+func (b *Block) inMemoryParentSpendsCapacity(multiplier uint64) uint64 {
+	return inMemoryParentSpendsCapacity(b.txMapEntryCount(), sizingInpointsPerTxMilli(), multiplier)
 }
 
 // buildParentSpendsBuckets sizes every bucket of s for perBucket entries.

@@ -19,8 +19,7 @@ import (
 //
 // Deliberately NOT tested by materialising a >2^32-entry map: newBlockTxMap
 // preallocates eagerly from its hint, and a single such call costs tens of
-// GB of RSS (the same trap TestGetTxMap_OversizedAllocatesFresh documents
-// removing after it dominated CI memory, issue 1051). The narrowing seam
+// GB of RSS (the trap that dominated CI memory in issue 1051). The narrowing seam
 // itself no longer exists at the type level — newBlockTxMap takes a uint64 — so the
 // pure preallocation-cap logic carries the behavioural pin.
 
@@ -137,9 +136,8 @@ func TestCheckDuplicateTransactionsAboveUint32(t *testing.T) {
 // the body-derived node count by the assumed inputs per transaction, treats a 0
 // multiplier as 1, never returns 0 (the mmap-backed table rejects a zero
 // capacity), and on an overflowing operator-supplied multiplier degrades to the
-// unmultiplied count rather than carrying a wrapped product into
-// NewSplitSyncedParentMap, whose uint32((e + e/5) / buckets) would turn it into
-// an arbitrary per-bucket size.
+// unmultiplied count rather than carrying a wrapped product into the
+// disk-backed map's FilterCapacity.
 func TestParentSpendsCapacity(t *testing.T) {
 	require.Equal(t, uint64(2_000), parentSpendsCapacity(1_000, 2))
 	require.Equal(t, uint64(1_000), parentSpendsCapacity(1_000, 1))
