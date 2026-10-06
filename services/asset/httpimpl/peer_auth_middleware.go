@@ -402,7 +402,7 @@ func (v *peerAuthVerifier) verifySignedRequest(c echo.Context) (peer.ID, string,
 	// request worth spending resources on — allowlist membership is. Check it
 	// before the replay claim, the signature check and the body read.
 	if _, ok := v.allowlist[peerID]; !ok {
-		v.logger.Debugf("[PeerAuth] authenticated peer %s not in allowlist; staying unverified", peerID)
+		v.logger.Debugf("[PeerAuth] signed request from non-allowlisted peer %s (signature not verified); staying unverified", peerID)
 		return peerID, peerAuthResultNotAllowlisted, true
 	}
 
