@@ -77,7 +77,7 @@ func TestGetTxMetaByTxID(t *testing.T) {
 		require.True(t, errors.As(err, &echoErr))
 
 		assert.Equal(t, http.StatusNotFound, echoErr.Code)
-		// Indistinguishable from an unregistered route: echo's own not-found error.
+		// The same body echo gives an unknown GET: its own not-found error.
 		require.Equal(t, echo.ErrNotFound.Message, echoErr.Message)
 	})
 
