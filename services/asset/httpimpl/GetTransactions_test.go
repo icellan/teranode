@@ -111,11 +111,10 @@ func TestGetTransactions(t *testing.T) {
 		echoErr := &echo.HTTPError{}
 		require.True(t, errors.As(err, &echoErr))
 
-		// Check response status code
-		assert.Equal(t, http.StatusInternalServerError, echoErr.Code)
-
-		// Check response body
-		assert.Equal(t, "PROCESSING (4): error reading request body -> UNKNOWN (0): unexpected EOF", echoErr.Message)
+		// A body whose length isn't a whole multiple of the hash size is a
+		// client error, not a transport/server error.
+		assert.Equal(t, http.StatusBadRequest, echoErr.Code)
+		assert.Equal(t, "INVALID_ARGUMENT (1): request body length is not a multiple of 32 bytes", echoErr.Message)
 	})
 
 	t.Run("Transaction not found", func(t *testing.T) {
@@ -467,12 +466,24 @@ func TestGetTransactionsPreservesResponseOrder(t *testing.T) {
 	setSubtreeRoute(echoContext, &subtreeHash)
 	mockGetSubtreeTransactions(mockRepo)
 
+	// tx1 is requested second (see body below) but must finish its lookup
+	// first, forcing the two lookups to complete out of request order. A
+	// storage path keyed on completion order rather than request index would
+	// then put tx1 ahead of tx2 in the response.
+	tx1Done := make(chan struct{})
+
 	mockRepo.On("GetTransaction", mock.MatchedBy(func(h *chainhash.Hash) bool {
 		return h.IsEqual(testTX1Hash)
-	})).Return(testTX1RawBytes, nil)
+	})).Return(testTX1RawBytes, nil).Run(func(mock.Arguments) { close(tx1Done) })
 	mockRepo.On("GetTransaction", mock.MatchedBy(func(h *chainhash.Hash) bool {
 		return h.IsEqual(testTX2Hash)
-	})).Return(testTX2RawBytes, nil)
+	})).Return(testTX2RawBytes, nil).Run(func(mock.Arguments) {
+		// Bounded, so a serialised or cancelled fan-out fails on the byte check instead of hanging.
+		select {
+		case <-tx1Done:
+		case <-time.After(5 * time.Second):
+		}
+	})
 
 	// Request tx2 before tx1: the response must still come back tx2, then tx1.
 	body := append(testTX2Hash.CloneBytes(), testTX1Hash.CloneBytes()...)
@@ -724,6 +735,22 @@ func TestReadSubtreeBatchHashesInitialCapacityIsCapped(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, hashes, n)
 	})
+}
+
+// TestReadSubtreeBatchHashesPartialTrailingHashIsBadRequest pins that a body
+// whose length is not a whole multiple of the hash size is a client error
+// (400), not a server error (500). io.ReadFull returns io.ErrUnexpectedEOF
+// (not io.EOF) on a short trailing read, and that must not fall through to
+// the generic "error reading request body" 500 path.
+func TestReadSubtreeBatchHashesPartialTrailingHashIsBadRequest(t *testing.T) {
+	body := append(bytes.Repeat([]byte{0x01}, chainhash.HashSize), 0x02, 0x03, 0x04)
+
+	_, err := readSubtreeBatchHashes(bytes.NewReader(body), 0, 0)
+	require.Error(t, err)
+
+	echoErr := &echo.HTTPError{}
+	require.ErrorAs(t, err, &echoErr)
+	require.Equal(t, http.StatusBadRequest, echoErr.Code)
 }
 
 // TestTxSizeMatchesResponseBytes pins the assumption the subtree-map branch of

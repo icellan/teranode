@@ -72,7 +72,9 @@ const (
 // Error Responses (all modes):
 //
 //   - 400 Bad Request: body length is not a multiple of 36 bytes.
-//   - 413 Request Entity Too Large: body exceeds the global asset_httpBodyLimit setting.
+//   - 413 Request Entity Too Large: body exceeds the global asset_httpBodyLimit setting,
+//     or the batch exceeds asset_maxBatchRecords (default 16384) or
+//     asset_maxBatchResponseBytes (default 0, off).
 //   - 429 Too Many Requests: heavy-route tiered rate limiter rejected the request
 //     (shared with /subtree/:hash/txs and other fan-out endpoints).
 //   - 500 Internal Server Error: transport error reading the body, an unrecoverable

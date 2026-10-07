@@ -255,6 +255,11 @@ func readSubtreeBatchHashes(body io.Reader, contentLength int64, maxRecords int)
 				break
 			}
 
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil, echo.NewHTTPError(http.StatusBadRequest,
+					errors.NewInvalidArgumentError("request body length is not a multiple of %d bytes", chainhash.HashSize).Error())
+			}
+
 			return nil, echo.NewHTTPError(http.StatusInternalServerError, errors.NewProcessingError("error reading request body", err).Error())
 		}
 
