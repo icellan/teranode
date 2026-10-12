@@ -146,23 +146,6 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   the body read, replacing the per-request `http_streaming_timeout` on this path. If you raised
   `http_streaming_timeout` above 10m, set this too. (#1802)
 
-### Breaking — pending, not yet merged
-
-- **Unauthenticated Blockchain read RPCs will be bounded.** Count and range
-  parameters on the public read RPCs will be rejected with `InvalidArgument` above
-  configurable caps: `blockchain_maxBlockHeadersPerRequest`,
-  `blockchain_maxBlocksByHeightRange`, `blockchain_maxInvalidBlocksPerRequest` and
-  `blockchain_maxMedianTimePastHeights`. Callers that currently request very large
-  counts will start receiving errors.
-
-  **Upgrade-order hazard:** the median-time-past cap rejects the whole-chain request
-  that every pre-change client sends on first load, and those clients do not retry
-  `InvalidArgument`. During a rolling upgrade, an old-image validator,
-  subtreevalidation or blockvalidation pod talking to an upgraded Blockchain pod will
-  fail every `EnsureMTPLoaded` and validate nothing until it is reimaged. No chain
-  state is corrupted. Upgrade Blockchain last, or raise
-  `blockchain_maxMedianTimePastHeights` for the duration of the rollout. (#1776)
-
 - **`/lastblocks` returns at most 1000 blocks, and a negative `n` returns 400.** `n` was unbounded,
   and `n=-1` returned every block on SQLite (and a 500 on Postgres). It is now clamped to 1000, or
   lower via `asset_maxLastNBlocks`. (#1792)
@@ -185,6 +168,23 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   configured with a larger batch size gets 413, which is not retried and is reported against the
   serving peer. Raise `asset_maxBatchRecords` (or set 0 to disable it on a node with no untrusted
   callers), and keep peer batch sizes at or below this node's. (#1797)
+
+### Breaking — pending, not yet merged
+
+- **Unauthenticated Blockchain read RPCs will be bounded.** Count and range
+  parameters on the public read RPCs will be rejected with `InvalidArgument` above
+  configurable caps: `blockchain_maxBlockHeadersPerRequest`,
+  `blockchain_maxBlocksByHeightRange`, `blockchain_maxInvalidBlocksPerRequest` and
+  `blockchain_maxMedianTimePastHeights`. Callers that currently request very large
+  counts will start receiving errors.
+
+  **Upgrade-order hazard:** the median-time-past cap rejects the whole-chain request
+  that every pre-change client sends on first load, and those clients do not retry
+  `InvalidArgument`. During a rolling upgrade, an old-image validator,
+  subtreevalidation or blockvalidation pod talking to an upgraded Blockchain pod will
+  fail every `EnsureMTPLoaded` and validate nothing until it is reimaged. No chain
+  state is corrupted. Upgrade Blockchain last, or raise
+  `blockchain_maxMedianTimePastHeights` for the duration of the rollout. (#1776)
 
 ### Not breaking, but worth knowing
 
@@ -235,14 +235,14 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
 
 - **`asset_maxNBlocks` never goes below 100**, the catchup client's batch size; a lower value is
   raised with a startup warning. `asset_maxBlockHeaders` applies only to
-  `/headers_to_common_ancestor`, never to the catchup route. (#1792, pending)
+  `/headers_to_common_ancestor`, never to the catchup route. (#1792)
 
 - **Legacy block and on-demand `subtree_data` streams fail rather than serving a reconstructed
   transaction that is incomplete.** The local-service client used for SV-peer block serving no
-  longer follows redirects, so point `asset_httpAddress` at its final address. (#1794, pending)
+  longer follows redirects, so point `asset_httpAddress` at its final address. (#1794)
 
 - **A `POST /subtree/:hash/txs` body that isn't a whole number of 32-byte hashes returns 400
-  instead of 500.** (#1797, pending)
+  instead of 500.** (#1797)
 
 - **New switches can withhold backend detail from anonymous callers** (`asset_publicErrorDetail`,
   `asset_publicHealthDetail`, `asset_healthStrictStatus`, `asset_publicPeersDetail`,
@@ -253,4 +253,4 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
 
 - **The block graph is bucketed in the store**, and `GetBlockGraphData` responses (gRPC and JSON)
   gain a `bucket_seconds` field (omitted, i.e. 0, for ranges of 24h or less). The returned data
-  points are unchanged. (#1798, pending)
+  points are unchanged. (#1798)
