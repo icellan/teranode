@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -69,6 +70,13 @@ func TestSettingsConfSelfSufficientUnderDocker(t *testing.T) {
 	require.Contains(t, string(out), helperOKPrefix,
 		"resolve helper did not run (test pattern matched nothing?); the guard would pass vacuously:\n%s", out)
 
+	// The sentinel alone is not enough. gocore logs a warning and carries on with
+	// an empty map when it finds no settings.conf, so a helper that reached no
+	// config at all still prints "HELPER-OK: 0" and exits clean. Requiring a
+	// realistic key count is what makes the guard notice that it checked nothing.
+	require.Greater(t, helperKeysChecked(t, string(out)), 100,
+		"resolve helper checked implausibly few keys, so it did not load settings.conf:\n%s", out)
+
 	unresolved := extractHelperFindings(string(out))
 	require.Empty(t, unresolved,
 		"settings.conf must be self-sufficient in the docker context: every ${VAR} it references "+
@@ -84,6 +92,28 @@ const helperFindingPrefix = "UNRESOLVED: "
 // the parent can tell the helper really ran (go test exits 0 when -test.run
 // matches no test).
 const helperOKPrefix = "HELPER-OK: "
+
+// helperKeysChecked returns the key count the helper reported alongside its
+// sentinel, so the caller can tell a real run from one that loaded no config.
+func helperKeysChecked(t *testing.T, output string) int {
+	t.Helper()
+
+	for _, line := range strings.Split(output, "\n") {
+		after, ok := strings.CutPrefix(strings.TrimSpace(line), helperOKPrefix)
+		if !ok {
+			continue
+		}
+
+		n, err := strconv.Atoi(strings.TrimSpace(after))
+		require.NoError(t, err, "malformed helper sentinel %q", line)
+
+		return n
+	}
+
+	require.FailNow(t, "no helper sentinel in output", output)
+
+	return 0
+}
 
 func extractHelperFindings(output string) []string {
 	var findings []string
