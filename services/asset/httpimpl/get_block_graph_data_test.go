@@ -456,3 +456,40 @@ func TestGetBlockGraphData_MaxBlockGraphPoints(t *testing.T) {
 			"bucket_seconds must match the actual spacing between returned buckets")
 	})
 }
+
+// TestCapDataPointsKeepsStoreBucketAlignment pins that coarsening a series the
+// store already bucketed uses a multiple of the store's bucket size. Any other
+// size re-grids aligned buckets onto misaligned ones (the 30d-onto-1w class of
+// bug the store-side bucketing exists to avoid).
+func TestCapDataPointsKeepsStoreBucketAlignment(t *testing.T) {
+	const storeBucket = int64(30 * 24 * 60 * 60) // 30 days
+
+	in := &model.BlockDataPoints{BucketSeconds: storeBucket}
+	for i := int64(0); i < 100; i++ {
+		in.DataPoints = append(in.DataPoints, &model.DataPoint{
+			Timestamp: uint32((475 + i) * storeBucket), // store buckets sit on multiples of the bucket size
+			TxCount:   uint64(i + 1),
+		})
+	}
+
+	out := capDataPoints(in, 7)
+
+	require.LessOrEqual(t, len(out.DataPoints), 7)
+	require.Zero(t, out.BucketSeconds%storeBucket, "coarsened bucket %d must be a multiple of the store's %d", out.BucketSeconds, storeBucket)
+
+	// Each store bucket covers [ts, ts+storeBucket); its first and last second
+	// must fall in the same coarse bucket, or the chart splits a month in two.
+	var total uint64
+	for _, dp := range in.DataPoints {
+		first := int64(dp.Timestamp)
+		last := first + storeBucket - 1
+		require.Equal(t, first/out.BucketSeconds, last/out.BucketSeconds,
+			"store bucket at %d straddles coarse bucket size %d", first, out.BucketSeconds)
+	}
+
+	for _, dp := range out.DataPoints {
+		total += dp.TxCount
+	}
+
+	require.Equal(t, uint64(100*101/2), total, "coarsening must keep every transaction")
+}

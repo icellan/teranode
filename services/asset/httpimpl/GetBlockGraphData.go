@@ -109,6 +109,13 @@ func capDataPoints(in *model.BlockDataPoints, maxPoints int) *model.BlockDataPoi
 		bucketSeconds = 1
 	}
 
+	// A series the store already bucketed must be coarsened by a multiple of its
+	// bucket size, so every store bucket lands whole in one coarser bucket.
+	// Any other size re-grids aligned buckets onto misaligned ones.
+	if in.BucketSeconds > 0 && bucketSeconds%in.BucketSeconds != 0 {
+		bucketSeconds = (bucketSeconds/in.BucketSeconds + 1) * in.BucketSeconds
+	}
+
 	out := aggregateDataPoints(in, bucketSeconds)
 
 	// Halving the bucket count each time, this terminates well inside the
