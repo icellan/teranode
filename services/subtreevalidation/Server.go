@@ -361,7 +361,14 @@ func (u *Server) blockchainSubscriptionListener(ctx context.Context) {
 						// Channel closed, reconnect
 						ctxLogger.Warnf("[SubtreeValidation:blockchainSubscriptionListener] subscription channel closed, reconnecting")
 						subscribeCancel()
-						time.Sleep(1 * time.Second)
+
+						select {
+						case <-ctx.Done():
+							ctxLogger.Warnf("[SubtreeValidation:blockchainSubscriptionListener] exiting during reconnect delay: %s", ctx.Err())
+							return
+						case <-time.After(1 * time.Second):
+						}
+
 						break subscriptionLoop
 					}
 

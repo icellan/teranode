@@ -71,7 +71,7 @@ const (
 func newRealBDKServer(t *testing.T, dbName string) (*Server, utxo.Store, *bt.Tx, *bt.Tx) {
 	InitPrometheusMetrics()
 
-	ctx := context.Background()
+	ctx := newCancelCtx(t)
 	logger := ulogger.TestLogger{}
 
 	tSettings := test.CreateBaseTestSettings(t)

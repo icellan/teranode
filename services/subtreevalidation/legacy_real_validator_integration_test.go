@@ -1,7 +1,6 @@
 package subtreevalidation
 
 import (
-	"context"
 	"net/url"
 	"testing"
 
@@ -70,7 +69,7 @@ func TestLegacyUnconfirmedParent_RealValidatorIntegration(t *testing.T) {
 	parentTx, err := bt.NewTxFromString("010000000000000000ef01154d5d31268f7ea94c80a7bf6de54e47812712feec25c17b8feceb570dfd9daf000000008b4830450220612b3ec065ec2b2a1757d97b7f57fba3c363645355cf6e1a5a1834411e6ab425022100bd071b90d391eb75dc9e2eea8b6774f36bf9c55439a971f0d1f4470b6448aef601410426e4e0654f72721b97a03c8170417c9ddabadcef97fe8ea626176ea62665b55ca2ff485f84df12ddec171e01ee8f9c7472c6c8467b0cf74ae8b3b614ed16cbdbffffffff008a6600000000001976a91429be45311cc66a5a6cc4a42516dbb7c9b126a3c188ac0280841e00000000001976a914996ed5e55d68aef653c85339f83873fac1321f0788ac60b74700000000001976a9148ac9bdc626352d16e18c26f431e834f9aae30e2888ac00000000")
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := newCancelCtx(t)
 	logger := ulogger.TestLogger{}
 
 	tSettings := test.CreateBaseTestSettings(t)
