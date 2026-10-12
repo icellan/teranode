@@ -30,13 +30,16 @@ When using PostgreSQL as the blockchain store, these settings override the [glob
 settings](../global_settings.md#postgresql-connection-pool) for this service only. Each is read directly
 (not through `PostgresPool`'s own struct tags, which only describe the opaque `blockchain_postgres_pool`
 field as a whole) via `getPostgresPoolSettings("blockchain", ...)`, and all default to the zero value.
-The family is six numeric/duration settings plus `RetryEnabled`: `PostgresPool` stays `nil` unless one of
-the six (`MaxOpenConns`, `MaxIdleConns`, `ConnMaxLifetime`, `ConnMaxIdleTime`, `RetryMaxAttempts`,
-`RetryBaseDelay`) is non-zero - `RetryEnabled` alone does not create the pool. `RetryEnabled` also has no
-global fallback: once the pool exists (because one of the six is set), it replaces the global
-`RetryEnabled` value outright, `false` included - setting only `blockchain_postgres_retryEnabled = true`
-with no other per-service pool setting does nothing. There is no per-service override for the circuit
-breaker settings - those are global only.
+The family is six numeric/duration settings plus `RetryEnabled` and five circuit breaker settings
+(`blockchain_postgres_circuitBreakerEnabled`, `..._circuitBreakerFailureThreshold`, `..._circuitBreakerHalfOpenMax`,
+`..._circuitBreakerCooldown`, `..._circuitBreakerFailureWindow`; documented in the
+[global table](../global_settings.md#postgresql-connection-pool)). `PostgresPool` stays `nil` only when
+none of the twelve is configured: any non-zero numeric/duration value, `RetryEnabled=true`, or an
+explicit `CircuitBreakerEnabled` (`true` or `false`) creates it, so a lone `blockchain_postgres_retryEnabled = true`
+does take effect. Once the pool exists, zero numeric/duration values and an unset `CircuitBreakerEnabled`
+fall back to the global values; an explicit `CircuitBreakerEnabled=false` is preserved. `RetryEnabled` has
+no global fallback: the service's value (`false` included) replaces the global one outright. Note that
+`blockchain_postgres_retryEnabled = false` alone is indistinguishable from unset and does not create the pool.
 
 | Setting | Type | Default | Environment Variable | Usage |
 |---------|------|---------|---------------------|-------|

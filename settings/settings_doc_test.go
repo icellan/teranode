@@ -878,7 +878,7 @@ var checkedRowsPerDoc = map[string]int{
 	"blockassembly_settings.md":     43,
 	"blockchain_settings.md":        11,
 	"blockpersister_settings.md":    9,
-	"blockvalidation_settings.md":   68,
+	"blockvalidation_settings.md":   67,
 	"coinbase_settings.md":          21,
 	"faucet_settings.md":            1,
 	"legacy_settings.md":            28,
@@ -886,9 +886,9 @@ var checkedRowsPerDoc = map[string]int{
 	"propagation_settings.md":       13,
 	"pruner_settings.md":            26,
 	"rpc_settings.md":               11,
-	"subtreevalidation_settings.md": 25,
+	"subtreevalidation_settings.md": 24,
 	"utxopersister_settings.md":     2,
-	"validator_settings.md":         18,
+	"validator_settings.md":         17,
 	"aerospike_settings.md":         13,
 	"blob_settings.md":              1,
 	"utxo_settings.md":              39,
@@ -896,11 +896,12 @@ var checkedRowsPerDoc = map[string]int{
 
 // exampleKeyRe matches a `key = value` or `key=value` assignment inside the
 // doc's configuration examples, tolerating the leading indentation of a code
-// block nested inside a numbered/bulleted list. The key may carry a
+// block nested inside a numbered/bulleted list and an optional shell `export`
+// prefix. The key may carry a
 // settings-context suffix (e.g. `aerospike_host.docker.teranode1`); only the
 // base key before the first "." is resolved against the settings package,
 // since context suffixes are not part of ExportMetadata().
-var exampleKeyRe = regexp.MustCompile(`(?m)^[ \t]*([A-Za-z][A-Za-z0-9_]*)((?:\.[A-Za-z0-9_]+)*)[ \t]*=[^=]`)
+var exampleKeyRe = regexp.MustCompile(`(?m)^[ \t]*(?:export[ \t]+)?([A-Za-z][A-Za-z0-9_]*)((?:\.[A-Za-z0-9_]+)*)[ \t]*=[^=]`)
 
 // configFenceRe matches a fenced code block and captures its language tag (if
 // any) and its content.

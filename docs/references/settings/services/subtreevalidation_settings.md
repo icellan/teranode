@@ -24,7 +24,6 @@
 | MissingTransactionsBatchSize | int | 16384 | subtreevalidation_missingTransactionsBatchSize | **CRITICAL** - Missing transaction batch size |
 | PercentageMissingGetFullData | float64 | 20 | subtreevalidation_percentageMissingGetFullData | **CRITICAL** - Full subtree vs individual transaction threshold |
 | BlacklistedBaseURLs | map[string]struct{} | {} | subtreevalidation_blacklisted_baseurls | URL blacklisting |
-| BlockHeightRetentionAdjustment | int32 | 0 | subtreevalidation_blockHeightRetentionAdjustment | Block height retention adjustment |
 | CheckBlockSubtreesConcurrency | int | 32 | subtreevalidation_check_block_subtrees_concurrency | **CRITICAL** - Block subtree checking concurrency |
 | PauseTimeout | time.Duration | 5m | subtreevalidation_pauseTimeout | **CRITICAL** - Maximum pause duration |
 | TxBatchSize | int | 1048576 | subtreevalidation_check_block_subtrees_tx_batch_size | Transaction batch size for CheckBlockSubtrees (0 = no batching) |

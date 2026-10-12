@@ -121,13 +121,16 @@ This hierarchy exists because file-level operations are the foundation of blob s
 #### PostgreSQL Connection Pool
 
 Default connection pool and resilience settings for every service's PostgreSQL store. A service can
-override the first six (`MaxOpenConns`, `MaxIdleConns`, `ConnMaxLifetime`, `ConnMaxIdleTime`,
-`RetryMaxAttempts`, `RetryBaseDelay`) with its own `<service>_postgres_*` settings, and setting any one of
-those six also activates a per-service `RetryEnabled` - but `RetryEnabled` has no global fallback of its
-own: it only takes effect alongside one of the six, and once active it replaces the global value outright
-(`false` included), so a service that sets only its own `retryEnabled` is silently ignored (see e.g.
-[Blockchain Settings](services/blockchain_settings.md) and [UTXO Store Settings](stores/utxo_settings.md)
-for the exact mechanics). There is no per-service override for the circuit breaker settings.
+override every one of these with its own `<service>_postgres_*` setting (the twelve keys in the table
+below, e.g. `blockchain_postgres_retryEnabled`, `utxostore_postgres_circuitBreakerCooldown`). A
+per-service pool is only created when at least one of its twelve keys is explicitly configured -
+including `RetryEnabled=true` or an explicit `CircuitBreakerEnabled` (`true` or `false`) on its own.
+Once it exists, each numeric/duration value left at zero falls back to the global value above, and an
+unset `CircuitBreakerEnabled` inherits the global one while an explicit `false` is preserved (so a
+service can opt out of a globally-enabled breaker). `RetryEnabled` is the exception: it has no
+global fallback, so once a per-service pool exists its value (`false` included) replaces the global
+`RetryEnabled` outright. See e.g. [Blockchain Settings](services/blockchain_settings.md) and
+[UTXO Store Settings](stores/utxo_settings.md).
 
 | Setting | Type | Default | Environment Variable | Usage |
 |---------|------|---------|---------------------|-------|
@@ -144,10 +147,7 @@ for the exact mechanics). There is no per-service override for the circuit break
 | CircuitBreakerCooldown | time.Duration | 30s | postgres_circuitBreakerCooldown | Duration circuit stays open before testing |
 | CircuitBreakerFailureWindow | time.Duration | 10s | postgres_circuitBreakerFailureWindow | Time window for counting consecutive failures |
 
-**Note**: the five `CircuitBreakerEnabled`/`CircuitBreakerFailureThreshold`/`CircuitBreakerHalfOpenMax`/
-`CircuitBreakerCooldown`/`CircuitBreakerFailureWindow` settings are not currently wired to any loader in
-`settings.go` - `Postgres.CircuitBreakerEnabled` is permanently `false` regardless of this setting, so the
-circuit breaker cannot currently be enabled via configuration. Tracked for a code fix in a separate PR.
+**Note**: all five circuit breaker settings are loaded by `settings.go` and applied in `util/sql.go`, but the breaker only runs when `CircuitBreakerEnabled` resolves to `true` - and it requires the threshold, half-open, cooldown and window values to be set (the defaults above satisfy this).
 
 ### Performance and Optimization
 
