@@ -2,6 +2,7 @@ package subtreevalidation
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,11 +16,11 @@ import (
 // newCancelCtx returns a context that is cancelled when the test ends, so the
 // goroutines New() starts on it (blockchainSubscriptionListener) exit with the
 // test instead of leaking for the life of the test binary.
-func newCancelCtx(t *testing.T) context.Context {
-	t.Helper()
+func newCancelCtx(tb testing.TB) context.Context {
+	tb.Helper()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	tb.Cleanup(cancel)
 
 	return ctx
 }
@@ -30,9 +31,12 @@ type subscribeOverrideClient struct {
 	blockchain.ClientI
 	subscribe func() (chan *blockchain.Notification, error)
 	called    chan struct{}
+	calls     atomic.Int64
 }
 
 func (c *subscribeOverrideClient) Subscribe(_ context.Context, _ string) (chan *blockchain.Notification, error) {
+	c.calls.Add(1)
+
 	select {
 	case c.called <- struct{}{}:
 	default:
@@ -121,7 +125,10 @@ func TestBlockchainSubscriptionListenerExitsOnCancelDuringReconnectDelay(t *test
 		require.Fail(t, "Subscribe was never called")
 	}
 
-	// the listener has seen the closed channel and is parked in the 1s delay
+	// The listener consumes the already-closed channel in microseconds, so after
+	// this it is parked in the 1s reconnect delay. The Subscribe count below
+	// confirms it: a second call would mean the delay elapsed and the cancel
+	// landed somewhere other than the branch this test exists to pin.
 	time.Sleep(100 * time.Millisecond)
 	cancel()
 
@@ -130,4 +137,7 @@ func TestBlockchainSubscriptionListenerExitsOnCancelDuringReconnectDelay(t *test
 	case <-time.After(500 * time.Millisecond):
 		require.Fail(t, "listener did not exit promptly after ctx cancel during reconnect delay")
 	}
+
+	require.Equal(t, int64(1), client.calls.Load(),
+		"cancel did not land inside the reconnect delay, so the ctx.Done() branch was not exercised")
 }
