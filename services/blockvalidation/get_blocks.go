@@ -1606,6 +1606,88 @@ func (u *Server) fetchSingleBlock(ctx context.Context, hash *chainhash.Hash, pee
 	return block, nil
 }
 
+// maxAnnouncedBlockAlternatives bounds how many other peers fetchAnnouncedBlock asks after the
+// announcer answers 429. All of them share the caller's fetch budget, so the bound is on load put
+// on other peers, not on time.
+const maxAnnouncedBlockAlternatives = 2
+
+// fetchAnnouncedBlock fetches the block a peer announced from the baseURL it announced, charging
+// the announcer by reportAnnouncedBlockFetchFailure if that fails. On an uncharged 429 it then tries up to
+// maxAnnouncedBlockAlternatives other peers advertising the same hash as their tip, so a rate limit
+// does not drop the block until the next announcement. The returned processBlockFound names the
+// peer that served the block, so later subtree fetches go there too; on error it is the input.
+//
+// ctx is the caller's context, used for reporting; fetchCtx bounds every fetch, alternatives included.
+func (u *Server) fetchAnnouncedBlock(ctx, fetchCtx context.Context, blockFound processBlockFound) (*model.Block, processBlockFound, error) {
+	block, err := u.fetchSingleBlock(fetchCtx, blockFound.hash, blockFound.peerID, blockFound.baseURL)
+	if err == nil {
+		return block, blockFound, nil
+	}
+
+	charged := u.reportAnnouncedBlockFetchFailure(ctx, blockFound.peerID, err)
+
+	// Only a 429 suggests the announcer has the block and is refusing us for now. Any other
+	// failure is the announcer's, and is not retried elsewhere. A charged 429 is not retried
+	// either: the announcer is past its allowance, so its 429s must not cost this node a peer
+	// lookup each. Nor is anything retried once the caller's ctx is done.
+	if !errors.Is(err, errors.ErrServiceRateLimited) || charged || ctx.Err() != nil {
+		return nil, blockFound, err
+	}
+
+	if altBlock, altSource, ok := u.fetchAnnouncedBlockFromTipPeers(fetchCtx, blockFound); ok {
+		return altBlock, altSource, nil
+	}
+
+	return nil, blockFound, err
+}
+
+// fetchAnnouncedBlockFromTipPeers asks peers whose advertised tip is the announced hash. Requiring
+// a tip match is what keeps a flood of made-up hashes, each answered 429 by its announcer, from
+// being amplified onto honest peers: no honest peer advertises a hash that does not exist.
+//
+// An alternative's failure is not charged. This node chose it, and it never announced the block
+// to us.
+func (u *Server) fetchAnnouncedBlockFromTipPeers(fetchCtx context.Context, blockFound processBlockFound) (*model.Block, processBlockFound, bool) {
+	peers, err := u.selectBestPeersForCatchup(fetchCtx, 0)
+	if err != nil || len(peers) == 0 {
+		return nil, blockFound, false
+	}
+
+	tried := 0
+
+	for _, p := range peers {
+		if tried >= maxAnnouncedBlockAlternatives {
+			break
+		}
+
+		if p.ID == blockFound.peerID || p.BlockHash == nil || !p.BlockHash.IsEqual(blockFound.hash) {
+			continue
+		}
+
+		if u.isPeerMalicious(fetchCtx, p.ID) {
+			continue
+		}
+
+		tried++
+
+		block, err := u.fetchSingleBlock(fetchCtx, blockFound.hash, p.ID, p.DataHubURL)
+		if err != nil {
+			u.logger.Infof("[fetchAnnouncedBlock][%s] alternative peer %s failed after announcer %s answered 429: %v", blockFound.hash.String(), p.ID, blockFound.peerID, err)
+			continue
+		}
+
+		u.logger.Infof("[fetchAnnouncedBlock][%s] fetched from alternative peer %s after announcer %s answered 429", blockFound.hash.String(), p.ID, blockFound.peerID)
+
+		source := blockFound
+		source.peerID = p.ID
+		source.baseURL = p.DataHubURL
+
+		return block, source, true
+	}
+
+	return nil, blockFound, false
+}
+
 // reverseBlocks reverses a slice of blocks in place.
 func reverseBlocks(blocks []*model.Block) {
 	for j, k := 0, len(blocks)-1; j < k; j, k = j+1, k-1 {
