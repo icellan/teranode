@@ -27,9 +27,11 @@ const settingsConfResolveHelperEnv = "SETTINGS_CONF_RESOLVE_HELPER"
 //
 // The check runs gocore itself, not a reimplementation of its resolution
 // rules, in a subprocess whose working directory contains nothing but a
-// copy of the repo's settings.conf: no settings_local.conf and no
-// settings_test.conf are reachable (gocore's processFile walks up parent
-// directories looking for them), so the result reflects settings.conf alone.
+// copy of the repo's settings.conf. gocore's processFile walks up parent
+// directories looking for settings_local.conf / settings_test.conf, so the
+// test asserts that none exists in the temp dir or any ancestor before
+// spawning the helper, and the subprocess gets a minimal explicit environment
+// because gocore consults environment variables before the file.
 func TestSettingsConfSelfSufficientUnderDocker(t *testing.T) {
 	repoRoot, err := filepath.Abs("..")
 	require.NoError(t, err)
@@ -42,15 +44,30 @@ func TestSettingsConfSelfSufficientUnderDocker(t *testing.T) {
 	dst := filepath.Join(tmpDir, "settings.conf")
 	require.NoError(t, os.WriteFile(dst, contents, 0o644))
 
+	for dir := tmpDir; ; dir = filepath.Dir(dir) {
+		for _, name := range []string{"settings_local.conf", "settings_test.conf"} {
+			_, statErr := os.Stat(filepath.Join(dir, name))
+			require.True(t, os.IsNotExist(statErr), "ambient %s in %s breaks this test isolation", name, dir)
+		}
+
+		if dir == filepath.Dir(dir) {
+			break
+		}
+	}
+
 	cmd := exec.Command(os.Args[0], "-test.run=^TestSettingsConfResolveHelper$", "-test.v")
 	cmd.Dir = tmpDir
-	cmd.Env = append(os.Environ(),
-		settingsConfResolveHelperEnv+"=1",
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+		settingsConfResolveHelperEnv + "=1",
 		"SETTINGS_CONTEXT=docker",
-	)
+	}
 
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "resolve helper subprocess failed:\n%s", out)
+	require.Contains(t, string(out), helperOKPrefix,
+		"resolve helper did not run (test pattern matched nothing?); the guard would pass vacuously:\n%s", out)
 
 	unresolved := extractHelperFindings(string(out))
 	require.Empty(t, unresolved,
@@ -62,6 +79,11 @@ func TestSettingsConfSelfSufficientUnderDocker(t *testing.T) {
 // helperFindingPrefix marks a line of helper stdout as a reportable finding,
 // so log noise from gocore's own INFO/WARN lines doesn't get misread as one.
 const helperFindingPrefix = "UNRESOLVED: "
+
+// helperOKPrefix is a sentinel the helper prints after checking every key, so
+// the parent can tell the helper really ran (go test exits 0 when -test.run
+// matches no test).
+const helperOKPrefix = "HELPER-OK: "
 
 func extractHelperFindings(output string) []string {
 	var findings []string
@@ -100,4 +122,6 @@ func TestSettingsConfResolveHelper(t *testing.T) {
 			fmt.Println(helperFindingPrefix + k + "=" + v)
 		}
 	}
+
+	fmt.Printf("%s%d\n", helperOKPrefix, len(keys))
 }
