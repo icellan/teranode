@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
+	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -535,4 +536,96 @@ func BenchmarkCheckBlockMaxSize_NoOp(b *testing.B) {
 	for b.Loop() {
 		stp.checkBlockMaxSize(ctx)
 	}
+}
+
+// TestEnforceBlockMaxSize_HashesRebuiltSubtreesBeforeSending pins that a resize computes
+// the root hash of every rebuilt subtree before handing it to storage. RootHash() caches
+// without a lock, and the resize only waits for the first block's worth of subtrees, so
+// otherwise the storage pipeline and the processor goroutine hash the tail concurrently.
+// Fails under -race only.
+func TestEnforceBlockMaxSize_HashesRebuiltSubtreesBeforeSending(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockAssembly.InitialMerkleItemsPerSubtree = 64
+	tSettings.Policy.BlockMaxSize = model.BlockHeaderSize + blockMaxSizeTestBudget
+
+	newSubtreeChan := make(chan NewSubtreeRequest, 1000)
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+
+	// hashes each request on receipt, as runNewSubtreeListener and subtreeStorageWorker do
+	go func() {
+		for {
+			select {
+			case req := <-newSubtreeChan:
+				go func() {
+					time.Sleep(time.Millisecond)
+					_ = req.Subtree.RootHash()
+
+					if req.ErrChan != nil {
+						req.ErrChan <- nil
+					}
+				}()
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	logger := ulogger.NewErrorTestLogger(t)
+	subtreeStore, _ := null.New(logger)
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///test")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(t.Context(), logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+
+	stp, err := NewSubtreeProcessor(t.Context(), ulogger.TestLogger{}, tSettings, subtreeStore, nil, utxoStore, newSubtreeChan)
+	require.NoError(t, err)
+	stp.InitCurrentBlockHeader(&model.BlockHeader{Version: 1, HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}})
+
+	addBlockMaxSizeTestTxs(t, stp, sizes(2000, blockMaxSizeTestTxSize)...)
+	require.NoError(t, stp.enforceBlockMaxSize(t.Context()))
+
+	// the next block arrives: the processor goroutine hashes every chained subtree
+	_, _ = stp.processBlockSubtrees(&model.Block{})
+
+	time.Sleep(200 * time.Millisecond)
+}
+
+// TestReset_ClearsBlockMaxSizeResizedFlag pins that a reset ends the resized block like a
+// block commit does: reset never reaches finalizeBlockProcessing, and a flag left set
+// would keep the next block's subtrees out of dynamic sizing's statistics.
+func TestReset_ClearsBlockMaxSizeResizedFlag(t *testing.T) {
+	stp, _ := newBlockMaxSizeProcessor(t, 64, model.BlockHeaderSize+blockMaxSizeTestBudget)
+	addBlockMaxSizeTestTxs(t, stp, sizes(200, blockMaxSizeTestTxSize)...)
+
+	require.NoError(t, stp.enforceBlockMaxSize(t.Context()))
+	require.True(t, stp.blockMaxSizeResizedInBlock)
+
+	require.NoError(t, stp.reset(&model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  &chainhash.Hash{},
+		HashMerkleRoot: &chainhash.Hash{},
+		Nonce:          1835,
+	}, nil, nil, false, func() error { return nil }))
+
+	require.False(t, stp.blockMaxSizeResizedInBlock)
+}
+
+// TestEnforceBlockMaxSize_CountsResizes pins the metric that shows operators how often
+// the queue is resized. A resize lasts for one block, so under sustained load it repeats
+// every block, and the full-queue rebuild it costs is otherwise invisible.
+func TestEnforceBlockMaxSize_CountsResizes(t *testing.T) {
+	stp, _ := newBlockMaxSizeProcessor(t, 64, model.BlockHeaderSize+blockMaxSizeTestBudget)
+	addBlockMaxSizeTestTxs(t, stp, sizes(200, blockMaxSizeTestTxSize)...)
+
+	before := promtestutil.ToFloat64(prometheusSubtreeProcessorBlockMaxSizeResizes)
+
+	require.NoError(t, stp.enforceBlockMaxSize(t.Context()))
+	require.Equal(t, before+1, promtestutil.ToFloat64(prometheusSubtreeProcessorBlockMaxSizeResizes))
+
+	// nothing to do: not counted
+	require.NoError(t, stp.enforceBlockMaxSize(t.Context()))
+	require.Equal(t, before+1, promtestutil.ToFloat64(prometheusSubtreeProcessorBlockMaxSizeResizes))
 }

@@ -1736,6 +1736,9 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	stp.closeChainedSubtrees()
 	stp.closeRetiredSubtrees()
 
+	// reset never reaches finalizeBlockProcessing, which ends a resized block otherwise
+	stp.blockMaxSizeResizedInBlock = false
+
 	itemsPerFile := int(stp.currentItemsPerFile.Load())
 
 	if cs := stp.currentSubtree.Load(); cs != nil {
@@ -2853,6 +2856,11 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subt
 		}
 
 		if currentSt.IsComplete() {
+			// Hash it now: RootHash() caches without a lock, and once a caller hands the
+			// chain to storage, the storage pipeline would otherwise hash it concurrently
+			// with the processor goroutine
+			_ = currentSt.RootHash()
+
 			// Move completed subtree to chainedSubtrees and reset currentSubtree
 			// to avoid it being referenced in both places
 			stp.chainedSubtrees = append(stp.chainedSubtrees, currentSt)
@@ -2908,6 +2916,12 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subt
 						return err
 					}
 				}
+
+				// Force merkle materialisation inside the worker, as
+				// parallelBuildRemainderSubtrees does: RootHash() caches without a lock,
+				// so a subtree handed to storage unhashed is hashed concurrently by the
+				// storage pipeline and the processor goroutine
+				_ = st.RootHash()
 
 				fullSubtrees[i] = st
 				return nil
@@ -3968,6 +3982,9 @@ func (stp *SubtreeProcessor) checkBlockMaxSize(ctx context.Context) {
 // The resize only lasts for the current block. currentItemsPerFile, the configured size,
 // is left alone: completed subtrees take the size of the previous subtree, so the rest of
 // the block keeps the resized size, and the next block starts at the configured size again.
+// This is deliberate: while the tx mix that caused the breach persists, the next block's
+// first subtree breaches again and the queue is rebuilt and stored again, once per block.
+// The blockmaxsize_resizes counter makes that repeat visible.
 //
 // Only the first subtree is checked: it is exactly what GetMiningCandidate filters on.
 // Must run on the processor goroutine.
@@ -4064,6 +4081,7 @@ func (stp *SubtreeProcessor) enforceBlockMaxSize(ctx context.Context) error {
 	// storage workers or retries may still read the old subtrees
 	stp.retireSubtrees(oldSubtrees...)
 	stp.blockMaxSizeResizedInBlock = true
+	prometheusSubtreeProcessorBlockMaxSizeResizes.Inc()
 
 	stp.logger.Warnf("[SubtreeProcessor][enforceBlockMaxSize] first subtree %d bytes exceeds blockmaxsize budget %d, resized %d subtrees from %d to %d items for this block", first.SizeInBytes, budget, len(oldSubtrees), oldSize, newSize)
 
