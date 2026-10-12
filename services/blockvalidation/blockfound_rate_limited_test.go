@@ -20,6 +20,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/jellydator/ttlcache/v3"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/require"
@@ -442,4 +443,79 @@ func TestRecordCatchupPeerFailure_RateLimitedIsRecorded(t *testing.T) {
 	u.recordCatchupPeerFailure("secondary", errors.NewServiceRateLimitedError("subtree fetch rate limited"))
 
 	require.Contains(t, u.activeCatchupCtx.failedPeers, "secondary")
+}
+
+// rateLimitedAnnouncementWithAlternative wires a Server whose announcer answers 429 for a block
+// that another peer, "alt", serves and advertises as its tip. The block's parent is not in the
+// chain, so both blockFound paths hand it to catchupCh, where the source it names can be read.
+func rateLimitedAnnouncementWithAlternative(t *testing.T) (*Server, *chainhash.Hash, *countingPeer, *countingPeer) {
+	t.Helper()
+
+	u, p2pClient := newBlockFoundFetchServer(t)
+	u.catchupCh = make(chan processBlockCatchup, 1)
+	u.processBlockNotify = ttlcache.New[chainhash.Hash, bool]()
+	u.catchupAlternatives = ttlcache.New[chainhash.Hash, []processBlockCatchup]()
+
+	blocks := testhelpers.CreateTestBlockChain(t, 2)
+	block := blocks[1]
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+
+	announcer := newStatusPeer(t, http.StatusTooManyRequests)
+	alt := newCountingPeer(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(blockBytes) })
+
+	p2pClient.peers = []*p2p.PeerInfo{tipPeer("alt", alt.url, block.Hash())}
+
+	return u, block.Hash(), announcer, alt
+}
+
+// requireCatchupSource reads the block handed to catchupCh and checks it names alt as its source.
+func requireCatchupSource(t *testing.T, u *Server, hash *chainhash.Hash, alt *countingPeer) {
+	t.Helper()
+
+	select {
+	case c := <-u.catchupCh:
+		require.Equal(t, hash, c.block.Hash())
+		require.Equal(t, peer.ID("alt").String(), c.peerID, "catch-up must be attributed to the peer that served the block")
+		require.Equal(t, alt.url, c.baseURL, "catch-up must run against the peer that served the block, not the announcer that answered 429")
+	case <-time.After(5 * time.Second):
+		t.Fatal("block was not handed to catchupCh")
+	}
+}
+
+// TestAddBlockToPriorityQueue_RateLimitedFallbackHandsOnAlternativeSource pins that
+// addBlockToPriorityQueue uses the source fetchAnnouncedBlock returns: the block came from the
+// alternative, so what follows the fetch must go there too.
+func TestAddBlockToPriorityQueue_RateLimitedFallbackHandsOnAlternativeSource(t *testing.T) {
+	u, hash, announcer, alt := rateLimitedAnnouncementWithAlternative(t)
+
+	require.NoError(t, announce(t, u, hash, announcer.url))
+	requireCatchupSource(t, u, hash, alt)
+	require.Equal(t, int64(1), alt.gets.Load())
+}
+
+// TestProcessBlockFoundChannel_CatchupBranchRateLimitedFallbackHandsOnAlternativeSource is the same
+// check for the backed-up-queue branch of processBlockFoundChannel.
+func TestProcessBlockFoundChannel_CatchupBranchRateLimitedFallbackHandsOnAlternativeSource(t *testing.T) {
+	u, hash, announcer, alt := rateLimitedAnnouncementWithAlternative(t)
+	u.settings.BlockValidation.UseCatchupWhenBehind = true
+
+	// len(blockFoundCh) > 3 selects the shouldConsiderCatchup branch.
+	for i := 0; i < 4; i++ {
+		u.blockFoundCh <- processBlockFound{}
+	}
+
+	errCh := make(chan error, 1)
+
+	err := u.processBlockFoundChannel(context.Background(), processBlockFound{
+		hash:    hash,
+		baseURL: announcer.url,
+		peerID:  peer.ID("announcer").String(),
+		errCh:   errCh,
+	})
+
+	require.NoError(t, err)
+	require.NoError(t, <-errCh)
+	requireCatchupSource(t, u, hash, alt)
+	require.Equal(t, int64(1), alt.gets.Load())
 }

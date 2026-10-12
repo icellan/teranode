@@ -1647,8 +1647,15 @@ func (u *Server) fetchAnnouncedBlock(ctx, fetchCtx context.Context, blockFound p
 //
 // An alternative's failure is not charged. This node chose it, and it never announced the block
 // to us.
+//
+// The registry is read directly rather than through selectBestPeersForCatchup, whose Info log would
+// make every fallback read as a catch-up.
 func (u *Server) fetchAnnouncedBlockFromTipPeers(fetchCtx context.Context, blockFound processBlockFound) (*model.Block, processBlockFound, bool) {
-	peers, err := u.selectBestPeersForCatchup(fetchCtx, 0)
+	if u.p2pClient == nil {
+		return nil, blockFound, false
+	}
+
+	peers, err := u.p2pClient.GetPeersForCatchup(fetchCtx)
 	if err != nil || len(peers) == 0 {
 		return nil, blockFound, false
 	}
@@ -1660,26 +1667,28 @@ func (u *Server) fetchAnnouncedBlockFromTipPeers(fetchCtx context.Context, block
 			break
 		}
 
-		if p.ID == blockFound.peerID || p.BlockHash == nil || !p.BlockHash.IsEqual(blockFound.hash) {
+		peerID := p.ID.String()
+
+		if peerID == blockFound.peerID || p.DataHubURL == "" || p.BlockHash == nil || !p.BlockHash.IsEqual(blockFound.hash) {
 			continue
 		}
 
-		if u.isPeerMalicious(fetchCtx, p.ID) {
+		if u.isPeerMalicious(fetchCtx, peerID) {
 			continue
 		}
 
 		tried++
 
-		block, err := u.fetchSingleBlock(fetchCtx, blockFound.hash, p.ID, p.DataHubURL)
+		block, err := u.fetchSingleBlock(fetchCtx, blockFound.hash, peerID, p.DataHubURL)
 		if err != nil {
-			u.logger.Infof("[fetchAnnouncedBlock][%s] alternative peer %s failed after announcer %s answered 429: %v", blockFound.hash.String(), p.ID, blockFound.peerID, err)
+			u.logger.Infof("[fetchAnnouncedBlock][%s] alternative peer %s failed after announcer %s answered 429: %v", blockFound.hash.String(), peerID, blockFound.peerID, err)
 			continue
 		}
 
-		u.logger.Infof("[fetchAnnouncedBlock][%s] fetched from alternative peer %s after announcer %s answered 429", blockFound.hash.String(), p.ID, blockFound.peerID)
+		u.logger.Infof("[fetchAnnouncedBlock][%s] fetched from alternative peer %s after announcer %s answered 429", blockFound.hash.String(), peerID, blockFound.peerID)
 
 		source := blockFound
-		source.peerID = p.ID
+		source.peerID = peerID
 		source.baseURL = p.DataHubURL
 
 		return block, source, true
