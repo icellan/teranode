@@ -793,12 +793,22 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 //
 // # COST
 //
-// Only the conflicting-node trailer is read, which go-subtree recovers by
-// seeking past the node array rather than streaming it. A block whose subtrees
-// carry no conflicting transactions — effectively all of them — costs a few
-// seeks per subtree and no blockchain or UTXO round trips at all. The ancestry
-// fetch and the counter-spend walk happen only when a conflicting transaction
-// is actually present.
+// Every transaction of every cached subtree is read from the UTXO store, for the
+// single field fields.Conflicting. On a path that previously did no UTXO round
+// trips at all this is the dominant new cost, and it is paid per block in the
+// steady state, where a node has already validated every subtree before the block
+// arrives.
+//
+// That is deliberate and is not configurable. The cheaper predecessor read only
+// each subtree's ConflictingNodes trailer, but the trailer records what was true
+// at blessing time and is never rewritten for a loser that was never mined, so it
+// answered a strictly weaker question than the fresh path's and left identical
+// block bytes to be judged by whether a node still held the blob (issue #1742). A
+// setting to skip the read would reintroduce exactly that divergence between
+// nodes, so the cost is taken unconditionally.
+//
+// The ancestry fetch and the counter-spend walk still happen only when a
+// conflicting transaction is actually present — effectively never.
 //
 // The ancestry window (retention*2) is deliberately wider than the subtree
 // retention window, so a cached subtree cannot outlive the range this check can
@@ -838,16 +848,12 @@ func (u *Server) checkCachedSubtreesAgainstCandidateChain(ctx context.Context, b
 
 	for _, txHash := range conflictingTxHashes {
 		// Same predicate the full-validation path applies via
-		// blessMissingTransaction. Note what that does and does not buy: the two
-		// paths agree on the QUESTION, but they do not start from the same facts.
-		// The fresh path asks it about every transaction the store currently
-		// flags Conflicting; this path can only ask it about the transactions the
-		// trailer names. A transaction that became conflicting after its subtree
-		// was blessed, and whose loser is never mined, never gets a trailer
-		// rewrite — so the cached path can still bless a block the fresh path
-		// would reject. That residual is divergence only: with no trailer entry
-		// there is no promotion, so no confirmed spend is reversed. Closing it
-		// needs the per-transaction conflicting flag, which is a wider change.
+		// blessMissingTransaction, and now over the same facts: both paths ask it
+		// about every transaction the store currently flags Conflicting. This used
+		// to be asked only of the transactions a subtree's trailer named, which
+		// missed any transaction that became conflicting after its subtree was
+		// blessed and whose loser was never mined — the residual tracked as issue
+		// #1742, closed by sourcing the flag from the store above.
 		//
 		// Wrapped as a processing error
 		// rather than forced to tx-invalid: the underlying call returns
@@ -882,13 +888,30 @@ func (u *Server) checkCachedSubtreesAgainstCandidateChain(ctx context.Context, b
 	return nil
 }
 
-// cachedSubtreeConflictingNodes collects the conflicting-node trailers of every
-// subtree referenced by the block.
+// cachedSubtreeConflictingNodes reports which transactions of the block's cached
+// subtrees the UTXO store currently flags Conflicting.
 //
-// Fails closed: the caller has just established that each file exists, so a read
-// or parse failure here is a transient fault or a corrupt file, never evidence
-// that a subtree has no conflicting transactions. Treating it as "none" would
-// turn a storage hiccup into a bypass of the check above.
+// It deliberately does NOT read each subtree's ConflictingNodes trailer. The
+// trailer records what was true when the subtree was blessed, and it is rewritten
+// only by markConflictingTxsInSubtrees, which buckets losers by txMeta.BlockIDs —
+// so a transaction demoted without ever being mined never gets its subtree
+// rewritten and never appears there. Asking the trailer therefore answered a
+// strictly weaker question than the fresh path's, which is the divergence issue
+// #1742 tracks: the same block bytes could be blessed by a node holding the blob
+// and rejected by one that had pruned it. The store holds the current fact, so
+// this asks the store.
+//
+// Fails closed on faults: the caller has just established that each file exists,
+// so a read or parse failure is a transient fault or a corrupt file, never
+// evidence that a subtree has no conflicting transactions. Treating it as "none"
+// would turn a storage hiccup into a bypass of the check above. The one exception
+// is a transaction absent from the store: both backends report that through
+// item.Err, and a record we do not have cannot be flagged conflicting, so it is
+// skipped rather than failed — the same fail-open the caller applies to a pruned
+// counter-conflicting record, and for the same reason.
+//
+// Only fields.Conflicting is requested: the narrowest question that settles the
+// verdict.
 func (u *Server) cachedSubtreeConflictingNodes(ctx context.Context, cachedSubtrees []chainhash.Hash) ([]chainhash.Hash, error) {
 	perSubtree := make([][]chainhash.Hash, len(cachedSubtrees))
 
@@ -900,21 +923,12 @@ func (u *Server) cachedSubtreeConflictingNodes(ctx context.Context, cachedSubtre
 		subtreeHash := cachedSubtrees[idx]
 
 		g.Go(func() error {
-			reader, err := u.subtreeStore.GetIoReader(gCtx, subtreeHash[:], fileformat.FileTypeSubtree)
+			conflicting, err := u.cachedSubtreeConflictingNodesFor(gCtx, subtreeHash)
 			if err != nil {
-				return errors.NewProcessingError("[cachedSubtreeConflictingNodes][%s] failed to read cached subtree", subtreeHash.String(), err)
+				return err
 			}
 
-			defer func() {
-				_ = reader.Close()
-			}()
-
-			conflictingNodes, err := subtreepkg.DeserializeSubtreeConflictingFromReader(reader)
-			if err != nil {
-				return errors.NewProcessingError("[cachedSubtreeConflictingNodes][%s] failed to read conflicting nodes from cached subtree", subtreeHash.String(), err)
-			}
-
-			perSubtree[idx] = conflictingNodes
+			perSubtree[idx] = conflicting
 
 			return nil
 		})
@@ -930,6 +944,104 @@ func (u *Server) cachedSubtreeConflictingNodes(ctx context.Context, cachedSubtre
 	}
 
 	return all, nil
+}
+
+// cachedSubtreeConflictingNodesFor reads one cached subtree's transaction hashes
+// and returns those the store currently flags Conflicting.
+func (u *Server) cachedSubtreeConflictingNodesFor(ctx context.Context, subtreeHash chainhash.Hash) ([]chainhash.Hash, error) {
+	reader, err := u.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+	if err != nil {
+		return nil, errors.NewProcessingError("[cachedSubtreeConflictingNodes][%s] failed to read cached subtree", subtreeHash.String(), err)
+	}
+
+	defer func() {
+		_ = reader.Close()
+	}()
+
+	// Node hashes only. Stopping before the trailer keeps this immune to what the
+	// trailer says (or whether it is there at all) and skips building Node structs
+	// for leaves that are only ever used as lookup keys.
+	nodeBytes, err := subtreepkg.DeserializeNodesFromReader(reader)
+	if err != nil {
+		return nil, errors.NewProcessingError("[cachedSubtreeConflictingNodes][%s] failed to read nodes from cached subtree", subtreeHash.String(), err)
+	}
+
+	numNodes := len(nodeBytes) / chainhash.HashSize
+
+	batchSize := u.settings.BlockValidation.ProcessTxMetaUsingStoreBatchSize
+	if batchSize <= 0 {
+		batchSize = numNodes
+	}
+
+	var conflicting []chainhash.Hash
+
+	for start := 0; start < numNodes; start += batchSize {
+		end := subtreepkg.Min(start+batchSize, numNodes)
+
+		conflicting, err = u.appendConflictingInBatch(ctx, subtreeHash, nodeBytes[start*chainhash.HashSize:end*chainhash.HashSize], conflicting)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return conflicting, nil
+}
+
+// appendConflictingInBatch decorates one run of 32-byte transaction hashes with
+// fields.Conflicting and appends the flagged ones to out.
+func (u *Server) appendConflictingInBatch(ctx context.Context, subtreeHash chainhash.Hash, nodeBytes []byte, out []chainhash.Hash) ([]chainhash.Hash, error) {
+	numNodes := len(nodeBytes) / chainhash.HashSize
+
+	itemsPtr := getUnresolvedMetaDataSlice(numNodes)
+	items := *itemsPtr
+
+	defer func() {
+		*itemsPtr = items
+		putUnresolvedMetaDataSlice(itemsPtr)
+	}()
+
+	for idx := 0; idx < numNodes; idx++ {
+		var hash chainhash.Hash
+		copy(hash[:], nodeBytes[idx*chainhash.HashSize:(idx+1)*chainhash.HashSize])
+
+		if hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			// Not a transaction, and not in the store.
+			continue
+		}
+
+		items = append(items, &utxostore.UnresolvedMetaData{Hash: hash, Idx: idx})
+	}
+
+	if len(items) == 0 {
+		return out, nil
+	}
+
+	if err := u.utxoStore.BatchDecorate(ctx, items, fields.Conflicting); err != nil {
+		return nil, errors.NewProcessingError("[cachedSubtreeConflictingNodes][%s] failed to read conflicting flags", subtreeHash.String(), err)
+	}
+
+	prometheusSubtreeValidationCachedConflictProbes.Add(float64(len(items)))
+
+	for _, item := range items {
+		if item.Err != nil {
+			// Absent from the store: cannot be flagged conflicting, so there is no
+			// verdict to reach. Failing here would reject any block whose subtree
+			// blob outlived its transaction records, and block validation maps
+			// ErrTxNotFound to a transient-incomplete retry against peers that
+			// cannot supply a record missing from OUR store.
+			if errors.Is(item.Err, errors.ErrTxNotFound) {
+				continue
+			}
+
+			return nil, errors.NewProcessingError("[cachedSubtreeConflictingNodes][%s][%s] failed to read conflicting flag", subtreeHash.String(), item.Hash.String(), item.Err)
+		}
+
+		if item.Data != nil && item.Data.Conflicting {
+			out = append(out, item.Hash)
+		}
+	}
+
+	return out, nil
 }
 
 // findLocalSubtreeFile reports whether this node already has a copy of the given
