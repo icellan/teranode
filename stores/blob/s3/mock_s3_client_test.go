@@ -34,6 +34,13 @@ type mockS3Client struct {
 	// *types.NotFound rather than *types.NoSuchKey. Injecting at this boundary is
 	// the only way to exercise that shape, since the delegation cannot produce it.
 	downloadErr error
+
+	// uploadErr and deleteErr fail the write and delete paths, so their error
+	// messages — which format the object key — can be exercised at all. Those are
+	// the branches that only run once something has already gone wrong, which is
+	// exactly when a mis-rendered key costs the most.
+	uploadErr error
+	deleteErr error
 }
 
 func newMockS3Client() S3Client {
@@ -123,6 +130,10 @@ func (m *mockS3Client) DeleteObject(ctx context.Context, input *s3.DeleteObjectI
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.deleteErr != nil {
+		return nil, m.deleteErr
+	}
+
 	key := aws.ToString(input.Key)
 	delete(m.store, key)
 
@@ -155,7 +166,16 @@ func (m *mockS3Client) AbortMultipartUpload(ctx context.Context, input *s3.Abort
 }
 
 func (m *mockS3Client) Upload(ctx context.Context, input *s3.PutObjectInput) error {
+	m.mu.RLock()
+	uploadErr := m.uploadErr
+	m.mu.RUnlock()
+
+	if uploadErr != nil {
+		return uploadErr
+	}
+
 	_, err := m.PutObject(ctx, input)
+
 	return err
 }
 
@@ -231,4 +251,18 @@ func (m *mockS3Client) SetDownloadError(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.downloadErr = err
+}
+
+// SetUploadError makes Upload fail, reaching the write paths' error messages.
+func (m *mockS3Client) SetUploadError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.uploadErr = err
+}
+
+// SetDeleteError makes DeleteObject fail, reaching Del's error message.
+func (m *mockS3Client) SetDeleteError(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deleteErr = err
 }

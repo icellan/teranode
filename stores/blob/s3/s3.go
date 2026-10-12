@@ -307,17 +307,10 @@ func (g *S3) Set(ctx context.Context, key []byte, fileType fileformat.FileType, 
 	objectKey := g.getObjectKey(key, fileType, merged)
 
 	if !merged.AllowOverwrite {
-		// Check if the object already exists
-		if _, err := g.client.HeadObject(ctx, &s3.HeadObjectInput{
-			Bucket: aws.String(g.bucket),
-			Key:    objectKey,
-		}); err == nil {
-			return errors.NewBlobAlreadyExistsError("[S3][Set] [%s] already exists in store", aws.ToString(objectKey))
-		}
-	}
-
-	if !merged.AllowOverwrite {
-		// Check if the object already exists
+		// Check if the object already exists. This ran twice, identically and back to
+		// back: the second copy could never return (the first already has, if the
+		// object is there) but did cost a second HeadObject round-trip on every
+		// non-overwrite Set.
 		if _, err := g.client.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(g.bucket),
 			Key:    objectKey,

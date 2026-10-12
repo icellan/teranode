@@ -1,11 +1,15 @@
 package s3
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -241,5 +245,130 @@ func TestS3_MissingKeyIsRecognisedThroughSDKWrappers(t *testing.T) {
 		require.Error(t, err)
 		require.False(t, errors.Is(err, errors.ErrNotFound),
 			"the wrapping must not turn a permission fault into a miss")
+	})
+}
+
+// TestS3_ErrorMessagesRenderTheObjectKey covers the paths whose only change here
+// was `%s` being handed a `*string`.
+//
+// They are all failure branches, so none of them ran in any existing test — which
+// is how the bug survived: the messages are only built once something has already
+// gone wrong, and that is precisely when a key rendered as `%!s(*string=0x...)`
+// costs the most to whoever is reading the log.
+//
+// Each case asserts the key is present and the pointer rendering is not, rather
+// than asserting on the whole message, so rewording a message does not break them.
+func TestS3_ErrorMessagesRenderTheObjectKey(t *testing.T) {
+	const badRender = "%!s("
+
+	key := []byte("render-me")
+
+	t.Run("SetFromReader on an existing object", func(t *testing.T) {
+		s3Store, _ := setupTestS3(t)
+		require.NoError(t, s3Store.Set(context.Background(), key, fileformat.FileTypeTx, []byte("v")))
+
+		err := s3Store.SetFromReader(context.Background(), key, fileformat.FileTypeTx,
+			io.NopCloser(bytes.NewReader([]byte("v"))))
+
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), badRender, "the object key must render as text")
+	})
+
+	t.Run("SetFromReader when the upload fails", func(t *testing.T) {
+		s3Store, mock := setupTestS3(t)
+		mock.SetUploadError(errors.NewError("upload refused"))
+
+		err := s3Store.SetFromReader(context.Background(), key, fileformat.FileTypeTx,
+			io.NopCloser(bytes.NewReader([]byte("v"))))
+
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), badRender)
+	})
+
+	t.Run("Set on an existing object", func(t *testing.T) {
+		s3Store, _ := setupTestS3(t)
+		require.NoError(t, s3Store.Set(context.Background(), key, fileformat.FileTypeTx, []byte("v")))
+
+		err := s3Store.Set(context.Background(), key, fileformat.FileTypeTx, []byte("v"))
+
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), badRender)
+	})
+
+	t.Run("Set when the upload fails", func(t *testing.T) {
+		s3Store, mock := setupTestS3(t)
+		mock.SetUploadError(errors.NewError("upload refused"))
+
+		err := s3Store.Set(context.Background(), key, fileformat.FileTypeTx, []byte("v"))
+
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), badRender)
+	})
+
+	t.Run("Del when the delete fails", func(t *testing.T) {
+		s3Store, mock := setupTestS3(t)
+		mock.SetDeleteError(errors.NewError("delete refused"))
+
+		err := s3Store.Del(context.Background(), key, fileformat.FileTypeTx)
+
+		require.Error(t, err)
+		require.NotContains(t, err.Error(), badRender)
+	})
+}
+
+// TestS3_MalformedStoredObjectIsAStorageFault covers the header branches. A blob
+// that is present but unreadable is neither a miss nor a success: it must not be
+// mapped to ErrNotFound, because the aerospike caller treats a miss as licence to
+// fall back to a different representation, and a corrupt blob is evidence that this
+// node's stored copy is wrong rather than absent.
+func TestS3_MalformedStoredObjectIsAStorageFault(t *testing.T) {
+	key := []byte("malformed")
+
+	// storeRaw puts bytes under the key with no valid fileformat header.
+	storeRaw := func(t *testing.T, mock *mockS3Client, s3Store *S3, raw []byte) {
+		t.Helper()
+		_, err := mock.PutObject(context.Background(), &s3.PutObjectInput{
+			Bucket: aws.String("test-bucket"),
+			Key:    s3Store.getObjectKey(key, fileformat.FileTypeTx, s3Store.options),
+			Body:   bytes.NewReader(raw),
+		})
+		require.NoError(t, err)
+	}
+
+	t.Run("GetIoReader on a blob with no valid header", func(t *testing.T) {
+		s3Store, mock := setupTestS3(t)
+		storeRaw(t, mock, s3Store, []byte("not a header"))
+
+		_, err := s3Store.GetIoReader(context.Background(), key, fileformat.FileTypeTx)
+
+		require.Error(t, err)
+		require.False(t, errors.Is(err, errors.ErrNotFound),
+			"a present but unreadable blob is not a miss — calling it one invites the caller's fallback")
+		require.NotContains(t, err.Error(), "%!s(")
+	})
+
+	t.Run("Get on a blob with no valid header", func(t *testing.T) {
+		s3Store, mock := setupTestS3(t)
+		storeRaw(t, mock, s3Store, []byte("not a header"))
+
+		_, err := s3Store.Get(context.Background(), key, fileformat.FileTypeTx)
+
+		require.Error(t, err)
+		require.False(t, errors.Is(err, errors.ErrNotFound))
+		require.NotContains(t, err.Error(), "%!s(")
+	})
+
+	t.Run("GetIoReader on a blob whose header is a different file type", func(t *testing.T) {
+		s3Store, mock := setupTestS3(t)
+
+		// A well-formed blob, stored under the .tx key but carrying a subtree header.
+		header := fileformat.NewHeader(fileformat.FileTypeSubtree)
+		storeRaw(t, mock, s3Store, append(header.Bytes(), []byte("body")...))
+
+		_, err := s3Store.GetIoReader(context.Background(), key, fileformat.FileTypeTx)
+
+		require.Error(t, err)
+		require.False(t, errors.Is(err, errors.ErrNotFound))
+		require.NotContains(t, err.Error(), "%!s(")
 	})
 }
