@@ -16,9 +16,9 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
 ### Breaking — action required before upgrading
 
 - **`grpc_admin_api_key` is now mandatory for the Blockchain service.** The service
-  validates it at startup and refuses to start when it is empty, carries leading or
-  trailing whitespace, is a well-known placeholder (`testkey`, `changeme`, …), or is
-  shorter than the minimum length. Every Blockchain RPC except `HealthGRPC` requires
+  validates it at startup and refuses to start when it is empty, is a well-known
+  placeholder (`testkey`, `changeme`, …), or is shorter than 16 characters. A value
+  with surrounding whitespace is trimmed as it loads rather than rejected. Every Blockchain RPC except `HealthGRPC` requires
   the key, and the HTTP `invalidate`/`revalidate` routes require it too.
 
   Every service that talks to Blockchain must be given the same value. Upgrade
@@ -43,8 +43,13 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
 - **Settings that previously did nothing now take effect.** Each of the following
   carried a `key:` struct tag and appeared in the reference documentation, but
   `NewSettings()` never populated it, so the field stayed at its Go zero value no
-  matter what was in `settings.conf`. They are now wired. **If you already have any
-  of these set, its value takes effect on upgrade — review them before rolling out.**
+  matter what was in `settings.conf`. They are now wired.
+
+  **This affects every deployment, not only those that set a value.** The loader
+  supplies non-zero code defaults, and the three peer-registry keys appear nowhere
+  in `settings.conf`, so a node that has never mentioned them now runs the cleanup
+  loop hourly, evicting peers on a 24-hour TTL under a 10,000-entry LRU bound.
+  Review these before rolling out.
 
   | Setting | Previously | Now |
   |---|---|---|
@@ -54,7 +59,7 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   | `pruner_skipDuringCatchup` | `false` — flag unreachable | configurable |
   | `pruner_skipProcessExpiredPreservations` | `false` — flag unreachable | configurable |
   | `aerospike_enable_preserve_filter_expressions` | permanently `false` | configurable |
-  | `txMetaCacheTrimRatio` | read directly from gocore, untyped | read from typed settings |
+  | `subtreevalidation_txMetaCacheTrimRatio` | read straight from gocore, bypassing the typed settings | read from typed settings; `settings.conf` ships `5`, the code default is `2` |
 
   The peer-registry entries are the ones most likely to be noticed: with the cleanup
   interval at zero the eviction loop never started, so registries grew without bound.
@@ -93,9 +98,14 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   codebase, so removing them changes no behaviour. If you have them in a config
   file they were already doing nothing and will continue to be ignored — the
   config loader has no schema and does not reject or report unknown keys, which
-  is precisely why these survived as long as they did. Removed: `blockmaxsize`
-  (#1640), `securityLevelGRPC` — a casing variant that never matched the real
-  `security_level_grpc` (#1674), and `blockchain_subscription_timeout` (#1643).
+  is precisely why these survived as long as they did. Removed:
+  `securityLevelGRPC` — a casing variant that never matched the real
+  `security_level_grpc` (#1674) — and `blockchain_subscription_timeout` (#1643).
+
+  **`blockmaxsize` was not removed and is still live.** #1640 deleted a duplicate
+  `BlockSettings.MaxSize` field that carried the same tag; the key itself is read
+  at `settings/settings.go` into `Policy.BlockMaxSize`, enforced in Block Assembly
+  and reported over RPC as `maxminedblocksize`. Leave it set.
 
 - **Two Blockchain RPCs now work that previously did not.**
   `GetLatestBlockHeaderFromBlockLocator` and `GetBlockHeadersFromOldest` were
@@ -104,7 +114,8 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   Callers that treated `Unimplemented` as "unsupported" will start receiving real
   responses. (#1848, pending)
 
-- **The Postgres circuit breaker is now reachable.** `*_postgres_circuitBreakerEnabled`
-  and its companions were never populated, so the breaker could not be turned on.
-  They are wired now, but the default remains off, so no deployment changes behaviour
-  unless you opt in. (#1642)
+- **The Postgres circuit breaker is now reachable.** The breaker could not be turned
+  on because its settings were never populated. Two forms exist and both are wired
+  now: a global `postgres_circuitBreakerEnabled` and a per-service
+  `<prefix>_postgres_circuitBreakerEnabled` that overrides it. The default remains
+  off, so no deployment changes behaviour unless you opt in. (#1642)
