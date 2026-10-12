@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -74,7 +75,11 @@ func TestClientGetMedianTimePastRange_RealServer(t *testing.T) {
 	}
 	_, address, _, err := util.GetListener(tSettings.Context, "blockchain", "", tSettings.BlockChain.GRPCListenAddress)
 	require.NoError(t, err)
-	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// The server requires x-api-key on every RPC except HealthGRPC.
+	withAPIKey := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		return invoker(metadata.AppendToOutgoingContext(ctx, "x-api-key", tSettings.GRPCAdminAPIKey), method, req, reply, cc, opts...)
+	}
+	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithUnaryInterceptor(withAPIKey))
 	require.NoError(t, err)
 	defer conn.Close()
 	rpcClient := blockchain_api.NewBlockchainAPIClient(conn)
