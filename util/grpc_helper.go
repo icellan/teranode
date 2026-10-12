@@ -115,8 +115,12 @@ var grpcPanicsRecoveredTotal = prometheusgolang.NewCounterVec(
 	[]string{"grpc_service", "grpc_method"},
 )
 
-// grpcAuthRejectionsTotal counts requests rejected by CreateAuthInterceptor
-// (missing metadata, missing API key, or an API key that does not match).
+// grpcAuthRejectionsTotal counts requests rejected by either admin API key
+// auth path: CreateAuthInterceptor (protected-method list, unary) and the
+// RequireAuthByDefault interceptors (every method except the public list,
+// unary and stream). A rejection means missing metadata, a missing API key,
+// or an API key that does not match. The two paths are mutually exclusive in
+// StartGRPCServer, so a request is counted at most once.
 // A misconfigured/mismatched admin API key across services makes every
 // protected RPC fail while HealthGRPC and Health stay green, so this counter
 // is the signal an operator watches during a rollout to notice that case.
@@ -124,7 +128,7 @@ var grpcAuthRejectionsTotal = prometheusgolang.NewCounterVec(
 	prometheusgolang.CounterOpts{
 		Namespace: "teranode",
 		Name:      "grpc_auth_rejections_total",
-		Help:      "Total number of gRPC requests rejected by the admin API key auth interceptor, by method",
+		Help:      "Total number of gRPC requests rejected by the admin API key auth interceptors (protected-method and require-by-default paths, unary and stream), by method",
 	},
 	[]string{"grpc_method"},
 )

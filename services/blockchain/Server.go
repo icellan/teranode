@@ -560,8 +560,8 @@ func (b *Blockchain) maxBlocksByHeightRange() int {
 
 // maxMedianTimePastHeights bounds the number of heights a single
 // GetMedianTimePastByHeights call may ask about. The request is a
-// caller-supplied slice on an unauthenticated RPC, and its min/max drive a
-// header range read. Settings-backed so an operator can raise it without a
+// caller-supplied slice on an RPC that any holder of the shared admin API key
+// can call, and its min/max drive a header range read. Settings-backed so an operator can raise it without a
 // rebuild; Client.GetMedianTimePastRange chunks into batches of at most this
 // size so raising or lowering it never breaks that first-party caller.
 func (b *Blockchain) maxMedianTimePastHeights() int {
