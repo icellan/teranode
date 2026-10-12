@@ -107,9 +107,18 @@ func TestMetadataCoverage(t *testing.T) {
 // documents the struct as a single override setting (e.g.
 // BlockChain.PostgresPool), but its children still need their own tags
 // checked. A struct from another package (e.g. *url.URL, *chaincfg.Params) is
-// opaque to extractFields' recursion in exactly the same way a `key:"-"`
-// field is - it is not ours to walk into - so it is treated as a leaf here
-// too, and must itself carry a tag.
+// treated as a leaf here and must itself carry a tag.
+//
+// This walk is deliberately NOT a mirror of extractFields (export.go) and is
+// stricter than it in two ways. First, extractFields recurses into any
+// untagged struct field, including foreign-package ones, and never descends
+// into a struct that carries a real key tag; this walk descends into
+// same-package structs regardless of tag and never into foreign ones. Second,
+// as a consequence, an untagged foreign struct passes silently through
+// extractFields (its exported fields are probed for tags, finding none) but
+// fails here, which is the point: it forces every such field to declare a tag
+// or an explicit key:"-" exemption instead of quietly dropping out of the
+// exported metadata.
 func settingsWalk(settingsPkgPath string, typ reflect.Type, prefix string, visit func(fieldName string, field reflect.StructField, fieldType reflect.Type)) {
 	settingsWalkExemptAware(settingsPkgPath, typ, prefix, visit, nil)
 }
