@@ -2140,10 +2140,25 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			case batchErr = <-errCh:
 				// Batch completed successfully or with error
 			case <-ctx.Done():
+				// Known residual window (#1291, store-level atomic Spend /
+				// reverse-on-abort): this item is still enqueued in the batcher and
+				// will be committed by the callback under the store's own context,
+				// not this caller ctx. A straggler UPDATE can land after we give up
+				// here and after the rollback below has already run, leaving exactly
+				// the #1214 dangling ref. Not fixed here — counted below so it is
+				// at least observable.
+				prometheusUtxoSpendAbortInFlight.Inc()
 				spends[idx].Err = errors.NewContextCanceledError("[SPEND][%s:%d] context canceled while waiting for batch response", spend.TxID.String(), spend.Vout)
 				return nil
 			case <-timer.C:
+				// Known residual window (#1291, store-level atomic Spend /
+				// reverse-on-abort): same straggler risk as the ctx.Done() arm
+				// above — the item remains enqueued and can still commit under the
+				// store's own context after this per-item wait gives up and after
+				// the rollback below has run. Not fixed here — counted below so it
+				// is at least observable.
 				prometheusUtxoErrors.WithLabelValues("Spend", "BatchTimeout").Inc()
+				prometheusUtxoSpendAbortInFlight.Inc()
 				spends[idx].Err = errors.NewServiceUnavailableError("[SPEND][%s:%d] batch operation timed out after %s", spend.TxID.String(), spend.Vout, spendTimeout)
 				return nil
 			}
@@ -2194,18 +2209,131 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 		})
 	}
 
+	// This arm performs no rollback of spentSpends, and is only safe to leave
+	// that way because every g.Go body above unconditionally returns nil —
+	// per-item failures are recorded in spends[idx].Err, never returned to the
+	// errgroup, so g.Wait() never actually observes an error today. If that
+	// invariant ever changes, this arm must route through the same rollback
+	// as the len(spends) != len(spentSpends) branch below, or a batch abort
+	// here will leak partial spends exactly like #1214.
 	if err = g.Wait(); err != nil {
 		return nil, errors.NewError("error in sql spend (batched mode)", err)
 	}
 
 	if len(spends) != len(spentSpends) {
-		// Rollback successful spends when the transaction has genuine validation failures
-		// (double-spend, frozen, conflicting, hash mismatch). For transient errors, skip
-		// rollback — the optimistic locking makes spends idempotent for the same spender.
-		if needsSpendRollback(spends) {
-			if unspendErr := s.Unspend(context.Background(), spentSpends); unspendErr != nil {
-				s.logger.Errorf("error in sql unspend (batched mode): %v", unspendErr)
+		// Atomicity contract (mirrors aerospike/spend.go rollbackPartialSpends):
+		// roll back the spends that succeeded, whatever the error class of the
+		// ones that failed, so no parent is left naming a spender whose record is
+		// never created (#1214). Keeping partial spends for "retriable" failures
+		// assumed a retry that callers do not guarantee.
+		//
+		// Gated on the spending tx having no record: with a record present the ref
+		// is not dangling and the rollback would instead clear a slot a live tx
+		// legitimately owns. An indeterminate lookup skips the rollback.
+		//
+		// Also skipped when any spend failed with ErrTxLocked or ErrTxCreating AND
+		// nothing else in the batch proves the tx unwinnable: both are transient
+		// two-phase-commit windows (see hasTransientLockFailure and
+		// hasTransientCreatingFailure — the latter is inert on this backend today,
+		// kept only so the two stores' guards stay in step), so a concurrent
+		// attempt at the SAME txid may be spending these very inputs successfully
+		// right now, and spending_data ({TxID, Vin}) carries no attempt identity
+		// for the rollback to tell the two apart. See hasTransientLockFailure for
+		// that reasoning and what covers this flavour of #1214 instead.
+		//
+		// That exclusion does not hold once the batch ALSO contains ErrSpent,
+		// ErrTxConflicting, ErrFrozen, or ErrUtxoHashMismatch: a concurrent attempt
+		// at this same txid sees the same outpoints and hits the same unwinnable
+		// failure, so it can never reach Create either — nobody can be a
+		// legitimate owner of the partial spends, and the rollback is both safe
+		// and required. See hasUnwinnableFailure.
+		sawTransientLock := hasTransientLockFailure(spends)
+		sawTransientCreating := hasTransientCreatingFailure(spends)
+
+		if len(spentSpends) > 0 && (!(sawTransientLock || sawTransientCreating) || hasUnwinnableFailure(spends)) {
+			// Wrapped in a closure so rbCancel can be deferred: Spend has a parent
+			// recover() (see the top of this function), and a panic between
+			// context.WithTimeout and a bare inline rbCancel() call would unwind
+			// past it, leaking the timer until it fires on its own. Scoping the
+			// defer to this closure keeps the leak-proofing without extending
+			// rbCtx's lifetime past this block, as a function-level defer would.
+			func() {
+				rollback := false
+
+				// Detached from the caller's ctx (on the context-cancel path it is
+				// already dead, and that is exactly a case where the partial spends
+				// must still be cleaned up) but bounded, so a wedged database cannot
+				// pin this goroutine forever. Deliberately not derived from the store's
+				// context either: that is canceled on shutdown, which would make the
+				// probe below fail as "indeterminate" and skip the rollback exactly
+				// when a shutdown races in-flight spends. Mirrors the aerospike store.
+				//
+				// Deliberately re-queried here rather than reusing txAlreadyExists: a
+				// stale "exists" memo is exactly what would let this rollback clear a
+				// slot a live spender still owns, and a stale "not found" memo is
+				// exactly what would leave a dangling ref behind. The extra query is
+				// the price of the freshest possible answer at the one point where
+				// getting it wrong is the failure mode we're rolling back to fix
+				// (#1214). Do not "optimise" this back to the memo.
+				//
+				// Uses SpendRollbackTimeout, not SpendWaitTimeout: SpendWaitTimeout
+				// is the end-to-end budget for ONE batched spend, while this budget
+				// covers the existence probe plus rollbackSpendChunks' sequence of
+				// chunked Unspend calls over spentSpends — a multiple of that
+				// single-spend cost on a wide transaction. On overrun the loop
+				// aborts and the remaining spends stay applied, counted via
+				// prometheusUtxoSpendRollbackFailed below.
+				rbTimeout := s.settings.UtxoStore.SpendRollbackTimeout
+				if rbTimeout <= 0 {
+					rbTimeout = 120 * time.Second
+				}
+
+				rbCtx, rbCancel := context.WithTimeout(context.Background(), rbTimeout)
+				defer rbCancel()
+
+				var spendingTxExists bool
+				if scanErr := s.db.QueryRowContext(rbCtx, "SELECT EXISTS(SELECT 1 FROM transactions WHERE hash = $1)", tx.TxIDChainHash()[:]).Scan(&spendingTxExists); scanErr != nil {
+					s.logger.Errorf("[SPEND][%s] cannot determine whether spender exists, skipping rollback of %d partial spend(s): %v", tx.TxID(), len(spentSpends), scanErr)
+					prometheusUtxoPartialSpendRollbacks.WithLabelValues(utxo.RollbackOutcomeIndeterminate).Inc()
+				} else {
+					rollback = !spendingTxExists
+
+					if rollback {
+						prometheusUtxoPartialSpendRollbacks.WithLabelValues(utxo.RollbackOutcomeFired).Inc()
+					} else {
+						prometheusUtxoPartialSpendRollbacks.WithLabelValues(utxo.RollbackOutcomeSpenderExists).Inc()
+					}
+				}
+
+				if rollback {
+					reverted, unspendErr := s.rollbackSpendChunks(rbCtx, spentSpends)
+					if unspendErr != nil {
+						left := len(spentSpends) - reverted
+						s.logger.Errorf("[SPEND][%s] error in sql unspend (batched mode): reverted %d of %d partial spend(s), %d left dangling: %v",
+							tx.TxID(), reverted, len(spentSpends), left, unspendErr)
+						// Counted per dangling spend left behind, not per call: with
+						// chunking, one failing chunk no longer means the whole
+						// rollback failed, so this is read as a ref count.
+						prometheusUtxoSpendRollbackFailed.Add(float64(left))
+					} else {
+						s.logger.Warnf("[SPEND][%s] rolled back %d partial spend(s) (batched mode)", tx.TxID(), reverted)
+					}
+				}
+			}()
+		} else if len(spentSpends) > 0 {
+			// Transient suppression: record the outcome so this store's dashboard
+			// signal has the same value set as aerospike's — a suppressed
+			// rollback here would otherwise be invisible next to aerospike's
+			// counters for the identical situation. When both signals fire in
+			// the same batch, report transient_lock, mirroring aerospike's rule
+			// (transient_lock has the existing dashboard history; creating is
+			// inert on this backend today — see hasTransientCreatingFailure).
+			outcome := utxo.RollbackOutcomeTransientLock
+			if sawTransientCreating && !sawTransientLock {
+				outcome = utxo.RollbackOutcomeTransientCreating
 			}
+
+			prometheusUtxoPartialSpendRollbacks.WithLabelValues(outcome).Inc()
 		}
 
 		var spendErrors error
@@ -2227,23 +2355,6 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	return spends, nil
 }
 
-// needsSpendRollback returns true if any spend failed due to a validation error
-// that indicates the transaction is genuinely invalid. Mirrors aerospike/spend.go.
-func needsSpendRollback(spends []*utxo.Spend) bool {
-	for _, spend := range spends {
-		if spend.Err == nil {
-			continue
-		}
-		if errors.Is(spend.Err, errors.ErrSpent) ||
-			errors.Is(spend.Err, errors.ErrTxConflicting) ||
-			errors.Is(spend.Err, errors.ErrFrozen) ||
-			errors.Is(spend.Err, errors.ErrUtxoHashMismatch) {
-			return true
-		}
-	}
-	return false
-}
-
 // isDeadlock checks if a database error is a PostgreSQL deadlock (SQLSTATE 40P01)
 // or a SQLite BUSY error that should be retried.
 func isDeadlock(err error) bool {
@@ -2254,7 +2365,19 @@ func isDeadlock(err error) bool {
 	if errors.As(err, &pgErr) && pgErr.Code == usql.PgErrDeadlockDetected {
 		return true
 	}
-	return strings.Contains(err.Error(), "database is locked")
+	// SQLite's shared cache, which sqlitememory uses, locks whole tables and
+	// reports a lock cycle between connections as SQLITE_LOCKED ("database table
+	// is locked: database is deadlocked"), not SQLITE_BUSY. Concurrent validation
+	// reads form that cycle with a spend transaction often enough to fail
+	// Test_handleMultipleTx in services/propagation once the validator reads every
+	// parent in one joined statement. SQLite's remedy is to roll back and retry,
+	// which is what a true return here does.
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) && usql.IsSQLiteLockCode(sqliteErr.Code()) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database table is locked")
 }
 
 // sendSpendBatch is the batcher callback that processes a batch of spend operations
@@ -2310,6 +2433,26 @@ func (s *Store) trySendSpendBatch(batch []*batchSpend) (retryable bool) {
 		return s.trySendSpendBatchBulk(batch)
 	}
 	return s.trySendSpendBatchPerRow(batch)
+}
+
+// spendUpdateRow is one output row the bulk spend UPDATE sets spending data on.
+type spendUpdateRow struct {
+	batchIdx      int
+	transactionID int
+	vout          uint32
+	spendingData  []byte
+}
+
+// sortSpendUpdateRows orders rows by (transaction_id, idx), the order every bulk
+// spend takes its row locks in.
+func sortSpendUpdateRows(rows []spendUpdateRow) {
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].transactionID != rows[j].transactionID {
+			return rows[i].transactionID < rows[j].transactionID
+		}
+
+		return rows[i].vout < rows[j].vout
+	})
 }
 
 // spendSelectResult holds the result of a bulk SELECT for a single spend item.
@@ -2400,13 +2543,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 
 	// Phase 2: Validate each item and build the bulk UPDATE set
 	validationErrors := make(map[int]error, len(batch))
-	type updateItem struct {
-		batchIdx      int
-		transactionID int
-		vout          uint32
-		spendingData  []byte
-	}
-	var toUpdate []updateItem
+	var toUpdate []spendUpdateRow
 	// Parent tx IDs from idempotent re-spends (output already carries matching
 	// spending_data). The CTE-based DAH recompute below only covers parents
 	// touched by the bulk UPDATE, so it would miss these. Recording them here
@@ -2478,7 +2615,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			continue
 		}
 
-		toUpdate = append(toUpdate, updateItem{
+		toUpdate = append(toUpdate, spendUpdateRow{
 			batchIdx:      i,
 			transactionID: r.transactionID,
 			vout:          spend.Vout,
@@ -2501,7 +2638,7 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 		spendingData []byte
 	}
 	seenKeys := make(map[utxoKey]seenEntry, len(toUpdate)) // key -> first entry
-	var dedupedUpdate []updateItem
+	var dedupedUpdate []spendUpdateRow
 	for _, u := range toUpdate {
 		key := utxoKey{u.transactionID, u.vout}
 		if entry, seen := seenKeys[key]; seen {
@@ -2522,6 +2659,14 @@ func (s *Store) trySendSpendBatchBulk(batch []*batchSpend) (retryable bool) {
 			dedupedUpdate = append(dedupedUpdate, u)
 		}
 	}
+
+	// Take the rows in one consistent order, so two batches that update
+	// overlapping outputs lock them in the same order instead of each waiting on
+	// the other. Postgres does not promise to visit an UPDATE ... FROM (VALUES)
+	// in list order, so this makes a deadlock less likely rather than impossible,
+	// and sendSpendBatch keeps its deadlock retries. The dedup above has already
+	// settled first-arrival-wins, so sorting here changes no outcome.
+	sortSpendUpdateRows(dedupedUpdate)
 
 	// Bulk UPDATE with optimistic locking.
 	// When retention > 0, the UPDATE is wrapped in a CTE that also runs a DAH
@@ -5908,14 +6053,20 @@ func isLockError(err error) bool {
 		return pqErr.Code == usql.PgErrSerializationFail || pqErr.Code == usql.PgErrDeadlockDetected || pqErr.Code == usql.PgErrLockNotAvailable
 	}
 
-	// SQLite busy/locked errors
-	if sqliteErr, ok := err.(*sqlite.Error); ok {
-		return sqliteErr.Code() == sqlite3.SQLITE_BUSY || sqliteErr.Code() == sqlite3.SQLITE_LOCKED
+	// SQLite busy/locked errors, extended codes included
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		return usql.IsSQLiteLockCode(sqliteErr.Code())
 	}
 
-	// Check error message for common lock patterns
+	// Check error message for common lock patterns. teranode's errors package
+	// keeps only the message of a driver error it wraps, so an insert failure
+	// wrapped by NewStorageError reaches here, not the typed arm above.
+	// "database table is locked" is SQLITE_LOCKED's message, matched as in
+	// isDeadlock.
 	errStr := err.Error()
 	return strings.Contains(errStr, "database is locked") ||
+		strings.Contains(errStr, "database table is locked") ||
 		strings.Contains(errStr, "deadlock") ||
 		strings.Contains(errStr, "lock timeout")
 }
