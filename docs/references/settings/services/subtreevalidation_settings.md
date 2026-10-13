@@ -12,8 +12,7 @@
 | GetMissingTransactions | int | max(4, CPU/2) | subtreevalidation_getMissingTransactions | **CRITICAL** - Missing transaction retrieval concurrency |
 | GRPCAddress | string | "localhost:8089" (Go default; overridden to `localhost:8086` by `settings.conf` via `SUBTREE_VALIDATION_GRPC_PORT`) | subtreevalidation_grpcAddress | gRPC client connections |
 | GRPCListenAddress | string | ":8089" (Go default; overridden to `:8086` by `settings.conf` via `SUBTREE_VALIDATION_GRPC_PORT`) | subtreevalidation_grpcListenAddress | **CRITICAL** - gRPC server binding, health checks only run if not empty |
-| ProcessTxMetaUsingCacheBatchSize | int | 1024 | subtreevalidation_processTxMetaUsingCache_BatchSize | No longer used: cache lookups are batched per cache bucket range |
-| ProcessTxMetaUsingCacheConcurrency | int | 32 | subtreevalidation_processTxMetaUsingCache_Concurrency | **CRITICAL** - Cache-probe workers shared by all subtrees being validated (server-wide, not per subtree) |
+| ProcessTxMetaUsingCacheConcurrency | int | 32 | subtreevalidation_processTxMetaUsingCache_Concurrency | **CRITICAL** - Cache-probe workers shared by all subtrees being validated (server-wide, not per subtree; peer subtrees and block validation each get a pool of this size) |
 | ProcessTxMetaUsingCacheMissingTxThreshold | int | 1 | subtreevalidation_processTxMetaUsingCache_MissingTxThreshold | Cache miss threshold |
 | SubtreeBlockHeightRetention | uint32 | globalBlockHeightRetention | subtreevalidation_subtreeBlockHeightRetention | Block height retention |
 | SubtreeDAHConcurrency | int | 8 | subtreevalidation_subtreeDAHConcurrency | DAH processing concurrency |
@@ -36,7 +35,7 @@
 
 ### Cache Processing
 
-- `ProcessTxMetaUsingCacheConcurrency` (server-wide probe workers) and `ProcessTxMetaUsingCacheMissingTxThreshold` work together
+- `ProcessTxMetaUsingCacheConcurrency` (server-wide probe workers, one pool for peer subtrees and one for block validation) and `ProcessTxMetaUsingCacheMissingTxThreshold` work together
 - A subtree's cache lookups are grouped by cache bucket range; each range is one batched read on one of the shared workers
 
 ### Missing Transaction Handling

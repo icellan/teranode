@@ -1251,7 +1251,7 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 	// Pre-check: identify transactions that are already validated in cache or UTXO store
 	txMetaSlice := make([]metaSliceItem, len(txHashes))
 
-	missed, err := u.processTxMetaUsingCache(ctx, txHashes, txMetaSlice, false)
+	missed, err := u.processBlockTxMetaUsingCache(ctx, txHashes, txMetaSlice)
 	if err != nil {
 		return errors.NewProcessingError("[processTransactionsInLevels] Failed to check txMeta cache", err)
 	}

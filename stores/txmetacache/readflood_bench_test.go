@@ -164,7 +164,7 @@ func perKeyProbe(cache *ImprovedCache, keys [][]byte, scratch *[]byte, _ [][2]in
 
 func rangedProbe(cache *ImprovedCache, keys [][]byte, scratch *[]byte, spans [][2]int) int {
 	*scratch = (*scratch)[:0]
-	cache.GetMulti(keys, scratch, spans[:len(keys)])
+	cache.GetMulti(keys, nil, scratch, spans[:len(keys)])
 
 	return len(keys)
 }

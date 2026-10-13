@@ -36,7 +36,27 @@ func TestImprovedCache_GetMultiMatchesGet(t *testing.T) {
 		var dst []byte
 
 		spans := make([][2]int, n)
-		cache.GetMulti(keys, &dst, spans)
+		cache.GetMulti(keys, nil, &dst, spans)
+
+		// Precomputed hashes give the same answer.
+		hashes := make([]uint64, n)
+		for i, k := range keys {
+			hashes[i] = xxhash.Sum64(k)
+		}
+
+		var dst2 []byte
+
+		spans2 := make([][2]int, n)
+		cache.GetMulti(keys, hashes, &dst2, spans2)
+
+		for i := range keys {
+			if spans[i][0] < 0 {
+				require.Equal(t, [2]int{-1, -1}, spans2[i])
+				continue
+			}
+
+			require.Equal(t, dst[spans[i][0]:spans[i][1]], dst2[spans2[i][0]:spans2[i][1]])
+		}
 
 		for i, k := range keys {
 			var want []byte
@@ -63,7 +83,7 @@ func TestProbeRangeOf_ContiguousBucketRanges(t *testing.T) {
 		_, _ = rand.Read(h[:])
 
 		bucket := int(xxhash.Sum64(h[:]) % BucketsCount)
-		require.Equal(t, bucket/per, ProbeRangeOf(&h))
+		require.Equal(t, bucket/per, ProbeRangeOf(KeyHash(&h)))
 	}
 }
 
@@ -90,8 +110,13 @@ func TestTxMetaCache_GetMetaCachedMultiMatchesGetMetaCached(t *testing.T) {
 
 	hitsBefore, missesBefore := c.metrics.hits.Load(), c.metrics.misses.Load()
 
+	keyHashes := make([]uint64, n)
+	for i := range hashes {
+		keyHashes[i] = KeyHash(&hashes[i])
+	}
+
 	out := make([]*meta.Data, n)
-	c.GetMetaCachedMulti(context.Background(), hashes, out)
+	c.GetMetaCachedMulti(context.Background(), hashes, keyHashes, out)
 
 	require.Equal(t, uint64(n-n/4), c.metrics.hits.Load()-hitsBefore)
 	require.Equal(t, uint64(n/4), c.metrics.misses.Load()-missesBefore)
@@ -123,4 +148,43 @@ func testInpoints(t *testing.T) subtree.TxInpoints {
 	require.NoError(t, err)
 
 	return inpoints
+}
+
+// A lookup confined to one probe range must not pay for the whole bucket
+// table: the per-call bookkeeping is sized to the buckets the keys span.
+func TestImprovedCache_GetMultiSmallBatchAllocatesForSpanOnly(t *testing.T) {
+	cache, err := New(64*1024*1024, Native)
+	require.NoError(t, err)
+
+	// Four keys from one probe range, as a range task passes them.
+	var (
+		keys   [][]byte
+		hashes []uint64
+	)
+
+	for len(keys) < 4 {
+		k := make([]byte, 32)
+		_, _ = rand.Read(k)
+
+		if h := xxhash.Sum64(k); ProbeRangeOf(h) == 0 {
+			keys = append(keys, k)
+			hashes = append(hashes, h)
+		}
+	}
+
+	var dst []byte
+
+	spans := make([][2]int, len(keys))
+
+	bytesPerCall := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+
+		for i := 0; i < b.N; i++ {
+			dst = dst[:0]
+			cache.GetMulti(keys, hashes, &dst, spans)
+		}
+	}).AllocedBytesPerOp()
+
+	// A full per-bucket table is BucketsCount*8 bytes (64 KiB in production).
+	require.Less(t, bytesPerCall, int64(max(BucketsCount*8, 4096)), "must not allocate a full per-bucket table for 4 keys")
 }

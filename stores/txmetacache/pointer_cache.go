@@ -222,8 +222,10 @@ func (c *PointerCache) Get(hash chainhash.Hash) (*meta.Data, bool) {
 	return d, ok
 }
 
-// GetMulti is Get for each hash. Implements cacheBackend.
-func (c *PointerCache) GetMulti(hashes []chainhash.Hash, out []*meta.Data) {
+// GetMulti is Get for each hash, one bucket lock per key: pointer mode does not
+// batch its locks (it is not the deployed bucket type). Implements
+// cacheBackend.
+func (c *PointerCache) GetMulti(hashes []chainhash.Hash, _ []uint64, out []*meta.Data) {
 	for i, h := range hashes {
 		out[i], _ = c.Get(h)
 	}

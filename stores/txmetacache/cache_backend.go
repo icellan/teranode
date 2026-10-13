@@ -51,8 +51,9 @@ type cacheBackend interface {
 	Get(hash chainhash.Hash) (*meta.Data, bool)
 
 	// GetMulti is the batch form of Get: out[i] is the entry for hashes[i], or
-	// nil on a miss. Same read-only contract as Get.
-	GetMulti(hashes []chainhash.Hash, out []*meta.Data)
+	// nil on a miss. keyHashes, if non-nil, holds KeyHash(&hashes[i]). Same
+	// read-only contract as Get.
+	GetMulti(hashes []chainhash.Hash, keyHashes []uint64, out []*meta.Data)
 
 	// Del removes the entry under key (raw bytes, typically hash[:]).
 	Del(key []byte)

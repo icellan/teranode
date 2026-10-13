@@ -817,27 +817,42 @@ func (c *ImprovedCache) Get(dst *[]byte, k []byte) error {
 // its keys instead of once per key, and returns the values in one buffer:
 // value i is (*dst)[spans[i][0]:spans[i][1]], or spans[i] = {-1, -1} on a miss.
 // Values are copied out under the lock, so callers decode without holding it.
+// hashes, if non-nil, must hold xxhash.Sum64(keys[i]) and saves rehashing.
 //
 // Pays off when many keys share a bucket: a whole subtree probed by bucket
 // range touches each bucket once rather than ~128 times, which is what keeps a
-// read flood from crowding the Kafka txmeta writers off the bucket locks.
-func (c *ImprovedCache) GetMulti(keys [][]byte, dst *[]byte, spans [][2]int) {
+// read flood from crowding the Kafka txmeta writers off the bucket locks. The
+// per-call bookkeeping is sized to the span of buckets the keys fall into, so
+// a small lookup confined to one probe range stays cheap.
+func (c *ImprovedCache) GetMulti(keys [][]byte, hashes []uint64, dst *[]byte, spans [][2]int) {
 	if len(keys) == 0 {
 		return
 	}
 
-	hashes := make([]uint64, len(keys))
-	counts := make([]int, BucketsCount)
-
-	for i, k := range keys {
-		h := xxhash.Sum64(k)
-		hashes[i] = h
-		counts[h%BucketsCount]++
+	if hashes == nil {
+		hashes = make([]uint64, len(keys))
+		for i, k := range keys {
+			hashes[i] = xxhash.Sum64(k)
+		}
 	}
 
-	// next[b] starts at bucket b's first slot in the sorted order and ends one
-	// past its last once the keys are scattered.
-	next := make([]int, BucketsCount)
+	lo, hi := uint64(BucketsCount), uint64(0)
+
+	for _, h := range hashes {
+		b := h % BucketsCount
+		lo = min(lo, b)
+		hi = max(hi, b)
+	}
+
+	counts := make([]int, hi-lo+1)
+
+	for _, h := range hashes {
+		counts[h%BucketsCount-lo]++
+	}
+
+	// next[b] starts at bucket lo+b's first slot in the sorted order and ends
+	// one past its last once the keys are scattered.
+	next := make([]int, len(counts))
 
 	offset := 0
 	for b, n := range counts {
@@ -850,7 +865,7 @@ func (c *ImprovedCache) GetMulti(keys [][]byte, dst *[]byte, spans [][2]int) {
 	sortedHashes := make([]uint64, len(keys))
 
 	for i, h := range hashes {
-		b := h % BucketsCount
+		b := h%BucketsCount - lo
 		j := next[b]
 		next[b]++
 		order[j] = i
@@ -866,7 +881,7 @@ func (c *ImprovedCache) GetMulti(keys [][]byte, dst *[]byte, spans [][2]int) {
 		}
 
 		start := next[b] - n
-		c.buckets[b].GetMulti(dst, sortedKeys[start:start+n], sortedHashes[start:start+n], sortedSpans[start:start+n])
+		c.buckets[lo+uint64(b)].GetMulti(dst, sortedKeys[start:start+n], sortedHashes[start:start+n], sortedSpans[start:start+n])
 	}
 
 	for j, i := range order {
@@ -1226,7 +1241,6 @@ func (b *bucketNative) Set(k, v []byte, h uint64, skipLocking ...bool) error {
 	return nil
 }
 
-// Get retrieves a value from the bucket. Pass skipLocking=true when the caller already holds b.mu.
 // GetMulti looks up keys under a single read lock; see ImprovedCache.GetMulti.
 func (b *bucketNative) GetMulti(dst *[]byte, keys [][]byte, hashes []uint64, spans [][2]int) {
 	b.mu.RLock()
@@ -1235,6 +1249,7 @@ func (b *bucketNative) GetMulti(dst *[]byte, keys [][]byte, hashes []uint64, spa
 	getMultiLocked(b, dst, keys, hashes, spans)
 }
 
+// Get retrieves a value from the bucket. Pass skipLocking=true when the caller already holds b.mu.
 func (b *bucketNative) Get(dst *[]byte, key []byte, h uint64, returnDst bool, skipLocking ...bool) bool {
 	found := false
 	chunks := b.chunks
@@ -1699,7 +1714,6 @@ func (b *bucketTrimmed) Set(k, v []byte, h uint64, skipLocking ...bool) error {
 	return nil
 }
 
-// Get skips locking if skipLocking is set to true. Locking should be only skipped when the caller holds the lock, i.e. when called from SetMulti.
 // GetMulti looks up keys under a single read lock; see ImprovedCache.GetMulti.
 func (b *bucketTrimmed) GetMulti(dst *[]byte, keys [][]byte, hashes []uint64, spans [][2]int) {
 	b.mu.RLock()
@@ -1708,6 +1722,7 @@ func (b *bucketTrimmed) GetMulti(dst *[]byte, keys [][]byte, hashes []uint64, sp
 	getMultiLocked(b, dst, keys, hashes, spans)
 }
 
+// Get skips locking if skipLocking is set to true. Locking should be only skipped when the caller holds the lock, i.e. when called from SetMulti.
 func (b *bucketTrimmed) Get(dst *[]byte, k []byte, h uint64, returnDst bool, skipLocking ...bool) bool {
 	found := false
 	chunks := b.chunks
@@ -2157,8 +2172,6 @@ func (b *bucketPreallocated) Set(k, v []byte, h uint64, skipLocking ...bool) err
 	return nil
 }
 
-// TODO: Simplify by removing references to generations, generations are not relevant for bucket.
-// Get skips locking if skipLocking is set to true. Locking should be only skipped when the caller holds the lock, i.e. when called from SetMulti.
 // GetMulti looks up keys under a single read lock; see ImprovedCache.GetMulti.
 func (b *bucketPreallocated) GetMulti(dst *[]byte, keys [][]byte, hashes []uint64, spans [][2]int) {
 	b.mu.RLock()
@@ -2167,6 +2180,8 @@ func (b *bucketPreallocated) GetMulti(dst *[]byte, keys [][]byte, hashes []uint6
 	getMultiLocked(b, dst, keys, hashes, spans)
 }
 
+// TODO: Simplify by removing references to generations, generations are not relevant for bucket.
+// Get skips locking if skipLocking is set to true. Locking should be only skipped when the caller holds the lock, i.e. when called from SetMulti.
 func (b *bucketPreallocated) Get(dst *[]byte, k []byte, h uint64, returnDst bool, skipLocking ...bool) bool {
 	found := false
 	chunks := b.chunks
@@ -2502,7 +2517,6 @@ func (b *bucketUnallocated) Set(k, v []byte, h uint64, skipLocking ...bool) erro
 	return nil
 }
 
-// Get skips locking if skipLocking is set to true. Locking should be only skipped when the caller holds the lock, i.e. when called from SetMulti.
 // GetMulti looks up keys under a single read lock; see ImprovedCache.GetMulti.
 func (b *bucketUnallocated) GetMulti(dst *[]byte, keys [][]byte, hashes []uint64, spans [][2]int) {
 	b.mu.RLock()
@@ -2511,6 +2525,7 @@ func (b *bucketUnallocated) GetMulti(dst *[]byte, keys [][]byte, hashes []uint64
 	getMultiLocked(b, dst, keys, hashes, spans)
 }
 
+// Get skips locking if skipLocking is set to true. Locking should be only skipped when the caller holds the lock, i.e. when called from SetMulti.
 func (b *bucketUnallocated) Get(dst *[]byte, k []byte, h uint64, returnDst bool, skipLocking ...bool) bool {
 	found := false
 	chunks := b.chunks

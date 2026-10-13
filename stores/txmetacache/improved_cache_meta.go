@@ -123,19 +123,23 @@ func (b *improvedCacheBackend) Get(hash chainhash.Hash) (*meta.Data, bool) {
 	return data, true
 }
 
+// getMultiValueSizeHint presizes the value buffer of a batched lookup; a
+// cached txmeta entry is typically 100-200 bytes.
+const getMultiValueSizeHint = 192
+
 // GetMulti looks up many hashes, taking each bucket's read lock once (see
 // ImprovedCache.GetMulti) and decoding outside the locks. out[i] is nil on a
 // miss. Undecodable entries are evicted and count as misses, as in Get.
-func (b *improvedCacheBackend) GetMulti(hashes []chainhash.Hash, out []*meta.Data) {
+func (b *improvedCacheBackend) GetMulti(hashes []chainhash.Hash, keyHashes []uint64, out []*meta.Data) {
 	keys := make([][]byte, len(hashes))
 	for i := range hashes {
 		keys[i] = hashes[i][:]
 	}
 
-	var values []byte
+	values := make([]byte, 0, len(hashes)*getMultiValueSizeHint)
 
 	spans := make([][2]int, len(hashes))
-	b.cache.GetMulti(keys, &values, spans)
+	b.cache.GetMulti(keys, keyHashes, &values, spans)
 
 	for i, sp := range spans {
 		if sp[0] < 0 {

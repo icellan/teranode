@@ -146,10 +146,11 @@ type Server struct {
 	// when transactions are expected to already be in the local UTXO store via propagation.
 	adaptiveFetch *adaptivefetch.State
 
-	// cacheProbeSlotsCh limits cache-probe workers across all concurrent
-	// processTxMetaUsingCache calls; see cacheProbeSlots.
-	cacheProbeSlotsOnce sync.Once
-	cacheProbeSlotsCh   chan struct{}
+	// peerProbePool and blockProbePool limit txmeta cache-probe workers across
+	// all concurrent peer-subtree and block-validation lookups respectively;
+	// see probeTxMetaCache.
+	peerProbePool  probePool
+	blockProbePool probePool
 }
 
 // New creates a new Server instance with the provided dependencies.

@@ -418,9 +418,10 @@ func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash) (*me
 // GetMetaCachedMulti is GetMetaCached for many hashes: out[i] is the cached
 // entry for hashes[i], or nil on a miss. Lookups that share a cache bucket take
 // its read lock once, so pass hashes grouped by ProbeRangeOf to get the
-// benefit. Same read-only contract as GetMetaCached.
-func (t *TxMetaCache) GetMetaCachedMulti(_ context.Context, hashes []chainhash.Hash, out []*meta.Data) {
-	t.cache.GetMulti(hashes, out)
+// benefit. keyHashes, if non-nil, holds KeyHash(&hashes[i]) so the cache does
+// not hash them again. Same read-only contract as GetMetaCached.
+func (t *TxMetaCache) GetMetaCachedMulti(_ context.Context, hashes []chainhash.Hash, keyHashes []uint64, out []*meta.Data) {
+	t.cache.GetMulti(hashes, keyHashes, out)
 
 	hits := 0
 
@@ -439,11 +440,17 @@ func (t *TxMetaCache) GetMetaCachedMulti(_ context.Context, hashes []chainhash.H
 // bucket count each range spans 32 buckets.
 const ProbeRanges = min(256, BucketsCount)
 
-// ProbeRangeOf returns the bucket range a hash's cache entry lives in. Grouping
-// a large lookup by range and handing each group to GetMetaCachedMulti makes
-// every bucket's read lock be taken once per group instead of once per key.
-func ProbeRangeOf(hash *chainhash.Hash) int {
-	return int(xxhash.Sum64(hash[:]) % BucketsCount / (BucketsCount / ProbeRanges))
+// KeyHash is the hash the cache places a transaction's entry by.
+func KeyHash(hash *chainhash.Hash) uint64 {
+	return xxhash.Sum64(hash[:])
+}
+
+// ProbeRangeOf returns the bucket range of the entry whose KeyHash is
+// keyHash. Grouping a large lookup by range and handing each group to
+// GetMetaCachedMulti makes every bucket's read lock be taken once per group
+// instead of once per key.
+func ProbeRangeOf(keyHash uint64) int {
+	return int(keyHash % BucketsCount / (BucketsCount / ProbeRanges))
 }
 
 // GetMeta retrieves transaction metadata for a given transaction hash, first checking the cache
