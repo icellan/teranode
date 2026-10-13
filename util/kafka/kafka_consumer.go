@@ -231,10 +231,12 @@ func (k *KafkaConsumerGroup) Close() error {
 	return nil
 }
 
-// drainTimeout bounds how long closing waits for the consume loop's final
-// commit: in-flight handlers finish first, and a handler that never returns
-// (or calls Close itself) must not block shutdown forever.
-const drainTimeout = 30 * time.Second
+// drainTimeout bounds how long closing waits for the consume loop to drain
+// in-flight handlers and make its final commit; the commit shares the same
+// deadline. A handler that never returns (or calls Close itself) must not
+// block shutdown forever, and services close several consumers in a row
+// within one pod termination grace period.
+const drainTimeout = 10 * time.Second
 
 // awaitDrained waits until the consume loop has made its final offset commit,
 // so the client is not closed underneath it.
@@ -580,7 +582,11 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 			// processBatch runs on the partition's worker (see partitionQueues):
 			// one worker per partition, batches strictly in fetch order, so a
 			// later batch can never mark/commit offsets past an earlier batch
-			// that has not been processed yet.
+			// that is still being processed. A handler error abandons the rest
+			// of its batch, but the partition's next batch is still processed
+			// and marked, which commits past the abandoned records (as before
+			// per-partition workers); consumers that must not skip records use
+			// a retry option.
 			processBatch := func(records []*kgo.Record, hwm int64) {
 				for _, record := range records {
 					select {
@@ -629,10 +635,14 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 			// otherwise records processed after the last ticker commit are
 			// lost despite successful processing.
 			shutdownDrain := func() {
+				// One deadline for draining and the final commit, matching
+				// awaitDrained, so the commit is not cut off by closeClient.
+				deadline := time.Now().Add(drainTimeout)
+
 				partitions.close()
 				partitionWg.Wait()
 				uncommittedMu.Lock()
-				k.commitRecordsSync(uncommittedRecords)
+				k.commitRecordsSync(uncommittedRecords, deadline)
 				uncommittedMu.Unlock()
 			}
 
@@ -788,12 +798,12 @@ func (k *KafkaConsumerGroup) commitRecords(records []*kgo.Record) {
 
 // commitRecordsSync is commitRecords for shutdown: it returns only once the
 // commit has completed, so the client can be closed right after it.
-func (k *KafkaConsumerGroup) commitRecordsSync(records []*kgo.Record) {
+func (k *KafkaConsumerGroup) commitRecordsSync(records []*kgo.Record, deadline time.Time) {
 	if len(records) == 0 || k.client == nil {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 
 	k.client.CommitOffsetsSync(ctx, recordOffsets(records), k.logCommitError)

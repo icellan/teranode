@@ -280,3 +280,39 @@ func TestTxMetaCache_WriteBackWriterHandsOffAfterOneBatch(t *testing.T) {
 
 	require.Equal(t, int32(2), gate.calls.Load())
 }
+
+// panicOnceBackend panics on its first write.
+type panicOnceBackend struct {
+	cacheBackend
+	calls atomic.Int32
+}
+
+func (p *panicOnceBackend) SetMultiSequential(keys, values [][]byte) error {
+	if p.calls.Add(1) == 1 {
+		panic("boom")
+	}
+
+	return p.cacheBackend.SetMultiSequential(keys, values)
+}
+
+// A panic while writing must not leave the lane marked as writing: every later
+// caller hashing into it would block forever.
+func TestTxMetaCache_WriteBackPanicReleasesLane(t *testing.T) {
+	c := newPerHashCache(t, Native)
+	c.cache = &panicOnceBackend{cacheBackend: c.cache}
+
+	key := hashFor(77, 0)
+	value := []byte("value")
+
+	require.Error(t, c.writeBack([][]byte{key.CloneBytes()}, [][]byte{value}))
+
+	done := make(chan error, 1)
+	go func() { done <- c.writeBack([][]byte{key.CloneBytes()}, [][]byte{value}) }()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("lane stayed wedged after a panicking write")
+	}
+}

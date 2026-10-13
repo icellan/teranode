@@ -76,8 +76,10 @@ func (d *partitionQueues) enqueue(partition int32, records []*kgo.Record, hwm in
 	}
 }
 
-// close tells the workers to return once they have processed everything
-// already queued.
+// close tells the workers to return once their queue is empty. On consumer
+// shutdown the context is already cancelled, so workers stop after the record
+// in hand and drop what is still queued; those records were never marked, so
+// they stay uncommitted and are re-delivered.
 func (d *partitionQueues) close() {
 	close(d.closing)
 }

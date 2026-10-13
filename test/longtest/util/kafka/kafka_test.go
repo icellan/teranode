@@ -431,9 +431,9 @@ func TestKafkaProducerAndConsumer(t *testing.T) {
 		client, err := ukafka.NewKafkaConsumerGroupFromURL(logger, kafkaURL, "kafka_test_stop", false, nil)
 		require.NoError(t, err)
 
-		// With no options a failed message is not retried in place: it is left
-		// uncommitted (and the rest of its batch with it) so a rebalance or
-		// restart re-delivers it.
+		// With no options a failed message is not retried in place: it and the
+		// rest of its fetch are not marked. Here every message fails, so nothing
+		// is committed and a restarted consumer gets the first message again.
 		client.Start(ctx, errClosure)
 		defer client.Close()
 

@@ -3,6 +3,7 @@ package txmetacache
 import (
 	"sync"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/cespare/xxhash/v2"
 )
 
@@ -23,7 +24,20 @@ const bucketsPerWriteBackLane = BucketsCount / writeBackLanes
 
 // maxRetainedLaneScratch caps the merge scratch a lane keeps between writes, so
 // one burst does not pin its largest-ever batch for the life of the process.
-const maxRetainedLaneScratch = 64 * 1024
+const maxRetainedLaneScratch = 4 * 1024
+
+// write stores the merged batch. A panic is turned into an error: otherwise the
+// lane would stay marked as writing and every later caller hashing into it
+// would block forever.
+func (l *writeBackLane) write(t *TxMetaCache) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = errors.NewProcessingError("txmeta cache write-back panicked: %v", r)
+		}
+	}()
+
+	return t.SetCacheMultiValuesRaw(l.keys, l.values)
+}
 
 func writeBackLaneOf(key []byte) int {
 	return int(xxhash.Sum64(key) % BucketsCount / bucketsPerWriteBackLane)
@@ -173,7 +187,7 @@ func (l *writeBackLane) writeOnce(t *TxMetaCache) {
 		l.values = append(l.values, req.values...)
 	}
 
-	err := t.SetCacheMultiValuesRaw(l.keys, l.values)
+	err := l.write(t)
 
 	// Drop references to the callers' (pooled) buffers before they are recycled.
 	clear(l.keys)
