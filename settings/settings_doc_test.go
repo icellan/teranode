@@ -874,7 +874,7 @@ var checkedRowsPerDoc = map[string]int{
 	"kafka_settings.md":             19,
 	"policy_settings.md":            26,
 	"alert_settings.md":             10,
-	"asset_settings.md":             35,
+	"asset_settings.md":             37,
 	"blockassembly_settings.md":     43,
 	"blockchain_settings.md":        11,
 	"blockpersister_settings.md":    9,
