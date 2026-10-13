@@ -1073,6 +1073,13 @@ func (b *bucketNative) Set(k, v []byte, h uint64, skipLocking ...bool) error {
 		defer b.mu.Unlock()
 	}
 
+	// If key exists, skip (don't overwrite).
+	// NativeSplitLockFreeMapUint64 does not support overwrite, so the new value
+	// could never become visible; skip it before spending ring space on it.
+	if b.m.Exists(h) {
+		return nil
+	}
+
 	// calculate the idx of the k-v pair to be added
 	// adjust idxNew, calculate where the new k-v pair will end
 	// the new k-v pair must be in the same chunk.
@@ -1131,11 +1138,7 @@ func (b *bucketNative) Set(k, v []byte, h uint64, skipLocking ...bool) error {
 	// Track entry count in current generation, increase by 1
 	b.currentGenCount++
 
-	// If key exists, skip (don't overwrite)
-	// NativeSplitLockFreeMapUint64 does not support overwrite, so we just skip the new value.
-	if !b.m.Exists(h) {
-		_ = b.m.Put(h, idx|(b.gen<<bucketSizeBits))
-	}
+	_ = b.m.Put(h, idx|(b.gen<<bucketSizeBits))
 	b.idx = idxNew
 
 	if needClean {
