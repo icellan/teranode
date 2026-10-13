@@ -66,9 +66,9 @@ const (
 // v1 is chosen on purpose for producers that are not the validator: receivers
 // detect v1 and v2 per message (see the package comment), and a v1 message needs
 // neither the validator's xxhash bucket routing nor a producer built with manual
-// partitioning, so any producer on the txmeta topic can use it. Only the 4-byte
-// count prefix can look like a v2 header when the count is 255, 511, ...; the
-// receiver's full-signature check (the second byte must be 0x02) rejects it.
+// partitioning, so any producer on the txmeta topic can use it. A count of 767
+// (0x02FF) encodes as FF 02 00 00, the full v2 header signature, and a receiver
+// may then parse the message as v2; callers must not send a batch of that size.
 func EncodeDeleteBatch(hashes []chainhash.Hash) []byte {
 	buf := make([]byte, 4+len(hashes)*WireV1MinEntrySize)
 	binary.LittleEndian.PutUint32(buf, uint32(len(hashes))) //nolint:gosec // callers bound batch size well below MaxUint32

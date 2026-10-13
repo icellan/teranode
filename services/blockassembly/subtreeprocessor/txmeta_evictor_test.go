@@ -327,3 +327,33 @@ func TestTxMetaEvictor(t *testing.T) {
 		}
 	})
 }
+
+// TestTxMetaEvictor_NeverEmitsAV2LookalikeCount pins that no DELETE message
+// carries the one v1 entry count, 767 (0x02FF), whose little-endian bytes
+// FF 02 00 00 are the v2 header signature. A receiver would then parse the
+// message as v2 when the first hash happens to read as a small count, and drop
+// every DELETE in it.
+func TestTxMetaEvictor_NeverEmitsAV2LookalikeCount(t *testing.T) {
+	producer := kafka.NewKafkaAsyncProducerMockWithBuffer(10)
+	evictor := NewTxMetaEvictor(ulogger.TestLogger{}, producer)
+
+	hashes := make([]chainhash.Hash, 767)
+	for i := range hashes {
+		hashes[i] = chainhash.HashH([]byte{byte(i), byte(i >> 8)})
+	}
+
+	evictor.Evict(hashes)
+
+	total := 0
+
+	for len(producer.PublishChannel()) > 0 {
+		value := (<-producer.PublishChannel()).Value
+
+		require.False(t, value[0] == txmetacache.WireV2Magic && value[1] == txmetacache.WireV2Version && value[2] == 0 && value[3] == 0,
+			"a DELETE message must never start with the v2 header signature")
+
+		total += int(binary.LittleEndian.Uint32(value[:4]))
+	}
+
+	require.Equal(t, len(hashes), total, "every hash must still be sent")
+}

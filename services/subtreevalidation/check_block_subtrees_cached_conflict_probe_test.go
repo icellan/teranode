@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/aerospike-client-go/v8"
 	bt "github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
@@ -291,7 +292,8 @@ func TestCachedSubtreeConflictingNodes_RetriesTransientItemError(t *testing.T) {
 
 	rootHash := storeCachedSubtreeOf(t, server, []chainhash.Hash{chainhash.HashH([]byte("item-retry-tx"))})
 
-	store := &itemErrStore{failures: 1, itemErr: errors.NewStorageError("record timeout", errors.NewError("ResultCode: TIMEOUT"))}
+	// Aerospike stores the client's own error on the item, not a teranode error.
+	store := &itemErrStore{failures: 1, itemErr: aerospike.ErrTimeout}
 	server.utxoStore = store
 
 	conflicting, err := server.cachedSubtreeConflictingNodes(context.Background(), []chainhash.Hash{rootHash})
@@ -300,9 +302,11 @@ func TestCachedSubtreeConflictingNodes_RetriesTransientItemError(t *testing.T) {
 	require.Equal(t, int64(2), store.calls.Load())
 }
 
-// TestCachedSubtreeConflictingNodes_NonTransientItemErrorFails pins that only
-// transient per-record failures are retried; anything else fails at once.
-func TestCachedSubtreeConflictingNodes_NonTransientItemErrorFails(t *testing.T) {
+// TestCachedSubtreeConflictingNodes_PersistentItemErrorFailsAfterBoundedRetries
+// pins that a per-record failure that never clears fails the check once the
+// retry budget is spent, rather than retrying forever or counting as "not
+// conflicting".
+func TestCachedSubtreeConflictingNodes_PersistentItemErrorFailsAfterBoundedRetries(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
 
@@ -315,7 +319,7 @@ func TestCachedSubtreeConflictingNodes_NonTransientItemErrorFails(t *testing.T) 
 
 	_, err := server.cachedSubtreeConflictingNodes(context.Background(), []chainhash.Hash{rootHash})
 	require.Error(t, err)
-	require.Equal(t, int64(1), store.calls.Load(), "a non-transient per-record failure must not be retried")
+	require.Equal(t, int64(4), store.calls.Load(), "one attempt plus the configured 3 retries")
 }
 
 // fullMetaStore answers BatchDecorate with a complete, non-conflicting meta —

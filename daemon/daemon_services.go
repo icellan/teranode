@@ -758,7 +758,7 @@ func (d *Daemon) startBlockAssemblyService(ctx context.Context, appSettings *set
 
 	// Optional producer used to evict demoted (conflicting) txs from subtree
 	// validation's txmeta cache; nil when no txmeta topic is configured
-	txMetaProducer, err := getKafkaTxmetaEvictionAsyncProducer(ctx, createLogger(loggerKafkaConsumerTxMeta), appSettings)
+	txMetaProducer, err := getKafkaTxmetaEvictionAsyncProducer(ctx, createLogger(serviceBlockAssembly), appSettings)
 	if err != nil {
 		return err
 	}

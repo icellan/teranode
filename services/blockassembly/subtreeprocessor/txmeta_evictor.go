@@ -12,6 +12,11 @@ import (
 // default 1 MiB message limit even for a very large conflict cascade.
 const txMetaEvictBatchSize = 10_000
 
+// v2LookalikeCount is the one v1 entry count whose little-endian bytes
+// (FF 02 00 00) are the v2 header signature. A receiver can parse such a message
+// as v2 and drop every entry in it, so Evict never sends a batch of this size.
+const v2LookalikeCount = int(txmetacache.WireV2Magic) | int(txmetacache.WireV2Version)<<8
+
 // TxMetaEvictor tells subtree validation to drop txmeta cache entries for
 // transactions that block assembly has just demoted to conflicting.
 //
@@ -49,12 +54,20 @@ func (e *TxMetaEvictor) Evict(hashes []chainhash.Hash) {
 		return
 	}
 
-	for start := 0; start < len(hashes); start += txMetaEvictBatchSize {
-		batch := hashes[start:min(start+txMetaEvictBatchSize, len(hashes))]
+	for start := 0; start < len(hashes); {
+		n := min(txMetaEvictBatchSize, len(hashes)-start)
+		if n == v2LookalikeCount {
+			n--
+		}
+
+		batch := hashes[start : start+n]
+		start += n
+
+		key := batch[0] // copied: the producer reads the key after Evict returns
 
 		// Keyed by tx hash like the validator's txmeta messages.
 		if !e.producer.TryPublish(&kafka.Message{
-			Key:   batch[0][:],
+			Key:   key[:],
 			Value: txmetacache.EncodeDeleteBatch(batch),
 		}) {
 			e.logger.Warnf("[TxMetaEvictor] dropped txmeta DELETE for %d demoted txs, producer buffer full or stopped; subtree validation may hold stale non-conflicting entries", len(batch))

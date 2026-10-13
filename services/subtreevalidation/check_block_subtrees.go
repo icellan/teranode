@@ -1083,10 +1083,12 @@ func (u *Server) conflictingInBatch(ctx context.Context, subtreeHash chainhash.H
 		}
 
 		// Aerospike reports a per-record timeout on the item, not from the call,
-		// so a transient item error has to fail the attempt to be retried.
+		// and as the client's own error, which IsRetryableError does not know.
+		// Any per-record failure other than not-found therefore fails the attempt
+		// as a storage error, so the bounded retry covers it.
 		for _, item := range items {
-			if item.Err != nil && errors.IsRetryableError(item.Err) {
-				return item.Err
+			if item.Err != nil && !errors.Is(item.Err, errors.ErrTxNotFound) {
+				return errors.NewStorageError("[cachedSubtreeConflictingNodes][%s] failed to read record %s", subtreeHash.String(), item.Hash.String(), item.Err)
 			}
 		}
 
@@ -1101,16 +1103,13 @@ func (u *Server) conflictingInBatch(ctx context.Context, subtreeHash chainhash.H
 
 	for _, item := range items {
 		if item.Err != nil {
-			// Absent from the store: cannot be flagged conflicting, so there is no
-			// verdict to reach. Failing here would reject any block whose subtree
-			// blob outlived its transaction records, and block validation maps
-			// ErrTxNotFound to a transient-incomplete retry against peers that
-			// cannot supply a record missing from OUR store.
-			if errors.Is(item.Err, errors.ErrTxNotFound) {
-				continue
-			}
-
-			return nil, errors.NewProcessingError("[cachedSubtreeConflictingNodes][%s][%s] failed to read conflicting flag", subtreeHash.String(), item.Hash.String(), item.Err)
+			// Absent from the store (the only item error the retry above lets
+			// through): skipped, see cachedSubtreeConflictingNodes. Failing here
+			// would reject any block whose subtree blob outlived its transaction
+			// records, and block validation maps ErrTxNotFound to a
+			// transient-incomplete retry against peers that cannot supply a record
+			// missing from OUR store.
+			continue
 		}
 
 		if item.Data != nil && item.Data.Conflicting {
