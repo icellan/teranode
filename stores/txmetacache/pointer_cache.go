@@ -222,6 +222,13 @@ func (c *PointerCache) Get(hash chainhash.Hash) (*meta.Data, bool) {
 	return d, ok
 }
 
+// GetMulti is Get for each hash. Implements cacheBackend.
+func (c *PointerCache) GetMulti(hashes []chainhash.Hash, out []*meta.Data) {
+	for i, h := range hashes {
+		out[i], _ = c.Get(h)
+	}
+}
+
 // SetFromBytes is the byte-oriented bridge: deserialises value into a fresh
 // *meta.Data and inserts it. Implements cacheBackend.
 //

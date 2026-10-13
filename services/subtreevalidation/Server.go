@@ -145,6 +145,11 @@ type Server struct {
 	// adaptiveFetch tracks whether subtreeData downloads should be skipped
 	// when transactions are expected to already be in the local UTXO store via propagation.
 	adaptiveFetch *adaptivefetch.State
+
+	// cacheProbeSlotsCh limits cache-probe workers across all concurrent
+	// processTxMetaUsingCache calls; see cacheProbeSlots.
+	cacheProbeSlotsOnce sync.Once
+	cacheProbeSlotsCh   chan struct{}
 }
 
 // New creates a new Server instance with the provided dependencies.

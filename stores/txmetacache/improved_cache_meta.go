@@ -123,6 +123,39 @@ func (b *improvedCacheBackend) Get(hash chainhash.Hash) (*meta.Data, bool) {
 	return data, true
 }
 
+// GetMulti looks up many hashes, taking each bucket's read lock once (see
+// ImprovedCache.GetMulti) and decoding outside the locks. out[i] is nil on a
+// miss. Undecodable entries are evicted and count as misses, as in Get.
+func (b *improvedCacheBackend) GetMulti(hashes []chainhash.Hash, out []*meta.Data) {
+	keys := make([][]byte, len(hashes))
+	for i := range hashes {
+		keys[i] = hashes[i][:]
+	}
+
+	var values []byte
+
+	spans := make([][2]int, len(hashes))
+	b.cache.GetMulti(keys, &values, spans)
+
+	for i, sp := range spans {
+		if sp[0] < 0 {
+			out[i] = nil
+			continue
+		}
+
+		data := &meta.Data{}
+		if err := meta.NewMetaDataFromBytes(values[sp[0]:sp[1]], data); err != nil {
+			b.unmarshalErrors.Add(1)
+			b.cache.Del(keys[i])
+			out[i] = nil
+
+			continue
+		}
+
+		out[i] = data
+	}
+}
+
 func (b *improvedCacheBackend) Del(key []byte) {
 	b.cache.Del(key)
 }
