@@ -756,6 +756,13 @@ func (d *Daemon) startBlockAssemblyService(ctx context.Context, appSettings *set
 		return err
 	}
 
+	// Optional producer used to evict demoted (conflicting) txs from subtree
+	// validation's txmeta cache; nil when no txmeta topic is configured
+	txMetaProducer, err := getKafkaTxmetaEvictionAsyncProducer(ctx, createLogger(loggerKafkaConsumerTxMeta), appSettings)
+	if err != nil {
+		return err
+	}
+
 	// Add the BlockAssembly service to the ServiceManager
 	return d.ServiceManager.AddService(serviceBlockAssemblyFormal, blockassembly.New(
 		createLogger(serviceBlockAssembly),
@@ -764,6 +771,7 @@ func (d *Daemon) startBlockAssemblyService(ctx context.Context, appSettings *set
 		utxoStore,
 		subtreeStore,
 		blockchainClient,
+		blockassembly.WithTxMetaProducer(txMetaProducer),
 	))
 }
 

@@ -3,6 +3,7 @@ package subtreevalidation
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"sort"
 	"sync"
@@ -519,6 +520,21 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		}
 	}
 
+	// The probe below costs a store read per leaf of every listed cached subtree,
+	// and the list is a peer claim until it is bound to the header. Bind it first,
+	// so a repeated or unbound list is rejected before it reaches the store.
+	bodyBound := false
+
+	if len(cachedSubtrees) > 0 {
+		dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
+
+		if err = u.checkBlockBodyBound(ctx, request, block, peerID, dah); err != nil {
+			return nil, errors.WrapGRPC(err)
+		}
+
+		bodyBound = true
+	}
+
 	if err = u.checkCachedSubtreesAgainstCandidateChain(ctx, block, cachedSubtrees); err != nil {
 		return nil, errors.WrapGRPC(err)
 	}
@@ -590,7 +606,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 	// block.Valid runs, so it first proves the body is the one the header
 	// commits to.
 	checker, batched := u.batchChecker(*currentState, block.Height)
-	if batched {
+	if batched && !bodyBound {
 		if err = u.checkBlockBodyBound(ctx, request, block, peerID, dah); err != nil {
 			return nil, errors.WrapGRPC(err)
 		}
@@ -861,12 +877,9 @@ func (u *Server) checkCachedSubtreesAgainstCandidateChain(ctx context.Context, b
 		// it through the chain. A walk-budget or store failure stays retryable
 		// instead of permanently marking the block invalid.
 		if err = u.checkCounterConflictingOnCurrentChain(ctx, txHash, blockIds); err != nil {
-			// A trailer names transactions that may have been pruned since the
-			// subtree was blessed — the trailer outlives the records it points
-			// at. The pre-existing caller of this predicate never saw that,
-			// because it had just validated the transaction and so knew the
-			// record existed; reading trailers from cached files removes that
-			// precondition.
+			// txHash was read from the store moments ago, so ErrTxNotFound here
+			// means a counter-conflicting record is gone, or txHash itself was
+			// pruned between the probe and this walk.
 			//
 			// A record we cannot find is not evidence of an ancestor double
 			// spend. Rejecting on it would make one node refuse a block its
@@ -906,9 +919,20 @@ func (u *Server) checkCachedSubtreesAgainstCandidateChain(ctx context.Context, b
 // evidence that a subtree has no conflicting transactions. Treating it as "none"
 // would turn a storage hiccup into a bypass of the check above. The one exception
 // is a transaction absent from the store: both backends report that through
-// item.Err, and a record we do not have cannot be flagged conflicting, so it is
-// skipped rather than failed — the same fail-open the caller applies to a pruned
-// counter-conflicting record, and for the same reason.
+// item.Err, and it is skipped rather than failed — the same fail-open the caller
+// applies to a pruned counter-conflicting record. Failing would reject any block
+// whose subtree blob outlived its transaction records, against peers that cannot
+// supply a record missing from this node's store.
+//
+// The skip is NOT proof the transaction was never conflicting. A record that aged
+// out may have been. It is only as safe as the retention ordering: a conflicting
+// record gets DAH = demotion height + 1 + UtxoStore retention (set only if no DAH
+// is set yet), a subtree blob gets DAH = blessing height + SubtreeValidation
+// retention, and demotion follows blessing. That ordering flips if
+// UtxoStore.BlockHeightRetentionAdjustment is set below
+// SubtreeValidation.BlockHeightRetentionAdjustment, and blockpersister sets the
+// subtree DAH to 0 (keep forever). In those cases this path can bless what the
+// fresh path would reject.
 //
 // Only fields.Conflicting is requested: the narrowest question that settles the
 // verdict.
@@ -1043,9 +1067,31 @@ func (u *Server) conflictingInBatch(ctx context.Context, subtreeHash chainhash.H
 		return nil, nil
 	}
 
-	// withStoreRetry already reports a cancelled context as cancellation, not as
-	// a storage fault blockvalidation would redeliver the block for.
-	if err := u.batchDecorateWithRetry(ctx, u.utxoStore, items, []fields.FieldName{fields.Conflicting}); err != nil {
+	// Straight to the origin store: a one-field read must not populate the txmeta
+	// cache (see decorateReadPath).
+	store, _ := u.decorateReadPath(true)
+
+	// withStoreRetry reports a cancelled context as cancellation, not as a storage
+	// fault blockvalidation would redeliver the block for.
+	if err := u.withStoreRetry(ctx, fmt.Sprintf("conflicting probe of %d txs", len(items)), func() error {
+		for _, item := range items {
+			item.Data, item.Err = nil, nil
+		}
+
+		if err := store.BatchDecorate(ctx, items, fields.Conflicting); err != nil {
+			return err
+		}
+
+		// Aerospike reports a per-record timeout on the item, not from the call,
+		// so a transient item error has to fail the attempt to be retried.
+		for _, item := range items {
+			if item.Err != nil && errors.IsRetryableError(item.Err) {
+				return item.Err
+			}
+		}
+
+		return nil
+	}); err != nil {
 		return nil, errors.NewProcessingError("[cachedSubtreeConflictingNodes][%s] failed to read conflicting flags", subtreeHash.String(), err)
 	}
 

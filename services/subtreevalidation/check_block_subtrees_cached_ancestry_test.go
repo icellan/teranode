@@ -102,20 +102,79 @@ func buildCachedSubtree(t *testing.T, server *Server, txHash chainhash.Hash, wit
 
 	require.NoError(t, server.subtreeStore.Set(context.Background(), rootHash[:], fileformat.FileTypeSubtree, serialized))
 
+	return boundBlock(t, st, rootHash)
+}
+
+// boundBlock returns a block whose header commits to subtreeHashes, the first
+// of which is first, so it passes the body-to-header binding the cached path runs
+// before probing.
+func boundBlock(t *testing.T, first *subtreepkg.Subtree, subtreeHashes ...*chainhash.Hash) *model.Block {
+	t.Helper()
+
+	coinbaseTx := &bt.Tx{Version: 1}
+
+	merkleRoot, err := first.RootHashWithReplaceRootNode(coinbaseTx.TxIDChainHash(), 0, uint64(coinbaseTx.Size())) // nolint: gosec
+	require.NoError(t, err)
+
+	if len(subtreeHashes) > 1 {
+		top, err := subtreepkg.NewIncompleteTreeByLeafCount(len(subtreeHashes))
+		require.NoError(t, err)
+		require.NoError(t, top.AddNode(*merkleRoot, 1, 0))
+
+		for _, h := range subtreeHashes[1:] {
+			require.NoError(t, top.AddNode(*h, 1, 0))
+		}
+
+		merkleRoot = top.RootHash()
+	}
+
 	prevHash := chainhash.HashH([]byte("candidate-parent"))
 
 	return &model.Block{
 		Header: &model.BlockHeader{
 			Version:        1,
 			HashPrevBlock:  &prevHash,
-			HashMerkleRoot: &chainhash.Hash{},
+			HashMerkleRoot: merkleRoot,
 			Timestamp:      12345678,
 			Bits:           model.NBit{},
 			Nonce:          1,
 		},
-		Height:   200,
-		Subtrees: []*chainhash.Hash{rootHash},
+		CoinbaseTx: coinbaseTx,
+		Height:     200,
+		Subtrees:   subtreeHashes,
 	}
+}
+
+// storeBoundCachedBlock stores n distinct blessed two-leaf subtrees and returns
+// a block whose header commits to them.
+func storeBoundCachedBlock(t *testing.T, server *Server, n int) *model.Block {
+	t.Helper()
+
+	subtrees := make([]*subtreepkg.Subtree, n)
+	hashes := make([]*chainhash.Hash, n)
+
+	for i := range subtrees {
+		st, err := subtreepkg.NewTreeByLeafCount(2)
+		require.NoError(t, err)
+
+		if i == 0 {
+			require.NoError(t, st.AddCoinbaseNode())
+		} else {
+			require.NoError(t, st.AddNode(chainhash.HashH([]byte{byte(i), 0}), 1, 1))
+		}
+
+		require.NoError(t, st.AddNode(chainhash.HashH([]byte{byte(i), 1}), 1, 1))
+
+		serialized, err := st.Serialize()
+		require.NoError(t, err)
+
+		hashes[i] = st.RootHash()
+		subtrees[i] = st
+
+		require.NoError(t, server.subtreeStore.Set(context.Background(), hashes[i][:], fileformat.FileTypeSubtree, serialized))
+	}
+
+	return boundBlock(t, subtrees[0], hashes...)
 }
 
 // TestCheckBlockSubtrees_StoreConflictingFlagTriggersAncestryCheck pins the gate:
@@ -235,13 +294,16 @@ func TestCheckBlockSubtrees_TrailerIsNotTrusted(t *testing.T) {
 // TestCheckBlockSubtrees_MissingTxRecordDoesNotFailTheBlock guards a block whose
 // subtree blob outlived its transaction records.
 //
-// The UTXO and subtree retention windows are independent, so a node can hold a
-// subtree whose transactions have aged out; reorgs and catchup over older blocks
-// reach exactly that. Both backends report the miss through item.Err, and block
+// The UTXO and subtree retention windows are configured separately, and
+// blockpersister keeps subtree blobs indefinitely, so a node can hold a subtree
+// whose transactions have aged out; reorgs and catchup over older blocks reach
+// exactly that. Both backends report the miss through item.Err, and block
 // validation maps ErrTxNotFound to a transient-incomplete retry — against peers
 // that cannot supply a record missing from THIS node's store, so the block would
-// never converge. A record we do not have also cannot be flagged conflicting, so
-// there is no verdict to reach.
+// never converge.
+//
+// Skipping is not proof the record was never conflicting; it depends on the
+// retention ordering documented on cachedSubtreeConflictingNodes.
 func TestCheckBlockSubtrees_MissingTxRecordDoesNotFailTheBlock(t *testing.T) {
 	server, cleanup := setupTestServer(t)
 	defer cleanup()
