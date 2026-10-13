@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/cespare/xxhash/v2"
 	"github.com/stretchr/testify/require"
@@ -133,7 +134,23 @@ func TestTxMetaCache_BatchDecorateWriteBackOneWriterPerLane(t *testing.T) {
 	rec := &laneBackend{cacheBackend: c.cache, inFlight: map[int]int{}, peak: map[int]int{}}
 	c.cache = rec
 
-	const callers = 64
+	const callers, perCaller = 64, 300
+
+	// Without merging, every (caller, non-empty lane) pair would be its own write.
+	unmerged := 0
+
+	for g := 0; g < callers; g++ {
+		lanes := map[int]struct{}{}
+
+		for i := 0; i < perCaller; i++ {
+			h := hashFor(g+10, i)
+			lanes[writeBackLaneOf(h[:])] = struct{}{}
+		}
+
+		unmerged += len(lanes)
+	}
+
+	errs := make(chan error, callers)
 
 	var wg sync.WaitGroup
 
@@ -143,22 +160,29 @@ func TestTxMetaCache_BatchDecorateWriteBackOneWriterPerLane(t *testing.T) {
 		go func(g int) {
 			defer wg.Done()
 
-			items := make([]*utxo.UnresolvedMetaData, 300)
+			items := make([]*utxo.UnresolvedMetaData, perCaller)
 			for i := range items {
 				items[i] = &utxo.UnresolvedMetaData{Hash: hashFor(g+10, i), Idx: i}
 			}
 
-			require.NoError(t, c.BatchDecorate(context.Background(), items))
+			errs <- c.BatchDecorate(context.Background(), items)
 
 			// Populated by the time BatchDecorate returns, whoever wrote it.
 			for i := range items {
-				_, ok := c.GetMetaCached(context.Background(), hashFor(g+10, i))
-				require.True(t, ok)
+				if _, ok := c.GetMetaCached(context.Background(), hashFor(g+10, i)); !ok {
+					errs <- errors.NewProcessingError("entry not cached when BatchDecorate returned")
+					return
+				}
 			}
 		}(g)
 	}
 
 	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		require.NoError(t, err)
+	}
 
 	require.NotEmpty(t, rec.peak)
 
@@ -167,5 +191,92 @@ func TestTxMetaCache_BatchDecorateWriteBackOneWriterPerLane(t *testing.T) {
 	}
 
 	// Concurrent callers' entries are merged into shared per-lane writes.
-	require.Less(t, int(rec.calls.Load()), callers*writeBackLanes)
+	require.Less(t, int(rec.calls.Load()), unmerged)
+}
+
+// gatedBackend blocks each of the first two writes until released.
+type gatedBackend struct {
+	cacheBackend
+	entered [2]chan struct{}
+	release [2]chan struct{}
+	calls   atomic.Int32
+}
+
+func newGatedBackend(inner cacheBackend) *gatedBackend {
+	g := &gatedBackend{cacheBackend: inner}
+	for i := range g.entered {
+		g.entered[i] = make(chan struct{})
+		g.release[i] = make(chan struct{})
+	}
+
+	return g
+}
+
+func (g *gatedBackend) SetMultiSequential(keys, values [][]byte) error {
+	if n := int(g.calls.Add(1)); n <= len(g.entered) {
+		close(g.entered[n-1])
+		<-g.release[n-1]
+	}
+
+	return g.cacheBackend.SetMultiSequential(keys, values)
+}
+
+// A writer writes one merged batch and hands the lane over: it must not keep
+// writing other callers' entries while they keep arriving, or one subtree
+// worker stalls for as long as the burst lasts.
+func TestTxMetaCache_WriteBackWriterHandsOffAfterOneBatch(t *testing.T) {
+	c := newPerHashCache(t, Native)
+	gate := newGatedBackend(c.cache)
+	c.cache = gate
+
+	// Keys that all fall into lane 0.
+	var laneKeys [][]byte
+
+	for i := 0; len(laneKeys) < 4; i++ {
+		h := hashFor(99, i)
+		if writeBackLaneOf(h[:]) == 0 {
+			laneKeys = append(laneKeys, h.CloneBytes())
+		}
+	}
+
+	value := []byte("value")
+
+	firstDone := make(chan error, 1)
+
+	go func() { firstDone <- c.writeBack(laneKeys[:1], [][]byte{value}) }()
+
+	<-gate.entered[0] // the first caller is writing, alone
+
+	othersDone := make(chan error, 3)
+
+	for _, k := range laneKeys[1:] {
+		go func(k []byte) { othersDone <- c.writeBack([][]byte{k}, [][]byte{value}) }(k)
+	}
+
+	require.Eventually(t, func() bool {
+		l := &c.lanes[0]
+		l.mu.Lock()
+		defer l.mu.Unlock()
+
+		return len(l.pending) == 3
+	}, 5*time.Second, time.Millisecond)
+
+	close(gate.release[0])
+	<-gate.entered[1] // the next batch, the three queued meanwhile, is being written
+
+	// ...but not by the first caller, which returns while it is still blocked.
+	select {
+	case err := <-firstDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("first writer kept writing other callers' batch instead of handing the lane over")
+	}
+
+	close(gate.release[1])
+
+	for range 3 {
+		require.NoError(t, <-othersDone)
+	}
+
+	require.Equal(t, int32(2), gate.calls.Load())
 }

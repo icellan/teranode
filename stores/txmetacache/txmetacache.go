@@ -372,10 +372,11 @@ func (t *TxMetaCache) SetCacheMultiSequentialWithHashes(keys [][]byte, values []
 	return nil
 }
 
-// SetCacheMultiValuesRaw stores already height-suffixed values on the calling
-// goroutine. It deliberately avoids SetMultiFromBytes: its per-bucket goroutine
-// fan-out, run from every concurrent BatchDecorate under a miss burst, flooded
-// the scheduler and the bucket locks and starved the Kafka txmeta handler.
+// SetCacheMultiValuesRaw stores values as given (no block height is appended)
+// on the calling goroutine. It deliberately avoids SetMultiFromBytes: its
+// per-bucket goroutine fan-out, run from every concurrent BatchDecorate under a
+// miss burst, flooded the scheduler and the bucket locks and starved the Kafka
+// txmeta handler.
 func (t *TxMetaCache) SetCacheMultiValuesRaw(keys [][]byte, values [][]byte) error {
 	if err := t.cache.SetMultiSequential(keys, values); err != nil {
 		return err
