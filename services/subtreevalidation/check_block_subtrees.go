@@ -967,29 +967,56 @@ func (u *Server) cachedSubtreeConflictingNodesFor(ctx context.Context, subtreeHa
 	}
 
 	numNodes := len(nodeBytes) / chainhash.HashSize
+	if numNodes == 0 {
+		return nil, nil
+	}
 
 	batchSize := u.settings.BlockValidation.ProcessTxMetaUsingStoreBatchSize
 	if batchSize <= 0 {
 		batchSize = numNodes
 	}
 
-	var conflicting []chainhash.Hash
+	numBatches := (numNodes + batchSize - 1) / batchSize
+	perBatch := make([][]chainhash.Hash, numBatches)
 
-	for start := 0; start < numNodes; start += batchSize {
+	// Batches go to the store in parallel, as in processTxMetaUsingStore:
+	// parallelism across subtrees alone leaves a block of a few large subtrees
+	// doing its round trips one at a time.
+	g, gCtx := errgroup.WithContext(ctx)
+	util.SafeSetLimit(u.logger, g, u.settings.BlockValidation.ProcessTxMetaUsingStoreConcurrency)
+
+	for batchIdx := 0; batchIdx < numBatches; batchIdx++ {
+		batchIdx := batchIdx
+		start := batchIdx * batchSize
 		end := subtreepkg.Min(start+batchSize, numNodes)
 
-		conflicting, err = u.appendConflictingInBatch(ctx, subtreeHash, nodeBytes[start*chainhash.HashSize:end*chainhash.HashSize], conflicting)
-		if err != nil {
-			return nil, err
-		}
+		g.Go(func() error {
+			conflicting, err := u.conflictingInBatch(gCtx, subtreeHash, nodeBytes[start*chainhash.HashSize:end*chainhash.HashSize])
+			if err != nil {
+				return err
+			}
+
+			perBatch[batchIdx] = conflicting
+
+			return nil
+		})
+	}
+
+	if err = g.Wait(); err != nil {
+		return nil, err
+	}
+
+	var conflicting []chainhash.Hash
+	for _, batch := range perBatch {
+		conflicting = append(conflicting, batch...)
 	}
 
 	return conflicting, nil
 }
 
-// appendConflictingInBatch decorates one run of 32-byte transaction hashes with
-// fields.Conflicting and appends the flagged ones to out.
-func (u *Server) appendConflictingInBatch(ctx context.Context, subtreeHash chainhash.Hash, nodeBytes []byte, out []chainhash.Hash) ([]chainhash.Hash, error) {
+// conflictingInBatch decorates one run of 32-byte transaction hashes with
+// fields.Conflicting and returns the flagged ones.
+func (u *Server) conflictingInBatch(ctx context.Context, subtreeHash chainhash.Hash, nodeBytes []byte) ([]chainhash.Hash, error) {
 	numNodes := len(nodeBytes) / chainhash.HashSize
 
 	itemsPtr := getUnresolvedMetaDataSlice(numNodes)
@@ -1013,14 +1040,18 @@ func (u *Server) appendConflictingInBatch(ctx context.Context, subtreeHash chain
 	}
 
 	if len(items) == 0 {
-		return out, nil
+		return nil, nil
 	}
 
-	if err := u.utxoStore.BatchDecorate(ctx, items, fields.Conflicting); err != nil {
+	// withStoreRetry already reports a cancelled context as cancellation, not as
+	// a storage fault blockvalidation would redeliver the block for.
+	if err := u.batchDecorateWithRetry(ctx, u.utxoStore, items, []fields.FieldName{fields.Conflicting}); err != nil {
 		return nil, errors.NewProcessingError("[cachedSubtreeConflictingNodes][%s] failed to read conflicting flags", subtreeHash.String(), err)
 	}
 
 	prometheusSubtreeValidationCachedConflictProbes.Add(float64(len(items)))
+
+	var out []chainhash.Hash
 
 	for _, item := range items {
 		if item.Err != nil {
