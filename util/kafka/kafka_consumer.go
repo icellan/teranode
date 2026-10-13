@@ -654,29 +654,10 @@ func (k *KafkaConsumerGroup) Start(ctx context.Context, consumerFn func(message 
 				default:
 				}
 
-				fetches := k.client.PollFetches(internalCtx)
-
-				if errs := fetches.Errors(); len(errs) > 0 {
-					for _, err := range errs {
-						if errors.Is(err.Err, context.Canceled) || errors.Is(err.Err, kgo.ErrClientClosed) {
-							k.Config.Logger.Debugf("Kafka consumer shutdown: %v", err.Err)
-							shutdownDrain()
-							return
-						}
-						k.Config.Logger.Errorf("Kafka consumer error on topic %s partition %d: %v", err.Topic, err.Partition, err.Err)
-					}
-					continue
+				if k.dispatchFetches(k.client.PollFetches(internalCtx), partitions) {
+					shutdownDrain()
+					return
 				}
-
-				fetches.EachPartition(func(p kgo.FetchTopicPartition) {
-					if len(p.Records) == 0 {
-						return
-					}
-
-					// Never blocks: fetching continues at full speed while the
-					// partition's worker catches up.
-					partitions.enqueue(p.Partition, p.Records, p.HighWatermark)
-				})
 
 				select {
 				case <-commitTicker.C:
@@ -785,6 +766,40 @@ func (k *KafkaConsumerGroup) startInMemory(ctx context.Context, consumerFn func(
 			k.Config.Logger.Errorf("In-memory consumer error: %v", err)
 		}
 	}()
+}
+
+// dispatchFetches hands every partition's fetched records to its worker and
+// reports whether the client is shutting down (in which case nothing is
+// dispatched: unmarked records stay uncommitted and are re-delivered).
+//
+// A fetch error on one partition is logged and does not stop the others being
+// dispatched: franz-go has already advanced past the records it returned, so
+// skipping them would lose them for good once later offsets are committed.
+func (k *KafkaConsumerGroup) dispatchFetches(fetches kgo.Fetches, partitions *partitionQueues) bool {
+	errs := fetches.Errors()
+
+	for _, err := range errs {
+		if errors.Is(err.Err, context.Canceled) || errors.Is(err.Err, kgo.ErrClientClosed) {
+			k.Config.Logger.Debugf("Kafka consumer shutdown: %v", err.Err)
+			return true
+		}
+	}
+
+	for _, err := range errs {
+		k.Config.Logger.Errorf("Kafka consumer error on topic %s partition %d: %v", err.Topic, err.Partition, err.Err)
+	}
+
+	fetches.EachPartition(func(p kgo.FetchTopicPartition) {
+		if len(p.Records) == 0 {
+			return
+		}
+
+		// Never blocks: fetching continues at full speed while the
+		// partition's worker catches up.
+		partitions.enqueue(p.Partition, p.Records, p.HighWatermark)
+	})
+
+	return false
 }
 
 // commitRecords commits the offsets for the given records
