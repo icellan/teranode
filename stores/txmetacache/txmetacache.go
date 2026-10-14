@@ -123,6 +123,9 @@ type CacheStats struct {
 	// PreviousGenEntries is the count of valid entries from the previous generation
 	// that have not yet been overwritten.
 	PreviousGenEntries uint64
+
+	// LaneWaits counts the times a lockfree-cache writer found every lane busy.
+	LaneWaits uint64
 }
 
 // BucketType defines the allocation strategy for the cache's internal buckets.
@@ -167,11 +170,9 @@ const (
 	// trade-off is measured for your workload.
 	Pointer
 
-	// Lockfree selects the lock-free cache: LaneCache (lockfree_lanes.go) by
-	// default, with LockFreeCache (lockfree_cache.go) kept as the per-shard
-	// alternative for comparison. Off-heap per-writer rings with a
-	// set-associative index, lock-free reads and writes, and no index rebuild
-	// when a ring wraps. Pair it with GetMetaCachedInto for reads that allocate
+	// Lockfree selects LaneCache (lockfree_lanes.go): off-heap per-writer
+	// rings with a set-associative index, lock-free reads and writes, and no
+	// index rebuild when a ring wraps. Pair it with GetMetaCachedInto for reads that allocate
 	// nothing per entry. Like ImprovedCache, its off-heap memory is never
 	// unmapped; a cache lives for the life of the process.
 	Lockfree
@@ -227,7 +228,7 @@ func NewTxMetaCache(
 
 		cache = pc
 	} else if bucketType == Lockfree {
-		lc, err := newLockFreeImpl(maxMB * 1024 * 1024)
+		lc, err := NewLaneCache(maxMB * 1024 * 1024)
 		if err != nil {
 			return nil, errors.NewProcessingError("error creating lock-free cache", err)
 		}
@@ -1034,6 +1035,7 @@ func (t *TxMetaCache) GetCacheStats() *CacheStats {
 		ValidEntriesCount:  s.ValidEntriesCount,
 		CurrentGenEntries:  s.CurrentGenEntries,
 		PreviousGenEntries: s.PreviousGenEntries,
+		LaneWaits:          s.LaneWaits,
 	}
 }
 

@@ -12,8 +12,10 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
-// LaneCache is LockFreeCache with the records kept in per-writer lane rings
-// instead of per-shard rings.
+// LaneCache is an off-heap txmeta cache whose reads take no lock, keeping its
+// records in per-writer lane rings. (An earlier per-shard-ring layout,
+// LockFreeCache, is kept in a test file for comparison; lanes measured 30-60%
+// faster for both ingest and reads on the production subtree nodes.)
 //
 // A writer takes a lane for a whole batch (one CAS) and appends its records to
 // that lane's ring one after another, so a batch's record writes are
@@ -31,9 +33,11 @@ import (
 // stale. An offset 8 TB behind would alias onto a recent one; the record's key
 // comparison and checksum reject it.
 //
-// Reads are validated exactly as in LockFreeCache: tail checked before and
-// after the copy (with a load fence between) and a 48-bit checksum over key
-// and value.
+// Reads are optimistic: check the lane's tail, copy the record, issue a load
+// fence, and check the tail again; a copy of a record that was lapped meanwhile
+// is a miss. A record's length can be garbage mid-overwrite, so it is bounded
+// before anything is copied. The 48-bit key and value checksum (see
+// lockfree_common.go) backs the tail check up.
 type LaneCache struct {
 	lanes    []lfLane
 	ringSize uint64 // bytes per lane ring, a power of two
@@ -44,18 +48,22 @@ type LaneCache struct {
 
 	region []byte
 
-	oversize atomic.Uint64
-	inserts  stripedCounter
+	oversize  atomic.Uint64
+	inserts   stripedCounter
+	laneWaits atomic.Uint64
 }
 
-// lfLane is two cache lines: the writer-side line (owner, tail) and the
-// read-mostly snapshot line.
+// lfLane is three cache lines: owner (scanned by writers looking for a lane),
+// the writer-side tail, and the read-mostly tail snapshot.
 type lfLane struct {
+	// owner is on its own cache line: writers looking for a free lane scan
+	// it, and it changes twice per batch.
 	owner atomic.Uint32
-	_     uint32
-	tail  atomic.Uint64
-	ring  unsafe.Pointer
-	_     [40]byte
+	_     [60]byte
+
+	tail atomic.Uint64
+	ring unsafe.Pointer
+	_    [48]byte
 
 	// snap is the lane's tail as of its last refresh, on its own cache line.
 	// Writers judge other lanes' slots (stale? oldest?) by it rather than by
@@ -90,7 +98,13 @@ func NewLaneCache(maxBytes int) (*LaneCache, error) {
 	// mask instead of a 64-bit division (one per insert and one per read).
 	// The ring is the smallest power of two that keeps the lane count within
 	// lnMaxLanes; the lane count then absorbs the rounding, so less than one
-	// ring's worth of the budget goes unused.
+	// ring's worth of the budget goes unused, and a large cache gets between
+	// half and all of lnMaxLanes. Doubling the lane count (9-bit lane ids) to
+	// stay above the subtree node's peak writer count (up to 256 BatchDecorate
+	// write-back lanes plus the Kafka partition workers) measured about 30%
+	// slower at the production shape: twice the write streams on rings half
+	// the size. So writers can outnumber lanes in a burst; a writer that finds
+	// none free waits and is counted in LaneWaits.
 	ringSize := max(nextPow2((ringBudget+lnMaxLanes-1)/lnMaxLanes), lnMinRing)
 	for ringSize > lnMinRing && ringSize > ringBudget {
 		ringSize >>= 1
@@ -195,7 +209,7 @@ func (c *LaneCache) acquire() int {
 	n := len(c.lanes)
 	start := int(mrand.Uint64() % uint64(n)) //nolint:gosec // not security relevant
 
-	for spins := 0; ; spins++ {
+	for {
 		for i := 0; i < n; i++ {
 			lane := (start + i) % n
 			if c.lanes[lane].owner.Load() == 0 && c.lanes[lane].owner.CompareAndSwap(0, 1) {
@@ -203,6 +217,8 @@ func (c *LaneCache) acquire() int {
 			}
 		}
 
+		// Every lane is busy: more writers than lanes right now.
+		c.laneWaits.Add(1)
 		runtime.Gosched()
 	}
 }
@@ -254,8 +270,8 @@ func (c *LaneCache) SetMulti(keys, values [][]byte) error {
 		n := min(lfPrefetchGroup, len(keys)-g)
 
 		// Locate the group and start its index sets' misses (plain loads of
-		// the off-heap index, see LockFreeCache.GetMulti), and lay its
-		// records out after the lane tail.
+		// the off-heap index whose values are not used; see GetMulti), and
+		// lay its records out after the lane tail.
 		end := t
 
 		for j := 0; j < n; j++ {
@@ -321,8 +337,8 @@ func (c *LaneCache) SetMulti(keys, values [][]byte) error {
 	return first
 }
 
-// writeLaneRecord writes header, key and value at ring position pos; the same
-// record format and checksum as LockFreeCache.writeRecord.
+// writeLaneRecord writes header, key and value at ring position pos, in the
+// record format described in lockfree_common.go.
 func writeLaneRecord(c *LaneCache, l *lfLane, pos uint64, key, value []byte) {
 	h := keyChecksum(key)
 
@@ -339,7 +355,7 @@ func writeLaneRecord(c *LaneCache, l *lfLane, pos uint64, key, value []byte) {
 		*c.wordAt(l, p+uint64(i)) = word //nolint:gosec // i >= 0
 	}
 
-	if rest := len(value) - full; rest > 0 {
+	if len(value) > full {
 		var last [8]byte
 
 		copy(last[:], value[full:])
@@ -352,9 +368,14 @@ func writeLaneRecord(c *LaneCache, l *lfLane, pos uint64, key, value []byte) {
 }
 
 // publish points a slot of the set at the new record. Preference: a slot with
-// this key's fingerprint (the new value replaces it; see LockFreeCache.publish
-// for why a fingerprint match is not verified), then an empty or stale slot,
-// then the slot whose record is closest to being overwritten.
+// this key's fingerprint (the new value replaces it), then an empty or stale
+// slot, then the slot whose record is closest to being overwritten.
+//
+// A fingerprint match is taken to be this key without reading the old record:
+// that read would be a cold, random cache miss on every re-insert. A false
+// match (same set and same 16 fingerprint bits) evicts the other key's entry,
+// which costs it a later miss but never returns wrong data: reads compare the
+// full key and the checksum.
 //
 // Records in different lanes cannot be ordered, so when two writers race on
 // one key the one that publishes last wins, even if it reserved first. Cached
@@ -477,8 +498,13 @@ func (c *LaneCache) read(v uint64, key []byte, dst *[]byte) bool {
 }
 
 // GetMulti looks up every key, appending found values to *dst: value i is
-// (*dst)[spans[i][0]:spans[i][1]], or spans[i] = {-1, -1} on a miss. Lookups
-// are grouped as in LockFreeCache.GetMulti.
+// (*dst)[spans[i][0]:spans[i][1]], or spans[i] = {-1, -1} on a miss.
+//
+// Lookups are handled in groups of lfPrefetchGroup: first every index set is
+// touched, then every candidate record, then the records are read, so the
+// group's cache misses overlap. The touches are plain loads whose values are
+// not used: on arm64 an atomic load is an acquire and would make each miss wait
+// for the previous one.
 func (c *LaneCache) GetMulti(dst *[]byte, keys []chainhash.Hash, spans [][2]int) {
 	var (
 		sink uint64
@@ -571,7 +597,9 @@ func (c *LaneCache) keyAt(v uint64, key []byte) bool {
 // not run concurrently with writers.
 func (c *LaneCache) Reset() {
 	for i := range c.lanes {
-		c.lanes[i].tail.Add(c.ringSize + 8)
+		// Bring the snapshot along, so publish sees the old records as the
+		// stale slots they now are (see lfLane.snap).
+		c.lanes[i].snap.Store(c.lanes[i].tail.Add(c.ringSize + 8))
 	}
 
 	c.inserts.reset()
@@ -601,4 +629,5 @@ func (c *LaneCache) UpdateStats(s *Stats) {
 	s.ValidEntriesCount += live
 	s.TotalMapSize += live
 	s.TotalElementsAdded += inserts
+	s.LaneWaits += c.laneWaits.Load()
 }

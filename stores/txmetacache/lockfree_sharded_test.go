@@ -11,6 +11,28 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 )
 
+// rawLockFreeCache is the byte-level API both lock-free layouts share, so the
+// contract and stress tests can run against each.
+type rawLockFreeCache interface {
+	Set(key, value []byte) error
+	SetMulti(keys, values [][]byte) error
+	Get(dst *[]byte, key []byte) bool
+	GetMulti(dst *[]byte, keys []chainhash.Hash, spans [][2]int)
+	Del(key []byte)
+	Reset()
+	Oversize() uint64
+	UpdateStats(s *Stats)
+}
+
+var (
+	_ rawLockFreeCache = (*LockFreeCache)(nil)
+	_ rawLockFreeCache = (*LaneCache)(nil)
+)
+
+// LockFreeCache is the per-shard-ring layout LaneCache replaced. It lives in a
+// test file so the contract and stress tests, and benchmarks, can still
+// compare the two; it does not ship.
+//
 // LockFreeCache is an off-heap txmeta cache whose reads take no lock and do no
 // atomic read-modify-write, and whose writes never block readers or rebuild an
 // index.
@@ -77,28 +99,12 @@ type lfShard struct {
 }
 
 const (
-	lfHeaderBytes = 8
-	lfKeyBytes    = 32
-	lfSlotsPerSet = 8
-	lfOffsetBits  = 48
-	lfOffsetMask  = 1<<lfOffsetBits - 1
-
-	// The header word is [48-bit checksum | 16-bit value length].
-	lfLenMask = 1<<16 - 1
+	lfOffsetBits = 48
+	lfOffsetMask = 1<<lfOffsetBits - 1
 
 	// lfMinShardRing keeps each shard's ring large enough to hold many maximum
 	// size records; small caches get fewer shards instead of tiny rings.
 	lfMinShardRing = 32 * 1024
-
-	// lfBytesPerSlot sizes the index: one slot per 64 ring bytes, about twice
-	// the number of records a ring holds (a typical record is 100-200 bytes),
-	// so 8-way sets rarely have to evict a live entry.
-	lfBytesPerSlot = 64
-
-	// lfMaxCASRetries bounds an insert's slot-publish loop. Losing that many
-	// races in a row means the set is extremely hot; the record is then left
-	// unindexed, which a cache may do.
-	lfMaxCASRetries = 16
 )
 
 // NewLockFreeCache allocates a cache of about maxBytes, rings and index
@@ -168,33 +174,6 @@ func NewLockFreeCache(maxBytes int) (*LockFreeCache, error) {
 	return c, nil
 }
 
-const maxInt = int(^uint(0) >> 1)
-
-func nextPow2(v uint64) uint64 {
-	if v <= 1 {
-		return 1
-	}
-
-	return 1 << bits.Len64(v-1)
-}
-
-// ShardOf is the lock-free cache shard a transaction hash belongs to, out of
-// BucketsCount. It is unseeded so the txmeta producer can partition by it.
-func ShardOf(hash *chainhash.Hash) uint64 {
-	return binary.LittleEndian.Uint64(hash[0:8]) % BucketsCount
-}
-
-// fmix64 is the murmur3 64-bit finaliser.
-func fmix64(h uint64) uint64 {
-	h ^= h >> 33
-	h *= 0xff51afd7ed558ccd
-	h ^= h >> 33
-	h *= 0xc4ceb9fe1a85ec53
-	h ^= h >> 33
-
-	return h
-}
-
 // locate returns the key's shard, the address of its index set, and its
 // fingerprint.
 func (c *LockFreeCache) locate(key []byte) (*lfShard, unsafe.Pointer, uint64) {
@@ -210,10 +189,6 @@ func (c *LockFreeCache) locate(key []byte) (*lfShard, unsafe.Pointer, uint64) {
 // from the CAS that publishes the record's slot.
 func storeWordPlain(p *uint64, v uint64) {
 	*p = v
-}
-
-func slotAt(set unsafe.Pointer, i int) *uint64 {
-	return (*uint64)(unsafe.Add(set, i*8))
 }
 
 func (c *LockFreeCache) wordAt(s *lfShard, pos uint64) *uint64 {
@@ -235,35 +210,6 @@ func (c *LockFreeCache) keyAt(s *lfShard, pos uint64, key []byte) bool {
 	}
 
 	return true
-}
-
-// The record checksum folds the key words and the value words (the last one
-// zero-padded) through checksumStep, one word at a time, so writer and reader
-// compute it in the same pass that stores or copies the words. Each step is a
-// bijection of the running hash for a fixed word and of the word for a fixed
-// hash, so changing any single word always changes the result; the header
-// keeps the top 48 bits.
-const checksumInit = 0x9e3779b97f4a7c15
-
-func checksumStep(h, w uint64) uint64 {
-	return bits.RotateLeft64(h^(w*0xbf58476d1ce4e5b9), 31) * 0x94d049bb133111eb
-}
-
-func checksumFinal(h, valueLen uint64) uint64 {
-	return fmix64(h^valueLen) &^ lfLenMask
-}
-
-func keyChecksum(key []byte) uint64 {
-	h := uint64(checksumInit)
-	for w := 0; w < 4; w++ {
-		h = checksumStep(h, binary.LittleEndian.Uint64(key[w*8:]))
-	}
-
-	return h
-}
-
-func recordBytes(valueLen int) uint64 {
-	return lfHeaderBytes + lfKeyBytes + (uint64(valueLen)+7)&^7 //nolint:gosec // valueLen < 2KB
 }
 
 // Set stores value under key, replacing any previous value. key must be a
@@ -586,15 +532,6 @@ func (c *LockFreeCache) read(s *lfShard, o uint64, key []byte, dst *[]byte) bool
 
 	return true
 }
-
-// lfPrefetchGroup is how many lookups GetMulti overlaps. Each lookup is two
-// dependent cache misses (index set, then record) on a large cache; touching a
-// group's sets, then its records, before reading lets those misses overlap
-// instead of being taken one after another.
-const lfPrefetchGroup = 16
-
-// lfPrefetchSink keeps the compiler from discarding prefetch loads.
-var lfPrefetchSink atomic.Uint64
 
 // GetMulti looks up every key, appending found values to *dst: value i is
 // (*dst)[spans[i][0]:spans[i][1]], or spans[i] = {-1, -1} on a miss.
