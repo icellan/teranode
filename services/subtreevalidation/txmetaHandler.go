@@ -217,6 +217,14 @@ func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) err
 
 		switch action {
 		case txmetacache.WireActionADD:
+			if u.txMetaTombstones.contains(bufs.keysBuf[hashStart : hashStart+32]) {
+				// Its DELETE was consumed first (different partition): caching it
+				// now would bring back a tx demoted to conflicting.
+				prometheusSubtreeValidationTxMetaAddSkippedTombstoned.Inc()
+
+				break
+			}
+
 			contentStart := len(bufs.contentBuf)
 			bufs.contentBuf = append(bufs.contentBuf, data[offset:offset+int(contentLen)]...)
 			bufs.keys = append(bufs.keys, bufs.keysBuf[hashStart:hashStart+32])
@@ -253,6 +261,8 @@ func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) err
 		prometheusSubtreeValidationSetTXMetaCacheKafkaBatch.Observe(elapsed)
 		prometheusSubtreeValidationSetTXMetaCacheKafkaCount.Add(float64(len(bufs.keys)))
 	}
+
+	u.txMetaTombstones.add(bufs.deletes)
 
 	for i := range bufs.deletes {
 		if err := u.DelTxMetaCache(ctx, &bufs.deletes[i]); err != nil {

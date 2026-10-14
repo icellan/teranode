@@ -28,6 +28,10 @@ const v2LookalikeCount = int(txmetacache.WireV2Magic) | int(txmetacache.WireV2Ve
 // pass the cached-meta fast path. DELETE is a hint to a cache that is repopulated
 // from the store on a miss, so publishing is best effort and never fails the caller.
 //
+// The DELETE and the validator's ADD for the same tx are on different
+// partitions, so the DELETE can be consumed first. Subtree validation's
+// txmetaHandler keeps recent DELETEs as tombstones and drops a late ADD for them.
+//
 // A nil *TxMetaEvictor is valid and does nothing, so call sites need no guard.
 type TxMetaEvictor struct {
 	logger   ulogger.Logger

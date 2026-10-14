@@ -109,6 +109,10 @@ var (
 	// based on Kafka messages, which is an important maintenance operation.
 	prometheusSubtreeValidationDelTXMetaCacheKafka prometheus.Histogram
 
+	// prometheusSubtreeValidationTxMetaAddSkippedTombstoned counts txmeta ADDs
+	// dropped because a DELETE for the same tx was consumed first.
+	prometheusSubtreeValidationTxMetaAddSkippedTombstoned prometheus.Counter
+
 	// prometheusSubtreeValidationSetTXMetaCacheKafkaErrors counts errors setting tx meta cache from kafka operations.
 	// This counter tracks how often errors occur when updating the transaction metadata cache
 	// from Kafka messages, which helps identify issues with the cache or Kafka connection.
@@ -280,6 +284,15 @@ func _initPrometheusMetrics() {
 			Name:      "del_tx_meta_cache_kafka",
 			Help:      "Duration of deleting tx meta cache from kafka",
 			Buckets:   util.MetricsBucketsMicroSeconds,
+		},
+	)
+
+	prometheusSubtreeValidationTxMetaAddSkippedTombstoned = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "txmeta_add_skipped_tombstoned_total",
+			Help:      "Txmeta Kafka ADDs dropped because a DELETE for the same tx was consumed first",
 		},
 	)
 
