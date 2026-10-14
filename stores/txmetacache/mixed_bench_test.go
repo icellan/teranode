@@ -296,9 +296,16 @@ func runMixed(b *testing.B, cfg mixedConfig) {
 		go func() {
 			defer writersWG.Done()
 
-			keys := make([][]byte, mixedWriterBatch)
-			values := make([][]byte, mixedWriterBatch)
-			hashes := make([]uint64, mixedWriterBatch)
+			// TXMETA_BENCH_WRITER_BATCH=1024 reproduces the v1 wire format
+			// (the production default): one Kafka message per validator batch
+			// of up to 1024 entries, written with SetCacheMultiSequential. The
+			// default 32 is the v2 shape (per-partition messages, with hashes).
+			batch := uint64(envInts("TXMETA_BENCH_WRITER_BATCH", []int{mixedWriterBatch})[0])
+			v1 := batch != mixedWriterBatch
+
+			keys := make([][]byte, batch)
+			values := make([][]byte, batch)
+			hashes := make([]uint64, batch)
 
 			var local int64
 
@@ -313,15 +320,22 @@ func runMixed(b *testing.B, cfg mixedConfig) {
 					return
 				}
 
-				for off := uint64(0); off < mixedWriterChunk; off += mixedWriterBatch {
-					for j := uint64(0); j < mixedWriterBatch; j++ {
+				for off := uint64(0); off < mixedWriterChunk; off += batch {
+					for j := uint64(0); j < batch; j++ {
 						i := (base + off + j) % mixedPoolSize
 						keys[j] = pool.keys[i][:]
 						values[j] = pool.value(i)
 						hashes[j] = pool.xx[i]
 					}
 
-					if err := c.SetCacheMultiSequentialWithHashes(keys, values, hashes); err != nil {
+					var err error
+					if v1 {
+						err = c.SetCacheMultiSequential(keys, values)
+					} else {
+						err = c.SetCacheMultiSequentialWithHashes(keys, values, hashes)
+					}
+
+					if err != nil {
 						b.Error(err)
 						return
 					}

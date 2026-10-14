@@ -2,6 +2,7 @@ package subtreevalidation
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -62,5 +63,51 @@ func bucketName(b txmetacache.BucketType) string {
 		return "lockfree"
 	default:
 		return "unallocated"
+	}
+}
+
+// TestServer_txmetaHandler_DeleteEvictsOnEveryBackend covers the DELETEs block
+// assembly publishes for transactions it demotes to conflicting (v1 wire,
+// [count][32 hash][DELETE][0 length] per entry): after one, the entry must be
+// gone, or a block containing the demoted tx would pass the cached-meta fast
+// path.
+func TestServer_txmetaHandler_DeleteEvictsOnEveryBackend(t *testing.T) {
+	for _, bucket := range []txmetacache.BucketType{txmetacache.Unallocated, txmetacache.Pointer, txmetacache.Lockfree} {
+		t.Run(bucketName(bucket), func(t *testing.T) {
+			testCacheBucket = bucket
+
+			t.Cleanup(func() { testCacheBucket = txmetacache.Unallocated })
+
+			cache := setupTestCache(t)
+			server := &Server{logger: ulogger.TestLogger{}, utxoStore: cache}
+
+			demoted := chainhash.HashH([]byte("demoted"))
+			kept := chainhash.HashH([]byte("kept"))
+
+			payload, err := (&meta.Data{
+				Fee:         1,
+				SizeInBytes: 2,
+				TxInpoints:  subtree.NewTxInpointsFromPacked([]chainhash.Hash{chainhash.HashH([]byte("p"))}, []uint32{1, 0}),
+			}).MetaBytes()
+			require.NoError(t, err)
+
+			for _, h := range []chainhash.Hash{demoted, kept} {
+				msg := &kafka.KafkaMessage{Value: buildV1TxmetaMessage(t, 1, h, payload)}
+				require.NoError(t, server.txmetaHandler(context.Background(), msg))
+			}
+
+			del := make([]byte, 4, 4+txmetacache.WireV1MinEntrySize)
+			binary.LittleEndian.PutUint32(del, 1)
+			del = append(del, demoted[:]...)
+			del = append(del, txmetacache.WireActionDELETE, 0, 0, 0, 0)
+
+			require.NoError(t, server.txmetaHandler(context.Background(), &kafka.KafkaMessage{Value: del}))
+
+			_, ok := cache.GetMetaCached(context.Background(), demoted)
+			require.False(t, ok, "a DELETEd entry must not be served")
+
+			_, ok = cache.GetMetaCached(context.Background(), kept)
+			require.True(t, ok, "a DELETE must not evict other entries")
+		})
 	}
 }
