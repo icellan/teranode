@@ -68,9 +68,14 @@ func (t *txMetaTombstones) add(hashes []chainhash.Hash) {
 	t.size.Store(int64(len(t.current) + len(t.previous)))
 }
 
+// empty reports whether no deletes are remembered, with one atomic load.
+func (t *txMetaTombstones) empty() bool {
+	return t == nil || t.size.Load() == 0
+}
+
 // contains reports whether key, a 32-byte tx hash, was deleted within the window.
 func (t *txMetaTombstones) contains(key []byte) bool {
-	if t == nil || t.size.Load() == 0 {
+	if t.empty() {
 		return false
 	}
 

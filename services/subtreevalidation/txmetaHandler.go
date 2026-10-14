@@ -240,6 +240,26 @@ func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) err
 		elapsed := float64(time.Since(enqueuedAt).Microseconds()) / 1_000_000
 		prometheusSubtreeValidationSetTXMetaCacheKafkaBatch.Observe(elapsed)
 		prometheusSubtreeValidationSetTXMetaCacheKafkaCount.Add(float64(len(bufs.keys)))
+
+		// A DELETE consumed from another partition after these ADDs passed their
+		// tombstone check may have run its Del before the Set above. It records
+		// the tombstone before it deletes, so either the tombstone is visible
+		// here or its Del runs after the Set.
+		if !u.txMetaTombstones.empty() {
+			for _, key := range bufs.keys {
+				if !u.txMetaTombstones.contains(key) {
+					continue
+				}
+
+				prometheusSubtreeValidationTxMetaAddSkippedTombstoned.Inc()
+
+				hash := chainhash.Hash(key)
+				if err := u.DelTxMetaCache(ctx, &hash); err != nil {
+					prometheusSubtreeValidationSetTXMetaCacheKafkaErrors.Inc()
+					u.logger.Errorf("[txmetaHandler][%s] failed to evict tombstoned tx meta data: %v", hash, err)
+				}
+			}
+		}
 	}
 
 	u.txMetaTombstones.add(bufs.deletes)

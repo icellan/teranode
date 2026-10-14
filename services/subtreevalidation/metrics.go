@@ -334,7 +334,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "subtreevalidation",
 			Name:      "txmeta_add_skipped_tombstoned_total",
-			Help:      "Txmeta Kafka ADDs dropped because a DELETE for the same tx was consumed first",
+			Help:      "Txmeta Kafka ADDs dropped, or evicted right after their write, because a DELETE for the same tx was consumed first or concurrently",
 		},
 	)
 
