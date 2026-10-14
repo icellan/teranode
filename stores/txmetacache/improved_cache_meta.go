@@ -160,6 +160,17 @@ func (b *improvedCacheBackend) GetMulti(hashes []chainhash.Hash, keyHashes []uin
 	}
 }
 
+// GetRawMulti copies the found entries out under each bucket's read lock (see
+// ImprovedCache.GetMulti) without decoding them.
+func (b *improvedCacheBackend) GetRawMulti(hashes []chainhash.Hash, dst *[]byte, spans [][2]int) {
+	keys := make([][]byte, len(hashes))
+	for i := range hashes {
+		keys[i] = hashes[i][:]
+	}
+
+	b.cache.GetMulti(keys, nil, dst, spans)
+}
+
 func (b *improvedCacheBackend) Del(key []byte) {
 	b.cache.Del(key)
 }

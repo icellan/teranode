@@ -13,7 +13,6 @@ import (
 	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 	"golang.org/x/sync/errgroup"
 )
@@ -188,7 +187,7 @@ dispatch:
 				<-slots
 			}()
 
-			return probeCacheRange(gCtx, cache, txHashes, keyHashes, txMetaSlice, indices, &missed, failFast, missingTxThreshold)
+			return probeCacheRange(gCtx, cache, txHashes, txMetaSlice, indices, &missed, failFast, missingTxThreshold)
 		})
 	}
 
@@ -238,40 +237,44 @@ func probeTasks(counts []int, minKeys int) [][2]int {
 
 // probeCacheRange looks up the given indices, which fall into one task's
 // bucket ranges, with a single batched cache read and fills txMetaSlice.
-func probeCacheRange(ctx context.Context, cache *txmetacache.TxMetaCache, txHashes []chainhash.Hash, keyHashes []uint64,
+func probeCacheRange(ctx context.Context, cache *txmetacache.TxMetaCache, txHashes []chainhash.Hash,
 	txMetaSlice []metaSliceItem, indices []int32, missed *atomic.Uint32, failFast bool, missingTxThreshold uint32) error {
 	if ctx.Err() != nil {
 		return errors.NewContextCanceledError("[processTxMetaUsingCache context cancelled]", ctx.Err())
 	}
 
 	hashes := make([]chainhash.Hash, len(indices))
-	hashKeys := make([]uint64, len(indices))
 
 	for j, i := range indices {
 		hashes[j] = txHashes[i]
-		hashKeys[j] = keyHashes[i]
 	}
 
-	found := make([]*meta.Data, len(indices))
-	cache.GetMetaCachedMulti(ctx, hashes, hashKeys, found)
+	// Decode straight into caller-owned values: no *meta.Data per hit. The
+	// TxInpoints reference slabs that are never reused, so txMetaSlice may
+	// keep them.
+	found := make([]bool, len(indices))
+	metas := make([]txmetacache.CachedMeta, len(indices))
+	cache.GetMetaCachedInto(ctx, hashes, metas, found)
 
 	for j, i := range indices {
-		txMeta := found[j]
+		txMeta := &metas[j]
 
 		// Defensively reject a partial cache entry: a non-coinbase tx with no
 		// parent tx hashes is incomplete (TxInpoints was never populated) and
 		// would later fail subtree-meta serialization and wedge the block. Treat
 		// it as a miss so the store fallback — which can reconstruct inpoints from
 		// the tx inputs — resolves it and self-heals the cache.
-		if txMeta != nil && (txMeta.IsCoinbase || len(txMeta.TxInpoints.ParentTxHashes) > 0) {
+		if found[j] && (txMeta.IsCoinbase || len(txMeta.TxInpoints.ParentTxHashes) > 0) {
 			txMetaSlice[i] = metaSliceItem{
 				fee:         txMeta.Fee,
 				sizeInBytes: txMeta.SizeInBytes,
 				coinbase:    txMeta.IsCoinbase,
 				conflicting: txMeta.Conflicting,
-				creating:    txMeta.Creating,
-				isSet:       true,
-				txInpoints:  txMeta.TxInpoints,
+				// The cached encoding has no Creating flag; a cached entry was
+				// always reported as not creating.
+				creating:   false,
+				isSet:      true,
+				txInpoints: txMeta.TxInpoints,
 			}
 
 			continue
