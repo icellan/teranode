@@ -1018,6 +1018,8 @@ func resolveTxMetaCacheBucketType(logger ulogger.Logger, raw string) txmetacache
 		return txmetacache.Native
 	case "pointer":
 		return txmetacache.Pointer
+	case "lockfree":
+		return txmetacache.Lockfree
 	default:
 		logger.Warnf("[SubtreeValidation] unknown txMetaCacheBucketType %q; falling back to unallocated", raw)
 		return txmetacache.Unallocated
