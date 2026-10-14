@@ -27,10 +27,18 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   them. The key travels in plaintext at `security_level_grpc=0`; use verified TLS
   across untrusted networks. (#1755)
 
-- **Kubernetes: Kafka now sits behind a NetworkPolicy.** `deploy/kubernetes/kafka/kafka-shared-networkpolicy.yaml`
-  restricts which pods may reach the shared Kafka broker. Pods that are not matched
-  by the policy's selectors lose Kafka connectivity on upgrade. Check your pod labels
-  against the policy before rolling it out. (#1617)
+- **Kubernetes: Kafka now sits behind a NetworkPolicy.**
+  `deploy/kubernetes/kafka/kafka-shared-networkpolicy.yaml` restricts which pods may
+  reach the shared Kafka broker. Pods outside the Kafka broker's namespace lose Kafka
+  connectivity once the policy is applied; the rule admits every pod in that namespace,
+  regardless of labels, so checking pod labels tells you nothing. If your Teranode
+  services run in a different namespace, move Kafka into it or replace the rule with a
+  `namespaceSelector` allowlist before applying.
+
+  Nothing changes on upgrade until someone applies the manifest, and it then takes
+  effect only on a CNI that enforces NetworkPolicy — one that does not will accept the
+  object and silently ignore it. The file's header carries a probe for confirming
+  enforcement. (#1617)
 
 - **The shipped `bitcoin`/`bitcoin` RPC credentials are removed.** `settings.conf` no longer sets
   `rpc_user`/`rpc_pass` (only the `test` context keeps them). With both empty, the JSON-RPC server
@@ -57,25 +65,42 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   matter what was in `settings.conf`. They are now wired.
 
   **This affects every deployment, not only those that set a value.** The loader
-  supplies non-zero code defaults, and the three peer-registry keys appear nowhere
-  in `settings.conf`, so a node that has never mentioned them now runs the cleanup
+  supplies non-zero code defaults, and the three `p2p_peer_registry_*` keys appear
+  nowhere in `settings.conf`, so a node that has never mentioned them now runs the cleanup
   loop hourly, evicting peers on a 24-hour TTL under a 10,000-entry LRU bound.
   Review these before rolling out.
 
   | Setting | Previously | Now |
-  |---|---|---|
+  | --- | --- | --- |
   | `p2p_peer_registry_max_size` | `0` — LRU bound disabled | configured value enforced (default 10,000) |
-  | `p2p_peer_registry_ttl` | `0` | configured value applies (default 24h) |
+  | `p2p_peer_registry_ttl` | `0` in settings, coerced to 24h inside Blockchain | configured value applies (default 24h); a positive value below 5m is raised to 5m with a warning |
   | `p2p_peer_registry_cleanup_interval` | `0` — the cleanup loop never ran | cleanup runs at the configured interval (default 1h); peers are evicted |
   | `pruner_skipDuringCatchup` | `false` — flag unreachable | configurable |
   | `pruner_skipProcessExpiredPreservations` | `false` — flag unreachable | configurable |
   | `aerospike_enable_preserve_filter_expressions` | permanently `false` | configurable |
-  | `subtreevalidation_txMetaCacheTrimRatio` | read straight from gocore, bypassing the typed settings | read from typed settings; `settings.conf` ships `5`, the code default is `2` |
+  | `blockchain_raw_miner_tag` | `false` — raw miner tags unreachable | configurable; `true` returns the coinbase text unsanitised |
+  | `legacy_upnp` | `false` — the UPnP path had never executed | configurable; `true` runs it |
+  | `blockchain_peerRegistryStore` | unset — the peer registry was never persisted | configurable; a blob URL makes Blockchain load the registry at startup and persist it |
+  | `blockchain_peerRegistrySaveInterval` | `0` | applies (default 60s) once a registry store is configured |
 
   The peer-registry entries are the ones most likely to be noticed: with the cleanup
   interval at zero the eviction loop never started, so registries grew without bound.
   After upgrading, peers are evicted on the configured TTL and LRU bound.
-  (#1645, #1641, #1644, #1746)
+
+  The remaining rows are default-off or unset and appear nowhere in `settings.conf`, so
+  they change nothing unless you set them — but a node that did set one gets it honoured
+  for the first time. `legacy_upnp = true` is the sharpest of those: it enables a UPnP
+  port-mapping path that has never run in this codebase.
+  (#1645, #1643, #1641, #1644)
+
+- **`txMetaCacheTrimRatio` is renamed `subtreevalidation_txMetaCacheTrimRatio`.** The
+  shipped value carries over and a default node is unaffected: `settings.conf` set the
+  old key to `5` and the old code read exactly that key, so the effective ratio was
+  already 5 and still is. What breaks is a local override — a value set under the old
+  name in `settings_local.conf` is now ignored, silently, because the loader does not
+  report unknown keys. Rename it. Only affects nodes running
+  `subtreevalidation_txMetaCacheBucketType = preallocated`; the code default is `2`.
+  (#1746)
 
 - **`aerospike_enable_preserve_filter_expressions` is mutually exclusive with
   `aerospike_use_native_teranode_ops` for preserve operations.** `PreserveTransactions`
@@ -171,9 +196,10 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
 
 ### Breaking — pending, not yet merged
 
-- **Unauthenticated Blockchain read RPCs will be bounded.** Count and range
-  parameters on the public read RPCs will be rejected with `InvalidArgument` above
-  configurable caps: `blockchain_maxBlockHeadersPerRequest`,
+- **Blockchain read RPCs will be bounded.** Count and range parameters on the read
+  RPCs will be rejected with `InvalidArgument` above configurable caps, whatever the
+  caller's authentication (since #1755 every Blockchain RPC but `HealthGRPC` requires
+  the admin key anyway): `blockchain_maxBlockHeadersPerRequest`,
   `blockchain_maxBlocksByHeightRange`, `blockchain_maxInvalidBlocksPerRequest` and
   `blockchain_maxMedianTimePastHeights`. Callers that currently request very large
   counts will start receiving errors.
