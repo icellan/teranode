@@ -91,7 +91,8 @@ func TestTxMetaCache_GetMetaCachedInto_MatchesGetMetaCached(t *testing.T) {
 
 			out := make([]CachedMeta, n)
 			found := make([]bool, n)
-			hits := c.GetMetaCachedInto(ctx, hashes, out, found)
+			hits, err := c.GetMetaCachedInto(ctx, hashes, out, found)
+			require.NoError(t, err)
 
 			want := 0
 
@@ -138,13 +139,17 @@ func TestTxMetaCache_GetMetaCachedInto_ResultsOutliveLaterCalls(t *testing.T) {
 
 	out1 := make([]CachedMeta, 2)
 	found1 := make([]bool, 2)
-	require.Equal(t, 2, c.GetMetaCachedInto(ctx, first, out1, found1))
+	hits, err := c.GetMetaCachedInto(ctx, first, out1, found1)
+	require.NoError(t, err)
+	require.Equal(t, 2, hits)
 
 	snapshot := append([]chainhash.Hash{}, out1[0].TxInpoints.ParentTxHashes...)
 
 	out2 := make([]CachedMeta, 2)
 	found2 := make([]bool, 2)
-	require.Equal(t, 2, c.GetMetaCachedInto(ctx, second, out2, found2))
+	hits, err = c.GetMetaCachedInto(ctx, second, out2, found2)
+	require.NoError(t, err)
+	require.Equal(t, 2, hits)
 
 	require.Equal(t, snapshot, out1[0].TxInpoints.ParentTxHashes, "a later call must not reuse an earlier call's slabs")
 
@@ -175,7 +180,7 @@ func TestTxMetaCache_GetMetaCachedInto_AllocationsDoNotScaleWithHits(t *testing.
 		found := make([]bool, m)
 
 		return testing.AllocsPerRun(50, func() {
-			if c.GetMetaCachedInto(ctx, hashes[:m], out, found) != m {
+			if hits, err := c.GetMetaCachedInto(ctx, hashes[:m], out, found); err != nil || hits != m {
 				t.Fatal("expected every lookup to hit")
 			}
 		})
@@ -185,4 +190,15 @@ func TestTxMetaCache_GetMetaCachedInto_AllocationsDoNotScaleWithHits(t *testing.
 	// hits), never one or more per hit as GetMetaCached does.
 	require.LessOrEqual(t, allocsFor(16), 2.0)
 	require.LessOrEqual(t, allocsFor(n), 10.0)
+}
+
+func TestTxMetaCache_GetMetaCachedInto_ShortOutputsAreAnError(t *testing.T) {
+	c := newTestTxMetaCache(t, Lockfree)
+	hashes := []chainhash.Hash{mixedKey(1), mixedKey(2)}
+
+	_, err := c.GetMetaCachedInto(context.Background(), hashes, make([]CachedMeta, 1), make([]bool, 2))
+	require.Error(t, err)
+
+	_, err = c.GetMetaCachedInto(context.Background(), hashes, make([]CachedMeta, 2), make([]bool, 1))
+	require.Error(t, err)
 }

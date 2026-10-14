@@ -186,7 +186,10 @@ func mixedReadInto(ctx context.Context, c *TxMetaCache, hashes []chainhash.Hash,
 	defer mixedIntoPool.Put(sc)
 
 	out, found := sc.out[:len(hashes)], sc.found[:len(hashes)]
-	hits = c.GetMetaCachedInto(ctx, hashes, out, found)
+	hits, err := c.GetMetaCachedInto(ctx, hashes, out, found)
+	if err != nil {
+		panic(err)
+	}
 
 	for j := range out {
 		if found[j] && (out[j].Fee != idx[j] || len(out[j].TxInpoints.ParentTxHashes) != mixedParents(idx[j])) {

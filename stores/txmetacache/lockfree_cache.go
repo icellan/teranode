@@ -60,16 +60,20 @@ type LockFreeCache struct {
 	region []byte // the single mmap holding every index and ring
 
 	oversize atomic.Uint64
+
+	// inserts is counted once per call, not per insert: a per-insert atomic
+	// on the shard's line would be a second locked instruction on the line
+	// the reservation CAS just took.
+	inserts stripedCounter
 }
 
 // lfShard is padded to a cache line so writers on different shards never
 // share one.
 type lfShard struct {
-	tail    atomic.Uint64
-	inserts atomic.Uint64
-	ring    unsafe.Pointer // R bytes
-	index   unsafe.Pointer // (setMask+1)*8 uint64 slots
-	_       [32]byte
+	tail  atomic.Uint64
+	ring  unsafe.Pointer // R bytes
+	index unsafe.Pointer // (setMask+1)*8 uint64 slots
+	_     [40]byte
 }
 
 const (
@@ -271,6 +275,7 @@ func (c *LockFreeCache) Set(key, value []byte) error {
 
 	s, set, fp := c.locate(key)
 	c.setLocated(s, set, fp, key, value)
+	c.inserts.Add(1)
 
 	return nil
 }
@@ -293,7 +298,6 @@ func (c *LockFreeCache) setLocated(s *lfShard, set unsafe.Pointer, fp uint64, ke
 	o := c.reserve(s, need)
 
 	c.writeRecord(s, o%c.ringSize, key, value)
-	s.inserts.Add(1)
 
 	// Lapped while writing: the record may already be overwritten, and our
 	// stores may have damaged the newer record that lapped it (its checksum
@@ -317,6 +321,7 @@ func (c *LockFreeCache) SetMulti(keys, values [][]byte) error {
 	var (
 		first  error
 		sink   uint64
+		stored uint64
 		shards [lfPrefetchGroup]*lfShard
 		sets   [lfPrefetchGroup]unsafe.Pointer
 		fps    [lfPrefetchGroup]uint64
@@ -353,9 +358,12 @@ func (c *LockFreeCache) SetMulti(keys, values [][]byte) error {
 		for j := 0; j < n; j++ {
 			if ok[j] {
 				c.setLocated(shards[j], sets[j], fps[j], keys[g+j], values[g+j])
+				stored++
 			}
 		}
 	}
+
+	c.inserts.Add(stored)
 
 	if sink == 0x5eed {
 		lfPrefetchSink.Add(1)
@@ -466,8 +474,16 @@ func (c *LockFreeCache) publish(s *lfShard, set unsafe.Pointer, fp, o uint64) {
 			// equal, about one insert in 8k) evicts the other key's entry,
 			// which costs it a later miss but can never return wrong data:
 			// reads compare the full key and the checksum.
-			if v>>lfOffsetBits == fp && so < o {
+			if v>>lfOffsetBits == fp {
+				// A newer record of this key is already indexed (a writer
+				// that reserved after us published first): ours is stale,
+				// and indexing it too could let a lookup return it.
+				if so > o {
+					return
+				}
+
 				victim, victimVal = i, v
+
 				break
 			}
 
@@ -658,8 +674,9 @@ func (c *LockFreeCache) Del(key []byte) {
 func (c *LockFreeCache) Reset() {
 	for i := range c.shards {
 		c.shards[i].tail.Add(c.ringSize)
-		c.shards[i].inserts.Store(0)
 	}
+
+	c.inserts.reset()
 }
 
 // Oversize is the number of values rejected for exceeding the size limit.
@@ -668,22 +685,24 @@ func (c *LockFreeCache) Oversize() uint64 {
 }
 
 // UpdateStats adds the cache's entry estimate to s. The live-entry count is
-// estimated from the bytes written rather than by scanning the index, which is
-// tens of GB on a large cache.
+// estimated from inserts and bytes written rather than by scanning the index,
+// which is tens of GB on a large cache.
 func (c *LockFreeCache) UpdateStats(s *Stats) {
+	inserts := c.inserts.Load()
+
+	var written uint64
+
 	for i := range c.shards {
-		sh := &c.shards[i]
-		inserts := sh.inserts.Load()
-		written := sh.tail.Load() - lfHeaderBytes
-
-		live := inserts
-		if written > c.ringSize && written > 0 {
-			live = uint64(float64(inserts) * float64(c.ringSize) / float64(written))
-		}
-
-		s.CurrentGenEntries += live
-		s.ValidEntriesCount += live
-		s.TotalMapSize += live
-		s.TotalElementsAdded += inserts
+		written += c.shards[i].tail.Load() - lfHeaderBytes
 	}
+
+	live := inserts
+	if capacity := uint64(len(c.shards)) * c.ringSize; written > capacity {
+		live = uint64(float64(inserts) * float64(capacity) / float64(written))
+	}
+
+	s.CurrentGenEntries += live
+	s.ValidEntriesCount += live
+	s.TotalMapSize += live
+	s.TotalElementsAdded += inserts
 }

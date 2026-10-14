@@ -36,3 +36,10 @@ func (c *stripedCounter) Load() uint64 {
 
 	return sum
 }
+
+// reset sets the counter to zero. It must not race with Add.
+func (c *stripedCounter) reset() {
+	for i := range c.stripes {
+		c.stripes[i].n.Store(0)
+	}
+}

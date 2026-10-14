@@ -388,3 +388,37 @@ func TestLockFreeCache_ConcurrentLapNeverTornRead(t *testing.T) {
 	require.Positive(t, hits.Load(), "the readers must have hit something, or the test proves nothing")
 	t.Logf("hits=%d misses=%d writes=%d", hits.Load(), misses.Load(), next.Load())
 }
+
+// TestLockFreeCache_OlderPublishNeverShadowsNewer covers two writers racing on
+// one key: the record reserved later (newer) is published first, then the
+// earlier (older) record's publish runs. The older one must not be indexed
+// alongside the newer one, or a lookup could return the stale value.
+func TestLockFreeCache_OlderPublishNeverShadowsNewer(t *testing.T) {
+	c := newTestLockFreeCache(t, 1024*1024)
+	k := mixedKey(42)
+
+	s, set, fp := c.locate(k[:])
+
+	older := c.reserve(s, recordBytes(len("older")))
+	newer := c.reserve(s, recordBytes(len("newer")))
+
+	c.writeRecord(s, older%c.ringSize, k[:], []byte("older"))
+	c.writeRecord(s, newer%c.ringSize, k[:], []byte("newer"))
+
+	c.publish(s, set, fp, newer)
+	c.publish(s, set, fp, older)
+
+	var dst []byte
+	require.True(t, c.Get(&dst, k[:]))
+	require.Equal(t, "newer", string(dst))
+
+	indexed := 0
+
+	for i := 0; i < lfSlotsPerSet; i++ {
+		if v := *slotAt(set, i); v != 0 && v>>lfOffsetBits == fp {
+			indexed++
+		}
+	}
+
+	require.Equal(t, 1, indexed, "the key must be indexed once")
+}

@@ -235,6 +235,30 @@ func probeTasks(counts []int, minKeys int) [][2]int {
 	return tasks
 }
 
+// probeScratch is probeCacheRange's per-task working memory. A task covers
+// thousands of lookups, so these slices are hundreds of KB; allocating them
+// per task would take the heap's global lock each time.
+type probeScratch struct {
+	hashes []chainhash.Hash
+	found  []bool
+	metas  []txmetacache.CachedMeta
+}
+
+var probeScratchPool = sync.Pool{
+	New: func() any { return &probeScratch{} },
+}
+
+// sized returns the scratch slices with length n, growing them if needed.
+func (sc *probeScratch) sized(n int) ([]chainhash.Hash, []bool, []txmetacache.CachedMeta) {
+	if cap(sc.hashes) < n {
+		sc.hashes = make([]chainhash.Hash, n)
+		sc.found = make([]bool, n)
+		sc.metas = make([]txmetacache.CachedMeta, n)
+	}
+
+	return sc.hashes[:n], sc.found[:n], sc.metas[:n]
+}
+
 // probeCacheRange looks up the given indices, which fall into one task's
 // bucket ranges, with a single batched cache read and fills txMetaSlice.
 func probeCacheRange(ctx context.Context, cache *txmetacache.TxMetaCache, txHashes []chainhash.Hash,
@@ -243,18 +267,21 @@ func probeCacheRange(ctx context.Context, cache *txmetacache.TxMetaCache, txHash
 		return errors.NewContextCanceledError("[processTxMetaUsingCache context cancelled]", ctx.Err())
 	}
 
-	hashes := make([]chainhash.Hash, len(indices))
+	sc := probeScratchPool.Get().(*probeScratch)
+	defer probeScratchPool.Put(sc)
+
+	hashes, found, metas := sc.sized(len(indices))
 
 	for j, i := range indices {
 		hashes[j] = txHashes[i]
 	}
 
 	// Decode straight into caller-owned values: no *meta.Data per hit. The
-	// TxInpoints reference slabs that are never reused, so txMetaSlice may
-	// keep them.
-	found := make([]bool, len(indices))
-	metas := make([]txmetacache.CachedMeta, len(indices))
-	cache.GetMetaCachedInto(ctx, hashes, metas, found)
+	// TxInpoints reference chunks that are never reused, so txMetaSlice may
+	// keep them after metas is recycled.
+	if _, err := cache.GetMetaCachedInto(ctx, hashes, metas, found); err != nil {
+		return err
+	}
 
 	for j, i := range indices {
 		txMeta := &metas[j]

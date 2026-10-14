@@ -495,11 +495,16 @@ func (cv *intoCarver) advance(np, nv int) {
 // may be kept for as long as the caller likes.
 //
 // Entries that fail to decode are evicted and count as misses. It returns the
-// number of hits; hit and miss metrics are updated once per call.
-func (t *TxMetaCache) GetMetaCachedInto(_ context.Context, hashes []chainhash.Hash, out []CachedMeta, found []bool) int {
+// number of hits, or an error if out or found is shorter than hashes; hit and
+// miss metrics are updated once per call.
+func (t *TxMetaCache) GetMetaCachedInto(_ context.Context, hashes []chainhash.Hash, out []CachedMeta, found []bool) (int, error) {
 	n := len(hashes)
+	if len(out) < n || len(found) < n {
+		return 0, errors.NewProcessingError("GetMetaCachedInto: %d hashes but room for %d results and %d flags", n, len(out), len(found))
+	}
+
 	if n == 0 {
-		return 0
+		return 0, nil
 	}
 
 	sc := intoScratchPool.Get().(*intoScratch)
@@ -550,7 +555,7 @@ func (t *TxMetaCache) GetMetaCachedInto(_ context.Context, hashes []chainhash.Ha
 	t.metrics.hits.Add(uint64(hits))       //nolint:gosec // non-negative count
 	t.metrics.misses.Add(uint64(n - hits)) //nolint:gosec // non-negative count
 
-	return hits
+	return hits, nil
 }
 
 // ProbeRanges is the number of disjoint, contiguous cache bucket ranges that
