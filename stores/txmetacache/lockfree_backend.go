@@ -126,7 +126,7 @@ func (b *lockFreeBackend) GetMulti(hashes []chainhash.Hash, _ []uint64, out []*m
 	}
 }
 
-func (b *lockFreeBackend) GetRawMulti(hashes []chainhash.Hash, dst *[]byte, spans [][2]int) {
+func (b *lockFreeBackend) GetRawMulti(hashes []chainhash.Hash, _ []uint64, dst *[]byte, spans [][2]int) {
 	b.cache.GetMulti(dst, hashes, spans)
 }
 

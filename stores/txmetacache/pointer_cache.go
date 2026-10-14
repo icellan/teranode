@@ -234,7 +234,7 @@ func (c *PointerCache) GetMulti(hashes []chainhash.Hash, _ []uint64, out []*meta
 // GetRawMulti serialises each found entry into *dst. Pointer mode stores
 // decoded entries, so this re-encodes them; it is not the deployed bucket
 // type. Implements cacheBackend.
-func (c *PointerCache) GetRawMulti(hashes []chainhash.Hash, dst *[]byte, spans [][2]int) {
+func (c *PointerCache) GetRawMulti(hashes []chainhash.Hash, _ []uint64, dst *[]byte, spans [][2]int) {
 	for i, h := range hashes {
 		d, ok := c.Get(h)
 		if !ok {

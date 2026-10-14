@@ -186,7 +186,7 @@ func mixedReadInto(ctx context.Context, c *TxMetaCache, hashes []chainhash.Hash,
 	defer mixedIntoPool.Put(sc)
 
 	out, found := sc.out[:len(hashes)], sc.found[:len(hashes)]
-	hits, err := c.GetMetaCachedInto(ctx, hashes, out, found)
+	hits, err := c.GetMetaCachedInto(ctx, hashes, nil, out, found)
 	if err != nil {
 		panic(err)
 	}

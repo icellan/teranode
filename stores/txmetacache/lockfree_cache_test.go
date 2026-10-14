@@ -1,6 +1,7 @@
 package txmetacache
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"sync"
@@ -454,4 +455,55 @@ func TestLockFreeCache_OlderPublishNeverShadowsNewer(t *testing.T) {
 	}
 
 	require.Equal(t, 1, indexed, "the key must be indexed once")
+}
+
+// lfRegion is the off-heap memory behind either implementation.
+func lfRegion(t *testing.T, c rawLockFreeCache) []byte {
+	t.Helper()
+
+	switch v := c.(type) {
+	case *LockFreeCache:
+		return v.region
+	case *LaneCache:
+		return v.region
+	default:
+		t.Fatalf("unknown implementation %T", c)
+		return nil
+	}
+}
+
+// TestLockFreeCache_CorruptedRecordIsAMiss is the deterministic check of the
+// checksum: a record whose value bytes change after it was written (a late or
+// overlapping writer) must read as a miss, never as data. The concurrent
+// stress test can only hit that window by chance.
+func TestLockFreeCache_CorruptedRecordIsAMiss(t *testing.T) {
+	forEachLFImpl(t, 1024*1024, func(t *testing.T, c rawLockFreeCache) {
+		for i := uint64(0); i < 32; i++ {
+			k := mixedKey(1050 + i)
+			v := lfValue(1050 + i) // 67+ bytes long
+			require.NoError(t, c.Set(k[:], v))
+
+			var dst []byte
+			require.True(t, c.Get(&dst, k[:]))
+
+			region := lfRegion(t, c)
+
+			// Find the record by its key, which is unique; in both layouts
+			// the value follows the key directly.
+			at := bytes.Index(region, k[:])
+			require.GreaterOrEqual(t, at, 0, "record not found")
+
+			flip := at + lfKeyBytes + int(i)%len(v)
+			region[flip] ^= 0x01
+
+			dst = dst[:0]
+			require.False(t, c.Get(&dst, k[:]), "a corrupted record must not be served (byte %d)", flip)
+
+			region[flip] ^= 0x01
+
+			dst = dst[:0]
+			require.True(t, c.Get(&dst, k[:]), "restoring the byte restores the record")
+			require.Equal(t, v, dst)
+		}
+	})
 }

@@ -130,17 +130,18 @@ func NewLockFreeCache(maxBytes int) (*LockFreeCache, error) {
 		return nil, errors.NewProcessingError("lock-free cache: size %d overflows int", total)
 	}
 
+	// The seed first: a failure after the mmap would leak the region.
+	var seed [8]byte
+	if _, err := rand.Read(seed[:]); err != nil {
+		return nil, errors.NewProcessingError("lock-free cache: cannot read seed", err)
+	}
+
 	region, err := allocateNamedMmap(int(total))
 	if err != nil {
 		return nil, err
 	}
 
 	adviseHugePages(region)
-
-	var seed [8]byte
-	if _, err := rand.Read(seed[:]); err != nil {
-		return nil, errors.NewProcessingError("lock-free cache: cannot read seed", err)
-	}
 
 	c := &LockFreeCache{
 		shards:   make([]lfShard, shards),

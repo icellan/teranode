@@ -187,7 +187,7 @@ dispatch:
 				<-slots
 			}()
 
-			return probeCacheRange(gCtx, cache, txHashes, txMetaSlice, indices, &missed, failFast, missingTxThreshold)
+			return probeCacheRange(gCtx, cache, txHashes, keyHashes, txMetaSlice, indices, &missed, failFast, missingTxThreshold)
 		})
 	}
 
@@ -239,9 +239,10 @@ func probeTasks(counts []int, minKeys int) [][2]int {
 // thousands of lookups, so these slices are hundreds of KB; allocating them
 // per task would take the heap's global lock each time.
 type probeScratch struct {
-	hashes []chainhash.Hash
-	found  []bool
-	metas  []txmetacache.CachedMeta
+	hashes    []chainhash.Hash
+	keyHashes []uint64
+	found     []bool
+	metas     []txmetacache.CachedMeta
 }
 
 var probeScratchPool = sync.Pool{
@@ -249,19 +250,20 @@ var probeScratchPool = sync.Pool{
 }
 
 // sized returns the scratch slices with length n, growing them if needed.
-func (sc *probeScratch) sized(n int) ([]chainhash.Hash, []bool, []txmetacache.CachedMeta) {
+func (sc *probeScratch) sized(n int) ([]chainhash.Hash, []uint64, []bool, []txmetacache.CachedMeta) {
 	if cap(sc.hashes) < n {
 		sc.hashes = make([]chainhash.Hash, n)
+		sc.keyHashes = make([]uint64, n)
 		sc.found = make([]bool, n)
 		sc.metas = make([]txmetacache.CachedMeta, n)
 	}
 
-	return sc.hashes[:n], sc.found[:n], sc.metas[:n]
+	return sc.hashes[:n], sc.keyHashes[:n], sc.found[:n], sc.metas[:n]
 }
 
 // probeCacheRange looks up the given indices, which fall into one task's
 // bucket ranges, with a single batched cache read and fills txMetaSlice.
-func probeCacheRange(ctx context.Context, cache *txmetacache.TxMetaCache, txHashes []chainhash.Hash,
+func probeCacheRange(ctx context.Context, cache *txmetacache.TxMetaCache, txHashes []chainhash.Hash, keyHashes []uint64,
 	txMetaSlice []metaSliceItem, indices []int32, missed *atomic.Uint32, failFast bool, missingTxThreshold uint32) error {
 	if ctx.Err() != nil {
 		return errors.NewContextCanceledError("[processTxMetaUsingCache context cancelled]", ctx.Err())
@@ -270,16 +272,17 @@ func probeCacheRange(ctx context.Context, cache *txmetacache.TxMetaCache, txHash
 	sc := probeScratchPool.Get().(*probeScratch)
 	defer probeScratchPool.Put(sc)
 
-	hashes, found, metas := sc.sized(len(indices))
+	hashes, hashKeys, found, metas := sc.sized(len(indices))
 
 	for j, i := range indices {
 		hashes[j] = txHashes[i]
+		hashKeys[j] = keyHashes[i]
 	}
 
 	// Decode straight into caller-owned values: no *meta.Data per hit. The
 	// TxInpoints reference chunks that are never reused, so txMetaSlice may
 	// keep them after metas is recycled.
-	if _, err := cache.GetMetaCachedInto(ctx, hashes, metas, found); err != nil {
+	if _, err := cache.GetMetaCachedInto(ctx, hashes, hashKeys, metas, found); err != nil {
 		return err
 	}
 

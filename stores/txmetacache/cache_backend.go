@@ -59,7 +59,9 @@ type cacheBackend interface {
 	// entry i is (*dst)[spans[i][0]:spans[i][1]], or spans[i] = {-1, -1} on a
 	// miss. Nothing is decoded or allocated per entry; GetMetaCachedInto
 	// decodes the result into caller-owned storage.
-	GetRawMulti(hashes []chainhash.Hash, dst *[]byte, spans [][2]int)
+	// keyHashes, if non-nil, holds KeyHash(&hashes[i]) so a backend that
+	// places entries by it does not hash them again.
+	GetRawMulti(hashes []chainhash.Hash, keyHashes []uint64, dst *[]byte, spans [][2]int)
 
 	// Del removes the entry under key (raw bytes, typically hash[:]).
 	Del(key []byte)

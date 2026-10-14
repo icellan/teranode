@@ -167,10 +167,13 @@ const (
 	// trade-off is measured for your workload.
 	Pointer
 
-	// Lockfree selects LockFreeCache (see lockfree_cache.go): off-heap rings
-	// with a set-associative index, lock-free reads and writes, and no index
-	// rebuild when a ring wraps. Pair it with GetMetaCachedInto for reads that
-	// allocate nothing per entry.
+	// Lockfree selects the lock-free cache: LaneCache (lockfree_lanes.go) by
+	// default, with LockFreeCache (lockfree_cache.go) kept as the per-shard
+	// alternative for comparison. Off-heap per-writer rings with a
+	// set-associative index, lock-free reads and writes, and no index rebuild
+	// when a ring wraps. Pair it with GetMetaCachedInto for reads that allocate
+	// nothing per entry. Like ImprovedCache, its off-heap memory is never
+	// unmapped; a cache lives for the life of the process.
 	Lockfree
 )
 
@@ -494,12 +497,15 @@ func (cv *intoCarver) advance(np, nv int) {
 // reference, each capped to its own entry. Chunks are never reused, so results
 // may be kept for as long as the caller likes.
 //
+// keyHashes, if non-nil, holds KeyHash(&hashes[i]) and saves backends that place
+// entries by it from hashing again (see GetMetaCachedMulti).
+//
 // Entries that fail to decode are evicted and count as misses. It returns the
-// number of hits, or an error if out or found is shorter than hashes; hit and
-// miss metrics are updated once per call.
-func (t *TxMetaCache) GetMetaCachedInto(_ context.Context, hashes []chainhash.Hash, out []CachedMeta, found []bool) (int, error) {
+// number of hits, or an error if out, found or a non-nil keyHashes is shorter
+// than hashes; hit and miss metrics are updated once per call.
+func (t *TxMetaCache) GetMetaCachedInto(_ context.Context, hashes []chainhash.Hash, keyHashes []uint64, out []CachedMeta, found []bool) (int, error) {
 	n := len(hashes)
-	if len(out) < n || len(found) < n {
+	if len(out) < n || len(found) < n || (keyHashes != nil && len(keyHashes) < n) {
 		return 0, errors.NewProcessingError("GetMetaCachedInto: %d hashes but room for %d results and %d flags", n, len(out), len(found))
 	}
 
@@ -523,7 +529,7 @@ func (t *TxMetaCache) GetMetaCachedInto(_ context.Context, hashes []chainhash.Ha
 	}
 
 	spans := sc.spans[:n]
-	t.cache.GetRawMulti(hashes, &sc.raw, spans)
+	t.cache.GetRawMulti(hashes, keyHashes, &sc.raw, spans)
 
 	carver := intoCarverPool.Get().(*intoCarver)
 	defer intoCarverPool.Put(carver)

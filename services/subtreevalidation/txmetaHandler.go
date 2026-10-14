@@ -37,6 +37,15 @@ var txmetaParseBuffersPool = sync.Pool{
 
 // reset clears length without dropping the backing arrays — the pool keeps
 // the capacity alive for the next caller.
+// release drops the references keys and values hold into msg.Value before the
+// buffers go back to the pool, so a pooled entry does not keep the last Kafka
+// message's buffer reachable.
+func (b *txmetaParseBuffers) release() {
+	clear(b.keys)
+	clear(b.values)
+	b.reset()
+}
+
 func (b *txmetaParseBuffers) reset() {
 	b.keys = b.keys[:0]
 	b.values = b.values[:0]
@@ -144,7 +153,10 @@ func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) err
 	// Pool-backed scratch: up to `entries` slice slots.
 	bufs := txmetaParseBuffersPool.Get().(*txmetaParseBuffers)
 	bufs.reset()
-	defer txmetaParseBuffersPool.Put(bufs)
+	defer func() {
+		bufs.release()
+		txmetaParseBuffersPool.Put(bufs)
+	}()
 
 	entriesInt := int(entries)
 	if cap(bufs.keys) < entriesInt {

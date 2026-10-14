@@ -106,17 +106,18 @@ func NewLaneCache(maxBytes int) (*LaneCache, error) {
 		return nil, errors.NewProcessingError("lane cache: size %d overflows int", total)
 	}
 
+	// The seed first: a failure after the mmap would leak the region.
+	var seed [8]byte
+	if _, err := rand.Read(seed[:]); err != nil {
+		return nil, errors.NewProcessingError("lane cache: cannot read seed", err)
+	}
+
 	region, err := allocateNamedMmap(int(total))
 	if err != nil {
 		return nil, err
 	}
 
 	adviseHugePages(region)
-
-	var seed [8]byte
-	if _, err := rand.Read(seed[:]); err != nil {
-		return nil, errors.NewProcessingError("lane cache: cannot read seed", err)
-	}
 
 	c := &LaneCache{
 		lanes:    make([]lfLane, lanes),
@@ -528,23 +529,42 @@ func (c *LaneCache) Del(key []byte) {
 
 	set, fp := c.locate(key)
 
-	var scratch [1 << maxValueSizeLog]byte
-
 	for i := 0; i < lfSlotsPerSet; i++ {
 		slot := slotAt(set, i)
 
 		v := atomic.LoadUint64(slot)
-		if v == 0 || v>>lnFpShift != fp {
+		if v == 0 || v>>lnFpShift != fp || !c.keyAt(v, key) {
 			continue
 		}
 
-		dst := scratch[:0]
-		if !c.read(v, key, &dst) {
-			continue
-		}
-
+		// A failed CAS means the slot changed under us: someone else cleared
+		// it or a newer insert took it, and that insert wins.
 		atomic.CompareAndSwapUint64(slot, v, 0)
 	}
+}
+
+// keyAt reports whether the record slot v points at holds key, comparing the
+// key in place rather than copying the record.
+func (c *LaneCache) keyAt(v uint64, key []byte) bool {
+	lane := (v >> lnOffBits) & (lnMaxLanes - 1)
+	if lane >= uint64(len(c.lanes)) {
+		return false
+	}
+
+	l := &c.lanes[lane]
+
+	pos := ((v & lnOffMask) << 3) & c.ringMask
+	if pos+lfHeaderBytes+lfKeyBytes > c.ringSize {
+		return false
+	}
+
+	for w := uint64(0); w < 4; w++ {
+		if atomic.LoadUint64(c.wordAt(l, pos+lfHeaderBytes+w*8)) != binary.LittleEndian.Uint64(key[w*8:]) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // Reset drops every entry by advancing each lane's tail a full ring. It must

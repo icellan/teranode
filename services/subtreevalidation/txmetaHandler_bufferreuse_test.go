@@ -61,6 +61,8 @@ func bucketName(b txmetacache.BucketType) string {
 		return "pointer"
 	case txmetacache.Lockfree:
 		return "lockfree"
+	case txmetacache.Native:
+		return "native"
 	default:
 		return "unallocated"
 	}
@@ -108,6 +110,59 @@ func TestServer_txmetaHandler_DeleteEvictsOnEveryBackend(t *testing.T) {
 
 			_, ok = cache.GetMetaCached(context.Background(), kept)
 			require.True(t, ok, "a DELETE must not evict other entries")
+		})
+	}
+}
+
+// TestServer_txmetaHandler_V2MultiEntryDoesNotRetainBuffer is the buffer-reuse
+// contract for a multi-entry v2 message: every entry is handed to the cache as
+// a sub-slice of msg.Value (with its wire xxhash), and all of them must
+// survive the buffer being overwritten.
+func TestServer_txmetaHandler_V2MultiEntryDoesNotRetainBuffer(t *testing.T) {
+	for _, bucket := range []txmetacache.BucketType{txmetacache.Unallocated, txmetacache.Native, txmetacache.Pointer, txmetacache.Lockfree} {
+		t.Run(bucketName(bucket), func(t *testing.T) {
+			testCacheBucket = bucket
+
+			t.Cleanup(func() { testCacheBucket = txmetacache.Unallocated })
+
+			cache := setupTestCache(t)
+			server := &Server{logger: ulogger.TestLogger{}, utxoStore: cache}
+
+			const n = 5
+
+			hashes := make([]chainhash.Hash, n)
+			msg := []byte{txmetacache.WireV2Magic, txmetacache.WireV2Version, 0, 0}
+			msg = binary.LittleEndian.AppendUint32(msg, n)
+
+			for i := range hashes {
+				hashes[i] = chainhash.HashH([]byte{byte(i), 'v', '2'})
+
+				payload, err := (&meta.Data{
+					Fee:         uint64(100 + i),
+					SizeInBytes: 250,
+					TxInpoints:  subtree.NewTxInpointsFromPacked([]chainhash.Hash{chainhash.HashH([]byte{byte(i), 'p'})}, []uint32{1, uint32(i)}),
+				}).MetaBytes()
+				require.NoError(t, err)
+
+				msg = binary.LittleEndian.AppendUint64(msg, txmetacache.KeyHash(&hashes[i]))
+				msg = append(msg, hashes[i][:]...)
+				msg = append(msg, txmetacache.WireActionADD)
+				msg = binary.LittleEndian.AppendUint32(msg, uint32(len(payload))) //nolint:gosec // small
+				msg = append(msg, payload...)
+			}
+
+			km := &kafka.KafkaMessage{Value: msg}
+			require.NoError(t, server.txmetaHandler(context.Background(), km))
+
+			for i := range km.Value {
+				km.Value[i] = 0xAA
+			}
+
+			for i := range hashes {
+				got, ok := cache.GetMetaCached(context.Background(), hashes[i])
+				require.True(t, ok, "entry %d", i)
+				require.Equal(t, uint64(100+i), got.Fee, "entry %d", i)
+			}
 		})
 	}
 }
