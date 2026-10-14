@@ -224,7 +224,7 @@ func NewTxMetaCache(
 
 		cache = pc
 	} else if bucketType == Lockfree {
-		lc, err := NewLockFreeCache(maxMB * 1024 * 1024)
+		lc, err := newLockFreeImpl(maxMB * 1024 * 1024)
 		if err != nil {
 			return nil, errors.NewProcessingError("error creating lock-free cache", err)
 		}

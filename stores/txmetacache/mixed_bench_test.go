@@ -232,6 +232,13 @@ func sampleCPU() cpuSample {
 }
 
 func runMixed(b *testing.B, cfg mixedConfig) {
+	if impl := os.Getenv("TXMETA_BENCH_LF_IMPL"); impl != "" {
+		prev := useLaneCache
+		useLaneCache = impl == "lanes"
+
+		b.Cleanup(func() { useLaneCache = prev })
+	}
+
 	pool := mixedPool()
 	c := newBenchTxMetaCache(b, cfg.sizeMB, cfg.bucket)
 	ctx := context.Background()

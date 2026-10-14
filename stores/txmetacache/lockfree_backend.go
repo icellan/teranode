@@ -5,9 +5,53 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 )
 
-// lockFreeBackend adapts *LockFreeCache to cacheBackend.
+// rawLockFreeCache is the byte-level API shared by the lock-free cache
+// implementations (LockFreeCache, LaneCache).
+type rawLockFreeCache interface {
+	Set(key, value []byte) error
+	SetMulti(keys, values [][]byte) error
+	Get(dst *[]byte, key []byte) bool
+	GetMulti(dst *[]byte, keys []chainhash.Hash, spans [][2]int)
+	Del(key []byte)
+	Reset()
+	Oversize() uint64
+	UpdateStats(s *Stats)
+}
+
+var (
+	_ rawLockFreeCache = (*LockFreeCache)(nil)
+	_ rawLockFreeCache = (*LaneCache)(nil)
+)
+
+// newLockFreeImpl builds the implementation behind the Lockfree bucket type.
+func newLockFreeImpl(maxBytes int) (rawLockFreeCache, error) {
+	if useLaneCache {
+		lc, err := NewLaneCache(maxBytes)
+		if err != nil {
+			return nil, err
+		}
+
+		return lc, nil
+	}
+
+	c, err := NewLockFreeCache(maxBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return c, nil
+}
+
+// useLaneCache selects LaneCache (the default) or LockFreeCache for the
+// Lockfree bucket type. On the production subtree nodes lane rings measured
+// 30-60% faster than per-shard rings for both ingest and reads, because a
+// writer's records land in sequential memory instead of a random page each.
+// Benchmarks switch it to compare the two layouts.
+var useLaneCache = true
+
+// lockFreeBackend adapts a rawLockFreeCache to cacheBackend.
 type lockFreeBackend struct {
-	cache *LockFreeCache
+	cache rawLockFreeCache
 }
 
 var _ cacheBackend = (*lockFreeBackend)(nil)
