@@ -48,13 +48,24 @@ type LaneCache struct {
 	inserts  stripedCounter
 }
 
-// lfLane is padded to a cache line.
+// lfLane is two cache lines: the writer-side line (owner, tail) and the
+// read-mostly snapshot line.
 type lfLane struct {
 	owner atomic.Uint32
 	_     uint32
 	tail  atomic.Uint64
 	ring  unsafe.Pointer
 	_     [40]byte
+
+	// snap is the lane's tail as of its last refresh, on its own cache line.
+	// Writers judge other lanes' slots (stale? oldest?) by it rather than by
+	// tail: tail's line is written by the lane's writer every few records, so
+	// reading it for up to eight slots per insert took that many cache misses
+	// on lines other cores were writing. snap is refreshed every 1/16 ring, so
+	// its line stays shared. Lagging behind tail only makes a slot look live
+	// for longer, which costs at most a slightly worse eviction choice.
+	snap atomic.Uint64
+	_    [56]byte
 }
 
 const (
@@ -121,6 +132,7 @@ func NewLaneCache(maxBytes int) (*LaneCache, error) {
 		c.lanes[i].ring = unsafe.Add(c.index, indexBytes+uint64(i)*ringSize) //nolint:gosec // inside region
 		// Offset 0 is reserved so that no valid slot is 0.
 		c.lanes[i].tail.Store(lfHeaderBytes)
+		c.lanes[i].snap.Store(lfHeaderBytes)
 	}
 
 	return c, nil
@@ -150,6 +162,26 @@ func (c *LaneCache) decode(v uint64) (l *lfLane, o uint64, ok bool) {
 	d := ((t >> 3) - (v & lnOffMask)) & lnOffMask * 8
 
 	return l, t - d, d <= c.ringSize
+}
+
+// ageBySnapshot is how far slot v's record is behind its lane's tail snapshot,
+// and whether it is still within one ring of it (see lfLane.snap).
+func (c *LaneCache) ageBySnapshot(v uint64) (uint64, bool) {
+	lane := (v >> lnOffBits) & (lnMaxLanes - 1)
+	if lane >= uint64(len(c.lanes)) {
+		return 0, false
+	}
+
+	snap := c.lanes[lane].snap.Load()
+	d := ((snap >> 3) - (v & lnOffMask)) & lnOffMask * 8
+
+	// d wraps to near 2^43 for a record written after the snapshot: that one
+	// is young, not stale.
+	if d > lnOffMask*8/2 {
+		return 0, true
+	}
+
+	return d, d <= c.ringSize
 }
 
 func (c *LaneCache) slotValue(fp uint64, lane int, o uint64) uint64 {
@@ -258,6 +290,10 @@ func (c *LaneCache) SetMulti(keys, values [][]byte) error {
 		l.tail.Store(end)
 		storeFence()
 
+		if end-l.snap.Load() > c.ringSize/16 {
+			l.snap.Store(end)
+		}
+
 		for j := 0; j < n; j++ {
 			if ok[j] {
 				writeLaneRecord(c, l, offs[j]&c.ringMask, keys[g+j], values[g+j])
@@ -344,7 +380,7 @@ func (c *LaneCache) publish(set unsafe.Pointer, fp, newSlot uint64) {
 				break
 			}
 
-			l, o, live := c.decode(v)
+			age, live := c.ageBySnapshot(v)
 			if !live {
 				if victim < 0 {
 					victim, victimVal = i, v
@@ -353,7 +389,7 @@ func (c *LaneCache) publish(set unsafe.Pointer, fp, newSlot uint64) {
 				continue
 			}
 
-			if age := l.tail.Load() - o; oldest < 0 || age > maxAge {
+			if oldest < 0 || age > maxAge {
 				oldest, oldestVal, maxAge = i, v, age
 			}
 		}
