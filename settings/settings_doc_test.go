@@ -115,7 +115,7 @@ func isTableSeparatorRow(cells []string) bool {
 }
 
 // parseDocSettingsTables walks every markdown table in doc and extracts data
-// rows from tables whose header has both a "Default" column and an
+// rows from tables whose header has both a "Default" (or "Loader fallback") column and an
 // "Environment Variable" column - the shape used by every settings-reference
 // table in docs/references/settings. Tables documenting something else (URL
 // query parameters, validation rules, enum-value tables, Kafka topic-name
@@ -146,7 +146,7 @@ func parseDocSettingsTables(doc string) []docTableRow {
 
 			for i, c := range cells {
 				switch c {
-				case "Default":
+				case "Default", "Loader fallback":
 					defaultIdx = i
 				case "Environment Variable":
 					envIdx = i
@@ -878,7 +878,7 @@ var checkedRowsPerDoc = map[string]int{
 	"blockassembly_settings.md":     43,
 	"blockchain_settings.md":        11,
 	"blockpersister_settings.md":    9,
-	"blockvalidation_settings.md":   67,
+	"blockvalidation_settings.md":   70,
 	"coinbase_settings.md":          21,
 	"faucet_settings.md":            1,
 	"legacy_settings.md":            28,
@@ -886,7 +886,7 @@ var checkedRowsPerDoc = map[string]int{
 	"propagation_settings.md":       13,
 	"pruner_settings.md":            26,
 	"rpc_settings.md":               11,
-	"subtreevalidation_settings.md": 24,
+	"subtreevalidation_settings.md": 23,
 	"utxopersister_settings.md":     2,
 	"validator_settings.md":         17,
 	"aerospike_settings.md":         13,

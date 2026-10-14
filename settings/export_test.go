@@ -253,6 +253,11 @@ func collectKeyTagFieldPaths(typ reflect.Type, paths map[string][]string) {
 		fieldType := field.Type
 
 		key := field.Tag.Get("key")
+		if key == "-" {
+			// Deliberately not a setting; ExportMetadata skips it too.
+			continue
+		}
+
 		if key == "" {
 			if fieldType.Kind() == reflect.Pointer && fieldType.Elem().Kind() == reflect.Struct {
 				collectKeyTagFieldPaths(fieldType.Elem(), paths)
