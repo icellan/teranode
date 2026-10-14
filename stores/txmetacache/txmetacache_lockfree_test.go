@@ -181,8 +181,8 @@ func TestTxMetaCache_GetMetaCachedInto_AllocationsDoNotScaleWithHits(t *testing.
 		})
 	}
 
-	// A handful per call (a 16 KB decode slab per ~350 hits), never one or
-	// more per hit as GetMetaCached does.
+	// A handful per call at most (a 256 KB decode chunk per few thousand
+	// hits), never one or more per hit as GetMetaCached does.
 	require.LessOrEqual(t, allocsFor(16), 2.0)
 	require.LessOrEqual(t, allocsFor(n), 10.0)
 }

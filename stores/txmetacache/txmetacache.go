@@ -43,11 +43,11 @@ import (
 // - Cache hit ratio (hits vs. misses) to evaluate cache effectiveness
 // - Insertion and eviction rates to detect memory pressure
 type metrics struct {
-	insertions atomic.Uint64 // Tracks number of items inserted into the cache; indicates write throughput
-	hits       atomic.Uint64 // Tracks number of successful cache retrievals; indicates cache effectiveness
-	misses     atomic.Uint64 // Tracks number of failed cache retrievals; helps identify sizing issues
-	evictions  atomic.Uint64 // Tracks number of items evicted from the cache; indicates memory pressure
-	getOrigin  atomic.Uint64 // Tracks origin-store metadata retrievals
+	insertions stripedCounter // Tracks number of items inserted into the cache; indicates write throughput
+	hits       stripedCounter // Tracks number of successful cache retrievals; indicates cache effectiveness
+	misses     stripedCounter // Tracks number of failed cache retrievals; helps identify sizing issues
+	evictions  stripedCounter // Tracks number of items evicted from the cache; indicates memory pressure
+	getOrigin  atomic.Uint64  // Tracks origin-store metadata retrievals
 }
 
 const (
@@ -448,19 +448,50 @@ var intoScratchPool = sync.Pool{
 // batch does not pin its buffer for the life of the process.
 const intoScratchMaxRetain = 4 * 1024 * 1024
 
-// Decoded parent hashes and vouts live in slabs that are never reused, because
-// callers keep the TxInpoints. Each slab stays at 16 KB so it comes
-// from the per-P allocation cache rather than the global heap lock (an
-// exactly-32 KB slab already takes the large-object path).
+// Decoded parent hashes and vouts are carved from chunks that are never
+// reused, because callers keep the TxInpoints. A chunk is held by a per-P
+// carver in intoCarverPool until it is used up, so the heap's global span lock
+// is taken once per chunk (a few thousand lookups) rather than once per
+// call: allocating a slab per call serialised every concurrent reader on that
+// lock once more than ~32 readers ran. A chunk stays alive while any caller
+// still holds a TxInpoints carved from it; idle carvers are dropped on GC.
 const (
-	intoParentSlab = 16 * 1024 / chainhash.HashSize
-	intoVoutSlab   = 16 * 1024 / 4
+	intoParentChunk = 256 * 1024 / chainhash.HashSize
+	intoVoutChunk   = 256 * 1024 / 4
 )
+
+type intoCarver struct {
+	parents []chainhash.Hash
+	vouts   []uint32
+}
+
+var intoCarverPool = sync.Pool{
+	New: func() any { return &intoCarver{} },
+}
+
+// take returns room for at least needP parent hashes and needV vout words,
+// starting a new chunk when the current one is too short.
+func (cv *intoCarver) take(needP, needV int) ([]chainhash.Hash, []uint32) {
+	if needP > len(cv.parents) {
+		cv.parents = make([]chainhash.Hash, max(needP, intoParentChunk))
+	}
+
+	if needV > len(cv.vouts) {
+		cv.vouts = make([]uint32, max(needV, intoVoutChunk))
+	}
+
+	return cv.parents, cv.vouts
+}
+
+// advance marks np parents and nv vouts as handed out.
+func (cv *intoCarver) advance(np, nv int) {
+	cv.parents, cv.vouts = cv.parents[np:], cv.vouts[nv:]
+}
 
 // GetMetaCachedInto looks up hashes and decodes each hit into out[i], setting
 // found[i]. It allocates no *meta.Data: hits' parent hashes and vouts are
-// decoded into shared slabs (see intoParentSlab) that the returned TxInpoints
-// reference, each capped to its own entry. Slabs are never reused, so results
+// decoded into shared chunks (see intoCarver) that the returned TxInpoints
+// reference, each capped to its own entry. Chunks are never reused, so results
 // may be kept for as long as the caller likes.
 //
 // Entries that fail to decode are evicted and count as misses. It returns the
@@ -489,11 +520,10 @@ func (t *TxMetaCache) GetMetaCachedInto(_ context.Context, hashes []chainhash.Ha
 	spans := sc.spans[:n]
 	t.cache.GetRawMulti(hashes, &sc.raw, spans)
 
-	var (
-		parents []chainhash.Hash
-		vouts   []uint32
-		hits    int
-	)
+	carver := intoCarverPool.Get().(*intoCarver)
+	defer intoCarverPool.Put(carver)
+
+	hits := 0
 
 	for i, sp := range spans {
 		if sp[0] < 0 {
@@ -502,15 +532,7 @@ func (t *TxMetaCache) GetMetaCachedInto(_ context.Context, hashes []chainhash.Ha
 		}
 
 		entry := sc.raw[sp[0]:sp[1]]
-
-		needP, needV := metaArenaNeed(entry)
-		if needP > len(parents) {
-			parents = make([]chainhash.Hash, max(needP, intoParentSlab))
-		}
-
-		if needV > len(vouts) {
-			vouts = make([]uint32, max(needV, intoVoutSlab))
-		}
+		parents, vouts := carver.take(metaArenaNeed(entry))
 
 		m, np, nv, err := decodeCachedMeta(entry, parents, vouts)
 		if err != nil {
@@ -520,7 +542,7 @@ func (t *TxMetaCache) GetMetaCachedInto(_ context.Context, hashes []chainhash.Ha
 			continue
 		}
 
-		parents, vouts = parents[np:], vouts[nv:]
+		carver.advance(np, nv)
 		out[i], found[i] = m, true
 		hits++
 	}
