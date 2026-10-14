@@ -754,6 +754,7 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 			BaseURL:       request.BaseUrl,
 			AllowFailFast: false,
 			PeerID:        peerID,
+			FromBlock:     true,
 		}
 
 		return u.ValidateSubtreeInternal(

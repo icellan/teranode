@@ -71,10 +71,11 @@ func (u *Server) processTxMetaUsingCache(ctx context.Context, txHashes []chainha
 	return u.probeTxMetaCache(ctx, &u.peerProbePool, txHashes, txMetaSlice, failFast)
 }
 
-// processBlockTxMetaUsingCache is processTxMetaUsingCache for block validation.
-// It uses a separate pool of the same size, so a burst of peer subtrees cannot
-// delay a block's cache pre-check, while the total number of probe workers
-// stays bounded.
+// processBlockTxMetaUsingCache is processTxMetaUsingCache for block validation's
+// cache pre-check. Block validation, here and in ValidateSubtreeInternal for a
+// block's subtrees (ValidateSubtree.FromBlock), uses a separate pool of the same
+// size, so a burst of peer subtrees cannot delay a block, while the total number
+// of probe workers stays bounded.
 func (u *Server) processBlockTxMetaUsingCache(ctx context.Context, txHashes []chainhash.Hash, txMetaSlice []metaSliceItem) (int, error) {
 	return u.probeTxMetaCache(ctx, &u.blockProbePool, txHashes, txMetaSlice, false)
 }
@@ -157,7 +158,10 @@ func (u *Server) probeTxMetaCache(ctx context.Context, pool *probePool, txHashes
 		next[r]++
 	}
 
-	var missed atomic.Uint32
+	var (
+		missed  atomic.Uint32
+		aborted bool // not every task was started
+	)
 
 	g, gCtx := errgroup.WithContext(ctx)
 	slots := pool.slotsFor(u)
@@ -172,6 +176,7 @@ dispatch:
 		select {
 		case slots <- struct{}{}:
 		case <-gCtx.Done():
+			aborted = true
 			break dispatch
 		}
 
@@ -188,7 +193,9 @@ dispatch:
 	}
 
 	err := g.Wait()
-	if err == nil && ctx.Err() != nil {
+	if err == nil && aborted {
+		// Cancelled while waiting for a slot: the unstarted tasks were neither found
+		// nor counted as missed.
 		err = errors.NewContextCanceledError("[processTxMetaUsingCache context cancelled]", ctx.Err())
 	}
 

@@ -7,6 +7,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-chaincfg"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/stores/txmetacache"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
 )
 
@@ -79,6 +89,65 @@ func TestProcessBlockTxMetaUsingCache_NotBlockedByPeerBurst(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("block cache probe waited on the peer subtree pool")
 	}
+}
+
+// A block's subtrees that this node has not validated yet go through
+// ValidateSubtreeInternal (CheckBlockSubtrees, CheckSubtreeFromBlock). Their cache
+// probe must use the block pool too, not queue behind a burst of peer subtrees.
+func TestValidateSubtreeInternal_FromBlockNotBlockedByPeerBurst(t *testing.T) {
+	InitPrometheusMetrics()
+
+	utxoStore, validatorClient, txStore, subtreeStore, blockchainClient, deferFunc := setup(t)
+	defer deferFunc()
+
+	for _, tx := range []*bt.Tx{tx1, tx2, tx3, tx4} {
+		_, _, err := utxoStore.SpendAndCreate(context.Background(), tx, 0, utxo.WithCreateOnly())
+		require.NoError(t, err)
+	}
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.SubtreeValidation.ProcessTxMetaUsingCacheConcurrency = 2
+	tSettings.SubtreeValidation.TxMetaCacheEnabled = true // New puts the txmeta cache in front of the store
+
+	nilConsumer := &kafka.KafkaConsumerGroup{}
+
+	server, err := New(context.Background(), ulogger.TestLogger{}, tSettings, subtreeStore, txStore, utxoStore, validatorClient, blockchainClient, nilConsumer, nilConsumer, nil, nil)
+	require.NoError(t, err)
+	require.IsType(t, &txmetacache.TxMetaCache{}, server.utxoStore)
+
+	// Occupy every peer slot, as a burst of peer subtrees would.
+	peer := server.peerProbePool.slotsFor(server)
+	for i := 0; i < cap(peer); i++ {
+		peer <- struct{}{}
+	}
+
+	st, err := subtreepkg.NewTreeByLeafCount(4)
+	require.NoError(t, err)
+
+	for _, h := range []*chainhash.Hash{hash1, hash2, hash3, hash4} {
+		require.NoError(t, st.AddNode(*h, 1, 0))
+	}
+
+	validate := func(fromBlock bool, timeout time.Duration) error {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		v := ValidateSubtree{
+			SubtreeHash: *st.RootHash(),
+			BaseURL:     "http://localhost:8000",
+			TxHashes:    []chainhash.Hash{*hash1, *hash2, *hash3, *hash4},
+			FromBlock:   fromBlock,
+		}
+
+		_, err := server.ValidateSubtreeInternal(ctx, v, chaincfg.GenesisActivationHeight, nil)
+
+		return err
+	}
+
+	// The peer path waits on the full peer pool, so this test does reach the pool.
+	require.ErrorIs(t, validate(false, 200*time.Millisecond), errors.ErrContextCanceled)
+
+	require.NoError(t, validate(true, 5*time.Second))
 }
 
 // A non-positive setting falls back to NumCPU workers, as the per-call errgroup
