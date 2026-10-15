@@ -66,11 +66,6 @@ func settingsDocFiles(t *testing.T) []string {
 	return files
 }
 
-// docKeyRe matches a bare settings key: letters, digits and underscores only.
-// It is used to reject table cells that are prose ("Usage" text, etc.) rather
-// than an actual environment variable key.
-var docKeyRe = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
-
 // tableSeparatorCellRe matches one cell of a markdown table header separator
 // row, e.g. the `---` or `:---:` in `|---|:---:|`.
 var tableSeparatorCellRe = regexp.MustCompile(`^:?-+:?$`)
@@ -90,9 +85,19 @@ func splitTableRow(trimmedLine string) []string {
 	inner := strings.TrimPrefix(trimmedLine, "|")
 	inner = strings.TrimSuffix(inner, "|")
 
+	// A cell may contain an escaped pipe (`\|`), which is a literal "|" in the
+	// rendered table, not a column break. Go's regexp has no lookbehind, so a
+	// split on (?<!\\)\| will not compile; park the escapes on a byte that
+	// cannot appear in Markdown source, split, then restore them. Without this
+	// a row like p2p_settings.md's `127.0.0.1/32\|::1/128` gains a phantom
+	// column, which shifts every later cell and silently misreads the key.
+	const pipePlaceholder = "\x00"
+
+	inner = strings.ReplaceAll(inner, `\|`, pipePlaceholder)
+
 	cells := strings.Split(inner, "|")
 	for i, c := range cells {
-		cells[i] = strings.TrimSpace(c)
+		cells[i] = strings.TrimSpace(strings.ReplaceAll(c, pipePlaceholder, "|"))
 	}
 
 	return cells
@@ -164,10 +169,13 @@ func parseDocSettingsTables(doc string) []docTableRow {
 			continue
 		}
 
+		// A key cell that is not an identifier ("N/A", or a cell shifted by a
+		// malformed row) is returned rather than skipped: the row loop fails it
+		// as an unresolvable key, which is the whole point of the guard. Dropping
+		// it here instead meant such a row was never checked AND never counted
+		// toward checkedRowsPerDoc, so the recorded counts were taken with the
+		// rows already missing and the omission could never be noticed.
 		key := cells[envIdx]
-		if !docKeyRe.MatchString(key) {
-			continue
-		}
 
 		row := docTableRow{docDefault: cells[defaultIdx], key: key}
 		if settingIdx != -1 && settingIdx < len(cells) {
@@ -493,6 +501,21 @@ func settingsKeys(t *testing.T) []string {
 	return keys
 }
 
+// isolationKeys returns every environment variable that has to be unset for a
+// runtime default to be the literal fallback in settings.go.
+//
+// ExportMetadata() only knows about tagged keys, but getPort also reads
+// PORT_PREFIX (helpers.go), which has no struct tag and so is not one. Leaving
+// it set shifts every port default - alert_settings.md documents PORT_PREFIX=1
+// as the way to do exactly that - so a developer with it exported saw both
+// drift tests fail on ports they had not touched, while CI (where it is unset)
+// stayed green.
+func isolationKeys(t *testing.T) []string {
+	t.Helper()
+
+	return append(settingsKeys(t), "PORT_PREFIX")
+}
+
 // buildIsolatedRuntimeSettings constructs a Settings the same way production
 // code does - via NewSettings - but isolated from every source of config
 // that could make the result depend on anything but the getX(...) literal
@@ -593,7 +616,7 @@ func TestSettingsDocDefaultsMatchCode(t *testing.T) {
 		codeDefaults[entry.Key] = entry.DefaultValue
 	}
 
-	runtimeSettings := buildIsolatedRuntimeSettings(t, settingsKeys(t))
+	runtimeSettings := buildIsolatedRuntimeSettings(t, isolationKeys(t))
 
 	runtimeDefaults := make(map[string]string)
 	for _, entry := range runtimeSettings.ExportMetadata().Settings {
@@ -799,7 +822,7 @@ var pendingWireExemptions []pendingWireExemption
 func TestSettingsTagMatchesRuntimeForAllKeys(t *testing.T) {
 	tagProbe := &Settings{ChainCfgParams: &chaincfg.MainNetParams}
 
-	runtimeSettings := buildIsolatedRuntimeSettings(t, settingsKeys(t))
+	runtimeSettings := buildIsolatedRuntimeSettings(t, isolationKeys(t))
 
 	runtimeDefaults := make(map[string]string)
 	for _, entry := range runtimeSettings.ExportMetadata().Settings {
@@ -874,15 +897,15 @@ var checkedRowsPerDoc = map[string]int{
 	"kafka_settings.md":             19,
 	"policy_settings.md":            26,
 	"alert_settings.md":             10,
-	"asset_settings.md":             37,
-	"blockassembly_settings.md":     43,
+	"asset_settings.md":             38,
+	"blockassembly_settings.md":     44,
 	"blockchain_settings.md":        11,
 	"blockpersister_settings.md":    9,
 	"blockvalidation_settings.md":   70,
 	"coinbase_settings.md":          21,
 	"faucet_settings.md":            1,
 	"legacy_settings.md":            28,
-	"p2p_settings.md":               45,
+	"p2p_settings.md":               46,
 	"propagation_settings.md":       13,
 	"pruner_settings.md":            26,
 	"rpc_settings.md":               11,
