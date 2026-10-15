@@ -588,6 +588,17 @@ func ProbeRangeOf(keyHash uint64) int {
 	return int(keyHash % BucketsCount / (BucketsCount / ProbeRanges))
 }
 
+// BucketLocality reports whether grouping a large lookup by ProbeRangeOf pays
+// off on this cache's backend. The bucketed backends take a lock per bucket,
+// so a grouped batch takes each lock once. The lockfree cache has one global
+// index and no locks; for it the grouping only scatters the caller's result
+// writes, and it ignores keyHashes.
+func (t *TxMetaCache) BucketLocality() bool {
+	_, lockfree := t.cache.(*lockFreeBackend)
+
+	return !lockfree
+}
+
 // GetMeta retrieves transaction metadata for a given transaction hash, first checking the cache
 // and falling back to the underlying store if needed.
 //

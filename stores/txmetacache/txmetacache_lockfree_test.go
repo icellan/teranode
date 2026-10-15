@@ -224,3 +224,15 @@ func TestTxMetaCache_Lockfree_CacheStatsReportsLappedEvictions(t *testing.T) {
 	require.Positive(t, stats.Evictions)
 	require.Equal(t, stats.TotalElementsAdded, stats.Evictions+stats.ValidEntriesCount)
 }
+
+// TestTxMetaCache_BucketLocality pins which backends gain from lookups grouped
+// by ProbeRangeOf: the bucketed ones take a lock per bucket, the lockfree
+// cache has one global index and gains nothing.
+func TestTxMetaCache_BucketLocality(t *testing.T) {
+	for _, tc := range allBucketTypes {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestTxMetaCache(t, tc.bucket)
+			require.Equal(t, tc.bucket != Lockfree, c.BucketLocality())
+		})
+	}
+}
