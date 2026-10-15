@@ -117,3 +117,32 @@ func TestLaneCache_LappedEntriesCountAsEvictions(t *testing.T) {
 		last = s.Evictions
 	}
 }
+
+// Reset drops every entry: they all count as evicted, the count still never
+// goes down, and entries inserted after the Reset are live.
+func TestLaneCache_ResetCountsEverythingAsEvicted(t *testing.T) {
+	c, err := NewLaneCache(1024 * 1024)
+	require.NoError(t, err)
+
+	for i := uint64(0); i < 50_000; i++ {
+		k := mixedKey(i)
+		require.NoError(t, c.Set(k[:], lfValue(i)))
+	}
+
+	var before Stats
+	c.UpdateStats(&before)
+
+	c.Reset()
+
+	for i := uint64(0); i < 100; i++ {
+		k := mixedKey(1_000_000 + i)
+		require.NoError(t, c.Set(k[:], lfValue(i)))
+	}
+
+	var after Stats
+	c.UpdateStats(&after)
+
+	require.Equal(t, uint64(50_000), after.Evictions, "every entry from before the Reset is evicted")
+	require.GreaterOrEqual(t, after.Evictions, before.Evictions)
+	require.Equal(t, uint64(100), after.ValidEntriesCount, "entries inserted after the Reset are live")
+}

@@ -2,6 +2,7 @@ package subtreevalidation
 
 import (
 	"context"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/require"
@@ -24,6 +26,7 @@ func TestAdmissionGate_BoundsConcurrentHolders(t *testing.T) {
 		gate    admissionGate
 		holding atomic.Int32
 		peak    atomic.Int32
+		failed  atomic.Int32
 		wg      sync.WaitGroup
 	)
 
@@ -33,8 +36,11 @@ func TestAdmissionGate_BoundsConcurrentHolders(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			release, err := gate.acquire(context.Background(), limit, noBypass)
-			require.NoError(t, err)
+			release, err := gate.acquire(context.Background(), limit)
+			if err != nil {
+				failed.Add(1)
+				return
+			}
 
 			n := holding.Add(1)
 			for {
@@ -52,53 +58,9 @@ func TestAdmissionGate_BoundsConcurrentHolders(t *testing.T) {
 
 	wg.Wait()
 
+	require.Zero(t, failed.Load())
 	require.LessOrEqual(t, peak.Load(), int32(limit))
 	require.Positive(t, peak.Load())
-}
-
-func noBypass() bool { return false }
-
-// Block validation can need a subtree whose peer goroutine is queued at the
-// gate (it holds the subtree's quorum lock). Once the subtree is a priority
-// check, the waiter must go ahead without a slot instead of making the block
-// wait for the queue.
-func TestAdmissionGate_BypassReleasesAWaiter(t *testing.T) {
-	var gate admissionGate
-
-	release, err := gate.acquire(context.Background(), 1, noBypass)
-	require.NoError(t, err)
-
-	defer release()
-
-	var priority atomic.Bool
-
-	done := make(chan error, 1)
-
-	go func() {
-		r, err := gate.acquire(context.Background(), 1, priority.Load)
-		if err == nil {
-			r()
-		}
-		done <- err
-	}()
-
-	select {
-	case <-done:
-		t.Fatal("acquired a slot while the gate was full")
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	priority.Store(true)
-
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("a priority subtree stayed queued at the gate")
-	}
-
-	// The bypassing waiter took no slot: the gate is still exactly full.
-	require.Len(t, gate.slots, 1)
 }
 
 func TestAdmissionGate_NonPositiveLimitDisablesIt(t *testing.T) {
@@ -107,7 +69,7 @@ func TestAdmissionGate_NonPositiveLimitDisablesIt(t *testing.T) {
 	releases := make([]func(), 0, 100)
 
 	for i := 0; i < 100; i++ {
-		release, err := gate.acquire(context.Background(), 0, noBypass)
+		release, err := gate.acquire(context.Background(), 0)
 		require.NoError(t, err)
 
 		releases = append(releases, release)
@@ -121,7 +83,7 @@ func TestAdmissionGate_NonPositiveLimitDisablesIt(t *testing.T) {
 func TestAdmissionGate_CancelWhileWaiting(t *testing.T) {
 	var gate admissionGate
 
-	release, err := gate.acquire(context.Background(), 1, noBypass)
+	release, err := gate.acquire(context.Background(), 1)
 	require.NoError(t, err)
 
 	defer release()
@@ -129,14 +91,17 @@ func TestAdmissionGate_CancelWhileWaiting(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err = gate.acquire(ctx, 1, noBypass)
+	_, err = gate.acquire(ctx, 1)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errors.ErrContextCanceled), "got %v", err)
 }
 
-// A peer subtree waits for admission before it allocates its working set; a
-// block's subtree (FromBlock) never waits on the peer gate.
-func TestValidateSubtreeInternal_PeerSubtreeWaitsForAdmission(t *testing.T) {
+// A peer subtree waits for admission before it takes the subtree's quorum
+// lock: block validation (CheckBlockSubtrees) waits on that lock, so a subtree
+// queued at the gate while holding it would make a block wait for the queue.
+// The quorum is nil here, so reaching the lock would panic: the error proves
+// the handler stopped at the gate.
+func TestSubtreesHandler_WaitsForAdmissionBeforeTheQuorumLock(t *testing.T) {
 	tSettings := test.CreateBaseTestSettings(t)
 	tSettings.SubtreeValidation.PeerSubtreeConcurrency = 1
 
@@ -145,7 +110,11 @@ func TestValidateSubtreeInternal_PeerSubtreeWaitsForAdmission(t *testing.T) {
 		settings: tSettings,
 	}
 
-	release, err := server.peerSubtreeAdmission.acquire(context.Background(), 1, noBypass)
+	blockIDs := map[uint32]bool{}
+	server.currentBlockIDsMap.Store(&blockIDs)
+	server.bestBlockHeaderMeta.Store(&model.BlockHeaderMeta{Height: 1})
+
+	release, err := server.peerSubtreeAdmission.acquire(context.Background(), 1)
 	require.NoError(t, err)
 
 	defer release()
@@ -153,13 +122,37 @@ func TestValidateSubtreeInternal_PeerSubtreeWaitsForAdmission(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	v := ValidateSubtree{
-		SubtreeHash: chainhash.HashH([]byte("peer subtree")),
-		TxHashes:    []chainhash.Hash{chainhash.HashH([]byte("tx"))},
-		peerSubtree: true,
-	}
+	hash := chainhash.HashH([]byte("peer subtree"))
+	baseURL, err := url.Parse("http://peer.invalid")
+	require.NoError(t, err)
 
-	_, err = server.ValidateSubtreeInternal(ctx, v, 1, nil)
+	err = server.subtreesHandler(ctx, &hash, baseURL, "peer-1")
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errors.ErrContextCanceled), "a peer subtree must wait at the gate, got %v", err)
+}
+
+// The slot is freed when the handler returns, whatever the outcome.
+func TestSubtreesHandler_ReleasesAdmissionOnReturn(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.SubtreeValidation.PeerSubtreeConcurrency = 1
+
+	server := &Server{
+		logger:   ulogger.TestLogger{},
+		settings: tSettings,
+	}
+
+	blockIDs := map[uint32]bool{}
+	server.currentBlockIDsMap.Store(&blockIDs)
+	server.bestBlockHeaderMeta.Store(&model.BlockHeaderMeta{Height: 1})
+
+	hash := chainhash.HashH([]byte("peer subtree"))
+	baseURL, err := url.Parse("http://peer.invalid")
+	require.NoError(t, err)
+
+	// No quorum: the handler panics right after taking its slot.
+	require.Panics(t, func() { _ = server.subtreesHandler(context.Background(), &hash, baseURL, "peer-1") })
+
+	release, err := server.peerSubtreeAdmission.acquire(context.Background(), 1)
+	require.NoError(t, err, "the slot must have been released")
+	release()
 }

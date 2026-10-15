@@ -260,13 +260,13 @@ func _initPrometheusMetrics() {
 
 	// Evictions metric tracks the number of entries removed from the cache: explicit deletes
 	// (mined or removed transactions) on every backend, plus, on the lockfree cache, entries
-	// overwritten when a ring wraps. High eviction rates may indicate cache pressure.
+	// overwritten when a ring wraps (an estimate, which also counts superseded and deleted records). High eviction rates may indicate cache pressure.
 	prometheusBlockValidationTxMetaCacheEvictions = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: "teranode",
 			Subsystem: "tx_meta_cache",
 			Name:      "evictions",
-			Help:      "Number of entries removed from the tx meta cache (deletes, plus ring-wrap evictions on the lockfree cache)",
+			Help:      "Number of entries removed from the tx meta cache (deletes, plus an estimate of ring-wrap evictions on the lockfree cache)",
 		},
 	)
 

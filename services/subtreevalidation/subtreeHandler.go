@@ -134,6 +134,17 @@ func (u *Server) subtreesHandler(ctx context.Context, hash *chainhash.Hash, base
 		return errors.NewProcessingError("[subtreesHandler] failed to get best block header meta during subtree validation")
 	}
 
+	// Wait for a validation slot before taking the subtree's quorum lock:
+	// block validation (CheckBlockSubtrees) waits on that lock, so a subtree
+	// queued here while holding it would make a block wait for the queue. A
+	// subtree validated while this one was queued is then skipped by the lock
+	// check below.
+	releaseAdmission, err := u.peerSubtreeAdmission.acquire(ctx, u.settings.SubtreeValidation.PeerSubtreeConcurrency)
+	if err != nil {
+		return err
+	}
+	defer releaseAdmission()
+
 	gotLock, _, releaseLockFunc, err := u.quorum.TryLockIfFileNotExists(ctx, hash, fileformat.FileTypeSubtree)
 	if err != nil {
 		return errors.NewProcessingError("[subtreesHandler] error getting lock for Subtree %s", hash.String(), err)
@@ -150,7 +161,6 @@ func (u *Server) subtreesHandler(ctx context.Context, hash *chainhash.Hash, base
 		PeerID:        peerID,
 		TxHashes:      nil,
 		AllowFailFast: true,
-		peerSubtree:   true,
 	}
 
 	// validate the subtree as if it is for the next block height
