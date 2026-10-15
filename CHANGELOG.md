@@ -13,6 +13,9 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
 
 ## [Unreleased]
 
+Entries marked "shipped in v0.16.0" were already in the v0.16.0 release (2026-10-05).
+Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier release, they apply in full.
+
 ### Breaking — action required before upgrading
 
 - **`grpc_admin_api_key` is now mandatory for the Blockchain service.** The service
@@ -27,7 +30,7 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   them. The key travels in plaintext at `security_level_grpc=0`; use verified TLS
   across untrusted networks. (#1755)
 
-- **Kubernetes: Kafka now sits behind a NetworkPolicy.**
+- **Kubernetes: Kafka now sits behind a NetworkPolicy.** (shipped in v0.16.0)
   `deploy/kubernetes/kafka/kafka-shared-networkpolicy.yaml` restricts which pods may
   reach the shared Kafka broker. Pods outside the Kafka broker's namespace lose Kafka
   connectivity once the policy is applied; the rule admits every pod in that namespace,
@@ -80,13 +83,13 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
 
 ### Breaking — behaviour changes on upgrade
 
-- **P2P HTTP endpoints are now rate limited.** `/health` and the websocket upgrade
+- **P2P HTTP endpoints are now rate limited.** (shipped in v0.16.0) `/health` and the websocket upgrade
   path are limited per source address, defaulting to 100 requests per second
   (`p2p_httpRateLimit`); requests over the limit receive HTTP 429. These endpoints
   were previously unlimited. Health checkers or probes polling faster than this will
   start being rejected. Set `p2p_httpRateLimit = 0` to disable. (#1566)
 
-- **Settings that previously did nothing now take effect.** Each of the following
+- **Settings that previously did nothing now take effect.** (shipped in v0.16.0) Each of the following
   carried a `key:` struct tag and appeared in the reference documentation, but
   `NewSettings()` never populated it, so the field stayed at its Go zero value no
   matter what was in `settings.conf`. They are now wired.
@@ -120,7 +123,7 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   port-mapping path that has never run in this codebase.
   (#1645, #1643, #1641, #1644)
 
-- **`txMetaCacheTrimRatio` is renamed `subtreevalidation_txMetaCacheTrimRatio`.** The
+- **`txMetaCacheTrimRatio` is renamed `subtreevalidation_txMetaCacheTrimRatio`.** (shipped in v0.16.0) The
   shipped value carries over and a default node is unaffected: `settings.conf` set the
   old key to `5` and the old code read exactly that key, so the effective ratio was
   already 5 and still is. What breaks is a local override — a value set under the old
@@ -140,7 +143,7 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   and logs a warning at startup. Remove it and set the UTXO-store key instead. (#1903)
 
 - **`aerospike_enable_preserve_filter_expressions` is mutually exclusive with
-  `aerospike_use_native_teranode_ops` for preserve operations.** `PreserveTransactions`
+  `aerospike_use_native_teranode_ops` for preserve operations.** (shipped in v0.16.0) `PreserveTransactions`
   is native-op-covered (`subOpPreserveUntil`). With native ops active and this flag
   false, the preserve write and its prune-eligibility filter go through the native
   operate path. Setting this flag true short-circuits that dispatch and uses a
@@ -441,19 +444,19 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   config loader has no schema and does not reject or report unknown keys, which
   is precisely why these survived as long as they did. Removed:
   `securityLevelGRPC` — a casing variant that never matched the real
-  `security_level_grpc` (#1674) — and `blockchain_subscription_timeout` (#1643).
-  #1744 removed more: among them `http_sign_response` (the live key is
+  `security_level_grpc` (#1674) — and `blockchain_subscription_timeout` (#1643); both
+  removals shipped in v0.16.0. #1744 removed more: among them `http_sign_response` (the live key is
   `asset_sign_http_responses`, and response signing stays off), `p2p_shared_key`,
   `utxostore_outpointBatcherConcurrency` (the live key is
   `utxostore_outpointBatcherMaxConcurrent`), `utxostore_dbTimeoutMillis`, `spent_utxo_ttl`
   and `blockvalidation_subtree_fetch_timeout`.
 
-  **`blockmaxsize` was not removed and is still live.** #1640 deleted a duplicate
+  **`blockmaxsize` was not removed and is still live.** #1640, shipped in v0.16.0, deleted a duplicate
   `BlockSettings.MaxSize` field that carried the same tag; the key itself is read
   at `settings/settings.go` into `Policy.BlockMaxSize`, enforced in Block Assembly
   and reported over RPC as `maxminedblocksize`. Leave it set.
 
-- **The Postgres circuit breaker is now reachable.** The breaker could not be turned
+- **The Postgres circuit breaker is now reachable.** (shipped in v0.16.0) The breaker could not be turned
   on because its settings were never populated. Two forms exist and both are wired
   now: a global `postgres_circuitBreakerEnabled` and a per-service
   `<prefix>_postgres_circuitBreakerEnabled` that overrides it. The default remains
