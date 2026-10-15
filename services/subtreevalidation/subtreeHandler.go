@@ -124,16 +124,6 @@ func (u *Server) subtreesHandler(ctx context.Context, hash *chainhash.Hash, base
 	)
 	defer deferFn()
 
-	blockIDsMap := u.currentBlockIDsMap.Load()
-	if blockIDsMap == nil {
-		return errors.NewProcessingError("[subtreesHandler] failed to get block IDs map during subtree validation")
-	}
-
-	bestBlockHeaderMeta := u.bestBlockHeaderMeta.Load()
-	if bestBlockHeaderMeta == nil {
-		return errors.NewProcessingError("[subtreesHandler] failed to get best block header meta during subtree validation")
-	}
-
 	// Wait for a validation slot before taking the subtree's quorum lock:
 	// block validation (CheckBlockSubtrees) waits on that lock, so a subtree
 	// queued here while holding it would make a block wait for the queue. A
@@ -144,6 +134,18 @@ func (u *Server) subtreesHandler(ctx context.Context, hash *chainhash.Hash, base
 		return err
 	}
 	defer releaseAdmission()
+
+	// Read the chain view after the wait: a block accepted while this subtree
+	// was queued must be in blockIds and the height it is validated for.
+	blockIDsMap := u.currentBlockIDsMap.Load()
+	if blockIDsMap == nil {
+		return errors.NewProcessingError("[subtreesHandler] failed to get block IDs map during subtree validation")
+	}
+
+	bestBlockHeaderMeta := u.bestBlockHeaderMeta.Load()
+	if bestBlockHeaderMeta == nil {
+		return errors.NewProcessingError("[subtreesHandler] failed to get best block header meta during subtree validation")
+	}
 
 	gotLock, _, releaseLockFunc, err := u.quorum.TryLockIfFileNotExists(ctx, hash, fileformat.FileTypeSubtree)
 	if err != nil {

@@ -153,8 +153,8 @@ type Server struct {
 	peerProbePool  probePool
 	blockProbePool probePool
 
-	// peerSubtreeAdmission bounds how many peer subtrees hold their working
-	// set at once; see ValidateSubtree.peerSubtree.
+	// peerSubtreeAdmission bounds how many peer subtrees are validated at
+	// once; see subtreesHandler.
 	peerSubtreeAdmission admissionGate
 }
 
