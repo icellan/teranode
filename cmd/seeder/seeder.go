@@ -114,6 +114,15 @@ func Seeder(logger ulogger.Logger, appSettings *settings.Settings, inputDir stri
 		return errors.NewProcessingError("-force and -recover-checkpoint are mutually exclusive: -force re-imports the UTXO set, -recover-checkpoint never imports")
 	}
 
+	// Both flags do their work inside the UTXO pass, which -skipUTXOs never
+	// starts: utxoTip stays nil, the tip record is never written and the run
+	// still exits 0. An operator following the "re-run with -recover-checkpoint"
+	// hint who also passes -skipUTXOs would see success with the checkpoint
+	// still missing, so refuse the combination rather than silently no-op.
+	if (force || recoverCheckpoint) && skipUTXOs {
+		return errors.NewProcessingError("-force and -recover-checkpoint both require the UTXO pass: do not combine either with -skipUTXOs")
+	}
+
 	profilerAddr := appSettings.ProfilerAddr
 	if profilerAddr != "" {
 		go func() {
@@ -417,10 +426,13 @@ func processHeaders(ctx context.Context, logger ulogger.Logger, blockchainStore 
 	// boundary, and utxo-headers files have no footer. WriteHeadersToStore
 	// writes exactly one record per height from 0 to the tip height read above,
 	// so the record count must equal tipHeight+1.
-	if recordsRead != uint64(height)+1 {
+	// This check runs only after every block has already gone through
+	// StoreBlock, so the operator has to be told the blockchain store has
+	// changed and a re-run will replay those blocks.
+	if expected := uint64(height) + 1; recordsRead != expected {
 		return errors.NewProcessingError(
-			"utxo-headers file record count mismatch: expected %d records (heights 0..%d), read %d",
-			uint64(height)+1, height, recordsRead)
+			"utxo-headers file %s record count mismatch%s: expected %d records (heights 0..%d), read %d; the %d blocks read so far have already been persisted",
+			headersFile, truncationHint(recordsRead, expected), expected, height, recordsRead, recordsRead)
 	}
 
 	logger.Infof("FINISHED  %16s headers with %16s transactions", formatNumber(headersProcessed), formatNumber(txCount))
@@ -596,10 +608,23 @@ func processUTXOs(ctx context.Context, logger ulogger.Logger, appSettings *setti
 		coinbaseTxs:            coinbaseTxs,
 	}
 
-	// A re-import invalidates whatever the previous import's tip record said:
-	// until this one completes, no record may vouch for the UTXO store.
+	// A re-import invalidates everything the previous import left vouching for
+	// the UTXO store, which is two records, not one.
+	//
+	// The tip record is the obvious one. lastProcessed.dat is the other, and it
+	// lives in the BLOCK store, so it survives the UTXO-store wipe that this
+	// command's own fsync warning recommends after a host crash. Leaving it in
+	// place meant a -force that crashed partway through importUTXOSet left the
+	// marker behind; a plain re-run then saw marker plus checkpoint, skipped the
+	// import via checkSkipUTXOImport and exited 0 over a half-written UTXO
+	// store. Clearing it makes that re-run fail loudly with "BlockAssembler
+	// state already exists ... use -force" instead.
 	if err = blockStore.Del(ctx, nil, fileformat.FileTypeDat, bloboptions.WithFilename(importedTipFilename), bloboptions.WithNoHashPrefix()); err != nil && !errors.Is(err, errors.ErrNotFound) {
 		return nil, errors.NewStorageError("failed to clear the previous import's tip record", err)
+	}
+
+	if err = blockStore.Del(ctx, nil, fileformat.FileTypeDat, bloboptions.WithFilename("lastProcessed"), bloboptions.WithNoHashPrefix()); err != nil && !errors.Is(err, errors.ErrNotFound) {
+		return nil, errors.NewStorageError("failed to clear lastProcessed.dat before re-import", err)
 	}
 
 	if err = importUTXOSet(ctx, logger, utxoStore, utxoFile, opts); err != nil {
@@ -1304,6 +1329,18 @@ func restoreCoinbaseInput(tx *bt.Tx, coinbaseTx *bt.Tx, txid *chainhash.Hash) {
 	}
 }
 
+// truncationHint returns the parenthetical to splice into a record-count
+// mismatch message. Reading fewer records than the tip height promises means
+// the file was almost certainly cut short; reading more cannot be truncation,
+// and saying so would send the operator after the wrong fault.
+func truncationHint(recordsRead, expected uint64) string {
+	if recordsRead < expected {
+		return " (likely truncated)"
+	}
+
+	return ""
+}
+
 // loadCoinbaseTxs reads the V2 utxo-headers file and returns a map from coinbase
 // txid to the coinbase transaction. Legacy V1 files carry no coinbase
 // transactions and yield an empty map, as does an absent file: coinbase input
@@ -1381,10 +1418,12 @@ func loadCoinbaseTxs(logger ulogger.Logger, headersFile string) (map[chainhash.H
 		}
 	}
 
-	if recordsRead != uint64(tipHeight)+1 {
+	// This loop stores nothing, so unlike processHeaders there is no "already
+	// persisted" warning to give - but the path still belongs in the message.
+	if expected := uint64(tipHeight) + 1; recordsRead != expected {
 		return coinbaseTxs, errors.NewProcessingError(
-			"utxo-headers file record count mismatch: expected %d records (heights 0..%d), read %d",
-			uint64(tipHeight)+1, tipHeight, recordsRead)
+			"utxo-headers file %s record count mismatch%s: expected %d records (heights 0..%d), read %d",
+			headersFile, truncationHint(recordsRead, expected), expected, tipHeight, recordsRead)
 	}
 
 	return coinbaseTxs, nil

@@ -171,6 +171,10 @@ func TestLoadCoinbaseTxs_TruncatedFile_ReturnsError(t *testing.T) {
 	_, err := loadCoinbaseTxs(ulogger.TestLogger{}, path)
 	require.ErrorContains(t, err, "record count mismatch",
 		"the record-count validation must be what rejects the file")
+	require.ErrorContains(t, err, "likely truncated",
+		"reading fewer records than promised must be diagnosed as truncation")
+	require.ErrorContains(t, err, path,
+		"the message must name the headers file the operator has to look at")
 }
 
 // TestLoadCoinbaseTxs_ExtraRecords_ReportsCountMismatchNotTruncation: more
@@ -181,7 +185,10 @@ func TestLoadCoinbaseTxs_ExtraRecords_ReportsCountMismatchNotTruncation(t *testi
 
 	_, err := loadCoinbaseTxs(ulogger.TestLogger{}, path)
 	require.ErrorContains(t, err, "expected 1 records (heights 0..0), read 2")
-	require.NotContains(t, err.Error(), "truncated")
+	// The phrase, not the bare word: the message now names the headers file,
+	// and writeUtxoHeadersFile calls it "truncated.utxo-headers", so matching
+	// "truncated" alone would hit the path rather than the diagnosis.
+	require.NotContains(t, err.Error(), "likely truncated")
 }
 
 // TestLoadCoinbaseTxs_TruncatedFile_ReturnsPartialMap is the regression test
