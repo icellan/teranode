@@ -352,6 +352,8 @@ The download gauges and the `download_*_total` counters are published from the 3
 | `teranode_subtreevalidation_set_tx_meta_cache_kafka_errors` | Counter   | Number of errors setting tx meta cache from kafka |
 | `teranode_subtreevalidation_kafka_malformed_messages_total` | Counter   | Malformed Kafka subtree messages dropped, labelled by `reason` (`nil_message`, `too_short`, `unmarshal_failure`, `bad_hash`, `bad_url`) |
 | `teranode_subtreevalidation_subtree_already_exists_skipped_total` | Counter | Subtree Kafka messages skipped because the subtree already exists. Benign individually; the per-message log line is at DEBUG, so watch this rate instead |
+| `teranode_subtreevalidation_peer_subtree_admission_wait` | Histogram | Seconds a peer subtree waited for a `subtreevalidation_peerSubtreeConcurrency` slot |
+| `teranode_subtreevalidation_peer_subtree_admission_waiting` | Gauge | Peer subtrees waiting for a `subtreevalidation_peerSubtreeConcurrency` slot |
 
 ## Validator Service Metrics
 

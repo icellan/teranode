@@ -40,3 +40,15 @@ func TestSeenPool_OversizedSetIsNotPooled(t *testing.T) {
 	putSeenSet(s)
 	require.Len(t, s.m, 1, "an oversized set is left alone, not cleared and pooled")
 }
+
+// A small subtree after a full-size one gets a map sized for itself: inserting
+// a few thousand hashes into a table sized for 1M costs ~15x more than into a
+// fresh one. The big set stays pooled for the next big subtree.
+func TestSeenPool_SmallSubtreeGetsAFreshMap(t *testing.T) {
+	big := getSeenSet(seenPoolMaxEntries)
+	putSeenSet(big)
+
+	small := getSeenSet(4096)
+	require.LessOrEqual(t, small.size, 4*4096, "a small subtree must not get a full-size map")
+	require.Empty(t, small.m)
+}

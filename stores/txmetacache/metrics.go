@@ -195,7 +195,7 @@ func initPrometheusMetrics() {
 //   - total_elements_added: Cumulative count of all elements ever added to the cache
 //
 // 4. Memory management metrics:
-//   - evictions: Number of entries removed from the cache due to memory constraints
+//   - evictions: Number of entries removed from the cache: deletes, plus an estimate of ring-wrap evictions on the lockfree cache
 //   - trims: Number of cache cleanup operations performed
 func _initPrometheusMetrics() {
 	// // Size metric tracks the current number of entries in the transaction metadata cache.

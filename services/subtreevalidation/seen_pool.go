@@ -25,9 +25,21 @@ var seenPool = sync.Pool{
 	New: func() any { return &seenSet{} },
 }
 
+// seenOversizeFactor is how much larger than needed a pooled set may be.
+// Inserting a few thousand hashes into a table sized for 1M costs ~15x more
+// than into a fresh one, so a much bigger set goes back for a big subtree.
+const seenOversizeFactor = 4
+
 // getSeenSet returns an empty set with room for n hashes.
 func getSeenSet(n int) *seenSet {
 	s := seenPool.Get().(*seenSet)
+
+	if s.m != nil && s.size > seenOversizeFactor*max(n, 1) {
+		seenPool.Put(s)
+
+		s = &seenSet{}
+	}
+
 	if s.m == nil || s.size < n {
 		s.m = make(map[chainhash.Hash]struct{}, n)
 		s.size = n

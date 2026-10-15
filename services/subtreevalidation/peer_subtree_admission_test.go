@@ -12,8 +12,10 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -106,10 +108,17 @@ func newAdmissionTestServer(t *testing.T, subtreeExists bool) (*Server, *Quorum)
 	q, err := NewQuorum(ulogger.TestLogger{}, newMockExister(subtreeExists), t.TempDir(), WithTimeout(quorumOpTimeout))
 	require.NoError(t, err)
 
+	InitPrometheusMetrics()
+
+	running := blockchain.FSMStateRUNNING
+	blockchainClient := &blockchain.Mock{}
+	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&running, nil)
+
 	server := &Server{
-		logger:   ulogger.TestLogger{},
-		settings: tSettings,
-		quorum:   q,
+		logger:           ulogger.TestLogger{},
+		settings:         tSettings,
+		quorum:           q,
+		blockchainClient: blockchainClient,
 	}
 
 	blockIDs := map[uint32]bool{}
@@ -150,7 +159,8 @@ func TestSubtreesHandler_WaitsForAdmissionBeforeTheQuorumLock(t *testing.T) {
 	go func() { done <- server.subtreesHandler(ctx, &hash, baseURL, "peer-1") }()
 
 	// While the handler is queued, nobody holds the subtree's lock.
-	time.Sleep(50 * time.Millisecond)
+	require.Eventually(t, func() bool { return server.peerSubtreeAdmission.waiting.Load() == 1 },
+		5*time.Second, time.Millisecond, "the handler must be queued at the gate")
 
 	gotLock, _, releaseLock, err := q.TryLockIfFileNotExists(context.Background(), &hash, fileformat.FileTypeSubtree)
 	require.NoError(t, err)
@@ -195,4 +205,57 @@ func TestSubtreesHandler_ReleasesAdmissionOnError(t *testing.T) {
 	require.Error(t, err)
 
 	requireSlotFree(t, server)
+}
+
+// The FSM is checked when a Kafka message arrives, but a subtree can wait at
+// the gate long enough for the node to leave RUNNING (CATCHINGBLOCKS, or IDLE
+// after an operator STOP). Once it has a slot it checks again and is dropped,
+// without taking the lock, if the node is no longer RUNNING.
+func TestSubtreesHandler_SkipsWhenNoLongerRunningAfterTheWait(t *testing.T) {
+	server, q := newAdmissionTestServer(t, false)
+
+	catchingBlocks := blockchain.FSMStateCATCHINGBLOCKS
+	blockchainClient := &blockchain.Mock{}
+	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil)
+	server.blockchainClient = blockchainClient
+
+	hash := chainhash.HashH([]byte("peer subtree"))
+	baseURL, err := url.Parse("http://peer.invalid")
+	require.NoError(t, err)
+
+	require.NoError(t, server.subtreesHandler(context.Background(), &hash, baseURL, "peer-1"))
+
+	gotLock, _, releaseLock, err := q.TryLockIfFileNotExists(context.Background(), &hash, fileformat.FileTypeSubtree)
+	require.NoError(t, err)
+	require.True(t, gotLock, "a dropped subtree must not have taken the lock")
+	releaseLock()
+
+	requireSlotFree(t, server)
+}
+
+func TestAdmissionGate_CountsWaiters(t *testing.T) {
+	var gate admissionGate
+
+	release, err := gate.acquire(context.Background(), 1)
+	require.NoError(t, err)
+
+	require.Zero(t, gate.waiting.Load(), "a caller that got a slot at once never waited")
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		r, err := gate.acquire(context.Background(), 1)
+		if err == nil {
+			r()
+		}
+	}()
+
+	require.Eventually(t, func() bool { return gate.waiting.Load() == 1 }, 5*time.Second, time.Millisecond)
+
+	release()
+	<-done
+
+	require.Zero(t, gate.waiting.Load())
 }
