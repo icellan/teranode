@@ -76,21 +76,6 @@ var settingsConfDeadKeyExceptions = []settingsConfDeadKeyException{
 			"sets it as a container env var, but no Go code reads this literal key and gocore's env lookup is " +
 			"exact-case, so the override appears inert - flagged for the settings owner, not fixed here",
 	},
-	{
-		key: "kafka_unitTest",
-		reason: "builds a full Kafka URL (settings.conf, near the other kafka_*Config entries) but, unlike " +
-			"every sibling kafka_*Config key, is never read by any Go code - the real setting is the ALL_CAPS " +
-			"KAFKA_UNITTEST, a bare topic-name string consumed by settings/kafka_settings.go. Looks dead in " +
-			"the same way securityLevelGRPC was dead, but left for the settings owner to decide whether to " +
-			"delete it or wire it up, to keep this change scoped to securityLevelGRPC",
-	},
-	{
-		key: "coinbase_Store",
-		reason: "settings.conf's only assignment is the context-only \"coinbase_Store.docker =\" line, which " +
-			"cannot resolve to anything on its own (no base assignment); the real key is coinbase_store " +
-			"(lowercase s), which already has its own context overrides a few lines above. Same typo shape as " +
-			"securityLevelGRPC, left for the settings owner to fix or remove so this change stays scoped",
-	},
 }
 
 // settingsConfPath returns the repo-root settings.conf path relative to this
