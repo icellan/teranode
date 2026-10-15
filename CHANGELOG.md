@@ -40,6 +40,11 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   object and silently ignore it. The file's header carries a probe for confirming
   enforcement. (#1617)
 
+- **Out-of-tree `utxo.Store` implementations must add two methods.** `SpendAndCreateMulti`
+  (`utxo.DefaultSpendAndCreateMulti` provides it) and `ParentOutputsForValidation` are now
+  part of the interface, so an external store stops compiling until it implements them.
+  (#1875)
+
 - **Legacy sync requires a `file://` temp store.** Affects every node running the legacy
   service. `temp_store` must be a `file://` URL: legacy sync now streams every downloaded
   block body into it and parks out-of-order blocks there, and a scheme it cannot enumerate
@@ -186,13 +191,24 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   runs on the caller's goroutine, bounded by the new `utxostore_spendRollbackTimeout`
   (default 120s), so a failing spend can hold its caller far longer than it used to. Lower
   it if caller latency matters more than rollback completeness, and watch the new
-  `utxo_partial_spend_rollbacks` and `utxo_spend_rollback_failed` counters. (#1376)
+  `teranode_{aerospike,sql}_utxo_partial_spend_rollbacks{outcome}` and
+  `teranode_{aerospike,sql}_utxo_spend_rollback_failed` counters. Transient store errors now
+  trigger the rollback too (previously only spent, conflicting, frozen and hash-mismatch
+  errors did), so a retry after one can find its inputs taken by another transaction and be
+  answered as a double spend. (#1376)
+
+- **Spending an output index the parent does not have is invalid, not a processing error.**
+  Affects every node. Propagation answers HTTP 400 (`TX_INVALID`) for such a transaction
+  where it answered 500, and a block containing one is rejected as invalid instead of being
+  retried indefinitely. (#1875)
 
 - **Script-number overflow is a consensus failure, not a policy one.** Affects every node;
   only consumers of the policy-rejection topic need to act. The script engine is now built
   against bitcoin-sv 1.2.3 (GoBDK v1.3.0), where a script number overflowing int64 is a
   consensus error. Transactions rejected for it are reported as invalid rather than
-  policy-rejected, and stop appearing on `KAFKA_TX_POLICY_REJECTED`. (#1911)
+  policy-rejected, and stop appearing on `KAFKA_TX_POLICY_REJECTED`. `OP_SPLIT` also
+  rejects positions above INT32_MAX. A node on an earlier build accepts transactions and
+  blocks that this one rejects, so upgrade every node together. (#1911)
 
 - **The shipped Docker compose healthchecks actually run.** Affects operators of
   `deploy/docker/base/docker-teranode.yml`. Every `test:` line split its pipeline across
@@ -203,7 +219,7 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   is therefore enforced for the first time: a service that cannot bind its port leaves its
   dependents unstarted instead of letting them come up and fail downstream, so a
   misconfiguration surfaces as a stuck `docker compose up` rather than a crash loop further
-  along. Containers also run with `init: true`. (#869)
+  along. Teranode service containers also run with `init: true`. (#869)
 
 - **`blockassembly_livenessStallTimeout` measures something different.** Affects only nodes
   that set it above 0; the default is still `0s` and those nodes see nothing. Block
@@ -221,7 +237,14 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   `legacy_blockDownloadWindow` 1024, `legacy_parkStoreTimeout` 10s and the three
   `legacy_blockDownloadTimeout*Percent` keys (100 / 600 / 50). None appear in
   `settings.conf`, so these are code defaults every deployment picks up. Set
-  `legacy_multiPeerBlockDownload = false` for the old single-peer behaviour. (#1699)
+  `legacy_multiPeerBlockDownload = false` for the old single-peer behaviour.
+
+  Peer handling changes with it: a peer streaming a needed block below 100 KB/s is
+  disconnected as a staller, `getheaders` goes only to outbound or whitelisted peers, and a
+  peer that sends an unrequested or oversized block is no longer disconnected (the body is
+  read and discarded, and an oversized hash is not requested again for ten minutes). Above
+  the last checkpoint, mainnet and testnet download no blocks until the header chain has
+  SV Node's minimum chain work. (#1699)
 
 - **Six legacy batcher settings are removed, and they were live.** Affects only nodes that
   set them, but those nodes lose the tuning silently — the loader does not report unknown
@@ -392,6 +415,11 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   is precisely why these survived as long as they did. Removed:
   `securityLevelGRPC` — a casing variant that never matched the real
   `security_level_grpc` (#1674) — and `blockchain_subscription_timeout` (#1643).
+  #1744 removed more: among them `http_sign_response` (the live key is
+  `asset_sign_http_responses`, and response signing stays off), `p2p_shared_key`,
+  `utxostore_outpointBatcherConcurrency` (the live key is
+  `utxostore_outpointBatcherMaxConcurrent`), `utxostore_dbTimeoutMillis`, `spent_utxo_ttl`
+  and `blockvalidation_subtree_fetch_timeout`.
 
   **`blockmaxsize` was not removed and is still live.** #1640 deleted a duplicate
   `BlockSettings.MaxSize` field that carried the same tag; the key itself is read
@@ -446,7 +474,7 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   `asset_txMetaRawEnabled`); all default to today's output. `asset_healthStrictStatus = true` makes a
   Kubernetes readiness probe on `:8090/health` fail whenever a dependency is unhealthy (for example
   Aerospike `stop_writes`), removing Asset pods from their Service. The Asset error log line gains a
-  `correlation_id=` field. (#1796, pending)
+  `correlation_id=` field. (#1796)
 
 - **`blockvalidation_quick_validate_create_concurrency` is new, default 0 (derived).** The
   create-wave limit was `utxostore_storeBatcherSize * 8`; it is now
@@ -461,8 +489,9 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   `false` as before. If you turn them on, the legacy and block-validation services must
   carry the same values for both and the same UTXO store type, since each evaluates the
   route from its own config. A new `ERR.BLOCK_BODY_MISMATCH` (122) and an additive
-  `header_proven` field on `ProcessBlockRequest` come with this work; an older block
-  validation simply falls back to full validation. (#1699)
+  `header_proven` field on `ProcessBlockRequest` come with this work. With the route on,
+  an older legacy service sends no proof and every below-checkpoint block takes full
+  validation; keep the legacy and block validation services on the same version. (#1699)
 
 - **A reorg no longer kills the node when the store has pruned a winning transaction.**
   Any record missing in `MarkTransactionsOnLongestChain` used to be fatal, taking the
@@ -478,7 +507,8 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   `subtreevalidation_spendAndCreateMultiMaxTxs` (default 1048576, matching the load batch
   size) caps a list; smaller values make deep blocks slower. Four additive metrics are
   added (`teranode_subtreevalidation_batch_step`, `_batch_txs`, `_batch_parent_outputs`,
-  `_batch_lists`); no existing metric or label changes. (#1875)
+  `_batch_lists`); no existing metric or label changes. The list path is taken only when the
+  validator runs in-process. (#1875)
 
 - **The seeder reads a snapshot footer from the stream, so a piped snapshot seeds.** It now
   refuses a named pipe outright when `utxostore_utxoBatchSize` is above 0, because that
@@ -487,3 +517,26 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
 - **The block graph is bucketed in the store**, and `GetBlockGraphData` responses (gRPC and JSON)
   gain a `bucket_seconds` field (omitted, i.e. 0, for ranges of 24h or less). The returned data
   points are unchanged. (#1798)
+
+- **Block validation no longer keeps its large maps between blocks, and
+  `block_parentSpendsCapacityMultiplier` changed role for the in-memory path.** The maps are
+  allocated per block and dropped afterwards, so an idle block-validation node holds neither.
+  Without `block_diskMapDirs`, duplicate inputs are found by sorting, and the multiplier only
+  sets how many partitions the entries are sorted in; it no longer sizes or preallocates
+  anything, and a wrong value never changes the result. The duplicate-input error is
+  unchanged; the reported transaction is now always the earliest spender. The disk-backed
+  maps are unchanged. (#1902, #1928)
+
+- **Merkle-proof lookups no longer fail when another client disconnects.** The shared
+  main-chain lookup behind `/merkle_proof/*` and `/txmeta*` runs on Asset's own context with a
+  30s limit. A newly derived proof that does not reproduce the block header merkle root now
+  returns an error instead of a proof that fails verification. (#1795)
+
+- **With `blockassembly_txMapDirs` set, block assembly releases the cleared half of its
+  transaction index.** Resident memory between blocks falls, and
+  `teranode_subtreeprocessor_diskmap_filter_ram_bytes` no longer counts the capacity a cleared
+  half used to keep. Limits sized from the old gauge can be lowered. (#1904)
+
+- **The in-memory Kafka broker no longer keeps every message.** Nodes running
+  `KAFKA_SCHEMA = memory` held every produced message for the life of the process; delivered
+  messages are now released. `InMemoryBroker.TruncateTopic` is removed. (#1906)
