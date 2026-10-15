@@ -64,6 +64,20 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   dashboard login fails. Set the credentials above, or set `asset_requireAuthCredentials = false`
   to restore anonymous admin access (not recommended). (#1790)
 
+- **Blockchain read RPCs are bounded, and old clients break against an upgraded Blockchain.**
+  Count and range parameters on the read RPCs are rejected with `InvalidArgument` above
+  `blockchain_maxBlockHeadersPerRequest` (default 1,000,000),
+  `blockchain_maxBlocksByHeightRange` (2000), `blockchain_maxInvalidBlocksPerRequest` (10000)
+  and `blockchain_maxMedianTimePastHeights` (10000), whatever the caller's authentication.
+  Callers that request larger counts receive errors.
+
+  **Upgrade order:** the median-time-past cap rejects the whole-chain request that every
+  pre-change client sends on first load, and those clients do not retry `InvalidArgument`.
+  During a rolling upgrade, an old-image validator, subtreevalidation or blockvalidation pod
+  talking to an upgraded Blockchain pod fails every `EnsureMTPLoaded` and validates nothing
+  until it is reimaged. No chain state is corrupted. Upgrade Blockchain last, or raise
+  `blockchain_maxMedianTimePastHeights` for the duration of the rollout. (#1776)
+
 ### Breaking — behaviour changes on upgrade
 
 - **P2P HTTP endpoints are now rate limited.** `/health` and the websocket upgrade
@@ -388,23 +402,14 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   serving peer. Raise `asset_maxBatchRecords` (or set 0 to disable it on a node with no untrusted
   callers), and keep peer batch sizes at or below this node's. (#1797)
 
-### Breaking — pending, not yet merged
+### Pending, not yet merged
 
-- **Blockchain read RPCs will be bounded.** Count and range parameters on the read
-  RPCs will be rejected with `InvalidArgument` above configurable caps, whatever the
-  caller's authentication (since #1755 every Blockchain RPC but `HealthGRPC` requires
-  the admin key anyway): `blockchain_maxBlockHeadersPerRequest`,
-  `blockchain_maxBlocksByHeightRange`, `blockchain_maxInvalidBlocksPerRequest` and
-  `blockchain_maxMedianTimePastHeights`. Callers that currently request very large
-  counts will start receiving errors.
-
-  **Upgrade-order hazard:** the median-time-past cap rejects the whole-chain request
-  that every pre-change client sends on first load, and those clients do not retry
-  `InvalidArgument`. During a rolling upgrade, an old-image validator,
-  subtreevalidation or blockvalidation pod talking to an upgraded Blockchain pod will
-  fail every `EnsureMTPLoaded` and validate nothing until it is reimaged. No chain
-  state is corrupted. Upgrade Blockchain last, or raise
-  `blockchain_maxMedianTimePastHeights` for the duration of the rollout. (#1776)
+- **Two Blockchain RPCs will start working (not breaking).**
+  `GetLatestBlockHeaderFromBlockLocator` and `GetBlockHeadersFromOldest` are
+  implemented under names that do not satisfy the generated server interface, so
+  both return `Unimplemented` to every gRPC caller. Once this merges they dispatch
+  correctly, and callers that treated `Unimplemented` as "unsupported" start receiving
+  real responses. (#1848)
 
 ### Not breaking, but worth knowing
 
@@ -425,13 +430,6 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   `BlockSettings.MaxSize` field that carried the same tag; the key itself is read
   at `settings/settings.go` into `Policy.BlockMaxSize`, enforced in Block Assembly
   and reported over RPC as `maxminedblocksize`. Leave it set.
-
-- **Two Blockchain RPCs now work that previously did not.**
-  `GetLatestBlockHeaderFromBlockLocator` and `GetBlockHeadersFromOldest` were
-  implemented under names that did not satisfy the generated server interface, so
-  both returned `Unimplemented` to every gRPC caller. They now dispatch correctly.
-  Callers that treated `Unimplemented` as "unsupported" will start receiving real
-  responses. (#1848, pending)
 
 - **The Postgres circuit breaker is now reachable.** The breaker could not be turned
   on because its settings were never populated. Two forms exist and both are wired
