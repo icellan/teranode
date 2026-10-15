@@ -457,6 +457,20 @@ var intoScratchPool = sync.Pool{
 // batch does not pin its buffer for the life of the process.
 const intoScratchMaxRetain = 4 * 1024 * 1024
 
+// intoScratchBytesPerEntry is the room reserved per lookup when a scratch has
+// to grow: a little above a typical entry (fee, size, flags and one or two
+// parents). The pool loses its scratches on every GC; reserving for the batch
+// up front replaces the doubling growth the reads would otherwise go through.
+const intoScratchBytesPerEntry = 128
+
+// reserve makes sure raw has room for n entries, up to intoScratchMaxRetain.
+func (sc *intoScratch) reserve(n int) {
+	need := min(n*intoScratchBytesPerEntry, intoScratchMaxRetain)
+	if cap(sc.raw) < need {
+		sc.raw = make([]byte, 0, need)
+	}
+}
+
 // Decoded parent hashes and vouts are carved from chunks that are never
 // reused, because callers keep the TxInpoints. A chunk is held by a per-P
 // carver in intoCarverPool until it is used up, so the heap's global span lock
@@ -535,6 +549,8 @@ func (t *TxMetaCache) GetMetaCachedInto(_ context.Context, hashes []chainhash.Ha
 	}
 
 	spans := sc.spans[:n]
+
+	sc.reserve(n)
 	t.cache.GetRawMulti(hashes, keyHashes, &sc.raw, spans)
 
 	carver := intoCarverPool.Get().(*intoCarver)

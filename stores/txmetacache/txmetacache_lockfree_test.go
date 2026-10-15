@@ -236,3 +236,20 @@ func TestTxMetaCache_BucketLocality(t *testing.T) {
 		})
 	}
 }
+
+// A scratch rebuilt after its pool was emptied (every GC) is sized for the
+// whole batch at once, instead of doubling its way up through the reads.
+func TestIntoScratch_ReserveSizesForTheBatch(t *testing.T) {
+	sc := &intoScratch{}
+	sc.reserve(4096)
+	require.GreaterOrEqual(t, cap(sc.raw), 4096*intoScratchBytesPerEntry)
+	require.Empty(t, sc.raw)
+
+	big := &intoScratch{}
+	big.reserve(1 << 20)
+	require.LessOrEqual(t, cap(big.raw), intoScratchMaxRetain, "never reserve more than the pool retains")
+
+	kept := &intoScratch{raw: make([]byte, 0, 1<<20)}
+	kept.reserve(16)
+	require.Equal(t, 1<<20, cap(kept.raw), "a big enough buffer is kept")
+}
