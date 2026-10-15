@@ -412,16 +412,15 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   shape. The same collapse on the HTTP blob store's own client and server is fixed
   too; no shipped configuration uses that store. (#1963)
 
-### Pending, not yet merged
-
-- **Two Blockchain RPCs will start working (not breaking).**
-  `GetLatestBlockHeaderFromBlockLocator` and `GetBlockHeadersFromOldest` are
-  implemented under names that do not satisfy the generated server interface, so
-  both return `Unimplemented` to every gRPC caller. Once this merges they dispatch
-  correctly, and callers that treated `Unimplemented` as "unsupported" start receiving
-  real responses. (#1848)
-
 ### Not breaking, but worth knowing
+
+- **Two Blockchain RPCs start working.** `GetLatestBlockHeaderFromBlockLocator` and
+  `GetBlockHeadersFromOldest` were implemented under names that did not satisfy the
+  generated server interface, so the embedded `UnimplementedBlockchainAPIServer`
+  answered both and every gRPC caller got `Unimplemented`. They now dispatch, and a
+  caller that treated `Unimplemented` as "this node does not support it" starts
+  receiving real responses. A compile-time interface assertion now fails the build
+  if a handler name drifts again. (#1848)
 
 - **Store URL passwords no longer appear in logs or the settings dump.** Store URLs
   carry credentials in their userinfo, so a URL in a log line was a working
