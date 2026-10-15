@@ -402,6 +402,16 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   serving peer. Raise `asset_maxBatchRecords` (or set 0 to disable it on a node with no untrusted
   callers), and keep peer batch sizes at or below this node's. (#1797)
 
+- **A transaction store fault now answers 500 instead of 404.** `GET /tx/:hash` (and
+  `/hex`, `/json`) decided its 404 partly on the error text: anything containing
+  "not found" got one. A misconfigured Aerospike namespace reports `Namespace not
+  found`, so a node that could not reach its store told every caller the transaction
+  did not exist. The 404 is now decided by error class alone, and a genuine miss is
+  unchanged. Expect 5xx where you previously saw 404s if a store is unhealthy —
+  which is the point, but it will move alert thresholds that counted on the old
+  shape. The same collapse on the HTTP blob store's own client and server is fixed
+  too; no shipped configuration uses that store. (#1963)
+
 ### Pending, not yet merged
 
 - **Two Blockchain RPCs will start working (not breaking).**
@@ -412,6 +422,19 @@ under "Not breaking, but worth knowing" where they look alarming but are not.
   real responses. (#1848)
 
 ### Not breaking, but worth knowing
+
+- **Store URL passwords no longer appear in logs or the settings dump.** Store URLs
+  carry credentials in their userinfo, so a URL in a log line was a working
+  credential in a log line. Every logging site that passed one is now wrapped in
+  `urlutil.Redact`, across the commands (`seeder`, `seedimport`, `monitor`,
+  `diagnose`, `settings`, `utxopersister`, `teranodecli`), the services (blockchain,
+  legacy, p2p, propagation, pruner, subtreevalidation, asset) and the stores (blob
+  file, blob http, Aerospike). `settings.ExportMetadata` redacts URL values too, so
+  the settings endpoint and dump no longer return them. A new test,
+  `TestNoUnredactedURLsInLogCalls`, fails the build if an unredacted URL reaches a
+  log call again. Log scrapers or dashboards matching a full store URL will see a
+  masked one. Rotate any credential that has already passed through a log sink you
+  do not control. (#1747)
 
 - **Dead configuration keys were removed.** These had no readers anywhere in the
   codebase, so removing them changes no behaviour. If you have them in a config
