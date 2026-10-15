@@ -681,6 +681,14 @@ type ValidateSubtree struct {
 	// CheckSubtreeFromBlock). Its cache probe uses the block probe pool, so a burst
 	// of peer-announced subtrees cannot delay it.
 	FromBlock bool
+
+	// peerSubtree marks a peer-announced subtree (subtreesHandler). It waits
+	// for a slot of subtreevalidation_peerSubtreeConcurrency once its tx
+	// hashes are in hand, before it allocates its working set, so a burst of
+	// peer subtrees after a block cannot each allocate ~1 GiB at once. A
+	// block's subtrees never wait on it, and a waiting peer subtree goes ahead
+	// without a slot once block validation asks for it (priority check).
+	peerSubtree bool
 }
 
 type metaSliceItem struct {
@@ -778,6 +786,19 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 		if err != nil {
 			return nil, errors.NewServiceError("[ValidateSubtreeInternal][%s] failed to get subtree from network", v.SubtreeHash.String(), err)
 		}
+	}
+
+	if v.peerSubtree {
+		subtreeHash := v.SubtreeHash.String()
+
+		release, err := u.peerSubtreeAdmission.acquire(ctx, u.settings.SubtreeValidation.PeerSubtreeConcurrency, func() bool {
+			return u.isPrioritySubtreeCheckActive(subtreeHash)
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		defer release()
 	}
 
 	// create the empty subtree

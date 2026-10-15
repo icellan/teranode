@@ -150,6 +150,7 @@ func (u *Server) subtreesHandler(ctx context.Context, hash *chainhash.Hash, base
 		PeerID:        peerID,
 		TxHashes:      nil,
 		AllowFailFast: true,
+		peerSubtree:   true,
 	}
 
 	// validate the subtree as if it is for the next block height

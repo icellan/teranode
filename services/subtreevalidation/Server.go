@@ -152,6 +152,10 @@ type Server struct {
 	// see probeTxMetaCache.
 	peerProbePool  probePool
 	blockProbePool probePool
+
+	// peerSubtreeAdmission bounds how many peer subtrees hold their working
+	// set at once; see ValidateSubtree.peerSubtree.
+	peerSubtreeAdmission admissionGate
 }
 
 // New creates a new Server instance with the provided dependencies.
