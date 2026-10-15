@@ -51,6 +51,10 @@ type LaneCache struct {
 	oversize  atomic.Uint64
 	inserts   stripedCounter
 	laneWaits atomic.Uint64
+
+	// lapped is the highest lapped-entry estimate UpdateStats has reported,
+	// so the evictions it feeds never go down between calls.
+	lapped atomic.Uint64
 }
 
 // lfLane is three cache lines: owner (scanned by writers looking for a lane),
@@ -625,6 +629,27 @@ func (c *LaneCache) UpdateStats(s *Stats) {
 		live = uint64(float64(inserts) * float64(capacity) / float64(written))
 	}
 
+	// Entries a ring wrap overwrote are the cache's evictions. The estimate
+	// can dip slightly as the average record size drifts; report the highest
+	// value seen so a rate() over the metric never reads a dip as a reset.
+	lapped := inserts - live
+	for {
+		prev := c.lapped.Load()
+		if lapped <= prev {
+			lapped = prev
+			break
+		}
+
+		if c.lapped.CompareAndSwap(prev, lapped) {
+			break
+		}
+	}
+
+	// After a Reset the insert count restarts below the reported high-water
+	// mark; nothing is live yet that the estimate calls lapped.
+	live = inserts - min(lapped, inserts)
+
+	s.Evictions += lapped
 	s.CurrentGenEntries += live
 	s.ValidEntriesCount += live
 	s.TotalMapSize += live

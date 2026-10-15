@@ -151,6 +151,7 @@ func updateTxMetaCachePrometheusMetrics() {
 		currentGenEntries += cacheStats.CurrentGenEntries
 		previousGenEntries += cacheStats.PreviousGenEntries
 		laneWaits += cacheStats.LaneWaits
+		evictions += cacheStats.Evictions
 	}
 
 	prometheusBlockValidationTxMetaCacheInsertions.Set(float64(insertions))
@@ -257,15 +258,15 @@ func _initPrometheusMetrics() {
 		},
 	)
 
-	// Evictions metric tracks the number of entries that were removed from the cache due to memory constraints
-	// High eviction rates may indicate cache pressure and potential performance degradation,
-	// as frequently used entries might be prematurely removed
+	// Evictions metric tracks the number of entries removed from the cache: explicit deletes
+	// (mined or removed transactions) on every backend, plus, on the lockfree cache, entries
+	// overwritten when a ring wraps. High eviction rates may indicate cache pressure.
 	prometheusBlockValidationTxMetaCacheEvictions = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: "teranode",
 			Subsystem: "tx_meta_cache",
 			Name:      "evictions",
-			Help:      "Number of evictions in the tx meta cache",
+			Help:      "Number of entries removed from the tx meta cache (deletes, plus ring-wrap evictions on the lockfree cache)",
 		},
 	)
 

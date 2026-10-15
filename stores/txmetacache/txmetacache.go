@@ -126,6 +126,11 @@ type CacheStats struct {
 
 	// LaneWaits counts the times a lockfree-cache writer found every lane busy.
 	LaneWaits uint64
+
+	// Evictions is the number of entries the cache dropped to make room (ring
+	// wraps); only the lockfree cache reports it. Explicit deletes are counted
+	// in the cache's own metrics.
+	Evictions uint64
 }
 
 // BucketType defines the allocation strategy for the cache's internal buckets.
@@ -1036,6 +1041,7 @@ func (t *TxMetaCache) GetCacheStats() *CacheStats {
 		CurrentGenEntries:  s.CurrentGenEntries,
 		PreviousGenEntries: s.PreviousGenEntries,
 		LaneWaits:          s.LaneWaits,
+		Evictions:          s.Evictions,
 	}
 }
 

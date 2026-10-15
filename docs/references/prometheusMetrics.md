@@ -402,7 +402,7 @@ The download gauges and the `download_*_total` counters are published from the 3
 | `teranode_tx_meta_cache_hits`                 | Gauge | Number of hits in the tx meta cache                          |
 | `teranode_tx_meta_cache_misses`               | Gauge | Number of misses in the tx meta cache                        |
 | `teranode_tx_meta_cache_get_origin`           | Gauge | Number of get origins in the tx meta cache                   |
-| `teranode_tx_meta_cache_evictions`            | Gauge | Number of evictions in the tx meta cache                     |
+| `teranode_tx_meta_cache_evictions`            | Gauge | Number of entries removed from the tx meta cache: deletes on every backend, plus entries overwritten by ring wraps on the `lockfree` cache |
 | `teranode_tx_meta_cache_trims`                | Gauge | Number of trim operations in the tx meta cache               |
 | `teranode_tx_meta_cache_map_size`             | Gauge | Number of total elements in the improved cache's bucket maps |
 | `teranode_tx_meta_cache_total_elements_added` | Gauge | Number of total number of elements added to the txmetacache  |
