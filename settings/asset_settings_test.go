@@ -104,7 +104,9 @@ func TestAssetSettings_BatchAndResponseBudgets(t *testing.T) {
 	t.Run("defaults preserve current behaviour", func(t *testing.T) {
 		s := NewSettings()
 
-		require.Equal(t, 0, s.Asset.MaxBatchRecords)
+		// asset_maxBatchRecords is the one exception in this group: it now
+		// defaults to a non-zero, enforced value (see its longdesc).
+		require.Equal(t, 16384, s.Asset.MaxBatchRecords)
 		require.Equal(t, int64(0), s.Asset.MaxBatchResponseBytes)
 		require.Equal(t, 0, s.Asset.MaxUTXOsPerTx)
 		require.Equal(t, 0, s.Asset.MaxBlockHeaders)
@@ -253,5 +255,31 @@ func TestAssetSettings_LegacyPeerPoolToken(t *testing.T) {
 		s := NewSettings()
 
 		require.Equal(t, "a-shared-secret", s.Asset.LegacyPeerPoolToken)
+	})
+}
+
+// TestAssetMaxNBlocksFloor pins the floor on asset_maxNBlocks: the peer catchup
+// client (services/blockvalidation/get_blocks.go) fetches blocks in batches of
+// blockvalidation_fetch_large_batch_size (default 100) and treats a shorter batch
+// as a hard error ("expected %d blocks, got %d"), not a short read. A configured
+// cap below that batch size breaks every batch of catchup from this node, so a
+// value below 100 is raised to it rather than honoured.
+func TestAssetMaxNBlocksFloor(t *testing.T) {
+	t.Run("default of 0 means uncapped and is left alone", func(t *testing.T) {
+		require.Equal(t, 0, NewSettings().Asset.MaxNBlocks)
+	})
+
+	t.Run("a configured value below the floor is raised to it", func(t *testing.T) {
+		gocore.Config().Set("asset_maxNBlocks", "10")
+		defer gocore.Config().Unset("asset_maxNBlocks")
+
+		require.Equal(t, 100, NewSettings().Asset.MaxNBlocks)
+	})
+
+	t.Run("a configured value at or above the floor is honoured", func(t *testing.T) {
+		gocore.Config().Set("asset_maxNBlocks", "250")
+		defer gocore.Config().Unset("asset_maxNBlocks")
+
+		require.Equal(t, 250, NewSettings().Asset.MaxNBlocks)
 	})
 }

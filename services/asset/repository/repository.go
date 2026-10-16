@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -61,7 +62,7 @@ type Interface interface {
 	GetSubtree(ctx context.Context, hash *chainhash.Hash) (*subtree.Subtree, error)
 	GetSubtreePage(ctx context.Context, hash *chainhash.Hash, offset, limit int) (*subtree.Subtree, int, int, error)
 	GetSubtreeData(ctx context.Context, hash *chainhash.Hash) (*subtree.Data, error)
-	GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, error)
+	GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, func(), error)
 	GetSubtreeExists(ctx context.Context, hash *chainhash.Hash) (bool, error)
 	GetSubtreeHead(ctx context.Context, hash *chainhash.Hash) (*subtree.Subtree, int, error)
 	FindBlocksContainingSubtree(ctx context.Context, subtreeHash *chainhash.Hash) ([]uint32, []uint32, []int, error)
@@ -337,7 +338,21 @@ func (repo *Repository) GetTransaction(ctx context.Context, hash *chainhash.Hash
 		return txMeta.Tx.ExtendedBytes(), nil
 	}
 
+	// A UTXO store failure that is not a miss has to survive the fallback below.
+	// Otherwise an outage on a transaction held only in the UTXO store - any
+	// transaction seen inside a block rather than submitted here - comes back as
+	// the tx store's "not found", and callers deny a transaction this node holds.
+	var utxoFault error
+
 	if err != nil {
+		// The store's own fault class first. A not-found anywhere in the chain is not
+		// a miss when the store has called it a storage failure: aerospike reports an
+		// external transaction whose blobs are gone as a STORAGE_ERROR wrapping the
+		// blob store's not-found.
+		if errors.Is(err, errors.ErrStorageError) || (!errors.Is(err, errors.ErrTxNotFound) && !errors.Is(err, errors.ErrNotFound)) {
+			utxoFault = err
+		}
+
 		repo.logger.Warnf("[Repository] GetTransaction: %s not found in txmeta store: %v", hash.String(), err)
 	} else {
 		// The record exists but does not carry the transaction we were asked for
@@ -353,6 +368,15 @@ func (repo *Repository) GetTransaction(ctx context.Context, hash *chainhash.Hash
 
 	tx, err := repo.TxStore.Get(ctx, hash.CloneBytes(), fileformat.FileTypeTx)
 	if err != nil {
+		if utxoFault != nil && (errors.Is(err, errors.ErrNotFound) || errors.Is(err, errors.ErrBlobNotFound)) {
+			// The fault itself is logged above and deliberately not wrapped here:
+			// the HTTP layer answers 404 for any error with a not-found in its chain,
+			// and the fault can carry one without being a miss - aerospike reports an
+			// external transaction whose blobs are gone as a STORAGE_ERROR wrapping
+			// the blob store's not-found.
+			return nil, errors.NewServiceError("[Repository] GetTransaction: %s: the utxo store failed and the tx store has no copy", hash.String())
+		}
+
 		return nil, err
 	}
 
@@ -882,11 +906,28 @@ func (repo *Repository) getSubtreeDataInternal(ctx context.Context, hash *chainh
 	return subtreeData, nil
 }
 
-func (repo *Repository) GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, error) {
+// GetSubtreeTransactions returns every transaction in the subtree, keyed by txid,
+// together with a release function the caller MUST call once it is done with the
+// map (the returned function is never nil, including on the error paths).
+//
+// The concurrency permit from asset_concurrency_get_subtree_transactions is held
+// until release is called rather than until this function returns. What the
+// permit budgets is the map — a subtree can hold millions of transactions and the
+// caller keeps it alive for the whole request — not the few milliseconds spent
+// building it. Releasing on return let an unbounded number of complete maps
+// coexist.
+func (repo *Repository) GetSubtreeTransactions(ctx context.Context, hash *chainhash.Hash) (map[chainhash.Hash]*bt.Tx, func(), error) {
 	if err := acquireSemaphorePermit(ctx, repo.semGetSubtreeTransactions, "GetSubtreeTransactions"); err != nil {
-		return nil, err
+		return nil, func() {}, err
 	}
-	defer releaseSemaphorePermit(repo.semGetSubtreeTransactions)
+
+	var releaseOnce sync.Once
+
+	release := func() {
+		releaseOnce.Do(func() {
+			releaseSemaphorePermit(repo.semGetSubtreeTransactions)
+		})
+	}
 
 	ctx, _, _ = tracing.Tracer("repository").Start(ctx, "GetSubtreeTransactions",
 		tracing.WithDebugLogMessage(repo.logger, "[Repository] GetSubtreeTransactions: %s", hash.String()),
@@ -896,12 +937,16 @@ func (repo *Repository) GetSubtreeTransactions(ctx context.Context, hash *chainh
 	subtreeData, err := repo.getSubtreeDataInternal(ctx, hash)
 	if err != nil {
 		// always return an empty map if no transactions are found
-		return make(map[chainhash.Hash]*bt.Tx), err
+		release()
+
+		return make(map[chainhash.Hash]*bt.Tx), func() {}, err
 	}
 
 	if subtreeData == nil || len(subtreeData.Txs) == 0 {
 		// always return an empty map if no transactions are found
-		return make(map[chainhash.Hash]*bt.Tx), errors.ErrNotFound
+		release()
+
+		return make(map[chainhash.Hash]*bt.Tx), func() {}, errors.ErrNotFound
 	}
 
 	transactionMap := make(map[chainhash.Hash]*bt.Tx, len(subtreeData.Txs))
@@ -914,7 +959,7 @@ func (repo *Repository) GetSubtreeTransactions(ctx context.Context, hash *chainh
 		transactionMap[*tx.TxIDChainHash()] = tx
 	}
 
-	return transactionMap, nil
+	return transactionMap, release, nil
 }
 
 // GetSubtreeExists checks whether a subtree exists in the subtree store.

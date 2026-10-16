@@ -82,6 +82,21 @@ var (
 	// which is an important aspect of subtree validation.
 	prometheusSubtreeValidationBlessMissingTransaction prometheus.Histogram
 
+	// prometheusSubtreeValidationBlessUnlockFailed counts transactions that were accepted
+	// but whose two-phase-commit unlock failed, and were blessed anyway.
+	prometheusSubtreeValidationBlessUnlockFailed prometheus.Counter
+
+	// prometheusSubtreeValidationBlessUnlockRecovered counts transactions in that set that
+	// the per-level retry in unlockAcceptedTransactions did manage to unlock.
+	prometheusSubtreeValidationBlessUnlockRecovered prometheus.Counter
+
+	// prometheusSubtreeValidationBlessUnlockRetryFailedBatches counts unlock retry calls that
+	// returned an error. SetLocked reports the first error without per-record results, so the
+	// unit is one call, not one transaction: on a failed call some or all of its hashes stay
+	// locked until they are mined. The same goes for a retry left unrun because the unlock
+	// context was already done.
+	prometheusSubtreeValidationBlessUnlockRetryFailedBatches prometheus.Counter
+
 	// prometheusSubtreeValidationSetTXMetaCacheKafkaBatch tracks the duration of processing one
 	// SetCacheMulti batch from a Kafka message. One observation per Kafka message that contained
 	// at least one ADD entry, regardless of how many entries the batch held.
@@ -118,6 +133,12 @@ var (
 	// subtree already exists. This is individually benign (best-effort, no retries), but without
 	// a metric a spike in the rate would be invisible.
 	prometheusSubtreeAlreadyExistsSkipped prometheus.Counter
+
+	// prometheusPeerSubtreeAdmissionWait tracks how long a peer subtree waited for a
+	// subtreevalidation_peerSubtreeConcurrency slot, and prometheusPeerSubtreeAdmissionWaiting
+	// how many are waiting now. Together they show whether the limit is too low.
+	prometheusPeerSubtreeAdmissionWait    prometheus.Histogram
+	prometheusPeerSubtreeAdmissionWaiting prometheus.Gauge
 )
 
 var (
@@ -238,6 +259,33 @@ func _initPrometheusMetrics() {
 		},
 	)
 
+	prometheusSubtreeValidationBlessUnlockFailed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "bless_unlock_failed",
+			Help:      "Accepted transactions blessed although their two-phase-commit unlock failed",
+		},
+	)
+
+	prometheusSubtreeValidationBlessUnlockRecovered = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "bless_unlock_recovered",
+			Help:      "Accepted transactions the per-level unlock retry unlocked, subset of bless_unlock_failed",
+		},
+	)
+
+	prometheusSubtreeValidationBlessUnlockRetryFailedBatches = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "bless_unlock_retry_failed_batches",
+			Help:      "Unlock retry calls that returned an error, per call not per transaction, the unlocked set of such a call is unknown",
+		},
+	)
+
 	prometheusSubtreeValidationSetTXMetaCacheKafkaBatch = promauto.NewHistogram(
 		prometheus.HistogramOpts{
 			Namespace: "teranode",
@@ -292,6 +340,25 @@ func _initPrometheusMetrics() {
 			Subsystem: "subtreevalidation",
 			Name:      "subtree_already_exists_skipped_total",
 			Help:      "Number of subtree Kafka messages skipped because the subtree already exists",
+		},
+	)
+
+	prometheusPeerSubtreeAdmissionWait = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "peer_subtree_admission_wait",
+			Help:      "Seconds a peer subtree waited for a validation slot (subtreevalidation_peerSubtreeConcurrency)",
+			Buckets:   util.MetricsBucketsMilliLongSeconds,
+		},
+	)
+
+	prometheusPeerSubtreeAdmissionWaiting = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "peer_subtree_admission_waiting",
+			Help:      "Peer subtrees waiting for a validation slot (subtreevalidation_peerSubtreeConcurrency)",
 		},
 	)
 }

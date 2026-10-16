@@ -2355,8 +2355,16 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	return spends, nil
 }
 
-// isDeadlock checks if a database error is a PostgreSQL deadlock (SQLSTATE 40P01)
-// or a SQLite BUSY error that should be retried.
+// isDeadlock reports whether a database error is a lock the spend batch should
+// retry: a PostgreSQL deadlock (SQLSTATE 40P01), or a SQLite BUSY or LOCKED
+// result. The SQLite arm matches the result code, as isLockError below and
+// usql.isRetriable do, because the two codes carry different messages: BUSY is
+// "database is locked", while the shared-cache table lock the sqlitememory
+// engine raises when two transactions wait on each other is LOCKED, "database
+// table is locked: database is deadlocked". This used to match the BUSY message
+// alone, so a spend batch that collided with a create's transaction was aborted
+// instead of retried (see is_deadlock_sqlite_test.go). The message check stays
+// as the fallback for a driver error that is not a *sqlite.Error.
 func isDeadlock(err error) bool {
 	if err == nil {
 		return false
@@ -3738,23 +3746,30 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 			}
 		}
 	} else {
-		// Not on longest chain: clear delete_at_height, set locked = false
+		// Not on longest chain. Aerospike's setMined always runs setDeleteAtHeight after
+		// updating the block list and unmined_since, so the DAH is re-evaluated rather than
+		// nulled: a fully spent tx that is still mined on the main chain (unmined_since NULL)
+		// keeps/bumps its DAH, anything else loses it. With retention 0 Lua leaves the DAH alone.
 		if minedBlockInfo.UnsetMined {
-			// UnsetMined path (block invalidation): unlock and clear delete_at_height
-			// for all affected transactions, then set unmined_since only for those
-			// with zero remaining block_ids.
-			// This mirrors the aerospike Lua which sets unmined_since = currentBlockHeight
-			// when #blocks == 0 after removing the block_id.
-			// Use the store's current block height (not the invalidated block's height)
-			// to match Aerospike's setMined UDF behavior.
-			currentBlockHeight := s.GetBlockHeight() + 1
+			// UnsetMined path (block invalidation): unlock, then set unmined_since only for
+			// those with zero remaining block_ids and no unmined_since yet.
+			// Mirrors the aerospike Lua, which stamps unmined_since when #blocks == 0 after
+			// removing the block_id. The stamp is backdated (utxo.BackdatedUnminedSince, issue
+			// 1768) exactly like MarkTransactionsOnLongestChain(false): the parent's DAH keeps
+			// counting from the original spend, so the pruner's parent-preservation scan has to
+			// see this tx on its next cycle. An existing unmined_since is kept.
+			var unminedTxRetention uint32
+			if s.settings != nil {
+				unminedTxRetention = s.settings.UtxoStore.UnminedTxRetention
+			}
 
-			// Step 1: Unlock and clear delete_at_height for all affected transactions
+			unminedSince := utxo.BackdatedUnminedSince(s.GetBlockHeight(), unminedTxRetention)
+
+			// Step 1: Unlock all affected transactions
 			inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
 			qUpdate := fmt.Sprintf(`
 				UPDATE transactions
 				SET locked = false
-				   ,delete_at_height = NULL
 				WHERE hash IN %s
 			`, inClause3)
 			if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
@@ -3775,8 +3790,9 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 				UPDATE transactions
 				SET unmined_since = $1
 				WHERE id IN (SELECT id FROM txs_without_blocks)
+				AND unmined_since IS NULL
 			`, inClause3b)
-			args := append([]interface{}{currentBlockHeight}, inArgs3b...)
+			args := append([]interface{}{unminedSince}, inArgs3b...)
 			if _, err = txn.ExecContext(ctx, qUpdateUnmined, args...); err != nil {
 				return nil, errors.NewStorageError("SQL error updating unmined_since: %v", err)
 			}
@@ -3785,10 +3801,45 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 			inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
 			qUpdate := fmt.Sprintf(`
 				UPDATE transactions
-				SET locked = false, delete_at_height = NULL
+				SET locked = false
 				WHERE hash IN %s
 			`, inClause3)
 			if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
+				return nil, errors.NewStorageError(errSQLUpdatingTransactions, err)
+			}
+		}
+
+		if retention > 0 {
+			// Follows the order of checks of aerospike Lua setDeleteAtHeight for a tx that is not
+			// (newly) on the longest chain (SQL has no pagination records or DAH signals):
+			// 1. If preserve_until is set -> don't touch DAH
+			// 2. If conflicting -> set the DAH when absent, otherwise leave it unchanged
+			// 3. If unmined_since is NULL (mined on the main chain) and all UTXOs are spent ->
+			//    set the DAH, or bump it forward if it is lower than the new value
+			// 4. Otherwise -> clear DAH
+			// The tx has at least one block here, except after UnsetMined removed its last one;
+			// that case has just been given an unmined_since above, so it falls into 4.
+			inClause3c, inArgs3c := buildINClause(existingHashBytes, 2)
+			qDAH := fmt.Sprintf(`
+				UPDATE transactions
+				SET delete_at_height = CASE
+				        WHEN preserve_until IS NOT NULL THEN delete_at_height
+				        WHEN conflicting THEN COALESCE(delete_at_height, $1)
+				        WHEN unmined_since IS NULL
+				             AND NOT EXISTS (
+				                 SELECT 1 FROM outputs o
+				                 WHERE o.transaction_id = transactions.id AND o.spending_data IS NULL
+				             )
+				             THEN CASE
+				                 WHEN delete_at_height IS NULL OR delete_at_height < $1 THEN $1
+				                 ELSE delete_at_height
+				             END
+				        ELSE NULL
+				    END
+				WHERE hash IN %s
+			`, inClause3c)
+			args := append([]interface{}{newDAH}, inArgs3c...)
+			if _, err = txn.ExecContext(ctx, qDAH, args...); err != nil {
 				return nil, errors.NewStorageError(errSQLUpdatingTransactions, err)
 			}
 		}
@@ -4446,7 +4497,11 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 			s.logger.Warnf("[PreviousOutputsDecorate] missing parent output: child=%x input[%d] parent=%x vout=%d parentTxExists=%v",
 				tx.TxIDChainHash()[:], idx, parentHash[:], input.PreviousTxOutIndex, txExists)
 		}
-		return errors.NewProcessingError("failed to decorate previous outputs for tx %s", tx.TxIDChainHash())
+		// TX_NOT_FOUND, as the aerospike store reports the same miss. Callers key
+		// on it: sendrawtransaction answers it as "Missing inputs", and legacy
+		// sync's per-transaction fallback takes the same branch for it as it did
+		// for the PROCESSING this used to be.
+		return errors.NewTxNotFoundError("failed to decorate previous outputs for tx %s: parent output not found", tx.TxIDChainHash())
 	}
 
 	return nil
@@ -4648,7 +4703,14 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 	}
 
 	if m := missingInputs.Load(); m > 0 {
-		return errors.NewProcessingError("failed to decorate previous outputs: %d inputs could not be resolved", m)
+		// ErrTxNotFound, not a generic processing error: a genuine query/connectivity fault
+		// above already returned via g.Wait() and never reaches here, so every path that lands
+		// on this line is "the store has no row for one of these outpoints" — the same class
+		// aerospike's own per-outpoint miss uses (aerospike/get.go sendOutpointBatch). Callers
+		// (quick validation's decorate in blockvalidation) tell a real backend fault, which
+		// stays fail-closed, apart from a plain not-found, by this class rather than by
+		// string-matching the message.
+		return errors.NewTxNotFoundError("failed to decorate previous outputs: %d inputs could not be resolved", m)
 	}
 
 	return nil
@@ -5022,13 +5084,17 @@ func (s *Store) setUnlockedBulk(ctx context.Context, txHashes []chainhash.Hash) 
 //   - Collects up to 10 errors for logging/debugging (prevents log spam)
 //   - Logs summary: attempted, succeeded, failed counts
 //   - Returns aggregated errors after attempting all transactions
-//   - Missing transactions trigger FATAL error (data corruption)
+//   - onLongestChain=true: transactions the store does not hold are logged and skipped
+//   - onLongestChain=false: a transaction the store does not hold is FATAL
 //
 // Why resilient processing is critical:
 //   - Large reorgs can affect millions of transactions
 //   - Transient network errors shouldn't prevent updating other transactions
 //   - Maximizes data integrity by updating as many as possible
-//   - Missing transaction = unrecoverable (FATAL to prevent corrupt state)
+//
+// Missing transactions, see the Aerospike implementation: a winning tx of a reorg
+// can be pruned legitimately and has nothing to clear; a tx moved off the longest
+// chain without a record would go back into block assembly.
 //
 // Timing guarantee:
 // This function is called synchronously from reset/reorg operations. By the time cleanup
@@ -5047,7 +5113,31 @@ func (s *Store) setUnlockedBulk(ctx context.Context, txHashes []chainhash.Hash) 
 //
 // Returns:
 //   - error: Aggregated errors (up to 10) if any failures occurred
-//   - Note: Function calls logger.Fatalf for missing transactions before returning
+//
+// existingHashes runs the existence query of MarkTransactionsOnLongestChain and
+// returns the hashes it found.
+func (s *Store) existingHashes(ctx context.Context, q string, args []interface{}) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	found := make(map[string]bool)
+
+	for rows.Next() {
+		var hb []byte
+		if err = rows.Scan(&hb); err != nil {
+			return nil, err
+		}
+
+		found[string(hb)] = true
+	}
+
+	return found, rows.Err()
+}
+
 func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
 	if len(txHashes) == 0 {
 		return nil
@@ -5057,6 +5147,9 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 	totalUpdated := 0
 	allErrors := make([]error, 0, 10)
 	errorCount := 0
+	missingCount := 0
+
+	var firstMissing []chainhash.Hash
 
 	// Convert all hashes to byte arrays up front
 	allHashBytes := make([][]byte, len(txHashes))
@@ -5113,39 +5206,29 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 		rowsAffected, _ := result.RowsAffected()
 		totalUpdated += int(rowsAffected)
 
-		// If fewer rows updated than expected, find which ones are missing
+		// If fewer rows updated than expected, find which ones are missing (a
+		// hash given twice also updates one row)
 		if int(rowsAffected) < len(chunk) {
-			missingCount := len(chunk) - int(rowsAffected)
-			errorCount += missingCount
-
 			// Query to find which hashes actually exist to identify the missing ones
 			qCheck := fmt.Sprintf(`SELECT hash FROM transactions WHERE hash IN %s`, func() string {
 				cl, _ := buildINClause(chunk, 1)
 				return cl
 			}())
 			_, checkArgs := buildINClause(chunk, 1)
-			rows, qErr := s.db.QueryContext(ctx, qCheck, checkArgs...)
+			foundHashes, qErr := s.existingHashes(ctx, qCheck, checkArgs)
 			if qErr != nil {
+				// the shortfall cannot be told apart: count it as failed
+				errorCount += len(chunk) - int(rowsAffected)
 				s.logger.Errorf("[MarkTransactionsOnLongestChain] could not identify missing txs in chunk %d-%d: %v", i, end-1, qErr)
 			} else {
-				foundHashes := make(map[string]bool)
-				for rows.Next() {
-					var hb []byte
-					if scanErr := rows.Scan(&hb); scanErr == nil {
-						foundHashes[string(hb)] = true
-					}
-				}
-				rows.Close()
-
-				missingLogged := 0
 				for _, hb := range chunk {
 					if !foundHashes[string(hb)] {
-						var h chainhash.Hash
-						copy(h[:], hb)
-						s.logger.Fatalf("CRITICAL: MISSING transaction %s during MarkTransactionsOnLongestChain - data integrity compromised", h)
-						missingLogged++
-						if missingLogged >= 10 {
-							break
+						missingCount++
+
+						if len(firstMissing) < 10 {
+							var h chainhash.Hash
+							copy(h[:], hb)
+							firstMissing = append(firstMissing, h)
 						}
 					}
 				}
@@ -5154,8 +5237,18 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 	}
 
 	// Log summary
-	s.logger.Infof("[MarkTransactionsOnLongestChain] completed: attempted=%d, updated=%d, failed=%d, onLongestChain=%t",
-		attempted, totalUpdated, errorCount, onLongestChain)
+	s.logger.Infof("[MarkTransactionsOnLongestChain] completed: attempted=%d, updated=%d, failed=%d, missing=%d, onLongestChain=%t",
+		attempted, totalUpdated, errorCount, missingCount, onLongestChain)
+
+	if missingCount > 0 {
+		if !onLongestChain {
+			s.logger.Fatalf("CRITICAL: %d MISSING transactions during MarkTransactionsOnLongestChain(false) - data integrity compromised, first: %v",
+				missingCount, firstMissing)
+		} else {
+			s.logger.Errorf("[MarkTransactionsOnLongestChain] skipped %d transactions the store does not hold, first: %v",
+				missingCount, firstMissing)
+		}
+	}
 
 	if len(allErrors) > 0 {
 		if errorCount > 10 {
