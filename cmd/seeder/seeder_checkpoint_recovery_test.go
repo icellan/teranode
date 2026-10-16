@@ -462,11 +462,59 @@ func TestProcessUTXOs_Reimport_ClearsTipRecordBeforeImporting(t *testing.T) {
 	require.False(t, exists, "a failed re-import must leave no tip record behind")
 }
 
+// TestProcessUTXOs_Reimport_ClearsLastProcessedBeforeImporting: lastProcessed.dat
+// lives in the block store and survives a UTXO-store wipe, so a re-import that
+// dies part-way must not leave it behind vouching for a half-written store.
+func TestProcessUTXOs_Reimport_ClearsLastProcessedBeforeImporting(t *testing.T) {
+	ctx := context.Background()
+	tSettings := forceSeederSettings(t)
+	pointUtxoStoreAt(t, tSettings, "reimport_clears_marker")
+	blockStore := openTestBlockStore(t, tSettings)
+
+	utxoFile, _ := snapshotWithOneTx(t, "reimport-clears-marker")
+	data, err := os.ReadFile(utxoFile)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(utxoFile, data[:len(data)-8], 0o600))
+
+	var tipHash chainhash.Hash
+	tipHash[0] = 0xcd
+
+	markImported(t, ctx, blockStore, 200, tipHash)
+
+	_, err = processUTXOs(ctx, ulogger.TestLogger{}, tSettings, newTestBlockchainStore(t), utxoFile, "", true, false)
+	require.Error(t, err, "the truncated snapshot must fail the import")
+
+	exists, err := blockStore.Exists(ctx, nil, fileformat.FileTypeDat, bloboptions.WithFilename("lastProcessed"), bloboptions.WithNoHashPrefix())
+	require.NoError(t, err)
+	require.False(t, exists, "a failed re-import must leave no lastProcessed.dat behind")
+}
+
 // TestSeeder_ForceAndRecoverCheckpoint_AreMutuallyExclusive: -force re-imports,
 // -recover-checkpoint never imports; asking for both is a mistake, not a mode.
 func TestSeeder_ForceAndRecoverCheckpoint_AreMutuallyExclusive(t *testing.T) {
 	err := Seeder(ulogger.TestLogger{}, forceSeederSettings(t), t.TempDir(), "abc", true, true, true, true, true)
 	require.ErrorContains(t, err, "mutually exclusive")
+}
+
+// TestSeeder_SkipUTXOs_RejectsForceAndRecoverCheckpoint: both flags do their
+// work inside the UTXO pass, so combining either with -skipUTXOs must be
+// refused rather than silently doing nothing.
+func TestSeeder_SkipUTXOs_RejectsForceAndRecoverCheckpoint(t *testing.T) {
+	tests := []struct {
+		name              string
+		force             bool
+		recoverCheckpoint bool
+	}{
+		{"recover-checkpoint", false, true},
+		{"force", true, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := Seeder(ulogger.TestLogger{}, forceSeederSettings(t), t.TempDir(), "abc", true, true, tc.force, tc.recoverCheckpoint, true)
+			require.ErrorContains(t, err, "-skipUTXOs")
+		})
+	}
 }
 
 // TestCheckpointRecoverable_UnparsableMarker_NotRecoverable: a marker whose

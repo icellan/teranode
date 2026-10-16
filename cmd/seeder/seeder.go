@@ -431,8 +431,8 @@ func processHeaders(ctx context.Context, logger ulogger.Logger, blockchainStore 
 	// changed and a re-run will replay those blocks.
 	if expected := uint64(height) + 1; recordsRead != expected {
 		return errors.NewProcessingError(
-			"utxo-headers file %s record count mismatch%s: expected %d records (heights 0..%d), read %d; the %d blocks read so far have already been persisted",
-			headersFile, truncationHint(recordsRead, expected), expected, height, recordsRead, recordsRead)
+			"utxo-headers file %s record count mismatch%s: expected %d records (heights 0..%d), read %d; the %d blocks stored so far have already been persisted",
+			headersFile, truncationHint(recordsRead, expected), expected, height, recordsRead, headersProcessed)
 	}
 
 	logger.Infof("FINISHED  %16s headers with %16s transactions", formatNumber(headersProcessed), formatNumber(txCount))

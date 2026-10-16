@@ -96,6 +96,8 @@ func TestProcessHeaders_TruncatedFile_ReturnsError(t *testing.T) {
 	err := processHeaders(context.Background(), ulogger.TestLogger{}, store, path)
 	require.ErrorContains(t, err, "record count mismatch",
 		"the record-count validation must be what rejects the file")
+	require.ErrorContains(t, err, path,
+		"the message must name the headers file the operator has to look at")
 }
 
 // TestProcessHeaders_BoundaryAlignedCut_ReturnsError covers the case a
@@ -115,6 +117,11 @@ func TestProcessHeaders_BoundaryAlignedCut_ReturnsError(t *testing.T) {
 	err := processHeaders(context.Background(), ulogger.TestLogger{}, store, path)
 	require.ErrorContains(t, err, "record count mismatch",
 		"a boundary-aligned cut yields a clean io.EOF and must be caught by the record-count check")
+	require.ErrorContains(t, err, path,
+		"the message must name the headers file the operator has to look at")
+	// Only genesis was read and genesis is never stored, so no block was persisted.
+	require.ErrorContains(t, err, "the 0 blocks stored so far",
+		"the count must be the blocks actually stored, not the records read")
 }
 
 // TestProcessHeaders_V1File_FinishesCleanly guards the V1 (no-coinbase) path
