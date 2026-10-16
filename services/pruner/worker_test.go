@@ -708,6 +708,9 @@ func TestPhase1ErrorOnContextCancelIsNotAFailure(t *testing.T) {
 	mockStore.On("GetPrunableUnminedTxIterator", mock.Anything).
 		Run(func(mock.Arguments) { cancel() }).
 		Return((*failingIterator)(nil), errors.NewStorageError("boom"))
+	// Stubbed so that if the shutdown guard regresses, the flow reaches Phase 1b
+	// and the assertions below fail cleanly instead of the mock panicking.
+	mockStore.On("ProcessExpiredPreservations", mock.Anything, mock.Anything).Return(nil)
 
 	pruneSvc := &recordingPruner{calls: make(chan uint32, 2)}
 	server := newPhase1TestServer(ctx, mockStore, pruneSvc, false)
