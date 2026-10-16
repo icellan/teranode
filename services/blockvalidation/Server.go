@@ -1079,6 +1079,9 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 	queueSize := u.blockPriorityQueue.Size()
 	shouldConsiderCatchup := u.settings.BlockValidation.UseCatchupWhenBehind && (queueSize > 10 || len(u.blockFoundCh) > 3)
 
+	// Set when the backlog branch below has fetched the block and falls through to the queue.
+	var block *model.Block
+
 	if shouldConsiderCatchup {
 		// Fetch the block to classify it before deciding on catchup. Bound the
 		// fetch: ctx here is the blockFoundCh worker's service-lifetime context,
@@ -1087,8 +1090,9 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 		// a slow peer pin the worker indefinitely. Same budget as the
 		// priority-queue catchup fetch in addBlockToPriorityQueue.
 		fetchCtx, fetchCancel := context.WithTimeout(ctx, peerBlockFetchTimeout)
-		block, source, err := u.fetchAnnouncedBlock(ctx, fetchCtx, blockFound)
+		fetched, source, err := u.fetchAnnouncedBlock(ctx, fetchCtx, blockFound)
 		fetchCancel()
+		block = fetched
 		blockFound = source
 		if err != nil {
 			if blockFound.errCh != nil {
@@ -1174,15 +1178,20 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 		}
 	}
 
-	// Add block to priority queue
-	u.addBlockToPriorityQueue(ctx, blockFound)
+	// Add block to priority queue. If the backlog branch fetched it, queue that block: fetching it
+	// again would charge the source a second time, and after a fallback that source is an alternative.
+	if block != nil {
+		u.queueFetchedBlock(ctx, blockFound, block)
+	} else {
+		u.addBlockToPriorityQueue(ctx, blockFound)
+	}
 
 	// Update metrics
 	prometheusBlockValidationBlockFoundCh.Set(float64(len(u.blockFoundCh)))
 
-	// Send response to error channel if it exists (addBlockToPriorityQueue handles the errCh internally)
+	// Send response to error channel if it exists (both queue paths answer the errCh internally)
 	// but if it doesn't send a response in all cases, we need to ensure we don't leave the caller hanging
-	// The errCh should already be handled by addBlockToPriorityQueue, so we just return
+	// The errCh should already be handled by them, so we just return
 	return nil
 }
 
@@ -2832,6 +2841,12 @@ func (u *Server) addBlockToPriorityQueue(ctx context.Context, blockFound process
 		return
 	}
 
+	u.queueFetchedBlock(ctx, blockFound, block)
+}
+
+// queueFetchedBlock hands an announced block, already fetched from blockFound's source, to catchup
+// if its parent is missing and to the priority queue otherwise. It answers blockFound.errCh.
+func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockFound, block *model.Block) {
 	// Check if parent exists - if not, send directly to catchup
 	parentExists, err := u.blockValidation.GetBlockExists(ctx, block.Header.HashPrevBlock)
 	if err != nil {

@@ -1629,8 +1629,9 @@ func (u *Server) fetchAnnouncedBlock(ctx, fetchCtx context.Context, blockFound p
 	// Only a 429 suggests the announcer has the block and is refusing us for now. Any other
 	// failure is the announcer's, and is not retried elsewhere. A charged 429 is not retried
 	// either: the announcer is past its allowance, so its 429s must not cost this node a peer
-	// lookup each. Nor is anything retried once the caller's ctx is done.
-	if !errors.Is(err, errors.ErrServiceRateLimited) || charged || ctx.Err() != nil {
+	// lookup each. Nor is anything retried once the caller's ctx is done, or for an announcement
+	// with no peer ID: it has no allowance to spend, so its 429s would fall back without bound.
+	if !errors.Is(err, errors.ErrServiceRateLimited) || charged || ctx.Err() != nil || blockFound.peerID == "" {
 		return nil, blockFound, err
 	}
 

@@ -519,3 +519,119 @@ func TestProcessBlockFoundChannel_CatchupBranchRateLimitedFallbackHandsOnAlterna
 	requireCatchupSource(t, u, hash, alt)
 	require.Equal(t, int64(1), alt.gets.Load())
 }
+
+// TestProcessBlockFoundChannel_CatchupBranchFallThroughDoesNotRefetch: a chain-extending block in
+// the backed-up-queue branch falls through to the priority queue. That path must queue the block
+// already fetched rather than fetch it again: a second fetch would go to the alternative and charge
+// it if it failed, and a 429 there could fall back onto the original announcer as an uncharged
+// alternative.
+func TestProcessBlockFoundChannel_CatchupBranchFallThroughDoesNotRefetch(t *testing.T) {
+	u, p2pClient := newBlockFoundFetchServer(t)
+	u.settings.BlockValidation.UseCatchupWhenBehind = true
+	u.blockClassifier = NewBlockClassifier(ulogger.TestLogger{}, 10, u.blockValidation.blockchainClient)
+
+	// Built on genesis, the sqlitememory chain's tip, so it classifies as chain-extending.
+	block := testhelpers.CreateTestBlocksWithPrev(t, 1, u.settings.ChainCfgParams.GenesisHash)[0]
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+
+	announcer := newStatusPeer(t, http.StatusTooManyRequests)
+	alt := newCountingPeer(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(blockBytes) })
+
+	p2pClient.peers = []*p2p.PeerInfo{
+		tipPeer("announcer", announcer.url, block.Hash()),
+		tipPeer("alt", alt.url, block.Hash()),
+	}
+
+	// len(blockFoundCh) > 3 selects the shouldConsiderCatchup branch.
+	for i := 0; i < 4; i++ {
+		u.blockFoundCh <- processBlockFound{}
+	}
+
+	errCh := make(chan error, 1)
+
+	err = u.processBlockFoundChannel(context.Background(), processBlockFound{
+		hash:    block.Hash(),
+		baseURL: announcer.url,
+		peerID:  peer.ID("announcer").String(),
+		errCh:   errCh,
+	})
+
+	require.NoError(t, err)
+	require.NoError(t, <-errCh)
+	require.Equal(t, int64(1), announcer.gets.Load(), "the announcer must be asked once")
+	require.Equal(t, int64(1), alt.gets.Load(), "the block already fetched from the alternative must not be fetched again")
+
+	queued, _, ok := u.blockPriorityQueue.Peek()
+	require.True(t, ok, "a chain-extending block must reach the priority queue")
+	require.Equal(t, block.Hash(), queued.hash)
+	require.Equal(t, peer.ID("alt").String(), queued.peerID)
+	require.Equal(t, alt.url, queued.baseURL)
+	require.Equal(t, 0, p2pClient.totalCharges())
+}
+
+// TestFetchAnnouncedBlock_NoFallbackWithoutPeerID: an announcement with no peer ID has no
+// allowance to spend, so its 429s are never charged. Falling back on them would put load on other
+// peers without bound.
+func TestFetchAnnouncedBlock_NoFallbackWithoutPeerID(t *testing.T) {
+	u, p2pClient := newBlockFoundFetchServer(t)
+
+	hash := testHash("no-peer-id")
+	announcer := newStatusPeer(t, http.StatusTooManyRequests)
+	alt := newStatusPeer(t, http.StatusNotFound)
+
+	p2pClient.peers = []*p2p.PeerInfo{tipPeer("alt", alt.url, hash)}
+
+	_, _, err := u.fetchAnnouncedBlock(context.Background(), context.Background(), processBlockFound{
+		hash:    hash,
+		baseURL: announcer.url,
+	})
+
+	require.ErrorIs(t, err, errors.ErrServiceRateLimited)
+	require.Equal(t, int64(0), alt.gets.Load(), "a 429 with no peer ID must not trigger the alternative fetch")
+}
+
+// TestFetchAnnouncedBlock_CallerCtxDoneIsNotCharged: a done caller ctx is this node shutting down,
+// so a failure that would otherwise be charged is not.
+func TestFetchAnnouncedBlock_CallerCtxDoneIsNotCharged(t *testing.T) {
+	u, p2pClient := newBlockFoundFetchServer(t)
+	announcer := newStatusPeer(t, http.StatusInternalServerError)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err := u.fetchAnnouncedBlock(ctx, context.Background(), processBlockFound{
+		hash:    testHash("shutdown-500"),
+		baseURL: announcer.url,
+		peerID:  "announcer",
+	})
+
+	require.Error(t, err)
+	require.Equal(t, int64(1), announcer.gets.Load())
+	require.Equal(t, 0, p2pClient.charged("announcer"), "a failure while this node shuts down must not be charged")
+	require.Empty(t, p2pClient.recordedErrors("announcer"))
+}
+
+// TestFetchAnnouncedBlock_CallerCtxDoneDoesNotFallBack: nothing is retried elsewhere once the
+// caller's ctx is done.
+func TestFetchAnnouncedBlock_CallerCtxDoneDoesNotFallBack(t *testing.T) {
+	u, p2pClient := newBlockFoundFetchServer(t)
+
+	hash := testHash("shutdown-429")
+	announcer := newStatusPeer(t, http.StatusTooManyRequests)
+	alt := newStatusPeer(t, http.StatusNotFound)
+
+	p2pClient.peers = []*p2p.PeerInfo{tipPeer("alt", alt.url, hash)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err := u.fetchAnnouncedBlock(ctx, context.Background(), processBlockFound{
+		hash:    hash,
+		baseURL: announcer.url,
+		peerID:  "announcer",
+	})
+
+	require.ErrorIs(t, err, errors.ErrServiceRateLimited)
+	require.Equal(t, int64(0), alt.gets.Load(), "a done caller ctx must not trigger the alternative fetch")
+}
