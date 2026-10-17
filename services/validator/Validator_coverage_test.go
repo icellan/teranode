@@ -576,10 +576,90 @@ func TestValidator_ValidateInternal_CreateConflicting_TxAlreadyExistsEvictsTxMet
 
 	mockStore.AssertExpectations(t)
 
+	deleted := drainTxMetaDeletes(txmetaProducer)
+
+	require.True(t, deleted[*tx.TxIDChainHash()], "the tx marked conflicting must be evicted from the txmeta cache")
+	require.True(t, deleted[child], "its cascaded descendant must be evicted from the txmeta cache")
+}
+
+// TestValidator_ValidateInternal_CreateConflicting_PartialMarkEvictsTxMeta pins
+// that a cascade failing below its first level still evicts what it may have
+// flipped. The tx itself is conflicting in the store by then.
+func TestValidator_ValidateInternal_CreateConflicting_PartialMarkEvictsTxMeta(t *testing.T) {
+	ctx := context.Background()
+	logger := ulogger.TestLogger{}
+	mockStore := &utxo.MockUtxostore{}
+	settings := test.CreateBaseTestSettings(t)
+
+	validator, err := New(ctx, logger, settings, mockStore, nil, nil, nil, nil, nil)
+	require.NoError(t, err)
+	v := validator.(*Validator)
+	v.settings.Validator.TxMetaWireFormat = "v1"
+
+	txmetaProducer := kafka.NewKafkaAsyncProducerMock()
+	v.txmetaKafkaProducerClient = txmetaProducer
+
+	privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("THIS_IS_A_DETERMINISTIC_PRIVATE_KEY"))
+	coinbaseTx := transactions.Create(t,
+		transactions.WithCoinbaseData(100, "/Test miner/"),
+		transactions.WithP2PKHOutputs(1, 50e8, publicKey),
+	)
+	tx := transactions.Create(t,
+		transactions.WithPrivateKey(privateKey),
+		transactions.WithInput(coinbaseTx, 0),
+		transactions.WithP2PKHOutputs(1, 1000),
+		transactions.WithChangeOutput(),
+	)
+
+	testHash, _ := chainhash.NewHashFromStr("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	spends := []*utxo.Spend{
+		{TxID: testHash, Vout: 0, Err: errors.ErrSpent},
+	}
+
+	// The store knows the real parent: the validator re-extends from the
+	// parent's own outputs rather than trusting the supplied ones
+	// (GHSA-v76m-6vc7-g7c7), so a synthetic parent would fail script or value
+	// checks against a genuinely signed child.
+	mockStore.On("ParentOutputsForValidation", mock.Anything, mock.Anything).Return(parentOutputsOf(coinbaseTx, utxo.ParentOutputNotMined), nil)
+	mockStore.On("GetBlockState").Return(utxo.BlockState{Height: 100, MedianTime: 1000000000})
+	// The main spend-and-create fails with a spend-phase utxo error (Once so the
+	// conflicting-fallback create below matches the second expectation).
+	mockStore.On("SpendAndCreate", mock.Anything, tx, mock.Anything, mock.Anything).Return(nil, spends, errors.NewUtxoError("utxo error", errors.ErrUtxoError)).Once()
+
+	// CreateInUtxoStore returns ErrTxExists — tx was already validated via P2P
+	mockStore.On("SpendAndCreate", mock.Anything, tx, uint32(100), mock.Anything).Return(&meta.Data{}, nil, errors.NewTxExistsError("already exists"))
+
+	// GetMeta succeeds — tx exists in store (not yet marked conflicting)
+	mockStore.On("GetMeta", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	// SetConflicting is called to mark the existing tx as conflicting
+	child := chainhash.HashH([]byte("spending-child"))
+	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{*tx.TxIDChainHash()}, true).Return([]*utxo.Spend{}, []chainhash.Hash{child}, nil)
+	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{child}, true).Return([]*utxo.Spend(nil), []chainhash.Hash(nil), errors.NewStorageError("child write failed"))
+
+	options := &Options{CreateConflicting: true}
+	_, err = v.validateInternal(ctx, tx, 100, options)
+
+	require.Error(t, err)
+	require.False(t, errors.Is(err, errors.ErrTxConflicting), "the cascade failed, so the call fails: %v", err)
+
+	mockStore.AssertExpectations(t)
+
+	deleted := drainTxMetaDeletes(txmetaProducer)
+
+	// A revalidation now reads the tx as conflicting and skips this branch, so
+	// this is the only chance to evict it.
+	require.True(t, deleted[*tx.TxIDChainHash()], "the tx flipped before the failure must be evicted from the txmeta cache")
+	require.True(t, deleted[child], "the descendant whose write failed may be flipped and must be evicted too")
+}
+
+// drainTxMetaDeletes decodes every v1 message on the producer and returns the
+// hashes sent as DELETEs.
+func drainTxMetaDeletes(producer *kafka.KafkaAsyncProducerMock) map[chainhash.Hash]bool {
 	deleted := map[chainhash.Hash]bool{}
 
-	for len(txmetaProducer.PublishChannel()) > 0 {
-		data := (<-txmetaProducer.PublishChannel()).Value
+	for len(producer.PublishChannel()) > 0 {
+		data := (<-producer.PublishChannel()).Value
 		offset := 4
 
 		for i := uint32(0); i < binary.LittleEndian.Uint32(data[:4]); i++ {
@@ -594,9 +674,9 @@ func TestValidator_ValidateInternal_CreateConflicting_TxAlreadyExistsEvictsTxMet
 		}
 	}
 
-	require.True(t, deleted[*tx.TxIDChainHash()], "the tx marked conflicting must be evicted from the txmeta cache")
-	require.True(t, deleted[child], "its cascaded descendant must be evicted from the txmeta cache")
+	return deleted
 }
+
 func XTestValidator_ValidateInternal_SpendUtxosError_TxNotFound(t *testing.T) {
 	ctx := context.Background()
 	logger := ulogger.TestLogger{}

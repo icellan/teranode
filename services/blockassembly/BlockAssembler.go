@@ -1724,35 +1724,31 @@ func (b *BlockAssembler) replayConflictIntent(ctx context.Context, intent utxo.C
 	}
 }
 
-// processConflictingAndEvict re-runs ProcessConflicting for a WAL intent and, once
-// the store demotion has succeeded, evicts every tx it marked conflicting (losers
-// and their cascaded descendants) from subtree validation's txmeta cache.
+// processConflictingAndEvict re-runs ProcessConflicting for a WAL intent and
+// evicts every tx it marked conflicting (losers and their cascaded descendants)
+// from subtree validation's txmeta cache. On failure it evicts what the run may
+// have flipped.
 func (b *BlockAssembler) processConflictingAndEvict(ctx context.Context, intent utxo.ConflictIntent, seeded map[chainhash.Hash]struct{}) error {
 	_, allMarkedConflicting, err := utxo.ProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes, seeded,
 		utxo.NewAncestryGuard(b.blockchainClient.CheckBlockIsAncestorOfBlock), b.conflictIntentRefusalHandler(intent.BlockHash))
-	if err != nil {
-		return err
-	}
 
 	b.txMetaEvictor.Evict(allMarkedConflicting)
 
-	return nil
+	return err
 }
 
 // reverseProcessConflictingAndEvict re-runs ReverseProcessConflicting for a WAL
 // intent and evicts every tx the reverse flipped to conflicting (the demoted
 // winners and their descendants). The counter side it flips back to
 // non-conflicting needs no eviction: the txmeta cache never holds conflicting
-// entries, so there is nothing stale, and a miss repopulates from the store.
+// entries, so there is nothing stale, and a miss repopulates from the store. On
+// failure it evicts what the run may have flipped.
 func (b *BlockAssembler) reverseProcessConflictingAndEvict(ctx context.Context, intent utxo.ConflictIntent) error {
 	cascadedToConflicting, _, err := utxo.ReverseProcessConflicting(ctx, b.utxoStore, intent.BlockHeight, intent.BlockHash, intent.TxHashes)
-	if err != nil {
-		return err
-	}
 
 	b.txMetaEvictor.Evict(cascadedToConflicting)
 
-	return nil
+	return err
 }
 
 // healStaleConflictIntent converges the UTXO state for an intent whose block has
@@ -3049,10 +3045,14 @@ func (b *BlockAssembler) validateParentChain(
 		for h := range conflictingDescendants {
 			cascadeHashes = append(cascadeHashes, h)
 		}
-		if _, marked, mErr := utxo.MarkConflictingRecursively(ctx, b.utxoStore, cascadeHashes); mErr != nil {
+		_, marked, mErr := utxo.MarkConflictingRecursively(ctx, b.utxoStore, cascadeHashes)
+
+		// a failed cascade may still have flipped some of them
+		b.txMetaEvictor.Evict(marked)
+
+		if mErr != nil {
 			b.logger.Errorf("[BlockAssembler][validateParentChain] failed to mark %d cascaded conflicting txs: %v", len(cascadeHashes), mErr)
 		} else {
-			b.txMetaEvictor.Evict(marked)
 			b.logger.Infof("[BlockAssembler][validateParentChain] marked %d txs conflicting (descendants of conflicting parents)", len(cascadeHashes))
 		}
 	}
@@ -3923,12 +3923,14 @@ func (b *BlockAssembler) validateUnminedTxInputs(ctx context.Context, txHash cha
 
 func (b *BlockAssembler) markAsConflicting(ctx context.Context, txHash chainhash.Hash) {
 	_, cascadedHashes, err := utxo.MarkConflictingRecursively(ctx, b.utxoStore, []chainhash.Hash{txHash})
+
+	// a failed cascade may still have flipped some of them
+	b.txMetaEvictor.Evict(cascadedHashes)
+
 	if err != nil {
 		b.logger.Errorf("[validateUnminedTxInputs][%s] failed to mark as conflicting: %v", txHash.String(), err)
 		return
 	}
-
-	b.txMetaEvictor.Evict(cascadedHashes)
 
 	// Stash cascade hashes for the post-load DrainQueue call. Safe because
 	// loadUnminedTransactions is serialised by unminedTransactionsLoading.

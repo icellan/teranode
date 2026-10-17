@@ -11,6 +11,8 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockassembly/subtreeprocessor"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
@@ -251,4 +253,152 @@ func TestMarkAsConflicting_EvictsMarkedFromTxMetaCache(t *testing.T) {
 	require.Eventually(t, func() bool { return collector.has(parentHash, childHash) }, 5*time.Second, 10*time.Millisecond,
 		"every tx markAsConflicting flips must be evicted from subtree validation's txmeta cache")
 	require.Equal(t, 2, collector.count())
+}
+
+// The tests below pin that a demotion which fails partway still evicts what it
+// may have flipped. MarkConflictingRecursively writes one BFS level at a time,
+// so a failure below the first level leaves the levels above conflicting in the
+// store, and nothing retries them into an eviction: a revalidation reads them as
+// conflicting and skips the demotion branch entirely.
+
+// failingCascadeStore marks parent conflicting, reports child as its spender,
+// then fails the write for child.
+func failingCascadeStore(parent, child chainhash.Hash) *utxo.MockUtxostore {
+	mockStore := new(utxo.MockUtxostore)
+	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{parent}, true).
+		Return([]*utxo.Spend{}, []chainhash.Hash{child}, nil)
+	mockStore.On("SetConflicting", mock.Anything, []chainhash.Hash{child}, true).
+		Return([]*utxo.Spend(nil), []chainhash.Hash(nil), errors.NewStorageError("child write failed"))
+
+	return mockStore
+}
+
+func TestMarkAsConflicting_CascadeErrorEvictsFlippedFromTxMetaCache(t *testing.T) {
+	parentHash := chainhash.HashH([]byte("mark-fail-parent"))
+	childHash := chainhash.HashH([]byte("mark-fail-child"))
+
+	mockStp := &subtreeprocessor.MockSubtreeProcessor{}
+
+	producer, collector := newInMemoryTxMetaTopic(t)
+
+	ba := &BlockAssembler{
+		utxoStore:        failingCascadeStore(parentHash, childHash),
+		subtreeProcessor: mockStp,
+		settings:         &settings.Settings{},
+		logger:           ulogger.TestLogger{},
+		txMetaEvictor:    subtreeprocessor.NewTxMetaEvictor(ulogger.TestLogger{}, producer),
+	}
+
+	ba.markAsConflicting(t.Context(), parentHash)
+
+	require.Eventually(t, func() bool { return collector.has(parentHash, childHash) }, 5*time.Second, 10*time.Millisecond,
+		"a cascade that failed partway must still evict what it may have flipped")
+	mockStp.AssertNotCalled(t, "Remove", mock.Anything, mock.Anything)
+}
+
+func TestValidateParentChain_CascadeErrorEvictsFlippedFromTxMetaCache(t *testing.T) {
+	parentHash := chainhash.HashH([]byte("vpc-conflicting-parent"))
+	childHash := chainhash.HashH([]byte("vpc-child"))
+	grandchildHash := chainhash.HashH([]byte("vpc-grandchild"))
+
+	mockStore := failingCascadeStore(childHash, grandchildHash)
+	mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			for _, unresolved := range args.Get(1).([]*utxo.UnresolvedMetaData) {
+				if unresolved.Hash.IsEqual(&parentHash) {
+					unresolved.Data = &meta.Data{UnminedSince: 1, Conflicting: true}
+				}
+			}
+		}).
+		Return(nil)
+
+	testSettings := &settings.Settings{}
+	testSettings.BlockAssembly.ParentValidationBatchSize = 50
+	testSettings.BlockAssembly.OnRestartRemoveInvalidParentChainTxs = true
+
+	producer, collector := newInMemoryTxMetaTopic(t)
+
+	ba := &BlockAssembler{
+		utxoStore:     mockStore,
+		settings:      testSettings,
+		logger:        ulogger.TestLogger{},
+		txMetaEvictor: subtreeprocessor.NewTxMetaEvictor(ulogger.TestLogger{}, producer),
+	}
+
+	childTx := &utxo.UnminedTransaction{
+		Node:       &subtree.Node{Hash: childHash, Fee: 1000, SizeInBytes: 250},
+		TxInpoints: singleParentInpointsPtr(parentHash, 0),
+		CreatedAt:  1,
+	}
+
+	_, err := ba.validateParentChain(t.Context(), []*utxo.UnminedTransaction{childTx}, map[uint32]bool{1: true})
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool { return collector.has(childHash, grandchildHash) }, 5*time.Second, 10*time.Millisecond,
+		"a cascade that failed partway must still evict what it may have flipped")
+}
+
+func TestReplayPendingConflictIntents_FailedForwardEvictsFlipped(t *testing.T) {
+	winner := chainhash.HashH([]byte("failed-replay-winner"))
+	loser := chainhash.HashH([]byte("failed-replay-loser"))
+	child := chainhash.HashH([]byte("failed-replay-child"))
+
+	intent := utxo.ConflictIntent{
+		Kind:        utxo.ConflictIntentForward,
+		BlockHeight: 400,
+		BlockHash:   chainhash.HashH([]byte("on-chain-block")),
+		TxHashes:    []chainhash.Hash{winner},
+		StartedAt:   1,
+	}
+
+	mockStore := failingCascadeStore(loser, child)
+	mockStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(&meta.Data{Conflicting: true}, nil)
+	mockStore.On("GetCounterConflicting", mock.Anything, winner).Return([]chainhash.Hash{loser}, nil)
+	mockStore.On("BatchDecorate", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	bc := blockchainMembershipMock(true, false)
+	bc.On("CheckBlockIsAncestorOfBlock", mock.Anything, mock.Anything, mock.Anything).Return(false, nil)
+
+	producer, collector := newInMemoryTxMetaTopic(t)
+
+	spy := &replaySpyStore{MockUtxostore: mockStore, pending: []utxo.ConflictIntent{intent}}
+	b := newReplayTestAssembler(spy, bc)
+	b.txMetaEvictor = subtreeprocessor.NewTxMetaEvictor(ulogger.TestLogger{}, producer)
+
+	b.replayPendingConflictIntents(t.Context())
+
+	require.NotContains(t, spy.completed, intent.IntentID(), "a failed replay must leave its intent for the next start")
+	require.Eventually(t, func() bool { return collector.has(loser, child) },
+		5*time.Second, 10*time.Millisecond, "a replay that failed partway must still evict what it may have flipped")
+}
+
+func TestReplayPendingConflictIntents_FailedReverseEvictsFlipped(t *testing.T) {
+	demoted := chainhash.HashH([]byte("failed-reverse-demoted"))
+	child := chainhash.HashH([]byte("failed-reverse-child"))
+
+	demotedTx := bt.NewTx()
+	require.NoError(t, demotedTx.From(chainhash.HashH([]byte("p")).String(), 0, "76a914000000000000000000000000000000000000000088ac", 1000))
+
+	intent := utxo.ConflictIntent{
+		Kind:        utxo.ConflictIntentReverse,
+		BlockHeight: 401,
+		TxHashes:    []chainhash.Hash{demoted},
+		StartedAt:   1,
+	}
+
+	mockStore := failingCascadeStore(demoted, child)
+	mockStore.On("Get", mock.Anything, &demoted, mock.Anything).Return(&meta.Data{Tx: demotedTx}, nil)
+	mockStore.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(&meta.Data{}, nil)
+
+	producer, collector := newInMemoryTxMetaTopic(t)
+
+	spy := &replaySpyStore{MockUtxostore: mockStore, pending: []utxo.ConflictIntent{intent}}
+	b := newReplayTestAssembler(spy, blockchainMembershipMock(false, true))
+	b.txMetaEvictor = subtreeprocessor.NewTxMetaEvictor(ulogger.TestLogger{}, producer)
+
+	b.replayPendingConflictIntents(t.Context())
+
+	require.NotContains(t, spy.completed, intent.IntentID(), "a failed replay must leave its intent for the next start")
+	require.Eventually(t, func() bool { return collector.has(demoted, child) },
+		5*time.Second, 10*time.Millisecond, "a reverse that failed partway must still evict what it may have flipped")
 }

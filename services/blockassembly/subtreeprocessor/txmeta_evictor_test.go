@@ -21,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	inmemkafka "github.com/bsv-blockchain/teranode/util/kafka/in_memory_kafka"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -138,6 +139,18 @@ type conflictScenario struct {
 	loser, child, winner chainhash.Hash
 }
 
+type conflictFailure int
+
+const (
+	failNone conflictFailure = iota
+	// failWinnerLookup makes the winner's Get fail, so ProcessConflicting aborts
+	// before mutating anything.
+	failWinnerLookup
+	// failChildMark fails the cascade's write for the child after the loser was
+	// already flipped.
+	failChildMark
+)
+
 // newConflictTestProcessor builds a processor over a mocked UTXO store whose
 // SetConflicting reports C as L's spending child.
 //
@@ -145,9 +158,8 @@ type conflictScenario struct {
 // (it reads through a second pooled connection on shared-cache SQLite while its
 // own write transaction is open), so ProcessConflicting cannot run end to end on
 // it. The existing TestProcessConflictingTransactions makes the same trade.
-// failWinnerLookup makes the winner's Get fail so ProcessConflicting aborts
-// before mutating anything.
-func newConflictTestProcessor(t *testing.T, evictor *TxMetaEvictor, failWinnerLookup bool) (*SubtreeProcessor, conflictScenario) {
+// failure selects where ProcessConflicting fails, if at all.
+func newConflictTestProcessor(t *testing.T, evictor *TxMetaEvictor, failure conflictFailure) (*SubtreeProcessor, conflictScenario) {
 	t.Helper()
 
 	scenario := conflictScenario{
@@ -158,7 +170,7 @@ func newConflictTestProcessor(t *testing.T, evictor *TxMetaEvictor, failWinnerLo
 
 	store := new(utxo.MockUtxostore)
 
-	if failWinnerLookup {
+	if failure == failWinnerLookup {
 		store.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(nil, errors.NewStorageError("store down"))
 	} else {
 		store.On("Get", mock.Anything, mock.Anything, mock.Anything).Return(&meta.Data{Conflicting: true}, nil)
@@ -167,8 +179,13 @@ func newConflictTestProcessor(t *testing.T, evictor *TxMetaEvictor, failWinnerLo
 	store.On("GetCounterConflicting", mock.Anything, scenario.winner).Return([]chainhash.Hash{scenario.loser}, nil)
 	store.On("SetConflicting", mock.Anything, []chainhash.Hash{scenario.loser}, true).
 		Return([]*utxo.Spend{}, []chainhash.Hash{scenario.child}, nil)
-	store.On("SetConflicting", mock.Anything, []chainhash.Hash{scenario.child}, true).
-		Return([]*utxo.Spend{}, []chainhash.Hash{}, nil)
+	if failure == failChildMark {
+		store.On("SetConflicting", mock.Anything, []chainhash.Hash{scenario.child}, true).
+			Return([]*utxo.Spend(nil), []chainhash.Hash(nil), errors.NewStorageError("child write failed"))
+	} else {
+		store.On("SetConflicting", mock.Anything, []chainhash.Hash{scenario.child}, true).
+			Return([]*utxo.Spend{}, []chainhash.Hash{}, nil)
+	}
 	store.On("SetConflicting", mock.Anything, []chainhash.Hash{scenario.winner}, false).
 		Return([]*utxo.Spend{}, []chainhash.Hash{}, nil)
 	store.On("Unspend", mock.Anything, mock.Anything, mock.Anything).Return(nil)
@@ -215,7 +232,7 @@ func testBlock() *model.Block {
 func TestProcessConflictingTransactions_PublishesTxMetaDeletes(t *testing.T) {
 	producer, collector := newInMemoryTxMetaTopic(t)
 
-	stp, scenario := newConflictTestProcessor(t, NewTxMetaEvictor(ulogger.TestLogger{}, producer), false)
+	stp, scenario := newConflictTestProcessor(t, NewTxMetaEvictor(ulogger.TestLogger{}, producer), failNone)
 
 	losers, marked, err := stp.processConflictingTransactions(t.Context(), testBlock(),
 		[]chainhash.Hash{scenario.winner}, map[chainhash.Hash]struct{}{})
@@ -240,7 +257,7 @@ func TestProcessConflictingTransactions_PublishesTxMetaDeletes(t *testing.T) {
 // TestProcessConflictingTransactions_NoEvictorIsNoop pins that block assembly
 // without a txmeta producer (Kafka txmeta not configured) still demotes.
 func TestProcessConflictingTransactions_NoEvictorIsNoop(t *testing.T) {
-	stp, scenario := newConflictTestProcessor(t, nil, false)
+	stp, scenario := newConflictTestProcessor(t, nil, failNone)
 
 	losers, _, err := stp.processConflictingTransactions(t.Context(), testBlock(),
 		[]chainhash.Hash{scenario.winner}, map[chainhash.Hash]struct{}{})
@@ -248,17 +265,40 @@ func TestProcessConflictingTransactions_NoEvictorIsNoop(t *testing.T) {
 	require.True(t, losers.Exists(scenario.loser))
 }
 
-// TestProcessConflictingTransactions_FailedDemotionPublishesNothing pins that
-// DELETEs are only sent once the store demotion succeeded.
+// TestProcessConflictingTransactions_FailedDemotionPublishesNothing pins that a
+// demotion that failed before flipping anything publishes nothing.
 func TestProcessConflictingTransactions_FailedDemotionPublishesNothing(t *testing.T) {
 	producer := kafka.NewKafkaAsyncProducerMock()
 
-	stp, scenario := newConflictTestProcessor(t, NewTxMetaEvictor(ulogger.TestLogger{}, producer), true)
+	stp, scenario := newConflictTestProcessor(t, NewTxMetaEvictor(ulogger.TestLogger{}, producer), failWinnerLookup)
 
 	_, _, err := stp.processConflictingTransactions(t.Context(), testBlock(),
 		[]chainhash.Hash{scenario.winner}, map[chainhash.Hash]struct{}{})
 	require.Error(t, err)
 	require.Empty(t, producer.PublishChannel(), "nothing may be published when the demotion failed")
+}
+
+// TestProcessConflictingTransactions_PartialDemotionEvictsFlipped pins that a
+// cascade failing below its first level still evicts what it flipped: the loser
+// stays conflicting in the store, and nothing guarantees a retry that would
+// evict it.
+func TestProcessConflictingTransactions_PartialDemotionEvictsFlipped(t *testing.T) {
+	producer, collector := newInMemoryTxMetaTopic(t)
+
+	stp, scenario := newConflictTestProcessor(t, NewTxMetaEvictor(ulogger.TestLogger{}, producer), failChildMark)
+
+	_, _, err := stp.processConflictingTransactions(t.Context(), testBlock(),
+		[]chainhash.Hash{scenario.winner}, map[chainhash.Hash]struct{}{})
+	require.Error(t, err)
+
+	require.Eventually(t, func() bool {
+		got := collector.deleted()
+		_, hasLoser := got[scenario.loser]
+		_, hasChild := got[scenario.child]
+
+		return hasLoser && hasChild
+	}, 5*time.Second, 10*time.Millisecond, "DELETE for the flipped loser and the child whose write failed must reach the txmeta topic")
+	require.NotContains(t, collector.deleted(), scenario.winner)
 }
 
 func TestTxMetaEvictor(t *testing.T) {
@@ -325,6 +365,19 @@ func TestTxMetaEvictor(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("Evict blocked on a full producer")
 		}
+	})
+
+	t.Run("every DELETE dropped on a full producer buffer is counted", func(t *testing.T) {
+		producer := kafka.NewKafkaAsyncProducerMockWithBuffer(1)
+		evictor := NewTxMetaEvictor(ulogger.TestLogger{}, producer)
+
+		before := testutil.ToFloat64(prometheusTxMetaDeleteDropped)
+
+		evictor.Evict(hashes(txMetaEvictBatchSize * 3))
+
+		require.Len(t, producer.PublishChannel(), 1)
+		require.Equal(t, float64(2*txMetaEvictBatchSize), testutil.ToFloat64(prometheusTxMetaDeleteDropped)-before,
+			"the two batches that did not fit must be counted per tx")
 	})
 }
 

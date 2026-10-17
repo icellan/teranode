@@ -47,12 +47,16 @@ func NewTxMetaEvictor(logger ulogger.Logger, producer kafka.KafkaAsyncProducerI)
 		return nil
 	}
 
+	initPrometheusMetrics()
+
 	return &TxMetaEvictor{logger: logger, producer: producer}
 }
 
-// Evict publishes a DELETE for every hash. Call it only after the store write
-// that marked the hashes conflicting has succeeded. It never blocks on a full
-// producer buffer and never returns an error; a dropped message is logged at WARN.
+// Evict publishes a DELETE for every hash. Call it after the store write that
+// marked the hashes conflicting, and after a failed one with the hashes it may
+// have flipped. It never blocks on a full producer buffer and never returns an
+// error; a dropped message is logged at WARN and counted per tx in
+// teranode_subtreeprocessor_txmeta_delete_dropped_total.
 func (e *TxMetaEvictor) Evict(hashes []chainhash.Hash) {
 	if e == nil || len(hashes) == 0 {
 		return
@@ -74,6 +78,7 @@ func (e *TxMetaEvictor) Evict(hashes []chainhash.Hash) {
 			Key:   key[:],
 			Value: txmetacache.EncodeDeleteBatch(batch),
 		}) {
+			prometheusTxMetaDeleteDropped.Add(float64(len(batch)))
 			e.logger.Warnf("[TxMetaEvictor] dropped txmeta DELETE for %d demoted txs, producer buffer full or stopped; subtree validation may hold stale non-conflicting entries", len(batch))
 		}
 	}
