@@ -587,6 +587,9 @@ func (r *recordingPruner) Prune(_ context.Context, height uint32, _ string) (int
 // skipped, and lastProcessedHeight is not advanced so the height is retried on the next trigger.
 func TestPhase1FailureSkipsPhase2(t *testing.T) {
 	initPrometheusMetrics()
+	// The gauge is package-global: start from 0 so a value left by an earlier test cannot
+	// satisfy, or overshoot, the expected 1.
+	prunerPreserveParentsFailing.Set(0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -660,6 +663,9 @@ func newPhase1TestServer(ctx context.Context, store *utxo.MockUtxostore, pruneSv
 // runs Phase 1 again and, once it succeeds, Phase 2 and the height advance.
 func TestPhase1FailureThenSuccessPrunes(t *testing.T) {
 	initPrometheusMetrics()
+	// The gauge is package-global: start from 0 so a value left by an earlier test cannot
+	// satisfy, or overshoot, the expected 1.
+	prunerPreserveParentsFailing.Set(0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

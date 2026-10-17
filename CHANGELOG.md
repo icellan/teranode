@@ -367,6 +367,13 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   matching `ErrServiceError` on a 429, or log alerts on `SERVICE_ERROR (59)`, will miss it; an older
   service receiving it over gRPC sees an unknown enum value. Upgrade services together. (#1802)
 
+- **A peer's 429 on an announced block is free only 3 times per 10 minutes.** When a peer announces
+  a block and its `/block/:hash` answers 429, that 429 is not charged to its reputation up to 3 times
+  per peer in a fixed 10-minute window; past that it is charged like any other failed fetch. Within
+  the allowance, the block is fetched instead from up to 2 other peers whose advertised tip is that
+  block, so those peers can see `/block/:hash` requests for blocks they did not announce to us.
+  (#1942)
+
 - **Catchup fetches retry a peer's 429.** `POST /subtree/:hash/txs` and `GET /subtree_data` retry 429
   and 503 up to 6 times with backoff (honouring `Retry-After` up to 5s) instead of reporting the
   peer at once, so a serving peer can see up to 6 requests per batch. These requests are now signed

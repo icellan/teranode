@@ -2958,7 +2958,7 @@ func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockF
 	// Check if parent exists - if not, send directly to catchup
 	parentExists, err := u.blockValidation.GetBlockExists(ctx, block.Header.HashPrevBlock)
 	if err != nil {
-		u.logger.Errorf("[addBlockToPriorityQueue] Failed to check if parent block %s exists: %v", block.Header.HashPrevBlock.String(), err)
+		u.logger.Errorf("[queueFetchedBlock] Failed to check if parent block %s exists: %v", block.Header.HashPrevBlock.String(), err)
 		if blockFound.errCh != nil {
 			blockFound.errCh <- err
 		}
@@ -2966,7 +2966,7 @@ func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockF
 	}
 
 	if !parentExists {
-		u.logger.Infof("[addBlockToPriorityQueue] Parent block %s doesn't exist for block %s, sending to catchup", block.Header.HashPrevBlock.String(), blockFound.hash.String())
+		u.logger.Infof("[queueFetchedBlock] Parent block %s doesn't exist for block %s, sending to catchup", block.Header.HashPrevBlock.String(), blockFound.hash.String())
 
 		// #1057: bound catchup retries. If this block has exhausted its per-block
 		// attempt budget within the cooldown window, do not re-enqueue it — a block
@@ -2975,7 +2975,7 @@ func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockF
 		// cache TTL lets the block be retried again once the window expires, so a
 		// transient outage self-heals.
 		if u.catchupAttemptsExhausted(blockFound.hash) {
-			u.logger.Warnf("[addBlockToPriorityQueue] Block %s has exhausted catchup attempts (cap %d); skipping re-enqueue until cooldown expires", blockFound.hash.String(), u.settings.BlockValidation.CatchupMaxAttemptsPerBlock)
+			u.logger.Warnf("[queueFetchedBlock] Block %s has exhausted catchup attempts (cap %d); skipping re-enqueue until cooldown expires", blockFound.hash.String(), u.settings.BlockValidation.CatchupMaxAttemptsPerBlock)
 
 			if blockFound.errCh != nil {
 				blockFound.errCh <- nil
@@ -2986,7 +2986,7 @@ func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockF
 
 		// Check if we're already processing this block in catchup
 		if u.processBlockNotify.Get(*blockFound.hash) != nil {
-			u.logger.Infof("[addBlockToPriorityQueue] Block %s already being processed in catchup, adding as alternative source", blockFound.hash.String())
+			u.logger.Infof("[queueFetchedBlock] Block %s already being processed in catchup, adding as alternative source", blockFound.hash.String())
 
 			// Add to alternative sources for potential failover
 			catchupBlock := processBlockCatchup{
@@ -3019,7 +3019,7 @@ func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockF
 
 		// Send directly to catchup channel (non-blocking)
 		go func() {
-			u.logger.Infof("[addBlockToPriorityQueue] Attempting to send block %s to catchup channel (queue size: %d/%d)",
+			u.logger.Infof("[queueFetchedBlock] Attempting to send block %s to catchup channel (queue size: %d/%d)",
 				blockFound.hash.String(), len(u.catchupCh), cap(u.catchupCh))
 
 			select {
@@ -3028,10 +3028,10 @@ func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockF
 				baseURL: blockFound.baseURL,
 				peerID:  blockFound.peerID,
 			}:
-				u.logger.Infof("[addBlockToPriorityQueue] Successfully sent block %s to catchup channel", blockFound.hash.String())
+				u.logger.Infof("[queueFetchedBlock] Successfully sent block %s to catchup channel", blockFound.hash.String())
 			default:
 				// Channel is full, log warning but don't block
-				u.logger.Warnf("[addBlockToPriorityQueue] Catchup channel full (%d/%d), dropping block %s from peer %s",
+				u.logger.Warnf("[queueFetchedBlock] Catchup channel full (%d/%d), dropping block %s from peer %s",
 					len(u.catchupCh), cap(u.catchupCh), blockFound.hash.String(), blockFound.peerID)
 				// Clear the processing marker so it can be retried later
 				u.processBlockNotify.Delete(*blockFound.hash)
@@ -3047,7 +3047,7 @@ func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockF
 	// Classify the block
 	priority, err := u.blockClassifier.ClassifyBlock(ctx, block)
 	if err != nil {
-		u.logger.Warnf("[addBlockToPriorityQueue] Failed to classify block %s, using deep fork priority: %v", blockFound.hash.String(), err)
+		u.logger.Warnf("[queueFetchedBlock] Failed to classify block %s, using deep fork priority: %v", blockFound.hash.String(), err)
 		priority = PriorityDeepFork
 	}
 
@@ -3055,10 +3055,10 @@ func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockF
 	if priority != PriorityChainExtending {
 		forkID, err := u.forkManager.DetermineForkID(ctx, block, u.blockchainClient)
 		if err != nil {
-			u.logger.Warnf("[addBlockToPriorityQueue] Failed to determine fork ID for block %s: %v", blockFound.hash.String(), err)
+			u.logger.Warnf("[queueFetchedBlock] Failed to determine fork ID for block %s: %v", blockFound.hash.String(), err)
 		} else {
 			if err := u.forkManager.AddBlockToFork(block, forkID); err != nil {
-				u.logger.Errorf("[addBlockToPriorityQueue] Failed to add block to fork %s: %v", forkID, err)
+				u.logger.Errorf("[queueFetchedBlock] Failed to add block to fork %s: %v", forkID, err)
 			}
 		}
 	}
@@ -3066,14 +3066,14 @@ func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockF
 	// Add to priority queue
 	u.blockPriorityQueue.Add(blockFound, priority, block.Height)
 
-	u.logger.Infof("[addBlockToPriorityQueue] Added block %s with priority %d at height %d", blockFound.hash.String(), priority, block.Height)
+	u.logger.Infof("[queueFetchedBlock] Added block %s with priority %d at height %d", blockFound.hash.String(), priority, block.Height)
 
 	// Send success signal if someone is waiting
 	if blockFound.errCh != nil {
-		u.logger.Debugf("[addBlockToPriorityQueue] Sending success response to errCh for block %s", blockFound.hash.String())
+		u.logger.Debugf("[queueFetchedBlock] Sending success response to errCh for block %s", blockFound.hash.String())
 		blockFound.errCh <- nil
 	} else {
-		u.logger.Debugf("[addBlockToPriorityQueue] No errCh to respond to for block %s", blockFound.hash.String())
+		u.logger.Debugf("[queueFetchedBlock] No errCh to respond to for block %s", blockFound.hash.String())
 	}
 }
 
