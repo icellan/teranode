@@ -354,6 +354,8 @@ The download gauges and the `download_*_total` counters are published from the 3
 | `teranode_subtreevalidation_subtree_already_exists_skipped_total` | Counter | Subtree Kafka messages skipped because the subtree already exists. Benign individually; the per-message log line is at DEBUG, so watch this rate instead |
 | `teranode_subtreevalidation_cached_subtree_conflict_probes_total` | Counter | Transactions of already-cached subtrees whose conflicting flag was read from the UTXO store during block blessing. Scales with transactions per block |
 | `teranode_subtreevalidation_txmeta_add_skipped_tombstoned_total` | Counter | Txmeta Kafka ADDs dropped, or evicted right after their write, because a DELETE for the same tx (a demotion to conflicting) was consumed first or concurrently, on another partition. Non-zero means the reordering happened and was absorbed |
+| `teranode_subtreevalidation_peer_subtree_admission_wait` | Histogram | Seconds a peer subtree waited for a `subtreevalidation_peerSubtreeConcurrency` slot |
+| `teranode_subtreevalidation_peer_subtree_admission_waiting` | Gauge | Peer subtrees waiting for a `subtreevalidation_peerSubtreeConcurrency` slot |
 
 ## Validator Service Metrics
 
@@ -404,7 +406,7 @@ The download gauges and the `download_*_total` counters are published from the 3
 | `teranode_tx_meta_cache_hits`                 | Gauge | Number of hits in the tx meta cache                          |
 | `teranode_tx_meta_cache_misses`               | Gauge | Number of misses in the tx meta cache                        |
 | `teranode_tx_meta_cache_get_origin`           | Gauge | Number of get origins in the tx meta cache                   |
-| `teranode_tx_meta_cache_evictions`            | Gauge | Number of evictions in the tx meta cache                     |
+| `teranode_tx_meta_cache_evictions`            | Gauge | Number of entries removed from the tx meta cache: deletes on every backend, plus an estimate of entries overwritten by ring wraps on the `lockfree` cache |
 | `teranode_tx_meta_cache_trims`                | Gauge | Number of trim operations in the tx meta cache               |
 | `teranode_tx_meta_cache_map_size`             | Gauge | Number of total elements in the improved cache's bucket maps |
 | `teranode_tx_meta_cache_total_elements_added` | Gauge | Number of total number of elements added to the txmetacache  |

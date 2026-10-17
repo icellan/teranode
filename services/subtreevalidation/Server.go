@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/adaptivefetch"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/pkg/urlutil"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
@@ -155,6 +156,10 @@ type Server struct {
 	// see probeTxMetaCache.
 	peerProbePool  probePool
 	blockProbePool probePool
+
+	// peerSubtreeAdmission bounds how many peer subtrees are validated at
+	// once; see subtreesHandler.
+	peerSubtreeAdmission admissionGate
 }
 
 // New creates a new Server instance with the provided dependencies.
@@ -1029,8 +1034,8 @@ func resolveTxMetaCacheBucketType(logger ulogger.Logger, raw string) txmetacache
 // initialiseInvalidSubtreeKafkaProducer creates a Kafka producer for invalid subtree events
 func initialiseInvalidSubtreeKafkaProducer(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings) (*kafka.KafkaAsyncProducer, error) {
 	logger.Infof("Initializing Kafka producer for invalid subtrees topic: %s", tSettings.Kafka.InvalidSubtrees)
-	logger.Infof("InvalidBlocksConfig: %s", tSettings.Kafka.InvalidBlocksConfig)
-	logger.Infof("InvalidSubtreesConfig: %s", tSettings.Kafka.InvalidSubtreesConfig)
+	logger.Infof("InvalidBlocksConfig: %s", urlutil.Redact(tSettings.Kafka.InvalidBlocksConfig))
+	logger.Infof("InvalidSubtreesConfig: %s", urlutil.Redact(tSettings.Kafka.InvalidSubtreesConfig))
 
 	invalidSubtreeKafkaProducer, err := kafka.NewKafkaAsyncProducerFromURL(ctx, logger, tSettings.Kafka.InvalidSubtreesConfig, &tSettings.Kafka)
 	if err != nil {

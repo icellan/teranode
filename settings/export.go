@@ -215,7 +215,14 @@ func formatValue(val reflect.Value) string {
 	case reflect.String:
 		return redactURLString(val.String())
 	case reflect.Struct:
-		// Special handling for url.URL struct
+		// Special handling for url.URL struct.
+		//
+		// This is the branch every URL setting reaches, even though they are
+		// declared *url.URL: getValueAtPath dereferences every pointer on the
+		// field path, including the last, so formatValue is handed a url.URL
+		// value, and a *url.URL that does arrive is sent here through Elem by
+		// the reflect.Pointer case below. TestExportMetadata_URLUserinfoRedaction
+		// covers this branch and fails if it stops redacting.
 		if val.Type() == reflect.TypeOf(url.URL{}) {
 			u := val.Interface().(url.URL)
 			return redactURL(&u).String()
@@ -228,10 +235,17 @@ func formatValue(val reflect.Value) string {
 		// A *url.URL reaches the url.URL struct case above through Elem, so it is redacted too.
 		return formatValue(val.Elem())
 	case reflect.Slice:
-		if val.Type().Elem().Kind() == reflect.String {
+		switch val.Type().Elem().Kind() {
+		case reflect.String:
 			slice := make([]string, val.Len())
 			for i := 0; i < val.Len(); i++ {
 				slice[i] = redactURLString(val.Index(i).String())
+			}
+			return formatStringSlice(slice)
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			slice := make([]string, val.Len())
+			for i := 0; i < val.Len(); i++ {
+				slice[i] = formatInt(int(val.Index(i).Int()))
 			}
 			return formatStringSlice(slice)
 		}
