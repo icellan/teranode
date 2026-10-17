@@ -8,11 +8,6 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 )
 
-// txMetaTombstoneWindow is how long a txmeta DELETE keeps blocking a late ADD
-// for the same tx. Entries live between one and two windows. It is generous
-// because it only has to outlast consumer lag on the partition carrying the ADD.
-const txMetaTombstoneWindow = 30 * time.Minute
-
 // txMetaTombstones remembers recently deleted txmeta hashes so txmetaHandler can
 // drop an ADD that arrives after its DELETE.
 //
@@ -22,7 +17,9 @@ const txMetaTombstoneWindow = 30 * time.Minute
 // subtree path then skips the counter-spend check for it. Dropping an ADD only
 // costs a cache miss, which falls through to the store.
 //
-// Two generations rotate every window. While both are empty — nearly always,
+// The window is subtreevalidation_txMetaTombstoneWindow: it has to outlast
+// consumer lag on the partition carrying the ADD. Entries live between one and
+// two windows. Two generations rotate every window. While both are empty — nearly always,
 // demotions are rare — contains is a single atomic load, so the ADD hot path
 // pays nothing. A nil *txMetaTombstones is valid and empty.
 type txMetaTombstones struct {

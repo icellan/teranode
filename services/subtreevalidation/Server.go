@@ -203,7 +203,7 @@ func New(
 ) (*Server, error) {
 	u := &Server{
 		logger:                            logger,
-		txMetaTombstones:                  newTxMetaTombstones(txMetaTombstoneWindow, time.Now),
+		txMetaTombstones:                  newTxMetaTombstones(tSettings.SubtreeValidation.TxMetaTombstoneWindow, time.Now),
 		settings:                          tSettings,
 		subtreeStore:                      subtreeStore,
 		txStore:                           txStore,
@@ -258,6 +258,11 @@ func New(
 		}
 	}
 	u.adaptiveFetch = af
+
+	if tSettings.SubtreeValidation.TxMetaTombstoneWindow <= 0 {
+		// a non-positive window forgets every DELETE at once, re-caching demoted txs
+		return nil, errors.NewConfigurationError("subtreevalidation_txMetaTombstoneWindow must be positive, got %s", tSettings.SubtreeValidation.TxMetaTombstoneWindow)
+	}
 
 	quorumPath := tSettings.SubtreeValidation.QuorumPath
 	if quorumPath == "" {

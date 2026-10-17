@@ -5,8 +5,11 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
+	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/kafka"
+	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/cespare/xxhash/v2"
 	"github.com/stretchr/testify/require"
 )
@@ -43,6 +46,30 @@ func TestTxMetaTombstones_RemembersDeletesForAtLeastTheWindow(t *testing.T) {
 	require.Zero(t, ts.size.Load(), "an expired set is empty again, so the ADD path is back on its fast path")
 }
 
+// TestNew_TxMetaTombstoneWindowComesFromSettings pins that the window is the
+// subtreevalidation_txMetaTombstoneWindow setting, and that a non-positive
+// value, which would forget every tombstone at once, refuses to start.
+func TestNew_TxMetaTombstoneWindowComesFromSettings(t *testing.T) {
+	utxoStore, validatorClient, txStore, subtreeStore, blockchainClient, deferFunc := setup(t)
+	defer deferFunc()
+
+	nilConsumer := &kafka.KafkaConsumerGroup{}
+
+	tSettings := test.CreateBaseTestSettings(t)
+	require.Equal(t, 30*time.Minute, tSettings.SubtreeValidation.TxMetaTombstoneWindow, "default")
+
+	tSettings.SubtreeValidation.TxMetaTombstoneWindow = 7 * time.Minute
+
+	server, err := New(t.Context(), ulogger.TestLogger{}, tSettings, subtreeStore, txStore, utxoStore, validatorClient, blockchainClient, nilConsumer, nilConsumer, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, 7*time.Minute, server.txMetaTombstones.window)
+
+	tSettings.SubtreeValidation.TxMetaTombstoneWindow = 0
+
+	_, err = New(t.Context(), ulogger.TestLogger{}, tSettings, subtreeStore, txStore, utxoStore, validatorClient, blockchainClient, nilConsumer, nilConsumer, nil, nil)
+	require.ErrorIs(t, err, errors.ErrConfiguration)
+}
+
 func TestTxMetaTombstones_NilIsEmpty(t *testing.T) {
 	var ts *txMetaTombstones
 
@@ -60,7 +87,7 @@ func TestTxmetaHandler_LateAddAfterDeleteIsNotCached(t *testing.T) {
 	h := newTxmetaE2EHarness(t, "v1", 32)
 	defer h.close()
 
-	h.server.txMetaTombstones = newTxMetaTombstones(txMetaTombstoneWindow, time.Now)
+	h.server.txMetaTombstones = newTxMetaTombstones(30*time.Minute, time.Now)
 
 	hashes, payloads := makeUniqueHashes(t, 2, 64)
 	demoted, unrelated := hashes[0], hashes[1]
@@ -149,7 +176,7 @@ func TestTxmetaHandler_DeleteBetweenCheckAndSetIsNotCached(t *testing.T) {
 			h := newTxmetaE2EHarness(t, tc.format, 32)
 			defer h.close()
 
-			h.server.txMetaTombstones = newTxMetaTombstones(txMetaTombstoneWindow, time.Now)
+			h.server.txMetaTombstones = newTxMetaTombstones(30*time.Minute, time.Now)
 
 			hashes, payloads := makeUniqueHashes(t, 2, 64)
 			demoted, unrelated := hashes[0], hashes[1]
