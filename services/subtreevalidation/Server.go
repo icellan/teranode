@@ -63,10 +63,6 @@ type Server struct {
 	// logger handles all logging operations for the service
 	logger ulogger.Logger
 
-	// txMetaTombstones drops txmeta ADDs that arrive after a DELETE for the same
-	// tx (see txMetaTombstones).
-	txMetaTombstones *txMetaTombstones
-
 	// settings contains the configuration parameters for the service
 	// including connection details, timeouts, and operational modes
 	settings *settings.Settings
@@ -203,7 +199,6 @@ func New(
 ) (*Server, error) {
 	u := &Server{
 		logger:                            logger,
-		txMetaTombstones:                  newTxMetaTombstones(tSettings.SubtreeValidation.TxMetaTombstoneWindow, time.Now),
 		settings:                          tSettings,
 		subtreeStore:                      subtreeStore,
 		txStore:                           txStore,
@@ -258,11 +253,6 @@ func New(
 		}
 	}
 	u.adaptiveFetch = af
-
-	if tSettings.SubtreeValidation.TxMetaTombstoneWindow <= 0 {
-		// a non-positive window forgets every DELETE at once, re-caching demoted txs
-		return nil, errors.NewConfigurationError("subtreevalidation_txMetaTombstoneWindow must be positive, got %s", tSettings.SubtreeValidation.TxMetaTombstoneWindow)
-	}
 
 	quorumPath := tSettings.SubtreeValidation.QuorumPath
 	if quorumPath == "" {

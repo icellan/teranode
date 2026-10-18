@@ -2,11 +2,12 @@ package subtreevalidation
 
 import (
 	"testing"
-	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
-	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -14,120 +15,52 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type fakeClock struct{ t time.Time }
+// newDemotionTestServer returns a server whose store is a real txmeta cache, so
+// the handler's DELETEs reach TxMetaCache.DeleteDemoted.
+func newDemotionTestServer(t *testing.T) (*Server, *txmetacache.TxMetaCache) {
+	t.Helper()
 
-func (c *fakeClock) now() time.Time { return c.t }
-
-func TestTxMetaTombstones_RemembersDeletesForAtLeastTheWindow(t *testing.T) {
-	clock := &fakeClock{t: time.Unix(1_000_000, 0)}
-	ts := newTxMetaTombstones(time.Minute, clock.now)
-
-	deleted := chainhash.HashH([]byte("deleted"))
-	other := chainhash.HashH([]byte("other"))
-
-	require.False(t, ts.contains(deleted[:]), "empty set holds nothing")
-
-	ts.add([]chainhash.Hash{deleted})
-
-	require.True(t, ts.contains(deleted[:]))
-	require.False(t, ts.contains(other[:]))
-
-	// Still remembered just before one full window has passed, and across the
-	// first rotation.
-	clock.t = clock.t.Add(59 * time.Second)
-	require.True(t, ts.contains(deleted[:]))
-
-	clock.t = clock.t.Add(30 * time.Second)
-	require.True(t, ts.contains(deleted[:]), "an entry survives the first rotation")
-
-	// Gone after two windows.
-	clock.t = clock.t.Add(2 * time.Minute)
-	require.False(t, ts.contains(deleted[:]), "an entry is forgotten after two windows")
-	require.Zero(t, ts.size.Load(), "an expired set is empty again, so the ADD path is back on its fast path")
-}
-
-// TestNew_TxMetaTombstoneWindowComesFromSettings pins that the window is the
-// subtreevalidation_txMetaTombstoneWindow setting, and that a non-positive
-// value, which would forget every tombstone at once, refuses to start.
-func TestNew_TxMetaTombstoneWindowComesFromSettings(t *testing.T) {
-	utxoStore, validatorClient, txStore, subtreeStore, blockchainClient, deferFunc := setup(t)
-	defer deferFunc()
-
-	nilConsumer := &kafka.KafkaConsumerGroup{}
+	InitPrometheusMetrics()
 
 	tSettings := test.CreateBaseTestSettings(t)
-	require.Equal(t, 30*time.Minute, tSettings.SubtreeValidation.TxMetaTombstoneWindow, "default")
 
-	tSettings.SubtreeValidation.TxMetaTombstoneWindow = 7 * time.Minute
-
-	server, err := New(t.Context(), ulogger.TestLogger{}, tSettings, subtreeStore, txStore, utxoStore, validatorClient, blockchainClient, nilConsumer, nilConsumer, nil, nil)
+	store, err := txmetacache.NewTxMetaCache(t.Context(), tSettings, ulogger.TestLogger{}, &utxo.MockUtxostore{}, txmetacache.Unallocated, 64)
 	require.NoError(t, err)
-	require.Equal(t, 7*time.Minute, server.txMetaTombstones.window)
 
-	tSettings.SubtreeValidation.TxMetaTombstoneWindow = 0
+	cache := store.(*txmetacache.TxMetaCache)
 
-	_, err = New(t.Context(), ulogger.TestLogger{}, tSettings, subtreeStore, txStore, utxoStore, validatorClient, blockchainClient, nilConsumer, nilConsumer, nil, nil)
-	require.ErrorIs(t, err, errors.ErrConfiguration)
+	return &Server{logger: ulogger.TestLogger{}, settings: tSettings, utxoStore: cache}, cache
 }
 
-func TestTxMetaTombstones_NilIsEmpty(t *testing.T) {
-	var ts *txMetaTombstones
+// demotionTestEntries returns n tx hashes and a valid serialised meta for each.
+func demotionTestEntries(t *testing.T, n int) ([]chainhash.Hash, [][]byte) {
+	t.Helper()
 
-	h := chainhash.HashH([]byte("x"))
+	hashes := make([]chainhash.Hash, n)
+	payloads := make([][]byte, n)
 
-	ts.add([]chainhash.Hash{h})
-	require.False(t, ts.contains(h[:]))
-}
+	for i := range hashes {
+		hashes[i] = chainhash.HashH([]byte{byte(i), 'd'})
 
-// TestTxmetaHandler_LateAddAfterDeleteIsNotCached pins the reordering case: a
-// DELETE from block assembly overtakes the validator's ADD for the same tx (they
-// travel on different partitions). The late ADD must not re-cache the demoted tx
-// as non-conflicting; other ADDs in the same message are still applied.
-func TestTxmetaHandler_LateAddAfterDeleteIsNotCached(t *testing.T) {
-	h := newTxmetaE2EHarness(t, "v1", 32)
-	defer h.close()
+		data := &meta.Data{
+			Fee:         1,
+			SizeInBytes: 100,
+			TxInpoints:  subtree.NewTxInpointsFromPacked([]chainhash.Hash{chainhash.HashH([]byte{byte(i), 'p'})}, []uint32{1, 0}),
+		}
 
-	h.server.txMetaTombstones = newTxMetaTombstones(30*time.Minute, time.Now)
+		b, err := data.MetaBytes()
+		require.NoError(t, err)
 
-	hashes, payloads := makeUniqueHashes(t, 2, 64)
-	demoted, unrelated := hashes[0], hashes[1]
-
-	require.NoError(t, h.server.txmetaHandler(h.ctx, &kafka.KafkaMessage{Value: txmetacache.EncodeDeleteBatch([]chainhash.Hash{demoted})}))
-
-	h.publishV1(t, hashes, payloads)
-	h.waitProcessed(t, 2, 5*time.Second)
-
-	_, cached := h.cache.GetRaw(demoted[:])
-	require.False(t, cached, "an ADD arriving after the DELETE for the same tx must not re-cache it")
-
-	_, cached = h.cache.GetRaw(unrelated[:])
-	require.True(t, cached, "other ADDs in the message are still applied")
-}
-
-// deleteDuringSetCache runs beforeSet once, inside the next batch write and just
-// before it, to place a DELETE between an ADD's tombstone check and its Set.
-type deleteDuringSetCache struct {
-	*e2eCache
-	beforeSet func()
-}
-
-func (c *deleteDuringSetCache) runBeforeSet() {
-	if f := c.beforeSet; f != nil {
-		c.beforeSet = nil
-		f()
+		payloads[i] = b
 	}
+
+	return hashes, payloads
 }
 
-func (c *deleteDuringSetCache) SetCacheMultiSequential(keys, values [][]byte) error {
-	c.runBeforeSet()
+func isCachedIn(t *testing.T, cache *txmetacache.TxMetaCache, h chainhash.Hash) bool {
+	_, ok := cache.GetMetaCached(t.Context(), h)
 
-	return c.e2eCache.SetCacheMultiSequential(keys, values)
-}
-
-func (c *deleteDuringSetCache) SetCacheMultiSequentialWithHashes(keys, values [][]byte, hashes []uint64) error {
-	c.runBeforeSet()
-
-	return c.e2eCache.SetCacheMultiSequentialWithHashes(keys, values, hashes)
+	return ok
 }
 
 // serializeV2ForE2E encodes all ADDs as one v2 message, in the layout publishV2 uses.
@@ -159,42 +92,85 @@ func serializeV2ForE2E(hashes []chainhash.Hash, payloads [][]byte) []byte {
 	return buf
 }
 
-// TestTxmetaHandler_DeleteBetweenCheckAndSetIsNotCached pins the interleaving the
-// parse-time tombstone check alone misses: the ADD passes the check, then a
-// DELETE for the same tx is consumed from another partition before the ADD's
-// batch Set. The tx must still end up evicted; other ADDs stay cached. Both wire
-// formats are covered, since they reach the cache through different Set calls.
-func TestTxmetaHandler_DeleteBetweenCheckAndSetIsNotCached(t *testing.T) {
-	for _, tc := range []struct {
-		format    string
-		serialize func([]chainhash.Hash, [][]byte) []byte
-	}{
-		{"v1", serializeV1ForE2E},
-		{"v2", serializeV2ForE2E},
-	} {
+var txmetaWireFormats = []struct {
+	format    string
+	serialize func([]chainhash.Hash, [][]byte) []byte
+}{
+	{"v1", serializeV1ForE2E},
+	{"v2", serializeV2ForE2E},
+}
+
+// TestTxmetaHandler_LateAddAfterDeleteIsNotCached pins the reordering case: a
+// DELETE from block assembly overtakes the validator's ADD for the same tx (they
+// travel on different partitions). The late ADD must not re-cache the demoted tx
+// as non-conflicting; other ADDs in the same message are still applied.
+func TestTxmetaHandler_LateAddAfterDeleteIsNotCached(t *testing.T) {
+	for _, tc := range txmetaWireFormats {
 		t.Run(tc.format, func(t *testing.T) {
-			h := newTxmetaE2EHarness(t, tc.format, 32)
-			defer h.close()
+			server, cache := newDemotionTestServer(t)
 
-			h.server.txMetaTombstones = newTxMetaTombstones(30*time.Minute, time.Now)
-
-			hashes, payloads := makeUniqueHashes(t, 2, 64)
+			hashes, payloads := demotionTestEntries(t, 2)
 			demoted, unrelated := hashes[0], hashes[1]
 
-			cache := &deleteDuringSetCache{e2eCache: h.cache}
-			cache.beforeSet = func() {
-				require.NoError(t, h.server.txmetaHandler(h.ctx, &kafka.KafkaMessage{Value: txmetacache.EncodeDeleteBatch([]chainhash.Hash{demoted})}))
+			require.NoError(t, server.txmetaHandler(t.Context(), &kafka.KafkaMessage{Value: txmetacache.EncodeDeleteBatch([]chainhash.Hash{demoted})}))
+			require.NoError(t, server.txmetaHandler(t.Context(), &kafka.KafkaMessage{Value: tc.serialize(hashes, payloads)}))
+
+			require.False(t, isCachedIn(t, cache, demoted), "an ADD arriving after the DELETE for the same tx must not re-cache it")
+			require.True(t, isCachedIn(t, cache, unrelated), "other ADDs in the message are still applied")
+		})
+	}
+}
+
+// deleteDuringSetStore runs beforeSet once, inside the next batch write and just
+// before it, to place a DELETE consumed from another partition in the middle of
+// an ADD's write.
+type deleteDuringSetStore struct {
+	*txmetacache.TxMetaCache
+	beforeSet func()
+}
+
+func (s *deleteDuringSetStore) runBeforeSet() {
+	if f := s.beforeSet; f != nil {
+		s.beforeSet = nil
+		f()
+	}
+}
+
+func (s *deleteDuringSetStore) SetCacheMultiSequential(keys, values [][]byte) error {
+	s.runBeforeSet()
+
+	return s.TxMetaCache.SetCacheMultiSequential(keys, values)
+}
+
+func (s *deleteDuringSetStore) SetCacheMultiSequentialWithHashes(keys, values [][]byte, hashes []uint64) error {
+	s.runBeforeSet()
+
+	return s.TxMetaCache.SetCacheMultiSequentialWithHashes(keys, values, hashes)
+}
+
+// TestTxmetaHandler_DeleteDuringAddWriteIsNotCached pins the interleaving where
+// the DELETE for a tx is handled while an ADD for it is being written. The tx
+// must still end up evicted; other ADDs stay cached. Both wire formats are
+// covered, since they reach the cache through different Set calls.
+func TestTxmetaHandler_DeleteDuringAddWriteIsNotCached(t *testing.T) {
+	for _, tc := range txmetaWireFormats {
+		t.Run(tc.format, func(t *testing.T) {
+			server, cache := newDemotionTestServer(t)
+
+			hashes, payloads := demotionTestEntries(t, 2)
+			demoted, unrelated := hashes[0], hashes[1]
+
+			store := &deleteDuringSetStore{TxMetaCache: cache}
+			store.beforeSet = func() {
+				require.NoError(t, server.txmetaHandler(t.Context(), &kafka.KafkaMessage{Value: txmetacache.EncodeDeleteBatch([]chainhash.Hash{demoted})}))
 			}
-			h.server.utxoStore = cache
+			server.utxoStore = store
 
-			require.NoError(t, h.server.txmetaHandler(h.ctx, &kafka.KafkaMessage{Value: tc.serialize(hashes, payloads)}))
-			require.Nil(t, cache.beforeSet, "the DELETE must have run inside the ADD's Set")
+			require.NoError(t, server.txmetaHandler(t.Context(), &kafka.KafkaMessage{Value: tc.serialize(hashes, payloads)}))
+			require.Nil(t, store.beforeSet, "the DELETE must have run inside the ADD's write")
 
-			_, cached := h.cache.GetRaw(demoted[:])
-			require.False(t, cached, "a DELETE landing between the tombstone check and the Set must still evict the tx")
-
-			_, cached = h.cache.GetRaw(unrelated[:])
-			require.True(t, cached, "other ADDs in the message are still applied")
+			require.False(t, isCachedIn(t, cache, demoted), "a DELETE handled during the ADD's write must still evict the tx")
+			require.True(t, isCachedIn(t, cache, unrelated), "other ADDs in the message are still applied")
 		})
 	}
 }

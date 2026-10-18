@@ -1,4 +1,4 @@
-package subtreevalidation
+package txmetacache
 
 import (
 	"sync"
@@ -8,21 +8,16 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 )
 
-// txMetaTombstones remembers recently deleted txmeta hashes so txmetaHandler can
-// drop an ADD that arrives after its DELETE.
-//
-// Block assembly's DELETE for a demoted tx and the validator's ADD for the same
-// tx travel on different Kafka partitions, so the DELETE can be consumed first.
-// Without this the late ADD re-caches the tx as non-conflicting, and the fresh
-// subtree path then skips the counter-spend check for it. Dropping an ADD only
-// costs a cache miss, which falls through to the store.
+// tombstones remembers the txs DeleteDemoted evicted, so that a write landing
+// after the eviction cannot cache them again (see DeleteDemoted).
 //
 // The window is subtreevalidation_txMetaTombstoneWindow: it has to outlast
-// consumer lag on the partition carrying the ADD. Entries live between one and
-// two windows. Two generations rotate every window. While both are empty — nearly always,
-// demotions are rare — contains is a single atomic load, so the ADD hot path
-// pays nothing. A nil *txMetaTombstones is valid and empty.
-type txMetaTombstones struct {
+// consumer lag on the txmeta partition carrying a late ADD. Entries live between
+// one and two windows. Two generations rotate every window. While both are
+// empty — nearly always, demotions are rare — empty and contains are a single
+// atomic load, so the write paths pay nothing. A nil *tombstones is valid and
+// empty.
+type tombstones struct {
 	window time.Duration
 	now    func() time.Time
 
@@ -35,8 +30,8 @@ type txMetaTombstones struct {
 	rotatedAt time.Time
 }
 
-func newTxMetaTombstones(window time.Duration, now func() time.Time) *txMetaTombstones {
-	return &txMetaTombstones{
+func newTombstones(window time.Duration, now func() time.Time) *tombstones {
+	return &tombstones{
 		window:    window,
 		now:       now,
 		current:   map[chainhash.Hash]struct{}{},
@@ -46,7 +41,7 @@ func newTxMetaTombstones(window time.Duration, now func() time.Time) *txMetaTomb
 }
 
 // add records hashes as deleted now.
-func (t *txMetaTombstones) add(hashes []chainhash.Hash) {
+func (t *tombstones) add(hashes []chainhash.Hash) {
 	if t == nil || len(hashes) == 0 {
 		return
 	}
@@ -66,13 +61,13 @@ func (t *txMetaTombstones) add(hashes []chainhash.Hash) {
 }
 
 // empty reports whether no deletes are remembered, with one atomic load.
-func (t *txMetaTombstones) empty() bool {
+func (t *tombstones) empty() bool {
 	return t == nil || t.size.Load() == 0
 }
 
 // contains reports whether key, a 32-byte tx hash, was deleted within the window.
-func (t *txMetaTombstones) contains(key []byte) bool {
-	if t.empty() {
+func (t *tombstones) contains(key []byte) bool {
+	if t.empty() || len(key) != chainhash.HashSize {
 		return false
 	}
 
@@ -100,7 +95,7 @@ func (t *txMetaTombstones) contains(key []byte) bool {
 }
 
 // rotateLocked ages the generations by however many windows have passed.
-func (t *txMetaTombstones) rotateLocked() {
+func (t *tombstones) rotateLocked() {
 	elapsed := t.now().Sub(t.rotatedAt)
 
 	switch {

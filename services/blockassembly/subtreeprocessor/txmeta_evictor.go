@@ -29,8 +29,9 @@ const v2LookalikeCount = int(txmetacache.WireV2Magic) | int(txmetacache.WireV2Ve
 // from the store on a miss, so publishing is best effort and never fails the caller.
 //
 // The DELETE and the validator's ADD for the same tx are on different
-// partitions, so the DELETE can be consumed first. Subtree validation's
-// txmetaHandler keeps recent DELETEs as tombstones and drops a late ADD for them.
+// partitions, so the DELETE can be consumed first. Subtree validation's txmeta
+// cache keeps recent DELETEs as tombstones and evicts any later write for them
+// (see txmetacache.TxMetaCache.DeleteDemoted).
 //
 // A nil *TxMetaEvictor is valid and does nothing, so call sites need no guard.
 type TxMetaEvictor struct {

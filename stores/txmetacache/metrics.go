@@ -42,6 +42,10 @@ var (
 	prometheusBlockValidationTxMetaCacheCurrentGenEntries prometheus.Gauge
 	// Count of valid entries from the previous generation not yet overwritten
 	prometheusBlockValidationTxMetaCachePreviousGenEntries prometheus.Gauge
+
+	// prometheusTxMetaCacheTombstonedWritesEvicted counts writes of a tx that
+	// DeleteDemoted had evicted, evicted again right after they landed.
+	prometheusTxMetaCacheTombstonedWritesEvicted prometheus.Counter
 )
 
 var (
@@ -344,6 +348,15 @@ func _initPrometheusMetrics() {
 			Subsystem: "tx_meta_cache",
 			Name:      "previous_gen_entries",
 			Help:      "Number of valid entries from the previous generation in the tx meta cache",
+		},
+	)
+
+	prometheusTxMetaCacheTombstonedWritesEvicted = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "tx_meta_cache",
+			Name:      "tombstoned_writes_evicted_total",
+			Help:      "Writes of a tx demoted to conflicting, evicted again right after they landed: a late txmeta ADD or a read-through write that raced the demotion",
 		},
 	)
 }

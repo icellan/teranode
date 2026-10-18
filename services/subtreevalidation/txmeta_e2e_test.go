@@ -32,6 +32,13 @@ type e2eCache struct {
 	c *txmetacache.ImprovedCache
 }
 
+// DeleteDemoted shadows the embedded zero TxMetaCache's, which has no backend.
+func (e *e2eCache) DeleteDemoted(hashes []chainhash.Hash) {
+	for i := range hashes {
+		_ = e.Delete(context.Background(), &hashes[i])
+	}
+}
+
 func (e *e2eCache) Delete(_ context.Context, hash *chainhash.Hash) error {
 	e.c.Del(hash[:])
 	return nil

@@ -21,6 +21,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -97,6 +98,7 @@ type TxMetaCache struct {
 	logger                        ulogger.Logger                // Logger for operational logging and diagnostic information
 	noOfBlocksToKeepInTxMetaCache uint32                        // Cache retention horizon (blocks); kept for compatibility with the height-based expiration plumbing in ImprovedCache
 	lanes                         [writeBackLanes]writeBackLane // BatchDecorate write-back, one writer per bucket range (see writeback_lanes.go)
+	tombstones                    *tombstones                   // txs DeleteDemoted evicted; every write path evicts them again (see DeleteDemoted)
 }
 
 // CacheStats provides statistical information about the current state of the cache.
@@ -214,6 +216,11 @@ func NewTxMetaCache(
 		return nil, errors.NewServiceError("Cannot use TxMetaCache as the underlying store for TxMetaCache")
 	}
 
+	if tSettings.SubtreeValidation.TxMetaTombstoneWindow <= 0 {
+		// a non-positive window forgets every demotion at once, so writes re-cache demoted txs
+		return nil, errors.NewConfigurationError("subtreevalidation_txMetaTombstoneWindow must be positive, got %s", tSettings.SubtreeValidation.TxMetaTombstoneWindow)
+	}
+
 	initPrometheusMetrics()
 
 	// base size (MB) from the tagged setting
@@ -264,6 +271,7 @@ func NewTxMetaCache(
 		metrics:                       metrics{},
 		logger:                        logger,
 		noOfBlocksToKeepInTxMetaCache: noOfBlocksToKeepInTxMetaCache,
+		tombstones:                    newTombstones(tSettings.SubtreeValidation.TxMetaTombstoneWindow, time.Now),
 	}
 
 	if bucketType == Pointer {
@@ -290,7 +298,10 @@ func NewTxMetaCache(
 // Returns:
 // - Error if the cache operation fails
 func (t *TxMetaCache) SetCache(hash *chainhash.Hash, txMeta *meta.Data) error {
-	if err := t.cache.Set(hash, txMeta); err != nil {
+	err := t.cache.Set(hash, txMeta)
+	t.evictTombstoned(hash[:])
+
+	if err != nil {
 		return err
 	}
 
@@ -310,7 +321,10 @@ func (t *TxMetaCache) SetCache(hash *chainhash.Hash, txMeta *meta.Data) error {
 // Returns:
 // - Error if the cache operation fails
 func (t *TxMetaCache) SetCacheFromBytes(key, txMetaBytes []byte) error {
-	if err := t.cache.SetFromBytes(key, txMetaBytes); err != nil {
+	err := t.cache.SetFromBytes(key, txMetaBytes)
+	t.evictTombstoned(key)
+
+	if err != nil {
 		return err
 	}
 
@@ -330,7 +344,10 @@ func (t *TxMetaCache) SetCacheFromBytes(key, txMetaBytes []byte) error {
 // Returns:
 // - Error if the batch cache operation fails
 func (t *TxMetaCache) SetCacheMulti(keys [][]byte, values [][]byte) error {
-	if err := t.cache.SetMultiFromBytes(keys, values); err != nil {
+	err := t.cache.SetMultiFromBytes(keys, values)
+	t.evictTombstoned(keys...)
+
+	if err != nil {
 		return err
 	}
 
@@ -351,7 +368,10 @@ func (t *TxMetaCache) SetCacheMultiSequential(keys [][]byte, values [][]byte) er
 		return nil
 	}
 
-	if err := t.cache.SetMultiSequential(keys, values); err != nil {
+	err := t.cache.SetMultiSequential(keys, values)
+	t.evictTombstoned(keys...)
+
+	if err != nil {
 		return err
 	}
 
@@ -369,7 +389,10 @@ func (t *TxMetaCache) SetCacheMultiSequentialWithHashes(keys [][]byte, values []
 		return nil
 	}
 
-	if err := t.cache.SetMultiSequentialWithHashes(keys, values, hashes); err != nil {
+	err := t.cache.SetMultiSequentialWithHashes(keys, values, hashes)
+	t.evictTombstoned(keys...)
+
+	if err != nil {
 		return err
 	}
 
@@ -384,7 +407,10 @@ func (t *TxMetaCache) SetCacheMultiSequentialWithHashes(keys [][]byte, values []
 // miss burst, flooded the scheduler and the bucket locks and starved the Kafka
 // txmeta handler.
 func (t *TxMetaCache) SetCacheMultiValuesRaw(keys [][]byte, values [][]byte) error {
-	if err := t.cache.SetMultiSequential(keys, values); err != nil {
+	err := t.cache.SetMultiSequential(keys, values)
+	t.evictTombstoned(keys...)
+
+	if err != nil {
 		return err
 	}
 
@@ -1012,6 +1038,40 @@ func (t *TxMetaCache) Delete(_ context.Context, hash *chainhash.Hash) error {
 	t.metrics.evictions.Add(1)
 
 	return nil
+}
+
+// DeleteDemoted evicts txs just demoted to conflicting and keeps them out of the
+// cache for subtreevalidation_txMetaTombstoneWindow. Unlike Delete, it also
+// blocks any write that lands after it: a txmeta ADD consumed late from another
+// partition, or a read-through write (GetMeta, BatchDecorate) whose store read
+// returned the tx before the demotion.
+//
+// It records the tombstones before it deletes, and every write path checks them
+// after its write, so either the write sees the tombstone and evicts again, or
+// it finished before the tombstone was recorded and the delete below removes it.
+func (t *TxMetaCache) DeleteDemoted(hashes []chainhash.Hash) {
+	t.tombstones.add(hashes)
+
+	for i := range hashes {
+		t.cache.Del(hashes[i][:])
+	}
+
+	t.metrics.evictions.Add(uint64(len(hashes)))
+}
+
+// evictTombstoned evicts the keys DeleteDemoted tombstoned. Every write path
+// calls it after its write; with no tombstones it is one atomic load.
+func (t *TxMetaCache) evictTombstoned(keys ...[]byte) {
+	if t.tombstones.empty() {
+		return
+	}
+
+	for _, key := range keys {
+		if t.tombstones.contains(key) {
+			t.cache.Del(key)
+			prometheusTxMetaCacheTombstonedWritesEvicted.Inc()
+		}
+	}
 }
 
 // DeleteComplete removes the transaction from the durable store completely

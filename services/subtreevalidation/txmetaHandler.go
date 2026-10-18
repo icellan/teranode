@@ -199,14 +199,6 @@ func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) err
 
 		switch action {
 		case txmetacache.WireActionADD:
-			if u.txMetaTombstones.contains(key) {
-				// Its DELETE was consumed first (different partition): caching it
-				// now would bring back a tx demoted to conflicting.
-				prometheusSubtreeValidationTxMetaAddSkippedTombstoned.Inc()
-
-				break
-			}
-
 			end := offset + int(contentLen)
 			bufs.keys = append(bufs.keys, key)
 			bufs.values = append(bufs.values, data[offset:end:end])
@@ -240,36 +232,21 @@ func (u *Server) txmetaHandler(ctx context.Context, msg *kafka.KafkaMessage) err
 		elapsed := float64(time.Since(enqueuedAt).Microseconds()) / 1_000_000
 		prometheusSubtreeValidationSetTXMetaCacheKafkaBatch.Observe(elapsed)
 		prometheusSubtreeValidationSetTXMetaCacheKafkaCount.Add(float64(len(bufs.keys)))
-
-		// A DELETE consumed from another partition after these ADDs passed their
-		// tombstone check may have run its Del before the Set above. It records
-		// the tombstone before it deletes, so either the tombstone is visible
-		// here or its Del runs after the Set.
-		if !u.txMetaTombstones.empty() {
-			for _, key := range bufs.keys {
-				if !u.txMetaTombstones.contains(key) {
-					continue
-				}
-
-				prometheusSubtreeValidationTxMetaAddSkippedTombstoned.Inc()
-
-				hash := chainhash.Hash(key)
-				if err := u.DelTxMetaCache(ctx, &hash); err != nil {
-					prometheusSubtreeValidationSetTXMetaCacheKafkaErrors.Inc()
-					u.logger.Errorf("[txmetaHandler][%s] failed to evict tombstoned tx meta data: %v", hash, err)
-				}
-			}
-		}
 	}
 
-	u.txMetaTombstones.add(bufs.deletes)
-
-	for i := range bufs.deletes {
-		if err := u.DelTxMetaCache(ctx, &bufs.deletes[i]); err != nil {
+	// A DELETE is a demotion to conflicting. The cache keeps it out against a
+	// late ADD from another partition and against read-through writes (see
+	// TxMetaCache.DeleteDemoted).
+	if len(bufs.deletes) > 0 {
+		if err := u.DelTxMetaCacheDemoted(ctx, bufs.deletes); err != nil {
 			prometheusSubtreeValidationSetTXMetaCacheKafkaErrors.Inc()
-			u.logger.Errorf("[txmetaHandler][%s] failed to delete tx meta data: %v", bufs.deletes[i], err)
+			u.logger.Errorf("[txmetaHandler] failed to delete %d demoted tx meta entries: %v", len(bufs.deletes), err)
 		}
-		prometheusSubtreeValidationDelTXMetaCacheKafka.Observe(float64(time.Since(enqueuedAt).Microseconds()) / 1_000_000)
+
+		elapsed := float64(time.Since(enqueuedAt).Microseconds()) / 1_000_000
+		for range bufs.deletes {
+			prometheusSubtreeValidationDelTXMetaCacheKafka.Observe(elapsed)
+		}
 	}
 
 	return nil
