@@ -298,6 +298,10 @@ func NewTxMetaCache(
 // Returns:
 // - Error if the cache operation fails
 func (t *TxMetaCache) SetCache(hash *chainhash.Hash, txMeta *meta.Data) error {
+	if t.skipTombstoned(hash[:]) {
+		return nil
+	}
+
 	err := t.cache.Set(hash, txMeta)
 	t.evictTombstoned(hash[:])
 
@@ -321,6 +325,10 @@ func (t *TxMetaCache) SetCache(hash *chainhash.Hash, txMeta *meta.Data) error {
 // Returns:
 // - Error if the cache operation fails
 func (t *TxMetaCache) SetCacheFromBytes(key, txMetaBytes []byte) error {
+	if t.skipTombstoned(key) {
+		return nil
+	}
+
 	err := t.cache.SetFromBytes(key, txMetaBytes)
 	t.evictTombstoned(key)
 
@@ -344,6 +352,8 @@ func (t *TxMetaCache) SetCacheFromBytes(key, txMetaBytes []byte) error {
 // Returns:
 // - Error if the batch cache operation fails
 func (t *TxMetaCache) SetCacheMulti(keys [][]byte, values [][]byte) error {
+	keys, values, _ = t.withoutTombstoned(keys, values, nil)
+
 	err := t.cache.SetMultiFromBytes(keys, values)
 	t.evictTombstoned(keys...)
 
@@ -368,6 +378,8 @@ func (t *TxMetaCache) SetCacheMultiSequential(keys [][]byte, values [][]byte) er
 		return nil
 	}
 
+	keys, values, _ = t.withoutTombstoned(keys, values, nil)
+
 	err := t.cache.SetMultiSequential(keys, values)
 	t.evictTombstoned(keys...)
 
@@ -389,6 +401,8 @@ func (t *TxMetaCache) SetCacheMultiSequentialWithHashes(keys [][]byte, values []
 		return nil
 	}
 
+	keys, values, hashes = t.withoutTombstoned(keys, values, hashes)
+
 	err := t.cache.SetMultiSequentialWithHashes(keys, values, hashes)
 	t.evictTombstoned(keys...)
 
@@ -407,6 +421,8 @@ func (t *TxMetaCache) SetCacheMultiSequentialWithHashes(keys [][]byte, values []
 // miss burst, flooded the scheduler and the bucket locks and starved the Kafka
 // txmeta handler.
 func (t *TxMetaCache) SetCacheMultiValuesRaw(keys [][]byte, values [][]byte) error {
+	keys, values, _ = t.withoutTombstoned(keys, values, nil)
+
 	err := t.cache.SetMultiSequential(keys, values)
 	t.evictTombstoned(keys...)
 
@@ -1059,18 +1075,62 @@ func (t *TxMetaCache) DeleteDemoted(hashes []chainhash.Hash) {
 	t.metrics.evictions.Add(uint64(len(hashes)))
 }
 
-// evictTombstoned evicts the keys DeleteDemoted tombstoned. Every write path
-// calls it after its write; with no tombstones it is one atomic load.
-func (t *TxMetaCache) evictTombstoned(keys ...[]byte) {
-	if t.tombstones.empty() {
-		return
+// Every write path drops tombstoned entries before its write, so a demoted tx
+// is not readable even briefly, and evicts tombstoned keys after it, for a
+// DeleteDemoted that ran during the write. With no tombstones each is one
+// atomic load.
+
+// skipTombstoned reports whether key is tombstoned and must not be written.
+func (t *TxMetaCache) skipTombstoned(key []byte) bool {
+	if !t.tombstones.contains(key) {
+		return false
 	}
 
-	for _, key := range keys {
-		if t.tombstones.contains(key) {
-			t.cache.Del(key)
-			prometheusTxMetaCacheTombstonedWritesEvicted.Inc()
+	prometheusTxMetaCacheTombstonedWritesEvicted.Inc()
+
+	return true
+}
+
+// withoutTombstoned returns the batch without its tombstoned entries. It copies
+// only when there is one; hashes may be nil.
+func (t *TxMetaCache) withoutTombstoned(keys, values [][]byte, hashes []uint64) ([][]byte, [][]byte, []uint64) {
+	drop := t.tombstones.matches(keys, nil)
+	if len(drop) == 0 {
+		return keys, values, hashes
+	}
+
+	prometheusTxMetaCacheTombstonedWritesEvicted.Add(float64(len(drop)))
+
+	keptKeys := make([][]byte, 0, len(keys)-len(drop))
+	keptValues := make([][]byte, 0, len(keys)-len(drop))
+
+	var keptHashes []uint64
+	if hashes != nil {
+		keptHashes = make([]uint64, 0, len(keys)-len(drop))
+	}
+
+	for i := range keys {
+		if len(drop) > 0 && drop[0] == i {
+			drop = drop[1:]
+			continue
 		}
+
+		keptKeys = append(keptKeys, keys[i])
+		keptValues = append(keptValues, values[i])
+
+		if hashes != nil {
+			keptHashes = append(keptHashes, hashes[i])
+		}
+	}
+
+	return keptKeys, keptValues, keptHashes
+}
+
+// evictTombstoned evicts the written keys a concurrent DeleteDemoted tombstoned.
+func (t *TxMetaCache) evictTombstoned(keys ...[]byte) {
+	for _, i := range t.tombstones.matches(keys, nil) {
+		t.cache.Del(keys[i])
+		prometheusTxMetaCacheTombstonedWritesEvicted.Inc()
 	}
 }
 

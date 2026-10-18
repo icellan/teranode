@@ -204,20 +204,72 @@ func (b *deleteDuringWriteBackend) SetMultiSequentialWithHashes(keys, values [][
 }
 
 func TestTxMetaCache_DeleteDemotedDuringWriteIsNotCached(t *testing.T) {
+	for _, bt := range tombstoneTestBucketTypes {
+		t.Run(bt.name, func(t *testing.T) {
+			c := newTombstoneTestCache(t, bt.bucketType, &utxo.MockUtxostore{})
+
+			demoted, _, demotedBytes := tombstoneTestEntry(t, "demoted")
+			other, _, otherBytes := tombstoneTestEntry(t, "other")
+
+			backend := &deleteDuringWriteBackend{cacheBackend: c.cache}
+			backend.during = func() { c.DeleteDemoted([]chainhash.Hash{demoted}) }
+			c.cache = backend
+
+			require.NoError(t, c.SetCacheMultiSequential([][]byte{demoted[:], other[:]}, [][]byte{demotedBytes, otherBytes}))
+			require.Nil(t, backend.during, "the DELETE must have run inside the write")
+
+			require.False(t, isCached(c, demoted), "a DELETE that lands during the write must still win")
+			require.True(t, isCached(c, other))
+		})
+	}
+}
+
+// keyRecordingBackend records the keys handed to its batch writes.
+type keyRecordingBackend struct {
+	cacheBackend
+	written [][]byte
+}
+
+func (b *keyRecordingBackend) SetMultiSequential(keys, values [][]byte) error {
+	b.written = append(b.written, keys...)
+
+	return b.cacheBackend.SetMultiSequential(keys, values)
+}
+
+func (b *keyRecordingBackend) SetMultiSequentialWithHashes(keys, values [][]byte, hashes []uint64) error {
+	b.written = append(b.written, keys...)
+
+	return b.cacheBackend.SetMultiSequentialWithHashes(keys, values, hashes)
+}
+
+// TestTxMetaCache_TombstonedKeysAreNeverWritten pins that a write of an already
+// tombstoned tx is dropped before it reaches the backend, so a concurrent
+// reader never sees the demoted tx cached, not even for the length of the
+// write. The other entries and their hashes stay aligned.
+func TestTxMetaCache_TombstonedKeysAreNeverWritten(t *testing.T) {
 	c := newTombstoneTestCache(t, Unallocated, &utxo.MockUtxostore{})
 
+	first, _, firstBytes := tombstoneTestEntry(t, "first")
 	demoted, _, demotedBytes := tombstoneTestEntry(t, "demoted")
-	other, _, otherBytes := tombstoneTestEntry(t, "other")
+	last, _, lastBytes := tombstoneTestEntry(t, "last")
 
-	backend := &deleteDuringWriteBackend{cacheBackend: c.cache}
-	backend.during = func() { c.DeleteDemoted([]chainhash.Hash{demoted}) }
+	c.DeleteDemoted([]chainhash.Hash{demoted})
+
+	backend := &keyRecordingBackend{cacheBackend: c.cache}
 	c.cache = backend
 
-	require.NoError(t, c.SetCacheMultiSequential([][]byte{demoted[:], other[:]}, [][]byte{demotedBytes, otherBytes}))
-	require.Nil(t, backend.during, "the DELETE must have run inside the write")
+	keys := [][]byte{first[:], demoted[:], last[:]}
+	values := [][]byte{firstBytes, demotedBytes, lastBytes}
 
-	require.False(t, isCached(c, demoted), "a DELETE that lands during the write must still win")
-	require.True(t, isCached(c, other))
+	require.NoError(t, c.SetCacheMultiSequential(keys, values))
+	require.NoError(t, c.SetCacheMultiSequentialWithHashes(keys, values,
+		[]uint64{xxhash.Sum64(first[:]), xxhash.Sum64(demoted[:]), xxhash.Sum64(last[:])}))
+
+	require.Equal(t, [][]byte{first[:], last[:], first[:], last[:]}, backend.written,
+		"the tombstoned key must never reach the backend")
+	require.True(t, isCached(c, first))
+	require.True(t, isCached(c, last), "entries after a dropped one keep their own value and hash")
+	require.False(t, isCached(c, demoted))
 }
 
 // TestTxMetaCache_ReadThroughRacingDemotionIsNotCached pins the read-through

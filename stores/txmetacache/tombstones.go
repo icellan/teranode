@@ -67,31 +67,44 @@ func (t *tombstones) empty() bool {
 
 // contains reports whether key, a 32-byte tx hash, was deleted within the window.
 func (t *tombstones) contains(key []byte) bool {
-	if t.empty() || len(key) != chainhash.HashSize {
-		return false
-	}
+	return len(t.matches([][]byte{key}, nil)) > 0
+}
 
-	h := chainhash.Hash(key)
+// matches appends to dst the index of every key, a 32-byte tx hash, deleted
+// within the window. A batch takes the lock and reads the clock once, not once
+// per key, so writers sharing the lock while tombstones exist stay cheap.
+func (t *tombstones) matches(keys [][]byte, dst []int) []int {
+	if t.empty() {
+		return dst
+	}
 
 	t.mu.RLock()
-	due := t.now().Sub(t.rotatedAt) >= t.window
-	_, inCurrent := t.current[h]
-	_, inPrevious := t.previous[h]
-	t.mu.RUnlock()
 
-	if !due {
-		return inCurrent || inPrevious
+	if t.now().Sub(t.rotatedAt) >= t.window {
+		t.mu.RUnlock()
+		t.mu.Lock()
+		t.rotateLocked()
+		t.mu.Unlock()
+		t.mu.RLock()
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	defer t.mu.RUnlock()
 
-	t.rotateLocked()
+	for i, key := range keys {
+		if len(key) != chainhash.HashSize {
+			continue
+		}
 
-	_, inCurrent = t.current[h]
-	_, inPrevious = t.previous[h]
+		h := chainhash.Hash(key)
 
-	return inCurrent || inPrevious
+		if _, ok := t.current[h]; ok {
+			dst = append(dst, i)
+		} else if _, ok := t.previous[h]; ok {
+			dst = append(dst, i)
+		}
+	}
+
+	return dst
 }
 
 // rotateLocked ages the generations by however many windows have passed.

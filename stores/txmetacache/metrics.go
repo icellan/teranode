@@ -44,7 +44,8 @@ var (
 	prometheusBlockValidationTxMetaCachePreviousGenEntries prometheus.Gauge
 
 	// prometheusTxMetaCacheTombstonedWritesEvicted counts writes of a tx that
-	// DeleteDemoted had evicted, evicted again right after they landed.
+	// DeleteDemoted had evicted: dropped before the write, or evicted right
+	// after it when the DeleteDemoted ran during the write.
 	prometheusTxMetaCacheTombstonedWritesEvicted prometheus.Counter
 )
 
@@ -356,7 +357,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "tx_meta_cache",
 			Name:      "tombstoned_writes_evicted_total",
-			Help:      "Writes of a tx demoted to conflicting, evicted again right after they landed: a late txmeta ADD or a read-through write that raced the demotion",
+			Help:      "Writes of a tx demoted to conflicting that were dropped, or evicted right after landing: a late txmeta ADD or a read-through write that raced the demotion",
 		},
 	)
 }
