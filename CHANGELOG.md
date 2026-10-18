@@ -83,6 +83,16 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **Peer-announced subtrees are validated at most 32 at a time.** The new
+  `subtreevalidation_peerSubtreeConcurrency` (default 32) bounds how many peer
+  subtrees a subtree validator works on at once; until now the bound was NumCPU. After a
+  block, a backlog of peer subtrees used to be admitted all at once, each allocating
+  about 1 GiB for 1M transactions. The rest now wait, holding no lock, and
+  `teranode_subtreevalidation_peer_subtree_admission_wait` / `_waiting` show the queue.
+  Raise the setting if subtrees queue while CPU is idle; `0` restores the old
+  behaviour. On the `lockfree` txmeta cache, `teranode_tx_meta_cache_evictions` now
+  also counts an estimate of entries lost to ring wraps, so it is no longer 0 there. (#1967)
+
 - **P2P HTTP endpoints are now rate limited.** (shipped in v0.16.0) `/health` and the websocket upgrade
   path are limited per source address, defaulting to 100 requests per second
   (`p2p_httpRateLimit`); requests over the limit receive HTTP 429. These endpoints
@@ -423,6 +433,15 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   too; no shipped configuration uses that store. (#1963)
 
 ### Not breaking, but worth knowing
+
+- **Mining candidates no longer build on the old tip during a reorg.** While block
+  assembly is in the `reorging`, `reconciling` or `resetting` state, it can still
+  hold the tip from before the reorg. `GetMiningCandidate` built candidates on that
+  old tip, so a miner could mine on the losing side of a reorg. In these states it
+  now returns an empty candidate on the Blockchain service tip, as it already did in
+  `blockchainSubscription` and `movingUp`. Mining pools can see more empty candidates
+  while a reorg or a block assembly reset runs, including a reset at an unchanged
+  tip after a storage error. No action is required. (#1983)
 
 - **Two Blockchain RPCs start working.** `GetLatestBlockHeaderFromBlockLocator` and
   `GetBlockHeadersFromOldest` were implemented under names that did not satisfy the
