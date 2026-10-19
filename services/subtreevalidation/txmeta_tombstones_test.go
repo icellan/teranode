@@ -193,3 +193,36 @@ func TestNew_TxMetaCacheFailureRefusesToStart(t *testing.T) {
 	require.ErrorIs(t, err, errors.ErrConfiguration)
 	require.Nil(t, server)
 }
+
+// TestTxmetaHandler_LargeDeleteCascadeRoundTrip pins that a demotion cascade
+// split by txmetacache.SplitDeleteBatches survives the real handler: every
+// batch is read as v1 (none is 767 long) and every tx is evicted.
+func TestTxmetaHandler_LargeDeleteCascadeRoundTrip(t *testing.T) {
+	for _, n := range []int{767, txmetacache.MaxDeleteBatch + 767} {
+		server, cache := newDemotionTestServer(t)
+		hashes, payloads := demotionTestEntries(t, 2)
+
+		cascade := make([]chainhash.Hash, n)
+		for i := range cascade {
+			cascade[i] = chainhash.HashH([]byte{byte(i), byte(i >> 8), byte(i >> 16), 'c'})
+		}
+
+		// A first hash whose leading bytes read as a small count: a 767-entry
+		// v1 message starting with it passes the handler's v2 detection, and
+		// every DELETE in it is lost. The two cacheable txs follow it and end
+		// the cascade.
+		cascade[0] = chainhash.Hash{1}
+		cascade[1], cascade[n-1] = hashes[0], hashes[1]
+
+		require.NoError(t, server.txmetaHandler(t.Context(), &kafka.KafkaMessage{Value: serializeV1ForE2E(hashes, payloads)}))
+		require.True(t, isCachedIn(t, cache, hashes[0]))
+		require.True(t, isCachedIn(t, cache, hashes[1]))
+
+		for _, batch := range txmetacache.SplitDeleteBatches(cascade) {
+			require.NoError(t, server.txmetaHandler(t.Context(), &kafka.KafkaMessage{Value: txmetacache.EncodeDeleteBatch(batch)}))
+		}
+
+		require.False(t, isCachedIn(t, cache, hashes[0]), "n=%d: a tx in the first batch must be evicted", n)
+		require.False(t, isCachedIn(t, cache, hashes[1]), "n=%d: the last tx of the cascade must be evicted", n)
+	}
+}

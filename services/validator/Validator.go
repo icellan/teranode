@@ -1875,16 +1875,27 @@ func (v *Validator) sendTxMetaDeletesToKafka(hashes []chainhash.Hash) {
 		return
 	}
 
-	if v.settings.Validator.TxMetaWireFormat == "v2" {
-		v.sendTxMetaBatchV2(items)
+	// One record per bounded batch: a demotion cascade has no size limit, and a
+	// v1 record of 767 entries would read as a v2 header (see SplitDeleteBatches).
+	start := 0
 
-		return
+	for _, batch := range txmetacache.SplitDeleteBatches(hashes) {
+		batchItems := items[start : start+len(batch)]
+		start += len(batch)
+
+		if v.settings.Validator.TxMetaWireFormat == "v2" {
+			v.sendTxMetaBatchV2(batchItems)
+
+			continue
+		}
+
+		key := batch[0] // copied: the producer reads the key after this returns
+
+		v.txmetaKafkaProducerClient.Publish(&kafka.Message{
+			Key:   key[:],
+			Value: serializeTxMetaBatch(batchItems),
+		})
 	}
-
-	v.txmetaKafkaProducerClient.Publish(&kafka.Message{
-		Key:   hashes[0][:],
-		Value: serializeTxMetaBatch(items),
-	})
 }
 
 // sendTxMetaBatch serializes and publishes a batch of TxMeta items to Kafka.

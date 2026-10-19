@@ -405,3 +405,33 @@ func TestTxMetaCache_NoStaleHitAfterDeleteDemotedReturns(t *testing.T) {
 		})
 	}
 }
+
+func TestSplitDeleteBatches(t *testing.T) {
+	hashes := func(n int) []chainhash.Hash {
+		out := make([]chainhash.Hash, n)
+		for i := range out {
+			out[i] = chainhash.HashH([]byte{byte(i), byte(i >> 8), byte(i >> 16)})
+		}
+
+		return out
+	}
+
+	for _, n := range []int{0, 1, v2LookalikeCount, MaxDeleteBatch, MaxDeleteBatch + v2LookalikeCount, 3*MaxDeleteBatch + 5} {
+		all := hashes(n)
+
+		var joined []chainhash.Hash
+
+		for _, b := range SplitDeleteBatches(all) {
+			require.NotEmpty(t, b)
+			require.LessOrEqual(t, len(b), MaxDeleteBatch)
+			require.NotEqual(t, v2LookalikeCount, len(b), "no batch may be 767 long")
+
+			joined = append(joined, b...)
+		}
+
+		require.Equal(t, len(all), len(joined), "n=%d", n)
+		if n > 0 {
+			require.Equal(t, all, joined, "batches keep the order, n=%d", n)
+		}
+	}
+}

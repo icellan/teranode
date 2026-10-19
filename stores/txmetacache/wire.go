@@ -86,3 +86,32 @@ func EncodeDeleteBatch(hashes []chainhash.Hash) []byte {
 
 	return buf
 }
+
+// MaxDeleteBatch caps the DELETE entries per message. 10,000 entries are 370 KB
+// on the v1 wire and 450 KB on v2, well under Kafka's default 1 MiB message
+// limit however large the demotion cascade.
+const MaxDeleteBatch = 10_000
+
+// v2LookalikeCount is the one v1 entry count whose little-endian bytes
+// (FF 02 00 00) are the v2 header signature.
+const v2LookalikeCount = int(WireV2Magic) | int(WireV2Version)<<8
+
+// SplitDeleteBatches cuts hashes into consecutive batches of at most
+// MaxDeleteBatch entries, none of them v2LookalikeCount long, so each batch can
+// be sent as one message in either wire format. The batches share hashes'
+// backing array.
+func SplitDeleteBatches(hashes []chainhash.Hash) [][]chainhash.Hash {
+	batches := make([][]chainhash.Hash, 0, len(hashes)/MaxDeleteBatch+1)
+
+	for start := 0; start < len(hashes); {
+		n := min(MaxDeleteBatch, len(hashes)-start)
+		if n == v2LookalikeCount {
+			n--
+		}
+
+		batches = append(batches, hashes[start:start+n])
+		start += n
+	}
+
+	return batches
+}

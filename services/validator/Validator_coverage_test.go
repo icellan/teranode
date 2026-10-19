@@ -3,6 +3,7 @@ package validator
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"net/http"
 	"net/url"
 	"testing"
@@ -1144,4 +1145,64 @@ func parentOutputsOf(parent *bt.Tx, status utxo.ParentOutputStatus) []utxo.Paren
 		Satoshis:      parent.Outputs[0].Satoshis,
 		LockingScript: parent.Outputs[0].LockingScript,
 	}}
+}
+
+// TestSendTxMetaDeletesToKafka_BoundsAndSplitsCascades pins that the unbatched
+// DELETE path never sends a record over Kafka's default 1 MiB limit, never
+// sends a v1 record whose entry count reads as a v2 header (767), and still
+// delivers every hash, in both wire formats.
+func TestSendTxMetaDeletesToKafka_BoundsAndSplitsCascades(t *testing.T) {
+	const maxRecord = 1 << 20
+
+	for _, format := range []string{"v1", "v2"} {
+		for _, n := range []int{767, 30_000} {
+			t.Run(fmt.Sprintf("%s/%d", format, n), func(t *testing.T) {
+				tSettings := test.CreateBaseTestSettings(t)
+				tSettings.Validator.TxMetaWireFormat = format
+				tSettings.Validator.TxMetaNumPartitions = 1
+
+				producer := kafka.NewKafkaAsyncProducerMockWithBuffer(1_000)
+				v := &Validator{settings: tSettings, txmetaKafkaProducerClient: producer}
+
+				hashes := make([]chainhash.Hash, n)
+				for i := range hashes {
+					hashes[i] = chainhash.HashH([]byte(fmt.Sprintf("cascade-%d", i)))
+				}
+
+				v.sendTxMetaDeletesToKafka(hashes)
+
+				seen := map[chainhash.Hash]bool{}
+
+				for len(producer.PublishChannel()) > 0 {
+					value := (<-producer.PublishChannel()).Value
+					require.LessOrEqual(t, len(value), maxRecord, "a record must fit Kafka's default message size")
+
+					isV2 := value[0] == txmetacache.WireV2Magic && value[1] == txmetacache.WireV2Version && value[2] == 0 && value[3] == 0
+					require.Equal(t, format == "v2", isV2, "a v1 record must never start with the v2 header signature")
+
+					count, offset := int(binary.LittleEndian.Uint32(value[:4])), 4
+					if isV2 {
+						count, offset = int(binary.LittleEndian.Uint32(value[4:])), txmetacache.WireV2HeaderLen
+					}
+
+					for i := 0; i < count; i++ {
+						if isV2 {
+							offset += 8
+						}
+
+						var h chainhash.Hash
+						copy(h[:], value[offset:offset+32])
+						require.Equal(t, txmetacache.WireActionDELETE, value[offset+32])
+
+						seen[h] = true
+						offset += 32 + 1 + 4
+					}
+
+					require.Equal(t, len(value), offset, "record length must match its entry count")
+				}
+
+				require.Len(t, seen, n, "every hash must be sent")
+			})
+		}
+	}
 }

@@ -7,15 +7,9 @@ import (
 	"github.com/bsv-blockchain/teranode/util/kafka"
 )
 
-// txMetaEvictBatchSize caps the DELETE entries per Kafka message. An entry is 37
-// bytes on the v1 wire, so 10,000 entries is 370 KB, comfortably under Kafka's
-// default 1 MiB message limit even for a very large conflict cascade.
-const txMetaEvictBatchSize = 10_000
-
-// v2LookalikeCount is the one v1 entry count whose little-endian bytes
-// (FF 02 00 00) are the v2 header signature. A receiver can parse such a message
-// as v2 and drop every entry in it, so Evict never sends a batch of this size.
-const v2LookalikeCount = int(txmetacache.WireV2Magic) | int(txmetacache.WireV2Version)<<8
+// txMetaEvictBatchSize caps the DELETE entries per Kafka message (see
+// txmetacache.SplitDeleteBatches).
+const txMetaEvictBatchSize = txmetacache.MaxDeleteBatch
 
 // TxMetaEvictor tells subtree validation to drop txmeta cache entries for
 // transactions that block assembly has just demoted to conflicting.
@@ -63,15 +57,7 @@ func (e *TxMetaEvictor) Evict(hashes []chainhash.Hash) {
 		return
 	}
 
-	for start := 0; start < len(hashes); {
-		n := min(txMetaEvictBatchSize, len(hashes)-start)
-		if n == v2LookalikeCount {
-			n--
-		}
-
-		batch := hashes[start : start+n]
-		start += n
-
+	for _, batch := range txmetacache.SplitDeleteBatches(hashes) {
 		key := batch[0] // copied: the producer reads the key after Evict returns
 
 		// Keyed by tx hash like the validator's txmeta messages.
