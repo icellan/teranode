@@ -621,17 +621,19 @@ func TestHandleMoveForwardRequest_ServesLeftoverSnapshotDuringDrain(t *testing.T
 	require.Less(t, time.Since(start), time.Second, "the snapshot request waited behind the deferred drain")
 	require.True(t, stp.DrainingAfterBlock(), "precondition: the drain is still running")
 
-	// Let the drain run on into the gate, so the later checks see it still running.
-	releaseOnce.Do(func() { close(releaseDrain) })
-
 	require.NotNil(t, data, "the leftover txs must be served while the drain runs")
 	require.Len(t, data.Subtrees, 1)
 	require.True(t, data.Subtrees[0].HasNode(leftover.Hash), "the snapshot must hold the leftover tx")
 	require.Equal(t, block.Header.Hash(), data.PreviousHeader.Hash(), "the snapshot must build on the new block")
 
+	require.True(t, stp.DrainingAfterBlock(), "precondition: the drain is still held for the second request")
 	require.Same(t, data, stp.GetIncompleteSubtreeMiningData(context.Background()), "later callers get the same snapshot")
 	require.Equal(t, int32(1), incompleteStored.Load(), "the snapshot is stored once, when first asked for")
 
+	// Only now let the drain go: the gate does not hold it (its one complete subtree's store is
+	// acknowledged asynchronously), so released earlier the handler could finish, clear the
+	// snapshot, and leave the second request above to time out with nil.
+	releaseOnce.Do(func() { close(releaseDrain) })
 	gateOnce.Do(func() { close(gate) })
 	handlerDone.Wait()
 }

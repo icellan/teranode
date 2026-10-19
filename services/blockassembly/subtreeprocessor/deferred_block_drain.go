@@ -94,7 +94,11 @@ func (stp *SubtreeProcessor) drainQueueAfterBlock(ctx context.Context, drain *de
 }
 
 // drainStartHook, when set, runs as the deferred drain starts. Nil in production; tests set it
-// to hold the drain where they need it, which ordering on newSubtreeChan cannot do reliably.
+// to hold the drain where they need it, which ordering on newSubtreeChan cannot do reliably when
+// a test reads that channel with one gated goroutine. Production is not order-sensitive here:
+// runNewSubtreeListener (services/blockassembly/Server.go) hands each request to one of the
+// parallel storage workers and answers its ErrChan from there, so a snapshot store waits only
+// for its own write.
 var drainStartHook func()
 
 // drainChunkItems is about how many txs drainQueueAfterBlock takes off the

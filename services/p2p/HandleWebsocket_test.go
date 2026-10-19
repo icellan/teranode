@@ -1334,10 +1334,12 @@ func TestHandleWebSocket_InboundFrameLimits(t *testing.T) {
 
 	// requireServerClosed reads until an error and asserts it is a real
 	// close/reset from the server, not the client's own read deadline (a
-	// timeout here would mean the server never closed - a false pass).
+	// timeout here would mean the server never closed - a false pass). The
+	// deadline is an upper bound: under -race on a loaded runner the server can
+	// take more than 5s to work through a flood before it closes.
 	requireServerClosed := func(t *testing.T, ws *websocket.Conn) {
 		t.Helper()
-		require.NoError(t, ws.SetReadDeadline(time.Now().Add(5*time.Second)))
+		require.NoError(t, ws.SetReadDeadline(time.Now().Add(15*time.Second)))
 
 		for {
 			if _, _, err := ws.ReadMessage(); err != nil {
