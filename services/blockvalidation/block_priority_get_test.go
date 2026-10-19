@@ -38,7 +38,7 @@ func (m *MockBlockProcessor) SetCanProcess(hash *chainhash.Hash, can bool) {
 	m.canProcess[*hash] = can
 }
 
-func (m *MockBlockProcessor) CanProcessBlock(ctx context.Context, hash *chainhash.Hash) (bool, error) {
+func (m *MockBlockProcessor) CanProcessBlock(ctx context.Context, hash *chainhash.Hash, _ BlockPriority) (bool, error) {
 	m.mu.Lock()
 	m.callCount++
 	if m.blockDelay > 0 {
@@ -62,7 +62,7 @@ func (m *MockBlockProcessor) CanProcessBlock(ctx context.Context, hash *chainhas
 
 // StartProcessingBlock claims a slot unless the mock simulates that another worker took the
 // last slot after CanProcessBlock said yes.
-func (m *MockBlockProcessor) StartProcessingBlock(hash *chainhash.Hash) bool {
+func (m *MockBlockProcessor) StartProcessingBlock(hash *chainhash.Hash, _ BlockPriority) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -80,6 +80,13 @@ func (m *MockBlockProcessor) FinishProcessingBlock(hash *chainhash.Hash) {
 	defer m.mu.Unlock()
 
 	delete(m.started, *hash)
+}
+
+func (m *MockBlockProcessor) IsProcessingBlock(hash *chainhash.Hash) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.started[*hash]
 }
 
 func (m *MockBlockProcessor) GetCallCount() int {
@@ -504,11 +511,11 @@ func TestForkManager_CanProcessBlock_EdgeCases(t *testing.T) {
 		hash3[0] = 3
 
 		// Fill to capacity
-		require.True(t, fm.StartProcessingBlock(hash1))
-		require.True(t, fm.StartProcessingBlock(hash2))
+		require.True(t, fm.StartProcessingBlock(hash1, PriorityChainExtending))
+		require.True(t, fm.StartProcessingBlock(hash2, PriorityChainExtending))
 
 		// CanProcessBlock should use fast-path and return false
-		canProcess, err := fm.CanProcessBlock(ctx, hash3)
+		canProcess, err := fm.CanProcessBlock(ctx, hash3, PriorityChainExtending)
 		require.NoError(t, err)
 		assert.False(t, canProcess)
 
@@ -546,7 +553,7 @@ func TestForkManager_CanProcessBlock_EdgeCases(t *testing.T) {
 		fm.mu.Unlock()
 
 		// Second block in same fork should not be processable
-		canProcess, err := fm.CanProcessBlock(ctx, hash2)
+		canProcess, err := fm.CanProcessBlock(ctx, hash2, PriorityChainExtending)
 		require.NoError(t, err)
 		assert.False(t, canProcess, "Fork already has a processing block")
 	})

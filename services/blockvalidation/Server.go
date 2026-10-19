@@ -108,6 +108,10 @@ type processBlockFound struct {
 	// a worker takes it off the queue, so a retry goes back where it was.
 	priority BlockPriority
 	height   uint32
+
+	// parentHash is the block's parent, set when the block is queued. The queue holds the
+	// block back while its parent is still queued or processing.
+	parentHash *chainhash.Hash
 }
 
 // processBlockCatchup contains information needed to process a block during chain catchup
@@ -1141,8 +1145,11 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 			return err
 		}
 
+		// A parent still being validated is not a gap: queue the block behind it.
+		parentInFlight := !parentExists && u.isBlockInFlight(block.Header.HashPrevBlock)
+
 		// If parent doesn't exist, always use catchup
-		if !parentExists {
+		if !parentExists && !parentInFlight {
 			if u.isPeerMalicious(ctx, blockFound.peerID) {
 				u.logger.Warnf("[processBlockFoundChannel][%s] peer %s is malicious, skipping catchup for block with missing parent", blockFound.hash.String(), blockFound.peerID)
 
@@ -1175,14 +1182,15 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 			return nil
 		}
 
-		// Parent exists, classify the block
+		// Parent exists or is in flight, classify the block
 		priority, err := u.blockClassifier.ClassifyBlock(ctx, block)
 		if err != nil {
 			u.logger.Warnf("[processBlockFoundChannel] Failed to classify block %s: %v", blockFound.hash.String(), err)
 			// Continue with normal processing if classification fails
-		} else if priority == PriorityChainExtending {
-			// Chain-extending blocks should NOT go to catchup, process normally
-			u.logger.Debugf("[processBlockFoundChannel] Block %s is chain-extending (queue depth %d), processing normally",
+		} else if priority == PriorityChainExtending || parentInFlight {
+			// Chain-extending blocks, and blocks whose parent is still being validated,
+			// should NOT go to catchup, process normally
+			u.logger.Debugf("[processBlockFoundChannel] Block %s is chain-extending or its parent is in flight (queue depth %d), processing normally",
 				blockFound.hash.String(), queueSize)
 		} else {
 			// Non-chain-extending blocks can go to catchup when behind
@@ -2232,11 +2240,7 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 					// not here (which would double-count the worker route and miss the direct route).
 				} else if delay, retry := u.blockRetryDelay(blockFound.hash, err); retry {
 					u.logger.Warnf("[BlockProcessing] Block %s failed without a verdict, requeueing in %s", blockFound.hash.String(), delay)
-
-					go func() {
-						time.Sleep(delay)
-						u.requeueBlock(blockFound)
-					}()
+					u.requeueBlock(blockFound, delay)
 				}
 			} else {
 				// Update processed metric with success
@@ -2306,11 +2310,34 @@ func (u *Server) clearBlockRetryAttempts(hash *chainhash.Hash) {
 }
 
 // requeueBlock puts a failed block back on the queue with the peer that announced it and the
-// class and height it had. Nobody waits on the retry, so the error channel is dropped.
-func (u *Server) requeueBlock(blockFound processBlockFound) {
+// class and height it had, held back for delay. Nobody waits on the retry, so the error
+// channel is dropped.
+func (u *Server) requeueBlock(blockFound processBlockFound, delay time.Duration) {
 	blockFound.errCh = nil
-	u.blockPriorityQueue.RequeueForRetry(blockFound, blockFound.priority, blockFound.height)
-	u.logger.Infof("[BlockProcessing] Re-queued block %s for retry from %s", blockFound.hash.String(), blockFound.baseURL)
+	u.blockPriorityQueue.RequeueAfter(blockFound, blockFound.priority, blockFound.height, delay)
+	u.logger.Infof("[BlockProcessing] Re-queued block %s for retry from %s in %s", blockFound.hash.String(), blockFound.baseURL, delay)
+}
+
+// isBlockInFlight reports whether a block is queued or being validated by a worker. A child
+// whose parent is in flight waits in the queue for it instead of going to catchup, which
+// would move the FSM to CATCHINGBLOCKS and stop mining while the parent is still validating.
+func (u *Server) isBlockInFlight(hash *chainhash.Hash) bool {
+	return u.blockPriorityQueue.Contains(*hash) || u.forkManager.IsProcessingBlock(hash)
+}
+
+// inFlightPriority returns the class of a queued or processing block, so a child queued
+// behind it gets the same class: a child of a chain-extending block extends the chain once
+// its parent is stored.
+func (u *Server) inFlightPriority(hash *chainhash.Hash) BlockPriority {
+	if priority, ok := u.blockPriorityQueue.PriorityOf(hash); ok {
+		return priority
+	}
+
+	if priority, ok := u.forkManager.ProcessingPriority(hash); ok {
+		return priority
+	}
+
+	return PriorityDeepFork
 }
 
 // logCatchupFSMRefusal selects severity only; the caller uses typed StateError
@@ -3037,7 +3064,9 @@ func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockF
 		return
 	}
 
-	if !parentExists {
+	parentInFlight := !parentExists && u.isBlockInFlight(block.Header.HashPrevBlock)
+
+	if !parentExists && !parentInFlight {
 		u.logger.Infof("[queueFetchedBlock] Parent block %s doesn't exist for block %s, sending to catchup", block.Header.HashPrevBlock.String(), blockFound.hash.String())
 
 		// #1057: bound catchup retries. If this block has exhausted its per-block
@@ -3116,11 +3145,20 @@ func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockF
 		return
 	}
 
-	// Classify the block
-	priority, err := u.blockClassifier.ClassifyBlock(ctx, block)
-	if err != nil {
-		u.logger.Warnf("[queueFetchedBlock] Failed to classify block %s, using deep fork priority: %v", blockFound.hash.String(), err)
-		priority = PriorityDeepFork
+	blockFound.parentHash = block.Header.HashPrevBlock
+
+	var priority BlockPriority
+
+	if parentInFlight {
+		priority = u.inFlightPriority(block.Header.HashPrevBlock)
+		u.logger.Infof("[queueFetchedBlock] Parent block %s of block %s is still being validated, queueing behind it", block.Header.HashPrevBlock.String(), blockFound.hash.String())
+	} else {
+		// Classify the block
+		priority, err = u.blockClassifier.ClassifyBlock(ctx, block)
+		if err != nil {
+			u.logger.Warnf("[queueFetchedBlock] Failed to classify block %s, using deep fork priority: %v", blockFound.hash.String(), err)
+			priority = PriorityDeepFork
+		}
 	}
 
 	// Add block to appropriate fork if it's not chain-extending

@@ -97,7 +97,7 @@ func TestRequeueForRetry_KeepsSourcePriorityAndHeight(t *testing.T) {
 	taken, status := server.blockPriorityQueue.Get(context.Background(), &mockBlockProcessor{})
 	require.Equal(t, GetOK, status)
 
-	server.requeueBlock(taken)
+	server.requeueBlock(taken, 0)
 
 	item, ok := server.blockPriorityQueue.hashIndex[*hash]
 	require.True(t, ok)

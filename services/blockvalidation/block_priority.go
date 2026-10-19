@@ -14,11 +14,13 @@ import (
 
 // BlockProcessor gates which queued blocks may start. Get claims a block's processing slot
 // with StartProcessingBlock before removing it from the queue, so a block never leaves the
-// queue without a slot; the caller releases the slot with FinishProcessingBlock.
+// queue without a slot; the caller releases the slot with FinishProcessingBlock. priority is
+// the class the block was queued with.
 type BlockProcessor interface {
-	CanProcessBlock(ctx context.Context, hash *chainhash.Hash) (bool, error)
-	StartProcessingBlock(hash *chainhash.Hash) bool
+	CanProcessBlock(ctx context.Context, hash *chainhash.Hash, priority BlockPriority) (bool, error)
+	StartProcessingBlock(hash *chainhash.Hash, priority BlockPriority) bool
 	FinishProcessingBlock(hash *chainhash.Hash)
+	IsProcessingBlock(hash *chainhash.Hash) bool
 }
 
 // BlockPriority represents the priority level of a block for processing
@@ -53,6 +55,10 @@ type PrioritizedBlock struct {
 	retryCount        int
 	lastRetryTime     time.Time
 	skipCount         int
+
+	// notBefore holds a requeued block back until its retry delay has passed. The block
+	// stays queued meanwhile, so its children still see their parent in flight.
+	notBefore time.Time
 }
 
 // BlockPriorityQueue implements a priority queue for blocks
@@ -194,8 +200,8 @@ func (pq *BlockPriorityQueue) takeIfPresent(hash *chainhash.Hash) (processBlockF
 // queue. Taking first would hand out a block whose slot another worker grabbed after
 // CanProcessBlock said yes, and the worker would drop it. If the block is gone by the time
 // the slot is claimed, the slot is released again.
-func (pq *BlockPriorityQueue) claimAndTake(bp BlockProcessor, hash *chainhash.Hash) (processBlockFound, bool) {
-	if !bp.StartProcessingBlock(hash) {
+func (pq *BlockPriorityQueue) claimAndTake(bp BlockProcessor, hash *chainhash.Hash, priority BlockPriority) (processBlockFound, bool) {
+	if !bp.StartProcessingBlock(hash, priority) {
 		return processBlockFound{}, false
 	}
 
@@ -205,6 +211,24 @@ func (pq *BlockPriorityQueue) claimAndTake(bp BlockProcessor, hash *chainhash.Ha
 	}
 
 	return takenBlock, ok
+}
+
+// isWaiting reports whether a queued block must not start yet: it is in its retry delay, or
+// its parent is still queued or processing. Validating it before the parent is stored would
+// find no parent and send it to catchup. This gate holds regardless of the block's effective
+// priority, so the skip and age promotions cannot bypass it. notBefore and parentHash are
+// set when the item is created and never change, so they are read without the lock.
+func (pq *BlockPriorityQueue) isWaiting(bp BlockProcessor, item *PrioritizedBlock) bool {
+	if time.Now().Before(item.notBefore) {
+		return true
+	}
+
+	parent := item.blockFound.parentHash
+	if parent == nil {
+		return false
+	}
+
+	return pq.Contains(*parent) || bp.IsProcessingBlock(parent)
 }
 
 func (pq *BlockPriorityQueue) Get(ctx context.Context, bp BlockProcessor) (block processBlockFound, status GetStatus) {
@@ -236,9 +260,11 @@ func (pq *BlockPriorityQueue) Get(ctx context.Context, bp BlockProcessor) (block
 		return processBlockFound{}, GetEmpty
 	}
 
-	if canProcess, err := bp.CanProcessBlock(ctx, front.blockFound.hash); err == nil && canProcess {
-		if takenBlock, ok := pq.claimAndTake(bp, front.blockFound.hash); ok {
-			return takenBlock, GetOK
+	if !pq.isWaiting(bp, front) {
+		if canProcess, err := bp.CanProcessBlock(ctx, front.blockFound.hash, front.priority); err == nil && canProcess {
+			if takenBlock, ok := pq.claimAndTake(bp, front.blockFound.hash, front.priority); ok {
+				return takenBlock, GetOK
+			}
 		}
 	}
 
@@ -265,7 +291,11 @@ func (pq *BlockPriorityQueue) Get(ctx context.Context, bp BlockProcessor) (block
 		default:
 		}
 
-		canProcess, err := bp.CanProcessBlock(ctx, item.blockFound.hash)
+		if pq.isWaiting(bp, item) {
+			continue
+		}
+
+		canProcess, err := bp.CanProcessBlock(ctx, item.blockFound.hash, item.priority)
 		if err != nil {
 			pq.logger.Warnf("Error checking if block %s can be processed: %v",
 				item.blockFound.hash, err)
@@ -273,7 +303,7 @@ func (pq *BlockPriorityQueue) Get(ctx context.Context, bp BlockProcessor) (block
 		}
 
 		if canProcess {
-			if takenBlock, ok := pq.claimAndTake(bp, item.blockFound.hash); ok {
+			if takenBlock, ok := pq.claimAndTake(bp, item.blockFound.hash, item.priority); ok {
 				return takenBlock, GetOK
 			}
 
@@ -385,6 +415,19 @@ func (pq *BlockPriorityQueue) Size() int {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 	return pq.Len()
+}
+
+// PriorityOf returns the class a queued block was added with.
+func (pq *BlockPriorityQueue) PriorityOf(hash *chainhash.Hash) (BlockPriority, bool) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	item, ok := pq.hashIndex[*hash]
+	if !ok {
+		return PriorityDeepFork, false
+	}
+
+	return item.priority, true
 }
 
 // GetAlternativeSource returns an alternative source for a block if available
@@ -501,6 +544,12 @@ func priorityToString(priority BlockPriority) string {
 }
 
 func (pq *BlockPriorityQueue) RequeueForRetry(blockFound processBlockFound, priority BlockPriority, height uint32) {
+	pq.RequeueAfter(blockFound, priority, height, 0)
+}
+
+// RequeueAfter puts a block back on the queue, held back for delay. A worker parked in
+// WaitForBlock is woken when the delay ends.
+func (pq *BlockPriorityQueue) RequeueAfter(blockFound processBlockFound, priority BlockPriority, height uint32, delay time.Duration) {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 
@@ -522,6 +571,11 @@ func (pq *BlockPriorityQueue) RequeueForRetry(blockFound processBlockFound, prio
 		retryCount:        1,
 		lastRetryTime:     time.Now(),
 		skipCount:         0,
+		notBefore:         time.Now().Add(delay),
+	}
+
+	if delay > 0 {
+		time.AfterFunc(delay, pq.Signal)
 	}
 
 	pq.items = append(pq.items, item)
