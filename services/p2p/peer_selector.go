@@ -4,18 +4,24 @@ import (
 	"context"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"sort"
 	"sync"
 	"time"
 
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockchain/work"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/health"
 )
 
 const (
+	// peerHealthCheckTimeout bounds a single peer availability probe.
+	peerHealthCheckTimeout = 2 * time.Second
+
 	// peerHealthCheckConcurrency bounds how many peer availability probes run at once.
 	peerHealthCheckConcurrency = 8
 
@@ -52,11 +58,17 @@ type SelectionCriteria struct {
 // randomized so a Sybil attacker cannot capture selection by grinding peer
 // IDs. When settings.P2P.HealthCheckEnabled is set it probes candidate DataHub
 // URLs over HTTP (bounded concurrency, overall deadline) and keeps a short-TTL
-// cache of those probe results, so it is neither pure nor stateless.
+// cache of those probe results, so it is neither pure nor stateless. Those URLs
+// are peer-supplied, so the probes go through an SSRF-safe client that
+// re-validates every resolved IP, under the same policy as the fetch path.
 type PeerSelector struct {
 	logger   ulogger.Logger
 	settings *settings.Settings
 	randIntN func(n int) int // injectable for tests; must return a uniform value in [0, n)
+
+	// httpClient probes peer-supplied DataHub URLs. Its dialer re-validates resolved IPs,
+	// so a hostname cannot be used to make the node probe an internal address.
+	httpClient *http.Client
 
 	// checkHealth probes a peer's DataHub URL; overridable in tests.
 	checkHealth func(ctx context.Context, dataHubURL string) (bool, error)
@@ -71,17 +83,27 @@ type PeerSelector struct {
 
 // NewPeerSelector creates a new peer selector
 func NewPeerSelector(logger ulogger.Logger, settings *settings.Settings) *PeerSelector {
-	return &PeerSelector{
+	ps := &PeerSelector{
 		logger:   logger,
 		settings: settings,
 		// math/rand/v2 uses a per-thread ChaCha8 generator seeded from OS
 		// entropy; a remote attacker cannot observe or predict the stream, so
 		// crypto/rand is unnecessary for this tiebreak.
 		randIntN:          rand.IntN,
-		checkHealth:       checkPeerAvailability,
 		healthCheckBudget: peerHealthCheckBudget,
 		healthCache:       make(map[string]peerHealthCacheEntry),
 	}
+
+	// The probe target is peer-supplied, so it goes through a client whose dialer
+	// re-validates every resolved IP. It shares util.DefaultSSRFDialPolicy with the block and
+	// subtree fetch path deliberately: the probe only decides whether to fetch from a peer, so
+	// a stricter policy here would drop peers the fetch path is willing to talk to - a node
+	// whose peers resolve into RFC1918 would find no sync peer at all. checkPeerAvailability
+	// is bound as a method value so tests can still replace ps.checkHealth.
+	ps.httpClient = util.NewSSRFSafeHTTPClient(peerHealthCheckTimeout, util.DefaultSSRFDialPolicy)
+	ps.checkHealth = ps.checkPeerAvailability
+
+	return ps
 }
 
 // randomIndex returns a uniform value in [0, n), falling back to the package
@@ -172,7 +194,7 @@ func (ps *PeerSelector) getFullNodeCandidates(peers []*blockchain.PeerInfo, basi
 	for _, p := range peers {
 		if ps.isEligibleFullNode(p, now, basicEligible, healthByURL) {
 			candidates = append(candidates, p)
-			ps.logger.Debugf("[PeerSelector] Full node candidate: %s (validated_height=%d, advertised_height=%d, mode=%s)",
+			ps.logger.Debugf("[PeerSelector] Full node candidate: %s (validated_height=%d, sync_height=%d, mode=%s)",
 				p.ID, p.ValidatedHeight, p.Height, p.Storage)
 		}
 	}
@@ -188,7 +210,7 @@ func (ps *PeerSelector) getPrunedNodeCandidates(peers []*blockchain.PeerInfo, ba
 		// Only include if eligible but NOT a full node
 		if ps.isEligible(p, basicEligible, healthByURL) && !ps.isEffectiveFullNode(p, now) {
 			candidates = append(candidates, p)
-			ps.logger.Debugf("[PeerSelector] Pruned node candidate: %s (validated_height=%d, advertised_height=%d, mode=%s)",
+			ps.logger.Debugf("[PeerSelector] Pruned node candidate: %s (validated_height=%d, sync_height=%d, mode=%s)",
 				p.ID, p.ValidatedHeight, p.Height, p.Storage)
 		}
 	}
@@ -296,11 +318,11 @@ func (ps *PeerSelector) selectFromCandidates(candidates []*blockchain.PeerInfo, 
 	if !isFullNode {
 		nodeType = "PRUNED"
 	}
-	ps.logger.Infof("[PeerSelector] Selected %s node peer %s (validated_height=%d, advertised_height=%d, banScore=%d, avgResponseTimeMs=%d) from %d candidates (topBandSize=%d, index=%d)",
+	ps.logger.Infof("[PeerSelector] Selected %s node peer %s (validated_height=%d, sync_height=%d, banScore=%d, avgResponseTimeMs=%d) from %d candidates (topBandSize=%d, index=%d)",
 		nodeType, selected.ID, selected.ValidatedHeight, selected.Height, selected.BanScore, selected.AvgResponseTimeMs, len(candidates), topBandSize, selectedIndex)
 
 	for i := 0; i < len(candidates) && i < 3; i++ {
-		ps.logger.Debugf("[PeerSelector] Candidate %d: %s (validated_height=%d, advertised_height=%d, banScore=%d, avgResponseTimeMs=%d, mode=%s, url=%s)",
+		ps.logger.Debugf("[PeerSelector] Candidate %d: %s (validated_height=%d, sync_height=%d, banScore=%d, avgResponseTimeMs=%d, mode=%s, url=%s)",
 			i+1, candidates[i].ID, candidates[i].ValidatedHeight, candidates[i].Height, candidates[i].BanScore, candidates[i].AvgResponseTimeMs, candidates[i].Storage, candidates[i].DataHubURL)
 	}
 
@@ -499,10 +521,18 @@ func (ps *PeerSelector) checkCandidatesHealth(ctx context.Context, peers []*bloc
 
 				healthy, err := ps.checkHealth(probeCtx, url)
 				if err != nil {
-					if probeCtx.Err() != nil {
-						ps.logger.Debugf("[PeerSelector] Availability probe for %s aborted: %v", url, err)
-					} else {
-						ps.logger.Debugf("[PeerSelector] Availability probe for %s failed: %v", url, err)
+					switch {
+					case probeCtx.Err() != nil:
+						ps.logger.Debugf("[PeerSelector] Availability probe for %s aborted: %v", peerURLForLog(url), err)
+					case errors.Is(err, errors.ErrInvalidArgument):
+						// The peer was refused before any packet left: an unusable base URL,
+						// or an address our own policy bars (a private-network address with
+						// p2p_allow_private_ips unset). That is a local configuration cause
+						// and it silently removes the peer from selection, so it is not a
+						// debug-level event. An unreachable peer stays at debug.
+						ps.logger.Warnf("[PeerSelector] Availability probe for %s refused before dialling: %v", peerURLForLog(url), err)
+					default:
+						ps.logger.Debugf("[PeerSelector] Availability probe for %s failed: %v", peerURLForLog(url), err)
 					}
 				}
 
@@ -587,19 +617,56 @@ func compareChainWork(a, b []byte) int {
 }
 
 // checkPeerAvailability tests if a peer's DataHub URL is reachable via HTTP.
-// DataHubURL already includes /api/v1 prefix, so we just append the endpoint path.
-// Uses existing util/health infrastructure with built-in 2s timeout.
-func checkPeerAvailability(ctx context.Context, dataHubURL string) (bool, error) {
+// DataHubURL already includes /api/v1 prefix, so the endpoint is appended as a path segment.
+// Any 2xx response counts as available; the probe is bounded by peerHealthCheckTimeout.
+//
+// The probe target is peer-supplied, so it goes through ps.httpClient, whose dialer
+// re-validates every resolved IP against util.DefaultSSRFDialPolicy.
+//
+// The URL is built with util.JoinPeerURL and the health path left empty, so the probe
+// cannot be steered by the base URL's shape. Announced DataHub URLs are shape-checked in
+// validateDataHubURL, but the registry this reads from is also written by the blockchain
+// RegisterPeer API and reloaded from persisted JSON, neither of which re-checks. Building
+// the URL here keeps the guarantee local to the call rather than three layers away.
+func (ps *PeerSelector) checkPeerAvailability(ctx context.Context, dataHubURL string) (bool, error) {
 	if dataHubURL == "" {
 		return false, nil
 	}
 
 	// DataHubURL format: "https://host/api/v1"
-	// Append /bestblockheader to get full endpoint path
-	checker := health.CheckHTTPServer(dataHubURL, "/bestblockheader")
+	// The base URL is not echoed here: userinfo is one of the shapes JoinPeerURL refuses,
+	// and the wrapped error names the shape without carrying the credentials.
+	probeURL, err := util.JoinPeerURL(dataHubURL, "bestblockheader")
+	if err != nil {
+		return false, errors.NewInvalidArgumentError("peer health check has an unusable base URL", err)
+	}
 
-	statusCode, _, err := checker(ctx, false)
+	checker := health.CheckPeerHTTPServer(ps.httpClient, probeURL, "")
 
-	// Only accept 200 OK - API endpoints should return exactly 200
-	return statusCode == http.StatusOK, err
+	statusCode, msg, err := checker(ctx, false)
+	if statusCode == http.StatusOK {
+		return true, nil
+	}
+
+	// A non-2xx response carries no error, so surface the status message instead - the
+	// caller only logs the error and would otherwise log "unhealthy: <nil>".
+	if err == nil && msg != "" {
+		err = errors.NewServiceError("peer health check failed: %s", msg)
+	}
+
+	return false, err
+}
+
+// peerURLForLog renders a peer-supplied URL for an operator log line with any userinfo
+// removed. The peer chooses this string, and credentials in it are one of the shapes
+// JoinPeerURL refuses, so logging it verbatim would copy them into the log.
+func peerURLForLog(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "<unparseable peer URL>"
+	}
+
+	parsed.User = nil
+
+	return parsed.String()
 }
