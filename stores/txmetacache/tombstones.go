@@ -67,7 +67,14 @@ func (t *tombstones) empty() bool {
 
 // contains reports whether key, a 32-byte tx hash, was deleted within the window.
 func (t *tombstones) contains(key []byte) bool {
-	return len(t.matches([][]byte{key}, nil)) > 0
+	if t.empty() || len(key) != chainhash.HashSize {
+		return false
+	}
+
+	t.rLockRotated()
+	defer t.mu.RUnlock()
+
+	return t.holdsLocked(chainhash.Hash(key))
 }
 
 // matches appends to dst the index of every key, a 32-byte tx hash, deleted

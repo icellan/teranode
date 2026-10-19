@@ -1206,3 +1206,35 @@ func TestSendTxMetaDeletesToKafka_BoundsAndSplitsCascades(t *testing.T) {
 		}
 	}
 }
+
+// TestSendTxMetaBatch_NeverSendsAV2LookalikeV1Record pins that a batcher flush
+// of exactly 767 items, whose v1 count encodes as the v2 header signature, is
+// not sent as one record: the handler could read it as v2 and drop every entry,
+// ADDs included.
+func TestSendTxMetaBatch_NeverSendsAV2LookalikeV1Record(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.Validator.TxMetaWireFormat = "v1"
+
+	producer := kafka.NewKafkaAsyncProducerMockWithBuffer(10)
+	v := &Validator{settings: tSettings, txmetaKafkaProducerClient: producer}
+
+	batch := make([]*txmetaBatchItem, 767)
+	for i := range batch {
+		h := chainhash.HashH([]byte(fmt.Sprintf("flush-%d", i)))
+		batch[i] = &txmetaBatchItem{hash: &h, metaBytes: []byte{1, 2, 3}}
+	}
+
+	v.sendTxMetaBatch(batch)
+
+	total := 0
+
+	for len(producer.PublishChannel()) > 0 {
+		value := (<-producer.PublishChannel()).Value
+		require.False(t, value[0] == txmetacache.WireV2Magic && value[1] == txmetacache.WireV2Version && value[2] == 0 && value[3] == 0,
+			"a v1 record must never start with the v2 header signature")
+
+		total += int(binary.LittleEndian.Uint32(value[:4]))
+	}
+
+	require.Equal(t, len(batch), total, "every item must still be sent")
+}

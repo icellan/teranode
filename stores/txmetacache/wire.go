@@ -92,12 +92,13 @@ func EncodeDeleteBatch(hashes []chainhash.Hash) []byte {
 // limit however large the demotion cascade.
 const MaxDeleteBatch = 10_000
 
-// v2LookalikeCount is the one v1 entry count whose little-endian bytes
-// (FF 02 00 00) are the v2 header signature.
-const v2LookalikeCount = int(WireV2Magic) | int(WireV2Version)<<8
+// V2LookalikeCount is the one v1 entry count whose little-endian bytes
+// (FF 02 00 00) are the v2 header signature. A receiver can read a v1 message of
+// this many entries as v2 and drop all of them, so no v1 producer sends one.
+const V2LookalikeCount = int(WireV2Magic) | int(WireV2Version)<<8
 
 // SplitDeleteBatches cuts hashes into consecutive batches of at most
-// MaxDeleteBatch entries, none of them v2LookalikeCount long, so each batch can
+// MaxDeleteBatch entries, none of them V2LookalikeCount long, so each batch can
 // be sent as one message in either wire format. The batches share hashes'
 // backing array.
 func SplitDeleteBatches(hashes []chainhash.Hash) [][]chainhash.Hash {
@@ -105,7 +106,7 @@ func SplitDeleteBatches(hashes []chainhash.Hash) [][]chainhash.Hash {
 
 	for start := 0; start < len(hashes); {
 		n := min(MaxDeleteBatch, len(hashes)-start)
-		if n == v2LookalikeCount {
+		if n == V2LookalikeCount {
 			n--
 		}
 

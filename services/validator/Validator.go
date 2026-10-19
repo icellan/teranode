@@ -1920,6 +1920,14 @@ func (v *Validator) sendTxMetaBatch(batch []*txmetaBatchItem) {
 		return
 	}
 
+	if len(batch) == txmetacache.V2LookalikeCount {
+		// its v1 count would read as the v2 header signature
+		v.sendTxMetaBatch(batch[:len(batch)-1])
+		v.sendTxMetaBatch(batch[len(batch)-1:])
+
+		return
+	}
+
 	value := serializeTxMetaBatch(batch)
 
 	v.txmetaKafkaProducerClient.Publish(&kafka.Message{

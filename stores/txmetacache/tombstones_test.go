@@ -416,7 +416,7 @@ func TestSplitDeleteBatches(t *testing.T) {
 		return out
 	}
 
-	for _, n := range []int{0, 1, v2LookalikeCount, MaxDeleteBatch, MaxDeleteBatch + v2LookalikeCount, 3*MaxDeleteBatch + 5} {
+	for _, n := range []int{0, 1, V2LookalikeCount, MaxDeleteBatch, MaxDeleteBatch + V2LookalikeCount, 3*MaxDeleteBatch + 5} {
 		all := hashes(n)
 
 		var joined []chainhash.Hash
@@ -424,7 +424,7 @@ func TestSplitDeleteBatches(t *testing.T) {
 		for _, b := range SplitDeleteBatches(all) {
 			require.NotEmpty(t, b)
 			require.LessOrEqual(t, len(b), MaxDeleteBatch)
-			require.NotEqual(t, v2LookalikeCount, len(b), "no batch may be 767 long")
+			require.NotEqual(t, V2LookalikeCount, len(b), "no batch may be 767 long")
 
 			joined = append(joined, b...)
 		}
