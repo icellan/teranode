@@ -179,7 +179,11 @@ func (pq *BlockPriorityQueue) takeIfPresent(hash *chainhash.Hash) (processBlockF
 
 			pq.removeItem(i)
 
-			return currentItem.blockFound, true
+			taken := currentItem.blockFound
+			taken.priority = currentItem.priority
+			taken.height = currentItem.height
+
+			return taken, true
 		}
 	}
 
