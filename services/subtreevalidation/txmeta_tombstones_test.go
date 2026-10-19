@@ -5,6 +5,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -173,4 +174,22 @@ func TestTxmetaHandler_DeleteDuringAddWriteIsNotCached(t *testing.T) {
 			require.True(t, isCachedIn(t, cache, unrelated), "other ADDs in the message are still applied")
 		})
 	}
+}
+
+// TestNew_TxMetaCacheFailureRefusesToStart pins that a txmeta cache New cannot
+// build, here because the tombstone window is not positive, fails New instead
+// of starting the service with a nil store.
+func TestNew_TxMetaCacheFailureRefusesToStart(t *testing.T) {
+	utxoStore, validatorClient, txStore, subtreeStore, blockchainClient, deferFunc := setup(t)
+	defer deferFunc()
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.SubtreeValidation.TxMetaCacheEnabled = true
+	tSettings.SubtreeValidation.TxMetaTombstoneWindow = 0
+
+	nilConsumer := &kafka.KafkaConsumerGroup{}
+
+	server, err := New(t.Context(), ulogger.TestLogger{}, tSettings, subtreeStore, txStore, utxoStore, validatorClient, blockchainClient, nilConsumer, nilConsumer, nil, nil)
+	require.ErrorIs(t, err, errors.ErrConfiguration)
+	require.Nil(t, server)
 }
