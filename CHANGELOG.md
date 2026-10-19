@@ -183,6 +183,18 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `utxo_pruner_pruned_set_rotations`. These metrics reported zero because the pruner
   no longer skipped parents. After this upgrade, their queries give no data. (#1969)
 
+- **Block validation keeps a worker slot free for the tip, and holds a block behind a
+  parent that is still validating.** Blocks that do not extend the current tip may now
+  hold at most `blockvalidation_max_parallel_forks - 1` worker slots. With
+  `blockvalidation_max_parallel_forks = 1` nothing changes. A block whose parent is still
+  queued or being validated now waits in the queue for it instead of starting catchup,
+  so the node no longer moves to CATCHINGBLOCKS and stops mining while a slow parent
+  validates. `blockValidationMaxRetries` (default 3), until now unread, caps how often a
+  block is requeued after a failed fetch (retried after 5 s) or after validation hits a
+  deadline such as `subtreevalidation_check_block_subtrees_timeout` (retried after
+  1 min). A block that timed out used to be dropped until a peer announced it again;
+  failed fetches were never actually retried. `0` turns these retries off.
+
 - **Peer-announced subtrees are validated at most 32 at a time.** The new
   `subtreevalidation_peerSubtreeConcurrency` (default 32) bounds how many peer
   subtrees a subtree validator works on at once; until now the bound was NumCPU. After a
