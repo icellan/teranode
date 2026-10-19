@@ -12,8 +12,13 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 )
 
+// BlockProcessor gates which queued blocks may start. Get claims a block's processing slot
+// with StartProcessingBlock before removing it from the queue, so a block never leaves the
+// queue without a slot; the caller releases the slot with FinishProcessingBlock.
 type BlockProcessor interface {
 	CanProcessBlock(ctx context.Context, hash *chainhash.Hash) (bool, error)
+	StartProcessingBlock(hash *chainhash.Hash) bool
+	FinishProcessingBlock(hash *chainhash.Hash)
 }
 
 // BlockPriority represents the priority level of a block for processing
@@ -181,6 +186,23 @@ func (pq *BlockPriorityQueue) takeIfPresent(hash *chainhash.Hash) (processBlockF
 	return processBlockFound{}, false
 }
 
+// claimAndTake claims the block's processing slot first and only then removes it from the
+// queue. Taking first would hand out a block whose slot another worker grabbed after
+// CanProcessBlock said yes, and the worker would drop it. If the block is gone by the time
+// the slot is claimed, the slot is released again.
+func (pq *BlockPriorityQueue) claimAndTake(bp BlockProcessor, hash *chainhash.Hash) (processBlockFound, bool) {
+	if !bp.StartProcessingBlock(hash) {
+		return processBlockFound{}, false
+	}
+
+	takenBlock, ok := pq.takeIfPresent(hash)
+	if !ok {
+		bp.FinishProcessingBlock(hash)
+	}
+
+	return takenBlock, ok
+}
+
 func (pq *BlockPriorityQueue) Get(ctx context.Context, bp BlockProcessor) (block processBlockFound, status GetStatus) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -211,7 +233,7 @@ func (pq *BlockPriorityQueue) Get(ctx context.Context, bp BlockProcessor) (block
 	}
 
 	if canProcess, err := bp.CanProcessBlock(ctx, front.blockFound.hash); err == nil && canProcess {
-		if takenBlock, ok := pq.takeIfPresent(front.blockFound.hash); ok {
+		if takenBlock, ok := pq.claimAndTake(bp, front.blockFound.hash); ok {
 			return takenBlock, GetOK
 		}
 	}
@@ -247,28 +269,12 @@ func (pq *BlockPriorityQueue) Get(ctx context.Context, bp BlockProcessor) (block
 		}
 
 		if canProcess {
-			pq.mu.Lock()
-
-			for i, currentItem := range pq.items {
-				if currentItem.blockFound.hash.IsEqual(item.blockFound.hash) {
-					if blockQueueWaitTime != nil {
-						waitTime := time.Since(currentItem.timestamp).Seconds()
-						blockQueueWaitTime.Observe(waitTime)
-					}
-
-					pq.removeItem(i)
-					pq.mu.Unlock()
-					return currentItem.blockFound, GetOK
-				}
+			if takenBlock, ok := pq.claimAndTake(bp, item.blockFound.hash); ok {
+				return takenBlock, GetOK
 			}
 
-			// Item not found - verify it wasn't already processed
-			if _, exists := pq.hashIndex[*item.blockFound.hash]; !exists {
-				pq.mu.Unlock()
-				continue // Item was processed by another worker, try next
-			}
-			pq.mu.Unlock()
-			return pq.Get(ctx, bp)
+			// The slot was lost to another worker, or the block was taken: leave it queued.
+			continue
 		}
 
 		// Mark this item for skip count update (apply later in batch)
