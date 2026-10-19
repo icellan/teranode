@@ -180,6 +180,28 @@ func TestErrorWrapWithAdditionalContext(t *testing.T) {
 	}
 }
 
+// TestErrTxCreatingSentinelAndWrapChain pins two things introduced together:
+// the ErrTxCreating sentinel exists as a comparable value (before this,
+// errors.Is(err, errors.ErrTxCreating) did not even compile — only the
+// NewTxCreatingError constructor existed), and it survives being wrapped
+// exactly the way the validator wraps it: spendAndCreateInUtxoStore wraps the
+// store's error once with NewProcessingError, and validateInternal wraps it
+// again, before the retry loop's errors.Is check ever sees it.
+func TestErrTxCreatingSentinelAndWrapChain(t *testing.T) {
+	original := NewTxCreatingError("[SPEND_BATCH_LUA] transaction is creating")
+
+	require.True(t, Is(original, ErrTxCreating), "the constructor's error must match the ErrTxCreating sentinel directly")
+
+	onceWrapped := NewProcessingError("validator: UTXO Store spend and create failed for %s", "txid", original)
+	require.True(t, Is(onceWrapped, ErrTxCreating), "ErrTxCreating must still match after one layer of wrapping")
+
+	twiceWrapped := NewProcessingError("[Validate][%s] error spending utxos", "txid", onceWrapped)
+	require.True(t, Is(twiceWrapped, ErrTxCreating), "ErrTxCreating must still match after two layers of wrapping, matching the real validator call chain")
+
+	// A sibling sentinel must not spuriously match.
+	require.False(t, Is(twiceWrapped, ErrTxLocked), "ErrTxCreating must not be conflated with the distinct ErrTxLocked sentinel")
+}
+
 // TestErrorEquality tests the equality of custom errors.
 func TestErrorEquality(t *testing.T) {
 	err1 := New(ERR_NOT_FOUND, "resource not found")
@@ -382,7 +404,7 @@ func Test_UtxoSpentError(t *testing.T) {
 		assert.Equal(t, txID, *spendingData2.TxID)
 		assert.Equal(t, 1, spendingData2.Vin)
 
-		contains := "70: UTXO_SPENT (70): 0000000000000000000000000000000000000000000000313233343536373839:1 utxo already spent by tx 0000000000000000000000000000000000000000000000313233343536373839[1] \"utxo 0000000000000000000000000000000000000000000000313233343536373839 already spent by 0000000000000000000000000000000000000000000000313233343536373839[1]\""
+		contains := "70: 0000000000000000000000000000000000000000000000313233343536373839:1 utxo already spent by tx 0000000000000000000000000000000000000000000000313233343536373839[1] \"utxo 0000000000000000000000000000000000000000000000313233343536373839 already spent by 0000000000000000000000000000000000000000000000313233343536373839[1]\""
 
 		assert.Contains(t, unwrappedErr.Error(), contains)
 	})
@@ -1464,6 +1486,36 @@ func TestErrorCodeToGRPCCode(t *testing.T) {
 			name:     "maps ERR_TX_LOCKED to codes.FailedPrecondition",
 			errCode:  ERR_TX_LOCKED,
 			expected: codes.FailedPrecondition,
+		},
+		{
+			// ERR_TX_CREATING (a large, multi-record parent still being
+			// written) is the same kind of transient chain-state conflict as
+			// ERR_TX_LOCKED, not an internal server fault, and must land in
+			// the same gRPC code family.
+			name:     "maps ERR_TX_CREATING to codes.FailedPrecondition",
+			errCode:  ERR_TX_CREATING,
+			expected: codes.FailedPrecondition,
+		},
+		{
+			// ERR_UTXO_FROZEN moved into the same family in this change. It is
+			// the one member that does not clear by itself, but it is still a
+			// verdict about the chain state rather than a fault in this node, and
+			// every code on publicCauseCodes needs a row here or WrapGRPCPublic
+			// returns its message inside a codes.Internal status.
+			name:     "maps ERR_UTXO_FROZEN to codes.FailedPrecondition",
+			errCode:  ERR_UTXO_FROZEN,
+			expected: codes.FailedPrecondition,
+		},
+		{
+			// ERR_TX_UNLOCK_FAILED means the transaction was accepted and only its
+			// post-acceptance unlock failed, so it must not join the
+			// FailedPrecondition family (that family means "not accepted yet"), and it
+			// must not answer codes.Internal ("this node broke") for a submission that
+			// took effect. The validator's HTTP /tx handler answers 200 OK for this
+			// same outcome; this row is the gRPC side of that decision.
+			name:     "maps ERR_TX_UNLOCK_FAILED to codes.Aborted, not FailedPrecondition or Internal",
+			errCode:  ERR_TX_UNLOCK_FAILED,
+			expected: codes.Aborted,
 		},
 		{
 			name:     "unmapped code BLOCK_NOT_FOUND defaults to codes.Internal",

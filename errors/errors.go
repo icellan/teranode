@@ -779,6 +779,20 @@ var publicCauseCodes = map[ERR]struct{}{
 	ERR_TX_CONFLICTING:          {},
 	ERR_UTXO_SPENT:              {},
 	ERR_TX_LOCKED:               {},
+	// ERR_TX_CREATING is the same kind of verdict as ERR_TX_LOCKED: the parent
+	// tx this one spends from is still completing its own commit. It carries no
+	// node-internal state and is actionable by the submitter (resubmit shortly),
+	// so it belongs on the same allowlist for the same reason ERR_TX_LOCKED does.
+	ERR_TX_CREATING: {},
+	// ERR_UTXO_FROZEN is a verdict about the submitted tx — an output it spends is
+	// held, either outright or until a given height. Its producers do not all
+	// format the same fields, so the claim here is only that none of them carries
+	// node-internal state: the transaction id always, the output index in every
+	// producer except the aerospike record-group formatter (createGeneralError,
+	// which reports the group rather than one output and substitutes the current
+	// block height), and the height the hold expires at only where the store knows
+	// it. All of that is either supplied by the submitter or already public.
+	ERR_UTXO_FROZEN: {},
 	// ERR_TX_MISSING_PARENT meets every bar above: its messages name transactions
 	// and nothing else, and "a parent this transaction spends is not in my utxo
 	// set" is the most actionable thing a submitter can be told — resubmit the
@@ -798,12 +812,11 @@ var publicCauseCodes = map[ERR]struct{}{
 // Deliberately NOT on the allowlist, recorded so the decision is not re-made by
 // accident:
 //
-//   - ERR_UTXO_FROZEN: freezing is administrative state set by the alert
-//     system, and whether to disclose it to an arbitrary submitter is a policy
-//     question rather than an error-plumbing one.
 //   - ERR_TX_COINBASE_IMMATURE: the message is built by the utxo store and
 //     embeds the node's block height and an internal batch id. It would qualify
-//     once it carries only the outpoint and the maturity height.
+//     once it carries only the outpoint and the maturity height. RPC's
+//     sendrawtransaction shows it as a fixed text instead (services/rpc,
+//     fixedVerdictText), which needs no change here.
 //   - ERR_STORAGE_ERROR, ERR_SERVICE_ERROR, ERR_PROCESSING: faults in this
 //     node, not verdicts. Collapsing them is correct — a caller that cannot
 //     tell them apart from a rejection would terminalize on an outage.
@@ -860,6 +873,17 @@ func DeepestPublicCause(err error) *Error {
 	}
 
 	return deepest
+}
+
+// IsPublicCause reports whether code is on the shared public-cause allowlist.
+//
+// Exported so a surface that needs per-link membership rather than
+// DeepestPublicCause's whole-chain answer still asks publicCauseCodes instead of
+// keeping its own copy. A second list is how the closed-membership test in
+// public_cause_allowlist_test.go gets bypassed: the widening happens somewhere
+// the test does not look.
+func IsPublicCause(code ERR) bool {
+	return isPublicCause(code)
 }
 
 // UserMessage returns a concise, user-facing error message without wrapped error chains or data.
@@ -1002,45 +1026,84 @@ func UnwrapGRPC(err error) *Error {
 		}
 	}
 
-	var prevErr, currErr *Error
+	links := make([]*TError, 0, len(st.Details()))
 
-	for i := len(st.Details()) - 1; i >= 0; i-- {
+	for _, detail := range st.Details() {
 		// Cast the protoadapt.MessageV1 to *anypb.Any, which is what we need to unmarshal
-		detail := st.Details()[i]
 		detailAny, ok := detail.(*anypb.Any)
-
 		if !ok {
 			// TODO: This should not happen, detail is not of type anypb.Any. What to do here?
 			continue // If the detail isn't of the expected type, skip it
 		}
 
-		var customDetails TError
-		if err = anypb.UnmarshalTo(detailAny, &customDetails, proto.UnmarshalOptions{}); err == nil {
-			currErr = New(customDetails.Code, customDetails.Message)
-
-			if customDetails.Data != nil {
-				// get the data
-				data, errorGettingData := GetErrorData(customDetails.Code, customDetails.Data)
-				if errorGettingData != nil {
-					// TODO (GOKHAN) CHECK OPTION OF LOGGING / PRINTING HERE
-					currErr.data = nil
-				} else {
-					currErr.data = data
-				}
-			}
-
-			// Set file, line and function information from the TError
-			currErr.file = customDetails.File
-			currErr.line = int(customDetails.Line)
-			currErr.function = customDetails.Function
-
-			// if we moved up higher in the hierarchy
-			if prevErr != nil {
-				currErr.wrappedErr = prevErr
-			}
-
-			prevErr = currErr
+		customDetails := &TError{}
+		if err = anypb.UnmarshalTo(detailAny, customDetails, proto.UnmarshalOptions{}); err == nil {
+			links = append(links, customDetails)
 		}
+	}
+
+	return chainFromTErrors(links)
+}
+
+// UnwrapTError converts a *TError chain into the equivalent *Error chain.
+//
+// A *TError is the protobuf form of an error, and it reaches callers without a
+// gRPC status around it wherever a response message carries errors as a field -
+// the validator's batch response does, one per transaction. Handing it on
+// unconverted leaves every consumer that reads a Teranode error with As seeing a
+// foreign one, so this is the same conversion UnwrapGRPC applies to a status.
+//
+// Returns nil for a nil or empty *TError.
+func UnwrapTError(t *TError) *Error {
+	if t.IsNil() {
+		return nil
+	}
+
+	// Iterative, not recursive: a mass spend failure builds a chain tens of
+	// thousands of links deep, and Wrap already recursed once to encode it.
+	links := make([]*TError, 0, 4)
+	for cur := t; cur != nil; cur = cur.WrappedError {
+		links = append(links, cur)
+	}
+
+	return chainFromTErrors(links)
+}
+
+// chainFromTErrors rebuilds an *Error chain from its protobuf links, given
+// outermost first. Code, message, data and source location are carried across
+// link by link, and the result's wrapping order matches the input order.
+//
+// Returns nil when links is empty.
+func chainFromTErrors(links []*TError) *Error {
+	var prevErr, currErr *Error
+
+	for i := len(links) - 1; i >= 0; i-- {
+		link := links[i]
+
+		currErr = New(link.Code, link.Message)
+
+		if link.Data != nil {
+			// get the data
+			data, errorGettingData := GetErrorData(link.Code, link.Data)
+			if errorGettingData != nil {
+				// TODO (GOKHAN) CHECK OPTION OF LOGGING / PRINTING HERE
+				currErr.data = nil
+			} else {
+				currErr.data = data
+			}
+		}
+
+		// Set file, line and function information from the TError
+		currErr.file = link.File
+		currErr.line = int(link.Line)
+		currErr.function = link.Function
+
+		// if we moved up higher in the hierarchy
+		if prevErr != nil {
+			currErr.wrappedErr = prevErr
+		}
+
+		prevErr = currErr
 	}
 
 	return currErr
@@ -1072,8 +1135,31 @@ func ErrorCodeToGRPCCode(code ERR) codes.Code {
 	// so an allowlisted code that falls through to codes.Internal returns the right
 	// message inside a transport status that says "this node broke", which is
 	// exactly the ambiguity the allowlist exists to remove.
-	case ERR_TX_INVALID_DOUBLE_SPEND, ERR_TX_CONFLICTING, ERR_UTXO_SPENT, ERR_TX_LOCKED, ERR_TX_MISSING_PARENT:
+	//
+	// Most codes in this family clear on their own, but ERR_UTXO_FROZEN does not —
+	// an outright freeze never clears, and a height-gated hold clears only many
+	// blocks later — so the family name should not be read as a promise that it
+	// will. It still belongs here rather than codes.PermissionDenied, which gRPC
+	// reserves for the caller lacking authorisation: a frozen output rejects every
+	// submitter equally, so it is a statement about the chain state, not about who
+	// asked. The HTTP layer answers 403 for the same error and the two maps are
+	// independent by design; see httpStatusForTxError in services/propagation.
+	case ERR_TX_INVALID_DOUBLE_SPEND, ERR_TX_CONFLICTING, ERR_UTXO_SPENT, ERR_TX_LOCKED, ERR_TX_CREATING,
+		ERR_UTXO_FROZEN, ERR_TX_MISSING_PARENT:
 		return codes.FailedPrecondition
+	// ERR_TX_UNLOCK_FAILED is not in the family above: the transaction WAS accepted
+	// (spent, created, delivered to block assembly) and only the post-acceptance
+	// unlock failed, so FailedPrecondition would be the wrong claim — that family
+	// means "not accepted yet, come back later", while a resubmit of this one is an
+	// already-exists success. Aborted says "the operation took effect, its final step
+	// did not", which is the truth, and matches what the validator's own HTTP /tx
+	// handler answers for the same outcome (200 OK, see handleSingleTx). It is not on
+	// publicCauseCodes, so the message stays private inside the status. Safe to move
+	// off codes.Internal: the retry gate keys on Unavailable/DeadlineExceeded only and
+	// the oversized-message HTTP fallback keys on ResourceExhausted, so neither fires
+	// on Aborted, and callers key control flow on the reconstructed ERR code.
+	case ERR_TX_UNLOCK_FAILED:
+		return codes.Aborted
 	default:
 		return codes.Internal
 	}
