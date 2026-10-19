@@ -93,7 +93,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   block is requeued after a failed fetch (retried after 5 s) or after validation hits a
   deadline such as `subtreevalidation_check_block_subtrees_timeout` (retried after
   1 min). A block that timed out used to be dropped until a peer announced it again;
-  failed fetches were never actually retried. `0` turns these retries off.
+  failed fetches were never actually retried. `0` turns these retries off. (#1997)
 
 - **Peer-announced subtrees are validated at most 32 at a time.** The new
   `subtreevalidation_peerSubtreeConcurrency` (default 32) bounds how many peer
