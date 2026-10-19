@@ -20,6 +20,10 @@ func (m *mockBlockProcessor) CanProcessBlock(ctx context.Context, hash *chainhas
 	return true, nil
 }
 
+func (m *mockBlockProcessor) StartProcessingBlock(hash *chainhash.Hash) bool { return true }
+
+func (m *mockBlockProcessor) FinishProcessingBlock(hash *chainhash.Hash) {}
+
 func TestBlockPriorityQueue(t *testing.T) {
 	t.Run("Priority ordering", func(t *testing.T) {
 		pq := NewBlockPriorityQueue(ulogger.TestLogger{})

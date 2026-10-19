@@ -2154,11 +2154,8 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 		default:
 			blockFound, status := u.blockPriorityQueue.WaitForBlock(ctx, u.forkManager)
 
+			// The block's processing slot is already claimed by Get.
 			if status != GetOK {
-				continue
-			}
-
-			if !u.forkManager.StartProcessingBlock(blockFound.hash) {
 				continue
 			}
 
