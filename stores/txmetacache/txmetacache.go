@@ -452,7 +452,7 @@ func (t *TxMetaCache) SetCacheMultiValuesRaw(keys [][]byte, values [][]byte) err
 // Hit/miss counts are exposed via the standard txmetacache Prometheus metrics.
 func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash) (*meta.Data, bool) {
 	d, ok := t.cache.Get(hash)
-	if !ok {
+	if !ok || t.tombstones.contains(hash[:]) {
 		t.metrics.misses.Add(1)
 		return nil, false
 	}
@@ -469,6 +469,10 @@ func (t *TxMetaCache) GetMetaCached(_ context.Context, hash chainhash.Hash) (*me
 // not hash them again. Same read-only contract as GetMetaCached.
 func (t *TxMetaCache) GetMetaCachedMulti(_ context.Context, hashes []chainhash.Hash, keyHashes []uint64, out []*meta.Data) {
 	t.cache.GetMulti(hashes, keyHashes, out)
+
+	for _, i := range t.tombstones.matchesHashes(hashes, nil) {
+		out[i] = nil
+	}
 
 	hits := 0
 
@@ -595,6 +599,10 @@ func (t *TxMetaCache) GetMetaCachedInto(_ context.Context, hashes []chainhash.Ha
 	sc.reserve(n)
 	t.cache.GetRawMulti(hashes, keyHashes, &sc.raw, spans)
 
+	for _, i := range t.tombstones.matchesHashes(hashes, nil) {
+		spans[i] = [2]int{-1, -1}
+	}
+
 	carver := intoCarverPool.Get().(*intoCarver)
 	defer intoCarverPool.Put(carver)
 
@@ -671,7 +679,7 @@ func (t *TxMetaCache) BucketLocality() bool {
 // This is one of the primary interface methods that proxies calls to the underlying store
 // with a caching layer in between for improved performance.
 func (t *TxMetaCache) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Data) error {
-	if cached, ok := t.cache.Get(*hash); ok {
+	if cached, ok := t.cache.Get(*hash); ok && !t.tombstones.contains(hash[:]) {
 		// In pointer mode the cache hands out the same *meta.Data to every
 		// concurrent reader. *data = *cached copies the struct but
 		// ParentTxHashes still points at the cache's backing slice — a
@@ -1065,6 +1073,10 @@ func (t *TxMetaCache) Delete(_ context.Context, hash *chainhash.Hash) error {
 // It records the tombstones before it deletes, and every write path checks them
 // after its write, so either the write sees the tombstone and evicts again, or
 // it finished before the tombstone was recorded and the delete below removes it.
+// A write that checked before the tombstone existed can still land after this
+// returns and stay readable until its own post-write eviction, so every read
+// path also checks the tombstones after reading: once this returns, no read
+// returns these txs.
 func (t *TxMetaCache) DeleteDemoted(hashes []chainhash.Hash) {
 	t.tombstones.add(hashes)
 

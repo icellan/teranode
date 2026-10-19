@@ -78,6 +78,39 @@ func (t *tombstones) matches(keys [][]byte, dst []int) []int {
 		return dst
 	}
 
+	t.rLockRotated()
+	defer t.mu.RUnlock()
+
+	for i, key := range keys {
+		if len(key) == chainhash.HashSize && t.holdsLocked(chainhash.Hash(key)) {
+			dst = append(dst, i)
+		}
+	}
+
+	return dst
+}
+
+// matchesHashes is matches for tx hashes.
+func (t *tombstones) matchesHashes(hashes []chainhash.Hash, dst []int) []int {
+	if t.empty() {
+		return dst
+	}
+
+	t.rLockRotated()
+	defer t.mu.RUnlock()
+
+	for i := range hashes {
+		if t.holdsLocked(hashes[i]) {
+			dst = append(dst, i)
+		}
+	}
+
+	return dst
+}
+
+// rLockRotated takes the read lock, rotating the generations first if a window
+// has passed.
+func (t *tombstones) rLockRotated() {
 	t.mu.RLock()
 
 	if t.now().Sub(t.rotatedAt) >= t.window {
@@ -87,24 +120,16 @@ func (t *tombstones) matches(keys [][]byte, dst []int) []int {
 		t.mu.Unlock()
 		t.mu.RLock()
 	}
+}
 
-	defer t.mu.RUnlock()
-
-	for i, key := range keys {
-		if len(key) != chainhash.HashSize {
-			continue
-		}
-
-		h := chainhash.Hash(key)
-
-		if _, ok := t.current[h]; ok {
-			dst = append(dst, i)
-		} else if _, ok := t.previous[h]; ok {
-			dst = append(dst, i)
-		}
+func (t *tombstones) holdsLocked(h chainhash.Hash) bool {
+	if _, ok := t.current[h]; ok {
+		return true
 	}
 
-	return dst
+	_, ok := t.previous[h]
+
+	return ok
 }
 
 // rotateLocked ages the generations by however many windows have passed.

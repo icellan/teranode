@@ -323,3 +323,85 @@ func TestTxMetaCache_ReadThroughRacingDemotionIsNotCached(t *testing.T) {
 		})
 	}
 }
+
+// staleWriteBackend reproduces a writer that passed the tombstone check before
+// DeleteDemoted ran: DeleteDemoted completes, then the old write lands, then
+// readInGap runs before the writer's post-write eviction.
+type staleWriteBackend struct {
+	cacheBackend
+	before    func()
+	readInGap func()
+}
+
+func (b *staleWriteBackend) SetMultiSequential(keys, values [][]byte) error {
+	if b.before != nil {
+		b.before()
+	}
+
+	err := b.cacheBackend.SetMultiSequential(keys, values)
+
+	if b.readInGap != nil {
+		b.readInGap()
+	}
+
+	return err
+}
+
+// TestTxMetaCache_NoStaleHitAfterDeleteDemotedReturns pins that once
+// DeleteDemoted has returned, no read path returns the demoted tx, even while
+// an older write of it has landed and not yet been evicted.
+func TestTxMetaCache_NoStaleHitAfterDeleteDemotedReturns(t *testing.T) {
+	for _, bt := range tombstoneTestBucketTypes {
+		t.Run(bt.name, func(t *testing.T) {
+			store := &utxo.MockUtxostore{}
+			c := newTombstoneTestCache(t, bt.bucketType, store)
+
+			demoted, demotedData, demotedBytes := tombstoneTestEntry(t, "demoted")
+
+			// GetMeta falls through to the store on a miss: the store has it demoted.
+			store.On("GetMeta", mock.Anything, &demoted, mock.Anything).
+				Return(&meta.Data{Fee: demotedData.Fee, SizeInBytes: demotedData.SizeInBytes, Conflicting: true})
+
+			var (
+				single, multi, into, getMeta bool
+				ran                          bool
+			)
+
+			backend := &staleWriteBackend{cacheBackend: c.cache}
+			backend.before = func() { c.DeleteDemoted([]chainhash.Hash{demoted}) }
+			backend.readInGap = func() {
+				ran = true
+
+				_, raw := c.cache.Get(demoted)
+				require.True(t, raw, "the stale write must have landed, otherwise this test proves nothing")
+
+				_, single = c.GetMetaCached(context.Background(), demoted)
+
+				out := make([]*meta.Data, 1)
+				c.GetMetaCachedMulti(context.Background(), []chainhash.Hash{demoted}, nil, out)
+				multi = out[0] != nil
+
+				cm := make([]CachedMeta, 1)
+				found := make([]bool, 1)
+				_, err := c.GetMetaCachedInto(context.Background(), []chainhash.Hash{demoted}, nil, cm, found)
+				require.NoError(t, err)
+				into = found[0]
+
+				got := &meta.Data{}
+				require.NoError(t, c.GetMeta(context.Background(), &demoted, got))
+				getMeta = !got.Conflicting
+			}
+
+			// Bypass the pre-write check the way a writer that checked before
+			// DeleteDemoted would: hand the write straight to the backend.
+			c.cache = backend
+			require.NoError(t, backend.SetMultiSequential([][]byte{demoted[:]}, [][]byte{demotedBytes}))
+			require.True(t, ran)
+
+			require.False(t, single, "GetMetaCached must not return a tx DeleteDemoted already evicted")
+			require.False(t, multi, "GetMetaCachedMulti must not return a tx DeleteDemoted already evicted")
+			require.False(t, into, "GetMetaCachedInto must not return a tx DeleteDemoted already evicted")
+			require.False(t, getMeta, "GetMeta must answer from the store, not the stale entry")
+		})
+	}
+}
