@@ -62,6 +62,21 @@ const (
 	SourceTypeRetry   = "retry"
 	SourceTypeCatchup = "catchup"
 
+	// blockFetchRetryDelay is how long a block waits before it is requeued after a fetch failure.
+	blockFetchRetryDelay = 5 * time.Second
+
+	// blockDeadlineRetryDelay is how long a block waits before it is requeued after its
+	// validation hit a deadline. Longer than the fetch delay: the subtree validation the
+	// deadline cut off is still running server side and cannot be cancelled.
+	blockDeadlineRetryDelay = time.Minute
+
+	// blockRetryAttemptsTTL bounds how long a block's requeue count is kept. It must outlive
+	// MaxRetries attempts that each run into CheckBlockSubtreesTimeout (30 min by default).
+	blockRetryAttemptsTTL = 24 * time.Hour
+
+	// blockRetryAttemptsCapacity bounds the requeue counter cache.
+	blockRetryAttemptsCapacity = 10_000
+
 	// maxCatchupAlternatives bounds how many alternative sources are retained
 	// per block hash in catchupAlternatives. Each element holds a full
 	// deserialized block for up to the cache TTL, and failover only ever walks
@@ -88,6 +103,11 @@ type processBlockFound struct {
 	// errCh receives any errors encountered during block validation and allows
 	// synchronous waiting for validation completion
 	errCh chan error
+
+	// priority and height are the block's class and height in the priority queue, set when
+	// a worker takes it off the queue, so a retry goes back where it was.
+	priority BlockPriority
+	height   uint32
 }
 
 // processBlockCatchup contains information needed to process a block during chain catchup
@@ -194,6 +214,11 @@ type Server struct {
 	// pinning a worker and the catchup lock. TTL window only (no touch-on-hit) so the
 	// block can be retried again later if better peers appear.
 	blockCatchupAttempts *ttlcache.Cache[chainhash.Hash, int]
+
+	// blockRetryAttempts counts worker requeues per block hash after a failure that is not
+	// a verdict (fetch error, deadline). Capped by BlockValidation.MaxRetries and cleared
+	// when the block is processed.
+	blockRetryAttempts *ttlcache.Cache[chainhash.Hash, int]
 
 	// peerMaliciousCache is a short-lived cache of IsPeerMalicious verdicts.
 	// Every gossip-driven Kafka message costs two of these checks and each is
@@ -469,6 +494,7 @@ func New(
 			// the TTL. Same reasoning as processBlockNotify above.
 			ttlcache.WithDisableTouchOnHit[chainhash.Hash, []processBlockCatchup](),
 		),
+		blockRetryAttempts: newBlockRetryAttemptsCache(),
 		blockCatchupAttempts: ttlcache.New[chainhash.Hash, int](
 			ttlcache.WithTTL[chainhash.Hash, int](10*time.Minute),
 			// Do not extend the window on reads: the cooldown runs a fixed time from
@@ -794,6 +820,10 @@ func (u *Server) Init(ctx context.Context) (err error) {
 	// call Init without initialising it (NewServer always does). Matches Stop().
 	if u.blockCatchupAttempts != nil {
 		go u.blockCatchupAttempts.Start()
+	}
+
+	if u.blockRetryAttempts != nil {
+		go u.blockRetryAttempts.Start()
 	}
 
 	if u.peerMaliciousCache != nil {
@@ -1299,6 +1329,9 @@ func (u *Server) Stop(ctx context.Context) error {
 		u.catchupAlternatives.Stop()
 		if u.blockCatchupAttempts != nil {
 			u.blockCatchupAttempts.Stop()
+		}
+		if u.blockRetryAttempts != nil {
+			u.blockRetryAttempts.Stop()
 		}
 		if u.peerMaliciousCache != nil {
 			u.peerMaliciousCache.Stop()
@@ -2197,29 +2230,12 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 					// processBlockFound (accountCorruptAttempt), which both this worker route and the
 					// direct ProcessBlock route funnel through — so it is counted there exactly once,
 					// not here (which would double-count the worker route and miss the direct route).
-				} else if errors.IsNetworkError(err) || errors.IsMaliciousResponseError(err) {
-					// If the error indicates the block couldn't be fetched (network error, malicious node, etc),
-					// we should retry the block later rather than dropping it completely
-					// TODO: We might want to limit the number of retries per block to avoid infinite loops
-					// For now, we'll just re-queue it with deepFork priority to ensure it gets retried eventually
-					// Note: This could lead to blocks being retried indefinitely if they are always failing to fetch
-					// A more robust solution would involve tracking retry counts and eventually giving up after a threshold
-					u.logger.Warnf("[BlockProcessing] Block %s fetch failed, will retry later", blockFound.hash.String())
-					// Re-add the block to the queue for retry
-					// We need to get the block metadata (height and priority) for re-queuing
-					// For now, we'll use deepFork priority as a safe default for retries
+				} else if delay, retry := u.blockRetryDelay(blockFound.hash, err); retry {
+					u.logger.Warnf("[BlockProcessing] Block %s failed without a verdict, requeueing in %s", blockFound.hash.String(), delay)
+
 					go func() {
-						// Add a small delay to avoid tight loops
-						time.Sleep(5 * time.Second)
-						// Create a new blockFound without specific peer info so any peer can provide it
-						retryBlock := processBlockFound{
-							hash:    blockFound.hash,
-							baseURL: SourceTypeRetry, // Special marker for retry attempts
-							peerID:  "",              // Clear peer ID so any peer can be used
-							errCh:   nil,             // No error channel for async retry
-						}
-						u.blockPriorityQueue.RequeueForRetry(retryBlock, PriorityDeepFork, 0)
-						u.logger.Infof("[BlockProcessing] Re-queued block %s for retry from any available peer", blockFound.hash.String())
+						time.Sleep(delay)
+						u.requeueBlock(blockFound)
 					}()
 				}
 			} else {
@@ -2227,6 +2243,8 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 				if prometheusBlockPriorityQueueProcessed != nil {
 					prometheusBlockPriorityQueueProcessed.WithLabelValues("unknown", "success").Inc()
 				}
+
+				u.clearBlockRetryAttempts(blockFound.hash)
 
 				// The per-(hash, peerID) corrupt counter (bitcoin-sv/teranode#4692) is cleared on a
 				// genuine validation success inside processBlockFound (accountCorruptAttempt). It is NOT
@@ -2236,6 +2254,63 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 			}
 		}
 	}
+}
+
+func newBlockRetryAttemptsCache() *ttlcache.Cache[chainhash.Hash, int] {
+	return ttlcache.New[chainhash.Hash, int](
+		ttlcache.WithTTL[chainhash.Hash, int](blockRetryAttemptsTTL),
+		ttlcache.WithCapacity[chainhash.Hash, int](blockRetryAttemptsCapacity),
+		ttlcache.WithDisableTouchOnHit[chainhash.Hash, int](),
+	)
+}
+
+// blockRetryDelay reports whether a block that failed with err goes back on the queue, and
+// after how long. Only failures that are not a verdict on the block are retried: a fetch
+// failure, and a deadline (the subtree check running past CheckBlockSubtreesTimeout). Each
+// block gets at most BlockValidation.MaxRetries requeues.
+func (u *Server) blockRetryDelay(hash *chainhash.Hash, err error) (time.Duration, bool) {
+	var delay time.Duration
+
+	switch {
+	case errors.IsNetworkError(err) || errors.IsMaliciousResponseError(err):
+		delay = blockFetchRetryDelay
+	case errors.Is(err, context.DeadlineExceeded):
+		delay = blockDeadlineRetryDelay
+	default:
+		return 0, false
+	}
+
+	if u.blockRetryAttempts == nil {
+		return 0, false
+	}
+
+	attempts := 1
+	if item := u.blockRetryAttempts.Get(*hash); item != nil {
+		attempts = item.Value() + 1
+	}
+
+	if attempts > u.settings.BlockValidation.MaxRetries {
+		u.logger.Warnf("[BlockProcessing] Block %s reached %d retries, not requeueing", hash.String(), u.settings.BlockValidation.MaxRetries)
+		return 0, false
+	}
+
+	u.blockRetryAttempts.Set(*hash, attempts, ttlcache.DefaultTTL)
+
+	return delay, true
+}
+
+func (u *Server) clearBlockRetryAttempts(hash *chainhash.Hash) {
+	if u.blockRetryAttempts != nil {
+		u.blockRetryAttempts.Delete(*hash)
+	}
+}
+
+// requeueBlock puts a failed block back on the queue with the peer that announced it and the
+// class and height it had. Nobody waits on the retry, so the error channel is dropped.
+func (u *Server) requeueBlock(blockFound processBlockFound) {
+	blockFound.errCh = nil
+	u.blockPriorityQueue.RequeueForRetry(blockFound, blockFound.priority, blockFound.height)
+	u.logger.Infof("[BlockProcessing] Re-queued block %s for retry from %s", blockFound.hash.String(), blockFound.baseURL)
 }
 
 // logCatchupFSMRefusal selects severity only; the caller uses typed StateError
