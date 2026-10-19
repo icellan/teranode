@@ -107,3 +107,16 @@ func TestRequeueForRetry_KeepsSourcePriorityAndHeight(t *testing.T) {
 	require.Equal(t, PriorityNearFork, item.priority)
 	require.Equal(t, uint32(42), item.height)
 }
+
+// TestBlockRetryDelay_DeadlineWinsOverNetworkSubstring pins the check order: IsNetworkError
+// matches substrings such as "http", so a deadline error mentioning a URL must still get the
+// deadline delay.
+func TestBlockRetryDelay_DeadlineWinsOverNetworkSubstring(t *testing.T) {
+	server := newRetryTestServer(t, 3)
+
+	err := errors.NewServiceError("validating block from http://peer", errors.New(errors.ERR_ERROR, "context deadline exceeded"))
+
+	delay, ok := server.blockRetryDelay(&chainhash.Hash{1}, err)
+	require.True(t, ok)
+	require.Equal(t, blockDeadlineRetryDelay, delay)
+}

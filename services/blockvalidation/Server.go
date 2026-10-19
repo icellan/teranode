@@ -2204,59 +2204,67 @@ func (u *Server) blockProcessingWorker(ctx context.Context, workerID int) {
 
 			err := u.processBlockWithPriority(ctx, blockFound)
 
-			u.forkManager.FinishProcessingBlock(blockFound.hash)
-
-			if err != nil {
-				u.logger.Errorf("[BlockProcessing] Worker %d failed to process block %s: %v", workerID, blockFound.hash.String(), err)
-
-				// Note: Failures are not reported here as these are normal block processing failures
-				// Catchup failures are reported by the catchup() function
-
-				// Update processed metric with failure
-				if prometheusBlockPriorityQueueProcessed != nil {
-					// We don't have the priority here, so we'll use "unknown"
-					prometheusBlockPriorityQueueProcessed.WithLabelValues("unknown", "failure").Inc()
-				}
-
-				// IsBlockCorrupt is tested BEFORE the network/malicious pair (bitcoin-sv/teranode#4692):
-				// IsMaliciousResponseError substring-matches the word "corrupt" in the rendered error
-				// text, so an ERR_BLOCK_CORRUPT error would otherwise always match the malicious branch
-				// and this dedicated corrupt-recovery branch would be dead code.
-				if errors.IsBlockCorrupt(err) {
-					// RUNNING corrupt body (bitcoin-sv/teranode#4692): the serving peer was already struck
-					// inside ValidateBlockWithOptions and nothing was persisted — no invalid=true,
-					// SetBlockExists never set, block never AddBlock'd. Clear the in-flight dedup
-					// marker so the same hash re-announced by an honest peer re-enters validation
-					// instead of being dropped as already-in-progress. Recovery is the natural
-					// re-announcement (many peers hold the honest block in RUNNING); the
-					// already-exists-as-invalid short-circuit never fires because we did not poison.
-					// If the corrupt peer was the sole announcer, no honest peer holds the hash and
-					// it correctly never connects.
-					u.logger.Warnf("[BlockProcessing] Block %s had a corrupt body, cleared for re-download from another peer", blockFound.hash.String())
-					u.processBlockNotify.Delete(*blockFound.hash)
-					// The per-(hash, peerID) corrupt cap (bitcoin-sv/teranode#4692) is accounted inside
-					// processBlockFound (accountCorruptAttempt), which both this worker route and the
-					// direct ProcessBlock route funnel through — so it is counted there exactly once,
-					// not here (which would double-count the worker route and miss the direct route).
-				} else if delay, retry := u.blockRetryDelay(blockFound.hash, err); retry {
-					u.logger.Warnf("[BlockProcessing] Block %s failed without a verdict, requeueing in %s", blockFound.hash.String(), delay)
-					u.requeueBlock(blockFound, delay)
-				}
-			} else {
-				// Update processed metric with success
-				if prometheusBlockPriorityQueueProcessed != nil {
-					prometheusBlockPriorityQueueProcessed.WithLabelValues("unknown", "success").Inc()
-				}
-
-				u.clearBlockRetryAttempts(blockFound.hash)
-
-				// The per-(hash, peerID) corrupt counter (bitcoin-sv/teranode#4692) is cleared on a
-				// genuine validation success inside processBlockFound (accountCorruptAttempt). It is NOT
-				// cleared here: a worker "success" also covers the exists / catchup / cap-exhausted
-				// early returns (which return nil), and clearing on a cap-exhausted skip would reset
-				// the very cooldown the cap just enforced.
-			}
+			u.finishProcessedBlock(workerID, blockFound, err)
 		}
+	}
+}
+
+// finishProcessedBlock handles the outcome of a worker's block and releases its slot.
+func (u *Server) finishProcessedBlock(workerID int, blockFound processBlockFound, err error) {
+	// The slot is released last. A block being retried must already be back on the queue
+	// when the release wakes a worker: in between it is neither queued nor processing, and a
+	// child waiting behind it would be taken and sent to catchup.
+	defer u.forkManager.FinishProcessingBlock(blockFound.hash)
+
+	if err != nil {
+		u.logger.Errorf("[BlockProcessing] Worker %d failed to process block %s: %v", workerID, blockFound.hash.String(), err)
+
+		// Note: Failures are not reported here as these are normal block processing failures
+		// Catchup failures are reported by the catchup() function
+
+		// Update processed metric with failure
+		if prometheusBlockPriorityQueueProcessed != nil {
+			// We don't have the priority here, so we'll use "unknown"
+			prometheusBlockPriorityQueueProcessed.WithLabelValues("unknown", "failure").Inc()
+		}
+
+		// IsBlockCorrupt is tested BEFORE the network/malicious pair (bitcoin-sv/teranode#4692):
+		// IsMaliciousResponseError substring-matches the word "corrupt" in the rendered error
+		// text, so an ERR_BLOCK_CORRUPT error would otherwise always match the malicious branch
+		// and this dedicated corrupt-recovery branch would be dead code.
+		if errors.IsBlockCorrupt(err) {
+			// RUNNING corrupt body (bitcoin-sv/teranode#4692): the serving peer was already struck
+			// inside ValidateBlockWithOptions and nothing was persisted — no invalid=true,
+			// SetBlockExists never set, block never AddBlock'd. Clear the in-flight dedup
+			// marker so the same hash re-announced by an honest peer re-enters validation
+			// instead of being dropped as already-in-progress. Recovery is the natural
+			// re-announcement (many peers hold the honest block in RUNNING); the
+			// already-exists-as-invalid short-circuit never fires because we did not poison.
+			// If the corrupt peer was the sole announcer, no honest peer holds the hash and
+			// it correctly never connects.
+			u.logger.Warnf("[BlockProcessing] Block %s had a corrupt body, cleared for re-download from another peer", blockFound.hash.String())
+			u.processBlockNotify.Delete(*blockFound.hash)
+			// The per-(hash, peerID) corrupt cap (bitcoin-sv/teranode#4692) is accounted inside
+			// processBlockFound (accountCorruptAttempt), which both this worker route and the
+			// direct ProcessBlock route funnel through — so it is counted there exactly once,
+			// not here (which would double-count the worker route and miss the direct route).
+		} else if delay, retry := u.blockRetryDelay(blockFound.hash, err); retry {
+			u.logger.Warnf("[BlockProcessing] Block %s failed without a verdict, requeueing in %s", blockFound.hash.String(), delay)
+			u.requeueBlock(blockFound, delay)
+		}
+	} else {
+		// Update processed metric with success
+		if prometheusBlockPriorityQueueProcessed != nil {
+			prometheusBlockPriorityQueueProcessed.WithLabelValues("unknown", "success").Inc()
+		}
+
+		u.clearBlockRetryAttempts(blockFound.hash)
+
+		// The per-(hash, peerID) corrupt counter (bitcoin-sv/teranode#4692) is cleared on a
+		// genuine validation success inside processBlockFound (accountCorruptAttempt). It is NOT
+		// cleared here: a worker "success" also covers the exists / catchup / cap-exhausted
+		// early returns (which return nil), and clearing on a cap-exhausted skip would reset
+		// the very cooldown the cap just enforced.
 	}
 }
 
@@ -2275,11 +2283,13 @@ func newBlockRetryAttemptsCache() *ttlcache.Cache[chainhash.Hash, int] {
 func (u *Server) blockRetryDelay(hash *chainhash.Hash, err error) (time.Duration, bool) {
 	var delay time.Duration
 
+	// The deadline is checked first: IsNetworkError matches substrings such as "timeout"
+	// and "http", which a deadline error's message can contain.
 	switch {
-	case errors.IsNetworkError(err) || errors.IsMaliciousResponseError(err):
-		delay = blockFetchRetryDelay
 	case errors.Is(err, context.DeadlineExceeded):
 		delay = blockDeadlineRetryDelay
+	case errors.IsNetworkError(err) || errors.IsMaliciousResponseError(err):
+		delay = blockFetchRetryDelay
 	default:
 		return 0, false
 	}
@@ -2327,17 +2337,13 @@ func (u *Server) isBlockInFlight(hash *chainhash.Hash) bool {
 
 // inFlightPriority returns the class of a queued or processing block, so a child queued
 // behind it gets the same class: a child of a chain-extending block extends the chain once
-// its parent is stored.
-func (u *Server) inFlightPriority(hash *chainhash.Hash) BlockPriority {
+// its parent is stored. ok is false if the parent finished in the meantime.
+func (u *Server) inFlightPriority(hash *chainhash.Hash) (BlockPriority, bool) {
 	if priority, ok := u.blockPriorityQueue.PriorityOf(hash); ok {
-		return priority
+		return priority, true
 	}
 
-	if priority, ok := u.forkManager.ProcessingPriority(hash); ok {
-		return priority
-	}
-
-	return PriorityDeepFork
+	return u.forkManager.ProcessingPriority(hash)
 }
 
 // logCatchupFSMRefusal selects severity only; the caller uses typed StateError
@@ -3149,10 +3155,15 @@ func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockF
 
 	var priority BlockPriority
 
+	inherited := false
+
 	if parentInFlight {
-		priority = u.inFlightPriority(block.Header.HashPrevBlock)
+		priority, inherited = u.inFlightPriority(block.Header.HashPrevBlock)
 		u.logger.Infof("[queueFetchedBlock] Parent block %s of block %s is still being validated, queueing behind it", block.Header.HashPrevBlock.String(), blockFound.hash.String())
-	} else {
+	}
+
+	// A parent that finished since the in-flight check has nothing to inherit from: classify.
+	if !inherited {
 		// Classify the block
 		priority, err = u.blockClassifier.ClassifyBlock(ctx, block)
 		if err != nil {

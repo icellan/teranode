@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/teranode/services/validator"
@@ -209,4 +210,43 @@ func TestAddBlockToPriorityQueue_ParentUnknown_GoesToCatchup(t *testing.T) {
 
 	require.Eventually(t, func() bool { return len(server.catchupCh) == 1 }, 2*time.Second, 10*time.Millisecond)
 	require.False(t, server.blockPriorityQueue.Contains(*child))
+}
+
+// slotReleaseRecorder records, at the moment the fork manager releases a slot, whether the
+// block is back on the queue.
+type slotReleaseRecorder struct {
+	pq       *BlockPriorityQueue
+	hash     chainhash.Hash
+	inQueue  bool
+	released bool
+}
+
+func (r *slotReleaseRecorder) Broadcast() {}
+
+func (r *slotReleaseRecorder) Signal() {
+	r.released = true
+	r.inQueue = r.pq.Contains(r.hash)
+}
+
+// TestFinishProcessedBlock_RequeuesBeforeReleasingSlot pins the order in the worker: a block
+// that will be retried is back on the queue before its slot is released. Releasing first
+// wakes a worker while the block is neither queued nor processing, and a child waiting
+// behind it is taken and sent to catchup.
+func TestFinishProcessedBlock_RequeuesBeforeReleasingSlot(t *testing.T) {
+	initPrometheusMetrics()
+	server := newRetryTestServer(t, 3)
+	server.forkManager = NewForkManager(ulogger.TestLogger{}, server.settings)
+
+	parent := &chainhash.Hash{1}
+	recorder := &slotReleaseRecorder{pq: server.blockPriorityQueue, hash: *parent}
+	server.forkManager.SetPriorityQueue(recorder)
+
+	require.True(t, server.forkManager.StartProcessingBlock(parent, PriorityChainExtending))
+
+	deadlineErr := errors.NewServiceError("failed block validation BlockFound", errors.New(errors.ERR_ERROR, "context deadline exceeded"))
+	server.finishProcessedBlock(0, processBlockFound{hash: parent, baseURL: "http://peer"}, deadlineErr)
+
+	require.True(t, recorder.released)
+	require.True(t, recorder.inQueue, "the block must be requeued before its slot is released")
+	require.False(t, server.forkManager.IsProcessingBlock(parent))
 }
