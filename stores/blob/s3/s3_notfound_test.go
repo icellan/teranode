@@ -263,6 +263,10 @@ func TestS3_ErrorMessagesRenderTheObjectKey(t *testing.T) {
 
 	key := []byte("render-me")
 
+	renderedKey := func(s3Store *S3) string {
+		return aws.ToString(s3Store.getObjectKey(key, fileformat.FileTypeTx, s3Store.options))
+	}
+
 	t.Run("SetFromReader on an existing object", func(t *testing.T) {
 		s3Store, _ := setupTestS3(t)
 		require.NoError(t, s3Store.Set(context.Background(), key, fileformat.FileTypeTx, []byte("v")))
@@ -272,6 +276,7 @@ func TestS3_ErrorMessagesRenderTheObjectKey(t *testing.T) {
 
 		require.Error(t, err)
 		require.NotContains(t, err.Error(), badRender, "the object key must render as text")
+		require.Contains(t, err.Error(), renderedKey(s3Store))
 	})
 
 	t.Run("SetFromReader when the upload fails", func(t *testing.T) {
@@ -283,6 +288,7 @@ func TestS3_ErrorMessagesRenderTheObjectKey(t *testing.T) {
 
 		require.Error(t, err)
 		require.NotContains(t, err.Error(), badRender)
+		require.Contains(t, err.Error(), renderedKey(s3Store))
 	})
 
 	t.Run("Set on an existing object", func(t *testing.T) {
@@ -293,6 +299,7 @@ func TestS3_ErrorMessagesRenderTheObjectKey(t *testing.T) {
 
 		require.Error(t, err)
 		require.NotContains(t, err.Error(), badRender)
+		require.Contains(t, err.Error(), renderedKey(s3Store))
 	})
 
 	t.Run("Set when the upload fails", func(t *testing.T) {
@@ -303,6 +310,7 @@ func TestS3_ErrorMessagesRenderTheObjectKey(t *testing.T) {
 
 		require.Error(t, err)
 		require.NotContains(t, err.Error(), badRender)
+		require.Contains(t, err.Error(), renderedKey(s3Store))
 	})
 
 	t.Run("Del when the delete fails", func(t *testing.T) {
@@ -313,6 +321,7 @@ func TestS3_ErrorMessagesRenderTheObjectKey(t *testing.T) {
 
 		require.Error(t, err)
 		require.NotContains(t, err.Error(), badRender)
+		require.Contains(t, err.Error(), renderedKey(s3Store))
 	})
 }
 

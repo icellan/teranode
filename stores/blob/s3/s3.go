@@ -70,8 +70,10 @@ import (
 //     under such a policy.
 //   - The bucket itself is never verified. S3 answers a HEAD against a missing or
 //     misconfigured bucket with a bodyless 404, indistinguishable from a missing key
-//     once the SDK has derived the error code (see isMissingObject), so Exists
-//     reports "not stored" for every key rather than failing loudly. A one-time
+//     once the SDK has derived the error code (see isMissingObject). Exists issues
+//     that HEAD directly and Get reaches it through transfermanager, which sends a
+//     HeadObject before reading and returns its error unwrapped, so Exists and Get
+//     report "not stored" for every key rather than failing loudly. A one-time
 //     HeadBucket at construction would turn that into a startup error; it is not
 //     done here.
 type S3 struct {
@@ -307,10 +309,7 @@ func (g *S3) Set(ctx context.Context, key []byte, fileType fileformat.FileType, 
 	objectKey := g.getObjectKey(key, fileType, merged)
 
 	if !merged.AllowOverwrite {
-		// Check if the object already exists. This ran twice, identically and back to
-		// back: the second copy could never return (the first already has, if the
-		// object is there) but did cost a second HeadObject round-trip on every
-		// non-overwrite Set.
+		// Check if the object already exists
 		if _, err := g.client.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(g.bucket),
 			Key:    objectKey,
@@ -485,16 +484,20 @@ func isMissingObject(err error) bool {
 	// check is needed: the S3 deserializers pass UseStatusCode, so s3shared
 	// derives the code "NotFound" from the status text when the response carries
 	// no error body. Widening to "any 404" would gain nothing and lose the one
-	// distinction there is to keep on a GET: NoSuchBucket is also a 404, arrives
-	// with a body naming it, and must stay a failure rather than read as a miss.
+	// distinction there is to keep on a direct GetObject (GetIoReader):
+	// NoSuchBucket is also a 404, arrives with a body naming it, and must stay a
+	// failure rather than read as a miss.
 	//
 	// That distinction does NOT survive on a HEAD. A HEAD response carries no body
 	// at all, so a wrong or missing bucket reaches us as the same derived
-	// "NotFound" as a missing key, and Exists reports (false, nil) for every key in
-	// a misconfigured bucket. Pre-existing — the previous strings.Contains match had
-	// it too — and not something this helper can resolve, since by then the
-	// distinguishing information is gone. Catching it needs a bucket-level check at
-	// construction; see the note on the S3 type.
+	// "NotFound" as a missing key. Exists issues that HEAD itself, and Get reaches
+	// it through transfermanager, which sends a HeadObject before reading and
+	// returns its error unwrapped; both report a miss for every key in a
+	// misconfigured bucket. Exists had this before (the strings.Contains match
+	// caught "NotFound" too); Get did not, because the derived NotFound message
+	// never contained "NoSuchKey", so on Get it is new. This helper cannot resolve
+	// it, since by then the distinguishing information is gone. Catching it needs a
+	// bucket-level check at construction; see the note on the S3 type.
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
