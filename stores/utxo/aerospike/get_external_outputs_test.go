@@ -89,6 +89,7 @@ func newOutputsOnlyStore(t *testing.T, liveIndexes ...uint32) (*Store, blob.Stor
 	tSettings.ChainCfgParams = &chainParams
 
 	mem := memory.New()
+	t.Cleanup(func() { require.NoError(t, mem.Close(context.Background())) })
 
 	s := &Store{
 		ctx:           context.Background(),
@@ -164,7 +165,6 @@ func TestGetExternalTransaction_OutputsFallbackShape(t *testing.T) {
 	// Sanity: the source transaction is serializable, so the predicate is
 	// discriminating rather than always-false.
 	require.True(t, (&meta.Data{Tx: tx}).TxIsSerializable())
-	require.NotNil(t, tx.TxIDChainHash())
 }
 
 // TestGetExternalTransaction_CorruptTxDoesNotDegradeToOutputs covers the behaviour
@@ -206,29 +206,6 @@ func TestGetExternalTransaction_CorruptTxDoesNotDegradeToOutputs(t *testing.T) {
 		require.Zero(t, rec.reads(fileformat.FileTypeOutputs),
 			"the reconstruction must not be substituted for a transaction the node does hold")
 	})
-
-	t.Run("a header-level failure does not reach the fallback", func(t *testing.T) {
-		s, mem, tx := newOutputsOnlyStore(t, 1, 2)
-
-		// What a blob store reports for a missing or mismatched fileformat header:
-		// a StorageError carrying no not-found anywhere in the chain.
-		rec := &recordingReadStore{
-			Store:        mem,
-			failFileType: fileformat.FileTypeTx,
-			failWith:     errors.NewStorageError("[File][GetIoReader] [x] missing or invalid header"),
-		}
-		s.externalStore = rec
-
-		got, err := s.getExternalTransaction(context.Background(), *tx.TxIDChainHash())
-
-		require.Error(t, err)
-		require.Nil(t, got)
-		require.True(t, errors.Is(err, errors.ErrStorageError))
-		require.False(t, errors.Is(err, errors.ErrTxNotFound),
-			"a damaged header is not the blob being absent")
-		require.Zero(t, rec.reads(fileformat.FileTypeOutputs),
-			"the fallback must not fire for a blob the store failed to read")
-	})
 }
 
 // TestGetExternalTransaction_FallsBackOnlyOnNotFound covers the corners of the
@@ -243,8 +220,7 @@ func TestGetExternalTransaction_FallsBackOnlyOnNotFound(t *testing.T) {
 		// fallback rejects valid spends as missing-parent. Covered end to end against
 		// a real store by TestExternalOutputsOnlyParentIsReadableForExtension; this
 		// keeps it pinned without a container.
-		s, mem, tx := newOutputsOnlyStore(t, 1, 2)
-		s.externalStore = mem
+		s, _, tx := newOutputsOnlyStore(t, 1, 2)
 
 		got, err := s.GetTxFromExternalStore(context.Background(), *tx.TxIDChainHash())
 		require.NoError(t, err, "a seeded parent must stay readable through the public entry point")

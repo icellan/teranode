@@ -38,6 +38,7 @@ func TestExternalOutputsOnlyParentIsReadableForExtension(t *testing.T) {
 	// Own the external store so the test can inspect which representation was
 	// written rather than assuming it.
 	ext := memory.New()
+	t.Cleanup(func() { require.NoError(t, ext.Close(ctx)) })
 	store.SetExternalStore(ext)
 
 	// Input-less tx (what cmd/seeder builds), with enough outputs to pass the
@@ -82,7 +83,9 @@ func TestExternalOutputsOnlyParentIsReadableForExtension(t *testing.T) {
 	require.NotNil(t, md.Tx.Outputs[0].LockingScript)
 
 	// And the reconstruction must still be recognisable as one, so the consumers
-	// that serialize keep refusing it.
+	// that serialize keep refusing it. What trips the gate here is the absent
+	// inputs rather than the nil output holes: TxIsSerializable rejects an
+	// input-less transaction before it inspects a single output.
 	require.False(t, md.TxIsSerializable(),
 		"a snapshot reconstruction must not pass the gate that serializing consumers use")
 }
