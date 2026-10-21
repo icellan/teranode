@@ -604,3 +604,29 @@ func TestBlockPriorityQueue_WaitForBlock_SignalDuringGetNotLost(t *testing.T) {
 	require.Equal(t, GetOK, status, "the signal sent during Get was lost")
 	require.Equal(t, hash, taken.hash)
 }
+
+// TestBlockPriorityQueue_WaitForBlock_ReturnsOnCancelWithQueuedBlocks pins that a worker stops
+// when its context is cancelled even though blocks are still queued. Get answers GetEmpty on a
+// cancelled context, and WaitForBlock used to read that as "items appeared" and loop forever.
+func TestBlockPriorityQueue_WaitForBlock_ReturnsOnCancelWithQueuedBlocks(t *testing.T) {
+	initPrometheusMetrics()
+	pq := NewBlockPriorityQueue(ulogger.TestLogger{})
+	pq.Add(processBlockFound{hash: &chainhash.Hash{1}}, PriorityChainExtending, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan GetStatus, 1)
+
+	go func() {
+		_, status := pq.WaitForBlock(ctx, NewMockBlockProcessor())
+		done <- status
+	}()
+
+	select {
+	case status := <-done:
+		require.Equal(t, GetEmpty, status)
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForBlock kept looping after its context was cancelled")
+	}
+}

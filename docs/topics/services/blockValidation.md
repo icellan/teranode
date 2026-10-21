@@ -769,7 +769,7 @@ The `WaitForBlock()` method:
 5. Returns block to worker for validation
 6. Blocks waiting if no blocks available (with timeout)
 
-When a block is announced and its parent is not stored yet but is being fetched, queued or validated, it is queued behind the parent instead of going to catchup. It takes the parent's class when the parent is queued or validating. A parent still being fetched has no class yet, so the child is classified on its own.
+When a block is announced and its parent is not stored yet but is being fetched, queued or validated, it is queued behind the parent instead of going to catchup. It takes the parent's class when the parent is queued or validating. A parent still being fetched has no class yet, so the child is classified on its own and takes the parent's class when the parent finishes.
 
 ##### Retry Mechanism
 

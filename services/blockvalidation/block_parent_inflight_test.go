@@ -311,3 +311,64 @@ func TestProcessBlockFoundChannel_MarksBlockFetching(t *testing.T) {
 	require.True(t, pendingDuringFetch, "the block must count as in flight while it is fetched")
 	require.False(t, server.blockPriorityQueue.IsPending(*child), "the fetching mark must be cleared once the fetch is over")
 }
+
+// TestFinishProcessedBlock_PromotesWaitingChildToParentClass pins that a child queued while its
+// parent was still being fetched, and so classified without it, takes the parent's class when
+// the parent finishes. Otherwise the next tip block keeps a fork class and loses the reserved
+// slot to fork blocks.
+func TestFinishProcessedBlock_PromotesWaitingChildToParentClass(t *testing.T) {
+	initPrometheusMetrics()
+	server := newRetryTestServer(t, 3)
+	server.settings.BlockValidation.MaxParallelForks = 4
+	server.forkManager = NewForkManager(ulogger.TestLogger{}, server.settings)
+
+	parent := &chainhash.Hash{1}
+	child := &chainhash.Hash{2}
+
+	server.blockPriorityQueue.Add(processBlockFound{hash: child, parentHash: parent}, PriorityDeepFork, 11)
+	require.True(t, server.forkManager.StartProcessingBlock(parent, PriorityChainExtending))
+
+	for i := byte(10); i < 13; i++ {
+		require.True(t, server.forkManager.StartProcessingBlock(&chainhash.Hash{i}, PriorityNearFork))
+	}
+
+	server.finishProcessedBlock(0, processBlockFound{hash: parent, priority: PriorityChainExtending}, nil)
+
+	priority, ok := server.blockPriorityQueue.PriorityOf(child)
+	require.True(t, ok)
+	require.Equal(t, PriorityChainExtending, priority)
+
+	taken, status := server.blockPriorityQueue.Get(context.Background(), server.forkManager)
+	require.Equal(t, GetOK, status, "the promoted child must get the slot reserved for the tip")
+	require.Equal(t, child, taken.hash)
+}
+
+// TestBlockPriorityQueue_MarkFetching_FirstFetcherOnly pins that only the first fetcher of a
+// block holds the mark. A duplicate announcement still fetching after the first one queued the
+// block must not hold children behind a parent that is already queued or stored.
+func TestBlockPriorityQueue_MarkFetching_FirstFetcherOnly(t *testing.T) {
+	pq := NewBlockPriorityQueue(ulogger.TestLogger{})
+	hash := &chainhash.Hash{1}
+
+	require.True(t, pq.MarkFetching(hash))
+	require.False(t, pq.MarkFetching(hash), "a second fetcher must not take the mark")
+
+	pq.UnmarkFetching(hash)
+	require.False(t, pq.IsPending(*hash))
+}
+
+// TestProcessBlockFoundChannel_DuplicateFetchKeepsFirstMark pins that a worker fetching a block
+// another worker is already fetching does not clear that worker's mark when it finishes.
+func TestProcessBlockFoundChannel_DuplicateFetchKeepsFirstMark(t *testing.T) {
+	initPrometheusMetrics()
+	server, hashes := newParentInFlightServer(t)
+	child := hashes[1]
+
+	httpmock.RegisterResponder("GET", fmt.Sprintf("http://peer/block/%s", child), httpmock.NewStringResponder(http.StatusInternalServerError, "unavailable"))
+
+	require.True(t, server.blockPriorityQueue.MarkFetching(child))
+
+	_ = server.processBlockFoundChannel(context.Background(), processBlockFound{hash: child, baseURL: "http://peer", peerID: "p1"})
+
+	require.True(t, server.blockPriorityQueue.IsPending(*child), "the first fetcher's mark must survive a duplicate fetch")
+}

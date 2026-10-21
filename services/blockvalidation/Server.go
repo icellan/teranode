@@ -1111,8 +1111,9 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 
 	// Count the block as in flight while it is fetched, so a child announced meanwhile waits
 	// for it instead of going to catchup. The mark is cleared after the block is queued.
-	u.blockPriorityQueue.MarkFetching(blockFound.hash)
-	defer u.blockPriorityQueue.UnmarkFetching(blockFound.hash)
+	if u.blockPriorityQueue.MarkFetching(blockFound.hash) {
+		defer u.blockPriorityQueue.UnmarkFetching(blockFound.hash)
+	}
 
 	// Check queue depth and determine if we might need catchup mode
 	queueSize := u.blockPriorityQueue.Size()
@@ -2221,6 +2222,10 @@ func (u *Server) finishProcessedBlock(workerID int, blockFound processBlockFound
 	// child waiting behind it would be taken and sent to catchup.
 	defer u.forkManager.FinishProcessingBlock(blockFound.hash)
 
+	// A child queued while this block was being fetched was classified without it. The
+	// deferred slot release lets it start, so give it this block's class first.
+	u.blockPriorityQueue.PromoteChildren(blockFound.hash, blockFound.priority)
+
 	if err != nil {
 		u.logger.Errorf("[BlockProcessing] Worker %d failed to process block %s: %v", workerID, blockFound.hash.String(), err)
 
@@ -2341,7 +2346,8 @@ func (u *Server) isBlockInFlight(hash *chainhash.Hash) bool {
 
 // inFlightPriority returns the class of a queued or processing block, so a child queued
 // behind it gets the same class: a child of a chain-extending block extends the chain once
-// its parent is stored. ok is false if the parent finished in the meantime.
+// its parent is stored. ok is false if the parent finished in the meantime, or is still being
+// fetched and has no class yet; such a child takes the parent's class when the parent finishes.
 func (u *Server) inFlightPriority(hash *chainhash.Hash) (BlockPriority, bool) {
 	if priority, ok := u.blockPriorityQueue.PriorityOf(hash); ok {
 		return priority, true
@@ -3166,7 +3172,8 @@ func (u *Server) queueFetchedBlock(ctx context.Context, blockFound processBlockF
 		u.logger.Infof("[queueFetchedBlock] Parent block %s of block %s is still being validated, queueing behind it", block.Header.HashPrevBlock.String(), blockFound.hash.String())
 	}
 
-	// A parent that finished since the in-flight check has nothing to inherit from: classify.
+	// A parent that finished since the in-flight check, or is still being fetched, has nothing
+	// to inherit from: classify. finishProcessedBlock promotes the child once the parent is done.
 	if !inherited {
 		// Classify the block
 		priority, err = u.blockClassifier.ClassifyBlock(ctx, block)
