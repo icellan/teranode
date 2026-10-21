@@ -1109,6 +1109,11 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 		return nil
 	}
 
+	// Count the block as in flight while it is fetched, so a child announced meanwhile waits
+	// for it instead of going to catchup. The mark is cleared after the block is queued.
+	u.blockPriorityQueue.MarkFetching(blockFound.hash)
+	defer u.blockPriorityQueue.UnmarkFetching(blockFound.hash)
+
 	// Check queue depth and determine if we might need catchup mode
 	queueSize := u.blockPriorityQueue.Size()
 	shouldConsiderCatchup := u.settings.BlockValidation.UseCatchupWhenBehind && (queueSize > 10 || len(u.blockFoundCh) > 3)
@@ -2224,8 +2229,7 @@ func (u *Server) finishProcessedBlock(workerID int, blockFound processBlockFound
 
 		// Update processed metric with failure
 		if prometheusBlockPriorityQueueProcessed != nil {
-			// We don't have the priority here, so we'll use "unknown"
-			prometheusBlockPriorityQueueProcessed.WithLabelValues("unknown", "failure").Inc()
+			prometheusBlockPriorityQueueProcessed.WithLabelValues(priorityToString(blockFound.priority), "failure").Inc()
 		}
 
 		// IsBlockCorrupt is tested BEFORE the network/malicious pair (bitcoin-sv/teranode#4692):
@@ -2255,7 +2259,7 @@ func (u *Server) finishProcessedBlock(workerID int, blockFound processBlockFound
 	} else {
 		// Update processed metric with success
 		if prometheusBlockPriorityQueueProcessed != nil {
-			prometheusBlockPriorityQueueProcessed.WithLabelValues("unknown", "success").Inc()
+			prometheusBlockPriorityQueueProcessed.WithLabelValues(priorityToString(blockFound.priority), "success").Inc()
 		}
 
 		u.clearBlockRetryAttempts(blockFound.hash)
@@ -2328,11 +2332,11 @@ func (u *Server) requeueBlock(blockFound processBlockFound, delay time.Duration)
 	u.logger.Infof("[BlockProcessing] Re-queued block %s for retry from %s in %s", blockFound.hash.String(), blockFound.baseURL, delay)
 }
 
-// isBlockInFlight reports whether a block is queued or being validated by a worker. A child
+// isBlockInFlight reports whether a block is being fetched, queued or validated. A child
 // whose parent is in flight waits in the queue for it instead of going to catchup, which
 // would move the FSM to CATCHINGBLOCKS and stop mining while the parent is still validating.
 func (u *Server) isBlockInFlight(hash *chainhash.Hash) bool {
-	return u.blockPriorityQueue.Contains(*hash) || u.forkManager.IsProcessingBlock(hash)
+	return u.blockPriorityQueue.IsPending(*hash) || u.forkManager.IsProcessingBlock(hash)
 }
 
 // inFlightPriority returns the class of a queued or processing block, so a child queued

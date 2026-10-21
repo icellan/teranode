@@ -3,6 +3,7 @@ package blockvalidation
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -249,4 +250,64 @@ func TestFinishProcessedBlock_RequeuesBeforeReleasingSlot(t *testing.T) {
 	require.True(t, recorder.released)
 	require.True(t, recorder.inQueue, "the block must be requeued before its slot is released")
 	require.False(t, server.forkManager.IsProcessingBlock(parent))
+}
+
+// TestBlockPriorityQueue_Get_ChildWaitsForParentBeingFetched pins that a parent still being
+// fetched counts as in flight: its child must not be handed out before the parent is queued.
+func TestBlockPriorityQueue_Get_ChildWaitsForParentBeingFetched(t *testing.T) {
+	initPrometheusMetrics()
+	ctx := context.Background()
+	pq := NewBlockPriorityQueue(ulogger.TestLogger{})
+	bp := NewMockBlockProcessor()
+
+	parent := &chainhash.Hash{1}
+	child := &chainhash.Hash{2}
+
+	pq.MarkFetching(parent)
+	pq.Add(processBlockFound{hash: child, parentHash: parent}, PriorityChainExtending, 11)
+
+	_, status := pq.Get(ctx, bp)
+	require.Equal(t, GetAllBlocked, status, "the child must wait while its parent is being fetched")
+
+	// The parent's fetch failed: nothing to wait for any more.
+	pq.UnmarkFetching(parent)
+
+	taken, status := pq.Get(ctx, bp)
+	require.Equal(t, GetOK, status)
+	require.Equal(t, child, taken.hash)
+}
+
+// TestAddBlockToPriorityQueue_ParentFetching_QueuesChild pins that a child announced while its
+// parent is still being fetched by another intake worker is queued, not sent to catchup.
+func TestAddBlockToPriorityQueue_ParentFetching_QueuesChild(t *testing.T) {
+	initPrometheusMetrics()
+	server, hashes := newParentInFlightServer(t)
+	parent, child := hashes[0], hashes[1]
+
+	server.blockPriorityQueue.MarkFetching(parent)
+
+	server.addBlockToPriorityQueue(context.Background(), processBlockFound{hash: child, baseURL: "http://peer", peerID: "p1"})
+
+	require.Empty(t, server.catchupCh, "a parent still being fetched is not a gap to catch up")
+	require.True(t, server.blockPriorityQueue.Contains(*child))
+}
+
+// TestProcessBlockFoundChannel_MarksBlockFetching pins that an announced block counts as in
+// flight for the whole fetch, and stops counting once the fetch is over (here: it failed).
+func TestProcessBlockFoundChannel_MarksBlockFetching(t *testing.T) {
+	initPrometheusMetrics()
+	server, hashes := newParentInFlightServer(t)
+	child := hashes[1]
+
+	var pendingDuringFetch bool
+
+	httpmock.RegisterResponder("GET", fmt.Sprintf("http://peer/block/%s", child), func(*http.Request) (*http.Response, error) {
+		pendingDuringFetch = server.blockPriorityQueue.IsPending(*child)
+		return httpmock.NewStringResponse(http.StatusInternalServerError, "unavailable"), nil
+	})
+
+	_ = server.processBlockFoundChannel(context.Background(), processBlockFound{hash: child, baseURL: "http://peer", peerID: "p1"})
+
+	require.True(t, pendingDuringFetch, "the block must count as in flight while it is fetched")
+	require.False(t, server.blockPriorityQueue.IsPending(*child), "the fetching mark must be cleared once the fetch is over")
 }

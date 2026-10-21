@@ -69,6 +69,14 @@ type BlockPriorityQueue struct {
 	needsSort bool
 	cond      *sync.Cond
 	logger    ulogger.Logger
+
+	// fetching counts the intake workers still fetching each announced block. A block being
+	// fetched is not queued yet, but its children must wait for it all the same.
+	fetching map[chainhash.Hash]int
+
+	// wakeups is bumped under mu by every Signal and Broadcast. WaitForBlock compares it with
+	// the value it saw before Get, so a wake-up sent while it was not parked is not lost.
+	wakeups uint64
 }
 
 // NewBlockPriorityQueue creates a new priority queue for blocks
@@ -78,6 +86,7 @@ func NewBlockPriorityQueue(logger ulogger.Logger) *BlockPriorityQueue {
 		hashIndex: make(map[chainhash.Hash]*PrioritizedBlock),
 		needsSort: false,
 		logger:    logger,
+		fetching:  make(map[chainhash.Hash]int),
 	}
 	pq.cond = sync.NewCond(&pq.mu)
 	return pq
@@ -162,6 +171,7 @@ func (pq *BlockPriorityQueue) Add(blockFound processBlockFound, priority BlockPr
 
 	// Always use Signal() to wake exactly one worker per block added
 	// This avoids thundering herd where all workers wake and race for one block
+	pq.wakeups++
 	pq.cond.Signal()
 
 	if prometheusBlockPriorityQueueAdded != nil {
@@ -214,7 +224,7 @@ func (pq *BlockPriorityQueue) claimAndTake(bp BlockProcessor, hash *chainhash.Ha
 }
 
 // isWaiting reports whether a queued block must not start yet: it is in its retry delay, or
-// its parent is still queued or processing. Validating it before the parent is stored would
+// its parent is still being fetched, queued or processing. Validating it before the parent is stored would
 // find no parent and send it to catchup. This gate holds regardless of the block's effective
 // priority, so the skip and age promotions cannot bypass it. notBefore and parentHash are
 // set when the item is created and never change, so they are read without the lock.
@@ -228,7 +238,7 @@ func (pq *BlockPriorityQueue) isWaiting(bp BlockProcessor, item *PrioritizedBloc
 		return false
 	}
 
-	return pq.Contains(*parent) || bp.IsProcessingBlock(parent)
+	return pq.IsPending(*parent) || bp.IsProcessingBlock(parent)
 }
 
 func (pq *BlockPriorityQueue) Get(ctx context.Context, bp BlockProcessor) (block processBlockFound, status GetStatus) {
@@ -332,16 +342,30 @@ func (pq *BlockPriorityQueue) Get(ctx context.Context, bp BlockProcessor) (block
 	return processBlockFound{}, GetAllBlocked
 }
 
+// Broadcast and Signal take mu to record the wake-up. The fork manager calls them while
+// holding its own lock, so mu must never be held while calling into the fork manager.
 func (pq *BlockPriorityQueue) Broadcast() {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	pq.wakeups++
 	pq.cond.Broadcast()
 }
 
 func (pq *BlockPriorityQueue) Signal() {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	pq.wakeups++
 	pq.cond.Signal()
 }
 
 func (pq *BlockPriorityQueue) WaitForBlock(ctx context.Context, bp BlockProcessor) (processBlockFound, GetStatus) {
 	for {
+		pq.mu.Lock()
+		wakeupsBefore := pq.wakeups
+		pq.mu.Unlock()
+
 		block, status := pq.Get(ctx, bp)
 
 		switch status {
@@ -365,11 +389,19 @@ func (pq *BlockPriorityQueue) WaitForBlock(ctx context.Context, bp BlockProcesso
 				continue // Items appeared, try Get() again
 			}
 
+			// A wake-up sent while Get was running, such as a retry delay ending or a slot
+			// being released, found no parked worker. Look again instead of waiting for the
+			// next one.
+			if pq.wakeups != wakeupsBefore {
+				pq.mu.Unlock()
+				continue
+			}
+
 			waitCh := make(chan struct{})
 			go func() {
 				select {
 				case <-ctx.Done():
-					pq.cond.Broadcast()
+					pq.Broadcast()
 				case <-waitCh:
 				}
 			}()
@@ -409,6 +441,41 @@ func (pq *BlockPriorityQueue) Contains(hash chainhash.Hash) bool {
 
 	_, exists := pq.hashIndex[hash]
 	return exists
+}
+
+// IsPending reports whether a block is queued or still being fetched by an intake worker.
+func (pq *BlockPriorityQueue) IsPending(hash chainhash.Hash) bool {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	_, queued := pq.hashIndex[hash]
+
+	return queued || pq.fetching[hash] > 0
+}
+
+// MarkFetching records that an intake worker has started fetching an announced block. Every
+// call must be paired with UnmarkFetching once the block is queued or dropped.
+func (pq *BlockPriorityQueue) MarkFetching(hash *chainhash.Hash) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	pq.fetching[*hash]++
+}
+
+// UnmarkFetching ends a fetch started with MarkFetching. A child waiting on a block whose
+// fetch failed can start now, so a worker is woken.
+func (pq *BlockPriorityQueue) UnmarkFetching(hash *chainhash.Hash) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	if pq.fetching[*hash] <= 1 {
+		delete(pq.fetching, *hash)
+	} else {
+		pq.fetching[*hash]--
+	}
+
+	pq.wakeups++
+	pq.cond.Signal()
 }
 
 func (pq *BlockPriorityQueue) Size() int {
@@ -558,6 +625,7 @@ func (pq *BlockPriorityQueue) RequeueAfter(blockFound processBlockFound, priorit
 		existingItem.lastRetryTime = time.Now()
 		pq.needsSort = true
 		// Signal one worker that the queue has been updated
+		pq.wakeups++
 		pq.cond.Signal()
 		return
 	}
@@ -583,6 +651,7 @@ func (pq *BlockPriorityQueue) RequeueAfter(blockFound processBlockFound, priorit
 	pq.needsSort = true
 
 	// Always use Signal() to wake exactly one worker
+	pq.wakeups++
 	pq.cond.Signal()
 
 	updateQueueSizeMetrics(pq.items)

@@ -763,13 +763,13 @@ When a new block is discovered via `BlockFound()`:
 The `WaitForBlock()` method:
 
 1. Skips blocks that are still in their retry delay
-2. Skips blocks whose parent is still queued or being validated. Validating a child before its parent is stored would find no parent and send it to catchup, moving the FSM to CATCHINGBLOCKS and stopping mining. This gate applies whatever the block's priority, so skip and age promotions cannot bypass it
+2. Skips blocks whose parent is still being fetched, queued or validated. Validating a child before its parent is stored would find no parent and send it to catchup, moving the FSM to CATCHINGBLOCKS and stopping mining. This gate applies whatever the block's priority, so skip and age promotions cannot bypass it
 3. Checks fork manager to ensure processing limits, including the tip slot, are not exceeded
 4. Selects highest priority block that can be processed, claiming its processing slot before removing it from the queue, so the block is always visible as either queued or processing
 5. Returns block to worker for validation
 6. Blocks waiting if no blocks available (with timeout)
 
-When a block is announced and its parent is not stored yet but is queued or being validated, it is queued behind the parent with the parent's class instead of going to catchup.
+When a block is announced and its parent is not stored yet but is being fetched, queued or validated, it is queued behind the parent instead of going to catchup. It takes the parent's class when the parent is queued or validating. A parent still being fetched has no class yet, so the child is classified on its own.
 
 ##### Retry Mechanism
 

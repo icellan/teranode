@@ -8,6 +8,8 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/jellydator/ttlcache/v3"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -119,4 +121,23 @@ func TestBlockRetryDelay_DeadlineWinsOverNetworkSubstring(t *testing.T) {
 	delay, ok := server.blockRetryDelay(&chainhash.Hash{1}, err)
 	require.True(t, ok)
 	require.Equal(t, blockDeadlineRetryDelay, delay)
+}
+
+// TestFinishProcessedBlock_LabelsProcessedMetricWithPriority pins that the processed counter
+// carries the block's class, which the queue sets when the block is taken.
+func TestFinishProcessedBlock_LabelsProcessedMetricWithPriority(t *testing.T) {
+	initPrometheusMetrics()
+	server := newRetryTestServer(t, 0)
+	server.forkManager = NewForkManager(ulogger.TestLogger{}, server.settings)
+	server.processBlockNotify = ttlcache.New[chainhash.Hash, bool]()
+
+	failures := prometheusBlockPriorityQueueProcessed.WithLabelValues("near_fork", "failure")
+	successes := prometheusBlockPriorityQueueProcessed.WithLabelValues("near_fork", "success")
+	failuresBefore, successesBefore := testutil.ToFloat64(failures), testutil.ToFloat64(successes)
+
+	server.finishProcessedBlock(0, processBlockFound{hash: &chainhash.Hash{1}, priority: PriorityNearFork}, errors.NewProcessingError("boom"))
+	server.finishProcessedBlock(0, processBlockFound{hash: &chainhash.Hash{2}, priority: PriorityNearFork}, nil)
+
+	require.Equal(t, failuresBefore+1, testutil.ToFloat64(failures))
+	require.Equal(t, successesBefore+1, testutil.ToFloat64(successes))
 }
