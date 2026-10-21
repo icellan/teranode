@@ -421,6 +421,18 @@ func (fm *ForkManager) FinishProcessingBlock(blockHash *chainhash.Hash) {
 	fm.logger.Debugf("Finished processing block %s", blockHash)
 }
 
+// IsBlockInFlight reports whether a worker is validating the block or pending reports it queued
+// or being fetched. Both are read under fm.mu, so no slot can be claimed or released in between.
+// A block claims its slot before it leaves the queue and is back on the queue before its slot is
+// released, so with slots held still one of the two reads always sees it. pending takes the
+// queue's lock, which is the same fm.mu → pq.mu order FinishProcessingBlock's Signal uses.
+func (fm *ForkManager) IsBlockInFlight(blockHash *chainhash.Hash, pending func(chainhash.Hash) bool) bool {
+	fm.mu.RLock()
+	defer fm.mu.RUnlock()
+
+	return fm.processingBlocks[*blockHash] || pending(*blockHash)
+}
+
 // IsProcessingBlock reports whether a worker is currently validating the block.
 func (fm *ForkManager) IsProcessingBlock(blockHash *chainhash.Hash) bool {
 	fm.mu.RLock()

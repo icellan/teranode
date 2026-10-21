@@ -82,11 +82,11 @@ func (m *MockBlockProcessor) FinishProcessingBlock(hash *chainhash.Hash) {
 	delete(m.started, *hash)
 }
 
-func (m *MockBlockProcessor) IsProcessingBlock(hash *chainhash.Hash) bool {
+func (m *MockBlockProcessor) IsBlockInFlight(hash *chainhash.Hash, pending func(chainhash.Hash) bool) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	return m.started[*hash]
+	return m.started[*hash] || pending(*hash)
 }
 
 func (m *MockBlockProcessor) GetCallCount() int {
