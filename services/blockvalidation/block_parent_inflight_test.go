@@ -372,3 +372,25 @@ func TestProcessBlockFoundChannel_DuplicateFetchKeepsFirstMark(t *testing.T) {
 
 	require.True(t, server.blockPriorityQueue.IsPending(*child), "the first fetcher's mark must survive a duplicate fetch")
 }
+
+// TestProcessBlockFoundChannel_DuplicateOfInFlightBlockNotMarked pins that a duplicate
+// announcement of a block already queued or being validated does not mark it as fetching.
+// Otherwise a child would keep waiting on the duplicate's fetch after the block is stored.
+func TestProcessBlockFoundChannel_DuplicateOfInFlightBlockNotMarked(t *testing.T) {
+	initPrometheusMetrics()
+	server, hashes := newParentInFlightServer(t)
+	child := hashes[1]
+
+	require.True(t, server.forkManager.StartProcessingBlock(child, PriorityChainExtending))
+
+	var pendingDuringFetch bool
+
+	httpmock.RegisterResponder("GET", fmt.Sprintf("http://peer/block/%s", child), func(*http.Request) (*http.Response, error) {
+		pendingDuringFetch = server.blockPriorityQueue.IsPending(*child)
+		return httpmock.NewStringResponse(http.StatusInternalServerError, "unavailable"), nil
+	})
+
+	_ = server.processBlockFoundChannel(context.Background(), processBlockFound{hash: child, baseURL: "http://peer", peerID: "p1"})
+
+	require.False(t, pendingDuringFetch, "a block already being validated must not also be marked as fetching")
+}
