@@ -589,7 +589,7 @@ func (s *Store) createWithRetry(ctx context.Context, tx *bt.Tx, blockHeight uint
 	}
 
 	if txMeta.Conflicting {
-		if err = s.updateParentConflictingChildren(ctx, transactionID, tx, txn); err != nil {
+		if err = s.updateParentConflictingChildren(ctx, transactionID, parentHashesOf(tx), txn); err != nil {
 			return nil, err
 		}
 	}
@@ -1399,7 +1399,32 @@ func asPgUniqueViolation(err error) error {
 	return nil
 }
 
-func (s *Store) updateParentConflictingChildren(ctx context.Context, transactionID int, tx *bt.Tx, txn *sql.Tx) error {
+// parentHashesOf returns the txid of every input's previous transaction, in input
+// order and including duplicates, which is what the conflicting_children insert
+// iterates. Keeps callers from pinning a whole *bt.Tx when only these are needed.
+func parentHashesOf(tx *bt.Tx) []chainhash.Hash {
+	if tx == nil {
+		return nil
+	}
+
+	hashes := make([]chainhash.Hash, 0, len(tx.Inputs))
+	for _, input := range tx.Inputs {
+		hashes = append(hashes, *input.PreviousTxIDChainHash())
+	}
+
+	return hashes
+}
+
+// updateParentConflictingChildren records transactionID as a conflicting child of
+// each parent named in parentHashes.
+//
+// Takes the parent hashes rather than the *bt.Tx it used to take: SetConflicting
+// resolves every transaction up front, before opening its write transaction, and
+// pinning a whole batch of full transaction bodies until the write pass finished
+// was a memory regression on a path that handles unbounded cascades
+// (MarkConflictingRecursively calls SetConflicting with an entire BFS level).
+// The parent txids are all the write pass ever needed.
+func (s *Store) updateParentConflictingChildren(ctx context.Context, transactionID int, parentHashes []chainhash.Hash, txn *sql.Tx) error {
 	// update all the parents to have this transaction as a conflicting child
 	// do not fail if already exists
 	q := `
@@ -1412,8 +1437,10 @@ func (s *Store) updateParentConflictingChildren(ctx context.Context, transaction
 			ON CONFLICT DO NOTHING
 		`
 
-	for _, input := range tx.Inputs {
-		if _, err := txn.ExecContext(ctx, q, input.PreviousTxIDChainHash()[:], transactionID); err != nil {
+	for _, parentHash := range parentHashes {
+		parentHash := parentHash
+
+		if _, err := txn.ExecContext(ctx, q, parentHash[:], transactionID); err != nil {
 			return errors.NewStorageError("Failed to insert conflicting_children", err)
 		}
 	}
@@ -2067,6 +2094,7 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	useIgnoreConflicting := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreConflicting
 	useIgnoreLocked := len(ignoreFlags) > 0 && ignoreFlags[0].IgnoreLocked
 	useSkipUTXOHashCheck := len(ignoreFlags) > 0 && ignoreFlags[0].SkipUTXOHashCheck
+	useRequireParentOutputs := len(ignoreFlags) > 0 && ignoreFlags[0].RequireParentOutputs
 
 	if useSkipUTXOHashCheck {
 		spends, err = utxo.GetSpendsOutpointOnly(tx)
@@ -2164,8 +2192,10 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 			}
 
 			// Handle "already blessed" — parent tx not found but spending tx exists.
-			// Mirrors aerospike spend.go:343-361.
-			if batchErr != nil && errors.Is(batchErr, errors.ErrTxNotFound) {
+			// Mirrors aerospike resolveSpendCompletions. Not with RequireParentOutputs:
+			// there the spending tx's record was created before this spend, so it
+			// proves nothing about the spend.
+			if batchErr != nil && errors.Is(batchErr, errors.ErrTxNotFound) && !useRequireParentOutputs {
 				mu.Lock()
 				exists := txAlreadyExists
 				mu.Unlock()
@@ -2355,8 +2385,16 @@ func (s *Store) Spend(ctx context.Context, tx *bt.Tx, blockHeight uint32, ignore
 	return spends, nil
 }
 
-// isDeadlock checks if a database error is a PostgreSQL deadlock (SQLSTATE 40P01)
-// or a SQLite BUSY error that should be retried.
+// isDeadlock reports whether a database error is a lock the spend batch should
+// retry: a PostgreSQL deadlock (SQLSTATE 40P01), or a SQLite BUSY or LOCKED
+// result. The SQLite arm matches the result code, as isLockError below and
+// usql.isRetriable do, because the two codes carry different messages: BUSY is
+// "database is locked", while the shared-cache table lock the sqlitememory
+// engine raises when two transactions wait on each other is LOCKED, "database
+// table is locked: database is deadlocked". This used to match the BUSY message
+// alone, so a spend batch that collided with a create's transaction was aborted
+// instead of retried (see is_deadlock_sqlite_test.go). The message check stays
+// as the fallback for a driver error that is not a *sqlite.Error.
 func isDeadlock(err error) bool {
 	if err == nil {
 		return false
@@ -3738,23 +3776,30 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 			}
 		}
 	} else {
-		// Not on longest chain: clear delete_at_height, set locked = false
+		// Not on longest chain. Aerospike's setMined always runs setDeleteAtHeight after
+		// updating the block list and unmined_since, so the DAH is re-evaluated rather than
+		// nulled: a fully spent tx that is still mined on the main chain (unmined_since NULL)
+		// keeps/bumps its DAH, anything else loses it. With retention 0 Lua leaves the DAH alone.
 		if minedBlockInfo.UnsetMined {
-			// UnsetMined path (block invalidation): unlock and clear delete_at_height
-			// for all affected transactions, then set unmined_since only for those
-			// with zero remaining block_ids.
-			// This mirrors the aerospike Lua which sets unmined_since = currentBlockHeight
-			// when #blocks == 0 after removing the block_id.
-			// Use the store's current block height (not the invalidated block's height)
-			// to match Aerospike's setMined UDF behavior.
-			currentBlockHeight := s.GetBlockHeight() + 1
+			// UnsetMined path (block invalidation): unlock, then set unmined_since only for
+			// those with zero remaining block_ids and no unmined_since yet.
+			// Mirrors the aerospike Lua, which stamps unmined_since when #blocks == 0 after
+			// removing the block_id. The stamp is backdated (utxo.BackdatedUnminedSince, issue
+			// 1768) exactly like MarkTransactionsOnLongestChain(false): the parent's DAH keeps
+			// counting from the original spend, so the pruner's parent-preservation scan has to
+			// see this tx on its next cycle. An existing unmined_since is kept.
+			var unminedTxRetention uint32
+			if s.settings != nil {
+				unminedTxRetention = s.settings.UtxoStore.UnminedTxRetention
+			}
 
-			// Step 1: Unlock and clear delete_at_height for all affected transactions
+			unminedSince := utxo.BackdatedUnminedSince(s.GetBlockHeight(), unminedTxRetention)
+
+			// Step 1: Unlock all affected transactions
 			inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
 			qUpdate := fmt.Sprintf(`
 				UPDATE transactions
 				SET locked = false
-				   ,delete_at_height = NULL
 				WHERE hash IN %s
 			`, inClause3)
 			if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
@@ -3775,8 +3820,9 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 				UPDATE transactions
 				SET unmined_since = $1
 				WHERE id IN (SELECT id FROM txs_without_blocks)
+				AND unmined_since IS NULL
 			`, inClause3b)
-			args := append([]interface{}{currentBlockHeight}, inArgs3b...)
+			args := append([]interface{}{unminedSince}, inArgs3b...)
 			if _, err = txn.ExecContext(ctx, qUpdateUnmined, args...); err != nil {
 				return nil, errors.NewStorageError("SQL error updating unmined_since: %v", err)
 			}
@@ -3785,10 +3831,45 @@ func (s *Store) setMinedMultiChunk(ctx context.Context, hashes []*chainhash.Hash
 			inClause3, inArgs3 := buildINClause(existingHashBytes, 1)
 			qUpdate := fmt.Sprintf(`
 				UPDATE transactions
-				SET locked = false, delete_at_height = NULL
+				SET locked = false
 				WHERE hash IN %s
 			`, inClause3)
 			if _, err = txn.ExecContext(ctx, qUpdate, inArgs3...); err != nil {
+				return nil, errors.NewStorageError(errSQLUpdatingTransactions, err)
+			}
+		}
+
+		if retention > 0 {
+			// Follows the order of checks of aerospike Lua setDeleteAtHeight for a tx that is not
+			// (newly) on the longest chain (SQL has no pagination records or DAH signals):
+			// 1. If preserve_until is set -> don't touch DAH
+			// 2. If conflicting -> set the DAH when absent, otherwise leave it unchanged
+			// 3. If unmined_since is NULL (mined on the main chain) and all UTXOs are spent ->
+			//    set the DAH, or bump it forward if it is lower than the new value
+			// 4. Otherwise -> clear DAH
+			// The tx has at least one block here, except after UnsetMined removed its last one;
+			// that case has just been given an unmined_since above, so it falls into 4.
+			inClause3c, inArgs3c := buildINClause(existingHashBytes, 2)
+			qDAH := fmt.Sprintf(`
+				UPDATE transactions
+				SET delete_at_height = CASE
+				        WHEN preserve_until IS NOT NULL THEN delete_at_height
+				        WHEN conflicting THEN COALESCE(delete_at_height, $1)
+				        WHEN unmined_since IS NULL
+				             AND NOT EXISTS (
+				                 SELECT 1 FROM outputs o
+				                 WHERE o.transaction_id = transactions.id AND o.spending_data IS NULL
+				             )
+				             THEN CASE
+				                 WHEN delete_at_height IS NULL OR delete_at_height < $1 THEN $1
+				                 ELSE delete_at_height
+				             END
+				        ELSE NULL
+				    END
+				WHERE hash IN %s
+			`, inClause3c)
+			args := append([]interface{}{newDAH}, inArgs3c...)
+			if _, err = txn.ExecContext(ctx, qDAH, args...); err != nil {
 				return nil, errors.NewStorageError(errSQLUpdatingTransactions, err)
 			}
 		}
@@ -4446,7 +4527,11 @@ func (s *Store) PreviousOutputsDecorate(ctx context.Context, tx *bt.Tx) error {
 			s.logger.Warnf("[PreviousOutputsDecorate] missing parent output: child=%x input[%d] parent=%x vout=%d parentTxExists=%v",
 				tx.TxIDChainHash()[:], idx, parentHash[:], input.PreviousTxOutIndex, txExists)
 		}
-		return errors.NewProcessingError("failed to decorate previous outputs for tx %s", tx.TxIDChainHash())
+		// TX_NOT_FOUND, as the aerospike store reports the same miss. Callers key
+		// on it: sendrawtransaction answers it as "Missing inputs", and legacy
+		// sync's per-transaction fallback takes the same branch for it as it did
+		// for the PROCESSING this used to be.
+		return errors.NewTxNotFoundError("failed to decorate previous outputs for tx %s: parent output not found", tx.TxIDChainHash())
 	}
 
 	return nil
@@ -4648,7 +4733,14 @@ func (s *Store) BatchPreviousOutputsDecorate(ctx context.Context, txs []*bt.Tx) 
 	}
 
 	if m := missingInputs.Load(); m > 0 {
-		return errors.NewProcessingError("failed to decorate previous outputs: %d inputs could not be resolved", m)
+		// ErrTxNotFound, not a generic processing error: a genuine query/connectivity fault
+		// above already returned via g.Wait() and never reaches here, so every path that lands
+		// on this line is "the store has no row for one of these outpoints" — the same class
+		// aerospike's own per-outpoint miss uses (aerospike/get.go sendOutpointBatch). Callers
+		// (quick validation's decorate in blockvalidation) tell a real backend fault, which
+		// stays fail-closed, apart from a plain not-found, by this class rather than by
+		// string-matching the message.
+		return errors.NewTxNotFoundError("failed to decorate previous outputs: %d inputs could not be resolved", m)
 	}
 
 	return nil
@@ -4723,35 +4815,45 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 	affectedParentSpends := make([]*utxo.Spend, 0, len(txHashes))
 	spendingTxHashes := make([]chainhash.Hash, 0, len(txHashes))
 
-	var (
-		transactionID int
-		utxoHash      *chainhash.Hash
-	)
+	var utxoHash *chainhash.Hash
 
-	// Create a database transaction
-	txn, err := s.db.Begin()
-	if err != nil {
-		return nil, nil, err
-	}
+	// Read pass — resolve every conflicting tx's metadata and current spend state
+	// BEFORE opening the write transaction below.
+	//
+	// s.Get and s.GetSpend both query the connection pool directly; they do not
+	// run on the txn opened further down. Calling them from inside that txn's
+	// loop (as this used to do) self-deadlocks on SQLite: the txn holds SQLite's
+	// single writer lock, s.Get/s.GetSpend block waiting for a connection that is
+	// waiting on that same lock, and the txn — stuck inside this same call
+	// stack — never reaches Commit() to release it. Latent only because the sole
+	// shared-suite caller of SetConflicting(..., true) runs against
+	// Aerospike/Postgres, not SQLite. Doing every read up front, before Begin(),
+	// removes the cross-connection wait entirely rather than papering over it
+	// with a timeout or a second connection.
+	// Retain only what the write pass consumes — each tx's parent txids — rather
+	// than the full transaction bodies s.Get returns. MarkConflictingRecursively
+	// calls SetConflicting with a whole BFS level, so keeping every body alive
+	// until the write loop finished would materialise that level's transactions
+	// simultaneously on a path that already handles unbounded cascades.
+	//
+	// Note on staleness: hoisting the reads widens an existing scan-to-commit
+	// window rather than introducing one. affectedParentSpends is built purely
+	// from each tx's own inputs and cannot go stale, but spendingTxHashes — the
+	// cascade set read from each tx's outputs below — is now resolved further
+	// ahead of the commit for a multi-hash call. A child that commits its spend
+	// in between is absent from that set, and MarkConflictingRecursively drives
+	// its BFS off it, so the miss propagates to the whole descendant walk. That
+	// is the race tracked in #1228; this only makes its window wider.
+	parentHashes := make([][]chainhash.Hash, len(txHashes))
 
-	defer func() {
-		_ = txn.Rollback()
-	}()
-
-	for _, conflictingTxHash := range txHashes {
+	for idx, conflictingTxHash := range txHashes {
 		// get the extended tx
 		txMeta, err := s.Get(ctx, &conflictingTxHash)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		if err = txn.QueryRowContext(ctx, qUpdate, conflictingTxHash[:], setValue, deleteAtHeight).Scan(&transactionID); err != nil {
-			return nil, nil, errors.NewStorageError("failed to set conflicting flag for %s", conflictingTxHash, err)
-		}
-
-		if err = s.updateParentConflictingChildren(ctx, transactionID, txMeta.Tx, txn); err != nil {
-			return nil, nil, err
-		}
+		parentHashes[idx] = parentHashesOf(txMeta.Tx)
 
 		for i, input := range txMeta.Tx.Inputs {
 			utxoHash, err = util.UTXOHashFromInput(input)
@@ -4803,6 +4905,30 @@ func (s *Store) SetConflicting(ctx context.Context, txHashes []chainhash.Hash, s
 			if spendResponse.Status == int(utxo.Status_SPENT) && spendResponse.SpendingData != nil && spendResponse.SpendingData.TxID != nil {
 				spendingTxHashes = append(spendingTxHashes, *spendResponse.SpendingData.TxID)
 			}
+		}
+	}
+
+	// Write pass — only the UPDATE and its dependent conflicting_children insert
+	// run inside the transaction; both are pure writes plus the id RETURNING from
+	// the UPDATE that updateParentConflictingChildren needs.
+	var transactionID int
+
+	txn, err := s.db.Begin()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	defer func() {
+		_ = txn.Rollback()
+	}()
+
+	for idx, conflictingTxHash := range txHashes {
+		if err = txn.QueryRowContext(ctx, qUpdate, conflictingTxHash[:], setValue, deleteAtHeight).Scan(&transactionID); err != nil {
+			return nil, nil, errors.NewStorageError("failed to set conflicting flag for %s", conflictingTxHash, err)
+		}
+
+		if err = s.updateParentConflictingChildren(ctx, transactionID, parentHashes[idx], txn); err != nil {
+			return nil, nil, err
 		}
 	}
 
@@ -5003,6 +5129,7 @@ func (s *Store) setUnlockedBulk(ctx context.Context, txHashes []chainhash.Hash) 
 }
 
 // MarkTransactionsOnLongestChain updates unmined_since for transactions based on their chain status.
+// Marking on the longest chain also re-evaluates the delete_at_height (see the query below).
 //
 // This function is critical for maintaining data integrity during blockchain reorganizations.
 // It ensures transactions have the correct unmined_since value based on whether they are on
@@ -5022,13 +5149,17 @@ func (s *Store) setUnlockedBulk(ctx context.Context, txHashes []chainhash.Hash) 
 //   - Collects up to 10 errors for logging/debugging (prevents log spam)
 //   - Logs summary: attempted, succeeded, failed counts
 //   - Returns aggregated errors after attempting all transactions
-//   - Missing transactions trigger FATAL error (data corruption)
+//   - onLongestChain=true: transactions the store does not hold are logged and skipped
+//   - onLongestChain=false: a transaction the store does not hold is FATAL
 //
 // Why resilient processing is critical:
 //   - Large reorgs can affect millions of transactions
 //   - Transient network errors shouldn't prevent updating other transactions
 //   - Maximizes data integrity by updating as many as possible
-//   - Missing transaction = unrecoverable (FATAL to prevent corrupt state)
+//
+// Missing transactions, see the Aerospike implementation: a winning tx of a reorg
+// can be pruned legitimately and has nothing to clear; a tx moved off the longest
+// chain without a record would go back into block assembly.
 //
 // Timing guarantee:
 // This function is called synchronously from reset/reorg operations. By the time cleanup
@@ -5047,7 +5178,31 @@ func (s *Store) setUnlockedBulk(ctx context.Context, txHashes []chainhash.Hash) 
 //
 // Returns:
 //   - error: Aggregated errors (up to 10) if any failures occurred
-//   - Note: Function calls logger.Fatalf for missing transactions before returning
+//
+// existingHashes runs the existence query of MarkTransactionsOnLongestChain and
+// returns the hashes it found.
+func (s *Store) existingHashes(ctx context.Context, q string, args []interface{}) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	found := make(map[string]bool)
+
+	for rows.Next() {
+		var hb []byte
+		if err = rows.Scan(&hb); err != nil {
+			return nil, err
+		}
+
+		found[string(hb)] = true
+	}
+
+	return found, rows.Err()
+}
+
 func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
 	if len(txHashes) == 0 {
 		return nil
@@ -5057,6 +5212,9 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 	totalUpdated := 0
 	allErrors := make([]error, 0, 10)
 	errorCount := 0
+	missingCount := 0
+
+	var firstMissing []chainhash.Hash
 
 	// Convert all hashes to byte arrays up front
 	allHashBytes := make([][]byte, len(txHashes))
@@ -5085,9 +5243,54 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 
 		if onLongestChain {
 			// hashes start at $1
-			inClause, inArgs := buildINClause(chunk, 1)
-			q = fmt.Sprintf(`UPDATE transactions SET unmined_since = NULL WHERE hash IN %s`, inClause)
-			args = inArgs
+			var retention uint32
+			if s.settings != nil {
+				retention = s.settings.GetUtxoStoreBlockHeightRetention()
+			}
+
+			if retention > 0 {
+				// The pruner clears the DAH of unmined records, and txs validated while their block was
+				// on a fork get none from setMined, so a tx brought onto the longest chain here must get
+				// its DAH again. This is the common case in reorgBlocks (the txs of the blocks moved
+				// forward), not only the BlockAssembler repair path.
+				//
+				// There is no mined block in this call, so the DAH is stamped from
+				// max(the store's current height + 1, the tx's highest block height) + retention. The
+				// +1 is the same lag allowance setDAH makes (the store height trails the block being
+				// validated), so a tx re-stamped here is pruned no sooner than a spend would have
+				// allowed. The block heights are what setMined would have stamped from, so the DAH is
+				// the setMined value or later.
+				//
+				// Same rules as Lua setDeleteAtHeight and the Aerospike path: a preserved tx is left
+				// alone; a conflicting tx gets a DAH if it has none and keeps an existing one; any other
+				// tx gets the DAH (set if none, raised if lower, never lowered) when it is in a block and
+				// has no unspent output, and a stale DAH is cleared when it is not.
+				// Current height is $1, retention $2, hashes start at $3.
+				inClause, inArgs := buildINClause(chunk, 3)
+				newDAH := `(CASE WHEN COALESCE((SELECT MAX(b.block_height) FROM block_ids b WHERE b.transaction_id = transactions.id), 0) > CAST($1 AS BIGINT)
+				                 THEN (SELECT MAX(b.block_height) FROM block_ids b WHERE b.transaction_id = transactions.id)
+				                 ELSE CAST($1 AS BIGINT) END + CAST($2 AS BIGINT))`
+				eligible := `(EXISTS (SELECT 1 FROM block_ids b WHERE b.transaction_id = transactions.id)
+				              AND NOT EXISTS (SELECT 1 FROM outputs o WHERE o.transaction_id = transactions.id AND o.spending_data IS NULL))`
+				q = fmt.Sprintf(`
+					UPDATE transactions
+					SET unmined_since = NULL
+					   ,delete_at_height = CASE
+					        WHEN preserve_until IS NOT NULL THEN delete_at_height
+					        WHEN conflicting THEN COALESCE(delete_at_height, %[1]s)
+					        WHEN %[3]s THEN
+					            CASE WHEN delete_at_height IS NULL OR delete_at_height < %[1]s THEN %[1]s ELSE delete_at_height END
+					        ELSE NULL
+					    END
+					WHERE hash IN %[2]s
+				`, newDAH, inClause, eligible)
+				args = append([]interface{}{int64(currentBlockHeight) + 1, int64(retention)}, inArgs...)
+			} else {
+				// hashes start at $1
+				inClause, inArgs := buildINClause(chunk, 1)
+				q = fmt.Sprintf(`UPDATE transactions SET unmined_since = NULL WHERE hash IN %s`, inClause)
+				args = inArgs
+			}
 		} else {
 			// unminedSince is $1, hashes start at $2. COALESCE keeps an existing unmined_since;
 			// only a NULL value (mined -> unmined) is stamped, and it is backdated so the
@@ -5113,39 +5316,29 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 		rowsAffected, _ := result.RowsAffected()
 		totalUpdated += int(rowsAffected)
 
-		// If fewer rows updated than expected, find which ones are missing
+		// If fewer rows updated than expected, find which ones are missing (a
+		// hash given twice also updates one row)
 		if int(rowsAffected) < len(chunk) {
-			missingCount := len(chunk) - int(rowsAffected)
-			errorCount += missingCount
-
 			// Query to find which hashes actually exist to identify the missing ones
 			qCheck := fmt.Sprintf(`SELECT hash FROM transactions WHERE hash IN %s`, func() string {
 				cl, _ := buildINClause(chunk, 1)
 				return cl
 			}())
 			_, checkArgs := buildINClause(chunk, 1)
-			rows, qErr := s.db.QueryContext(ctx, qCheck, checkArgs...)
+			foundHashes, qErr := s.existingHashes(ctx, qCheck, checkArgs)
 			if qErr != nil {
+				// the shortfall cannot be told apart: count it as failed
+				errorCount += len(chunk) - int(rowsAffected)
 				s.logger.Errorf("[MarkTransactionsOnLongestChain] could not identify missing txs in chunk %d-%d: %v", i, end-1, qErr)
 			} else {
-				foundHashes := make(map[string]bool)
-				for rows.Next() {
-					var hb []byte
-					if scanErr := rows.Scan(&hb); scanErr == nil {
-						foundHashes[string(hb)] = true
-					}
-				}
-				rows.Close()
-
-				missingLogged := 0
 				for _, hb := range chunk {
 					if !foundHashes[string(hb)] {
-						var h chainhash.Hash
-						copy(h[:], hb)
-						s.logger.Fatalf("CRITICAL: MISSING transaction %s during MarkTransactionsOnLongestChain - data integrity compromised", h)
-						missingLogged++
-						if missingLogged >= 10 {
-							break
+						missingCount++
+
+						if len(firstMissing) < 10 {
+							var h chainhash.Hash
+							copy(h[:], hb)
+							firstMissing = append(firstMissing, h)
 						}
 					}
 				}
@@ -5154,8 +5347,18 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 	}
 
 	// Log summary
-	s.logger.Infof("[MarkTransactionsOnLongestChain] completed: attempted=%d, updated=%d, failed=%d, onLongestChain=%t",
-		attempted, totalUpdated, errorCount, onLongestChain)
+	s.logger.Infof("[MarkTransactionsOnLongestChain] completed: attempted=%d, updated=%d, failed=%d, missing=%d, onLongestChain=%t",
+		attempted, totalUpdated, errorCount, missingCount, onLongestChain)
+
+	if missingCount > 0 {
+		if !onLongestChain {
+			s.logger.Fatalf("CRITICAL: %d MISSING transactions during MarkTransactionsOnLongestChain(false) - data integrity compromised, first: %v",
+				missingCount, firstMissing)
+		} else {
+			s.logger.Errorf("[MarkTransactionsOnLongestChain] skipped %d transactions the store does not hold, first: %v",
+				missingCount, firstMissing)
+		}
+	}
 
 	if len(allErrors) > 0 {
 		if errorCount > 10 {
