@@ -1875,27 +1875,7 @@ func (v *Validator) sendTxMetaDeletesToKafka(hashes []chainhash.Hash) {
 		return
 	}
 
-	// One record per bounded batch: a demotion cascade has no size limit, and a
-	// v1 record of 767 entries would read as a v2 header (see SplitDeleteBatches).
-	start := 0
-
-	for _, batch := range txmetacache.SplitDeleteBatches(hashes) {
-		batchItems := items[start : start+len(batch)]
-		start += len(batch)
-
-		if v.settings.Validator.TxMetaWireFormat == "v2" {
-			v.sendTxMetaBatchV2(batchItems)
-
-			continue
-		}
-
-		key := batch[0] // copied: the producer reads the key after this returns
-
-		v.txmetaKafkaProducerClient.Publish(&kafka.Message{
-			Key:   key[:],
-			Value: serializeTxMetaBatch(batchItems),
-		})
-	}
+	v.sendTxMetaBatch(items)
 }
 
 // sendTxMetaBatch serializes and publishes a batch of TxMeta items to Kafka.
@@ -1915,25 +1895,73 @@ func (v *Validator) sendTxMetaBatch(batch []*txmetaBatchItem) {
 		return
 	}
 
-	if v.settings.Validator.TxMetaWireFormat == "v2" {
-		v.sendTxMetaBatchV2(batch)
-		return
+	// A batch has no size limit of its own (validator_txmeta_kafka_batchSize, or
+	// a whole demotion cascade), so it goes out as records of bounded size.
+	for _, chunk := range splitTxMetaBatch(batch) {
+		if v.settings.Validator.TxMetaWireFormat == "v2" {
+			v.sendTxMetaBatchV2(chunk)
+
+			continue
+		}
+
+		key := *chunk[0].hash // copied: the producer reads the key after this returns
+
+		v.txmetaKafkaProducerClient.Publish(&kafka.Message{
+			Key:   key[:],
+			Value: serializeTxMetaBatch(chunk),
+		})
+	}
+}
+
+// maxTxMetaRecordBytes bounds one txmeta record, leaving headroom under Kafka's
+// default 1 MiB message limit.
+const maxTxMetaRecordBytes = 768 * 1024
+
+// splitTxMetaBatch cuts batch into consecutive chunks whose serialised size, in
+// either wire format, stays under maxTxMetaRecordBytes (an item larger than that
+// goes alone), and none of which is txmetacache.V2LookalikeCount items long:
+// that v1 count encodes as the v2 header signature, and a receiver can read
+// such a record as v2 and drop every entry in it.
+func splitTxMetaBatch(batch []*txmetaBatchItem) [][]*txmetaBatchItem {
+	var chunks [][]*txmetaBatchItem
+
+	start, size := 0, txmetacache.WireV2HeaderLen
+
+	for i, item := range batch {
+		if i > start && size+txMetaEntrySize(item) > maxTxMetaRecordBytes {
+			end := i
+			if end-start == txmetacache.V2LookalikeCount {
+				end-- // the item moved out starts the next chunk
+			}
+
+			chunks = append(chunks, batch[start:end])
+			start, size = end, txmetacache.WireV2HeaderLen
+
+			for _, carried := range batch[end:i] {
+				size += txMetaEntrySize(carried)
+			}
+		}
+
+		size += txMetaEntrySize(item)
 	}
 
-	if len(batch) == txmetacache.V2LookalikeCount {
-		// its v1 count would read as the v2 header signature
-		v.sendTxMetaBatch(batch[:len(batch)-1])
-		v.sendTxMetaBatch(batch[len(batch)-1:])
-
-		return
+	switch rest := batch[start:]; {
+	case len(rest) == txmetacache.V2LookalikeCount:
+		chunks = append(chunks, rest[:len(rest)-1], rest[len(rest)-1:])
+	case len(rest) > 0:
+		chunks = append(chunks, rest)
 	}
 
-	value := serializeTxMetaBatch(batch)
+	return chunks
+}
 
-	v.txmetaKafkaProducerClient.Publish(&kafka.Message{
-		Key:   batch[0].hash[:],
-		Value: value,
-	})
+// txMetaEntrySize is item's size on the v2 wire, the larger of the two formats.
+func txMetaEntrySize(item *txmetaBatchItem) int {
+	if item.isDelete {
+		return txmetacache.WireV2MinEntrySize
+	}
+
+	return txmetacache.WireV2MinEntrySize + len(item.metaBytes)
 }
 
 // serializeTxMetaBatch serializes a batch of TxMeta items to raw bytes.

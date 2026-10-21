@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
@@ -1237,4 +1238,106 @@ func TestSendTxMetaBatch_NeverSendsAV2LookalikeV1Record(t *testing.T) {
 	}
 
 	require.Equal(t, len(batch), total, "every item must still be sent")
+}
+
+// TestSendTxMetaDeletesToKafka_BatchedRecordsStayBounded pins that DELETEs sent
+// through a real batcher with a large batch size still go out in records under
+// Kafka's default 1 MiB limit, in both wire formats, and that every hash arrives.
+func TestSendTxMetaDeletesToKafka_BatchedRecordsStayBounded(t *testing.T) {
+	const (
+		maxRecord = 1 << 20
+		n         = 30_000
+	)
+
+	for _, format := range []string{"v1", "v2"} {
+		t.Run(format, func(t *testing.T) {
+			tSettings := test.CreateBaseTestSettings(t)
+			tSettings.Validator.TxMetaWireFormat = format
+			tSettings.Validator.TxMetaNumPartitions = 1
+			tSettings.Validator.TxMetaKafkaBatchSize = n
+			tSettings.Validator.TxMetaKafkaBatchTimeoutMs = 50
+
+			producer := kafka.NewKafkaAsyncProducerMockWithBuffer(1_000)
+
+			validator, err := New(t.Context(), ulogger.TestLogger{}, tSettings, &utxo.MockUtxostore{}, producer, nil, nil, nil, nil)
+			require.NoError(t, err)
+
+			v := validator.(*Validator)
+			require.NotNil(t, v.txmetaKafkaBatcher, "this test needs the batched path")
+
+			hashes := make([]chainhash.Hash, n)
+			for i := range hashes {
+				hashes[i] = chainhash.HashH([]byte(fmt.Sprintf("batched-cascade-%d", i)))
+			}
+
+			v.sendTxMetaDeletesToKafka(hashes)
+
+			total := 0
+
+			require.Eventually(t, func() bool {
+				for len(producer.PublishChannel()) > 0 {
+					value := (<-producer.PublishChannel()).Value
+					require.LessOrEqual(t, len(value), maxRecord, "a record must fit Kafka's default message size")
+
+					if format == "v2" {
+						total += int(binary.LittleEndian.Uint32(value[4:]))
+					} else {
+						require.False(t, value[0] == txmetacache.WireV2Magic && value[1] == txmetacache.WireV2Version && value[2] == 0 && value[3] == 0)
+						total += int(binary.LittleEndian.Uint32(value[:4]))
+					}
+				}
+
+				return total == n
+			}, 10*time.Second, 10*time.Millisecond, "every DELETE must be sent")
+		})
+	}
+}
+
+func TestSplitTxMetaBatch(t *testing.T) {
+	items := func(n, content int) []*txmetaBatchItem {
+		out := make([]*txmetaBatchItem, n)
+		for i := range out {
+			h := chainhash.HashH([]byte(fmt.Sprintf("split-%d", i)))
+			out[i] = &txmetaBatchItem{hash: &h, metaBytes: make([]byte, content), isDelete: content == 0}
+		}
+
+		return out
+	}
+
+	cases := map[string][]*txmetaBatchItem{
+		"empty":             nil,
+		"767 deletes":       items(767, 0),
+		"30k deletes":       items(30_000, 0),
+		"size cut at 767":   items(2_000, 980), // 767 entries of 1,025 bytes fill a record exactly
+		"oversized item":    items(3, maxTxMetaRecordBytes),
+		"one under the cut": items(766, 980),
+	}
+
+	for name, batch := range cases {
+		t.Run(name, func(t *testing.T) {
+			var joined []*txmetaBatchItem
+
+			for _, chunk := range splitTxMetaBatch(batch) {
+				require.NotEmpty(t, chunk)
+				require.NotEqual(t, txmetacache.V2LookalikeCount, len(chunk), "no chunk may be 767 items long")
+
+				size := txmetacache.WireV2HeaderLen
+				for _, item := range chunk {
+					size += txMetaEntrySize(item)
+				}
+
+				if len(chunk) > 1 {
+					require.LessOrEqual(t, size, maxTxMetaRecordBytes)
+				}
+
+				joined = append(joined, chunk...)
+			}
+
+			require.Equal(t, len(batch), len(joined))
+
+			for i := range batch {
+				require.Same(t, batch[i], joined[i], "chunks keep every item, in order")
+			}
+		})
+	}
 }
