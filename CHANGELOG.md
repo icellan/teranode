@@ -106,6 +106,14 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **`utxostore_updateTxMinedStatus` is removed, and it was live.** Affects only nodes that
+  set it to `false`. Mined-tagging, the step after `AddBlock` that writes a block's ID onto
+  each of its transactions, now always runs. So does the check it carries, which rejects a
+  block that re-includes a transaction an ancestor block already mined. With the key at
+  `false`, neither ran, yet the block was still flagged as mined. The loader does not report
+  unknown keys, so a leftover `false` is ignored without an error and those nodes take on
+  the mined-tagging write load again. Delete the key from your config. (#2019)
+
 - **A local processing error is no longer charged to a peer.** During catchup and
   announced-block fetches, a `ProcessingError` with no peer or consensus code in its
   chain no longer records a reputation failure or a malicious report, and no longer
