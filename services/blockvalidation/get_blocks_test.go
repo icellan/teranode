@@ -4855,7 +4855,7 @@ func TestFetchAndStoreSubtree_PoisonedResponses(t *testing.T) {
 		_, err := server.fetchAndStoreSubtree(ctx, testBlock, f.hash, peerID, baseURL, false, nil)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "not a whole number")
-		require.True(t, errors.Is(err, errors.ErrProcessing), "the class must stay ProcessingError")
+		require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse), "the class must stay peer-attributable")
 		require.False(t, errors.IsLocalError(err), "must not short-circuit the alternative-peer loop")
 		require.True(t, isCacheBypassRetryable(err), "a truncated body is the issue-1368 signature and must be retryable")
 	})
@@ -4871,7 +4871,7 @@ func TestFetchAndStoreSubtree_PoisonedResponses(t *testing.T) {
 		_, err := server.fetchAndStoreSubtree(ctx, testBlock, f.hash, peerID, baseURL, false, nil)
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "that hash to")
-		require.True(t, errors.Is(err, errors.ErrProcessing), "the class must stay ProcessingError")
+		require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse), "the class must stay peer-attributable")
 		require.False(t, errors.IsLocalError(err))
 		require.True(t, isCacheBypassRetryable(err))
 	})
@@ -4988,7 +4988,7 @@ func TestTryPeerForSubtree_WrongRootSubtreeStrikesOnlyAfterCacheBypass(t *testin
 
 		err := server.tryPeerForSubtree(ctx, testBlock, f.hash, peerID, baseURL, nil)
 		require.Error(t, err)
-		require.True(t, errors.Is(err, errors.ErrProcessing))
+		require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse))
 		require.True(t, isCacheBypassRetryable(err))
 
 		mu.Lock()
@@ -6193,7 +6193,7 @@ func TestSubtreeDataWriteFailure_Classification(t *testing.T) {
 				return
 			}
 
-			require.True(t, errors.Is(err, errors.ErrProcessing))
+			require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse))
 			require.Contains(t, err.Error(), peerID, "a peer-attributable error must name the peer")
 		})
 	}

@@ -352,7 +352,7 @@ func (u *Server) getSubtreeToCheck(ctx context.Context, request *subtreevalidati
 		}
 
 		if !subtreeHash.Equal(*subtreeToCheck.RootHash()) {
-			return nil, errors.NewProcessingError("[CheckBlockSubtrees][%s] subtree root hash mismatch: %s", subtreeHash.String(), subtreeToCheck.RootHash().String())
+			return nil, errors.NewNetworkInvalidResponseError("[CheckBlockSubtrees][%s] subtree root hash mismatch: %s", subtreeHash.String(), subtreeToCheck.RootHash().String())
 		}
 
 		subtreeBytes, err := subtreeToCheck.Serialize()
@@ -395,7 +395,7 @@ func (u *Server) getSubtreeToCheck(ctx context.Context, request *subtreevalidati
 	// keeps the model-side "emptied first subtree" case reachable only via our own concurrent
 	// node release, not via peer-supplied data.
 	if subtreeToCheck.Length() == 0 {
-		return nil, errors.NewProcessingError("[CheckBlockSubtrees][%s] subtree has zero nodes", subtreeHash.String())
+		return nil, errors.NewNetworkInvalidResponseError("[CheckBlockSubtrees][%s] subtree has zero nodes", subtreeHash.String())
 	}
 
 	return subtreeToCheck, nil
@@ -1168,12 +1168,12 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 	}
 
 	if parseErr != nil {
-		return errors.NewProcessingError("[processSubtreeDataStream] failed to parse transactions", parseErr)
+		return errors.NewNetworkInvalidResponseError("[processSubtreeDataStream] failed to parse transactions", parseErr)
 	}
 
 	// Verify transaction count
 	if txCount != subtree.Length() {
-		return errors.NewProcessingError("[processSubtreeDataStream] transaction count mismatch: expected %d, got %d", subtree.Length(), txCount)
+		return errors.NewNetworkInvalidResponseError("[processSubtreeDataStream] transaction count mismatch: expected %d, got %d", subtree.Length(), txCount)
 	}
 
 	u.logger.Debugf("[processSubtreeDataStream] Processed %d transactions from subtree %s (single-pass streaming)",
@@ -1757,11 +1757,11 @@ func validateSubtreeLeafCount(subtreeHash chainhash.Hash, leafCount, policyMax i
 	// guarantee local and stable if that constructor ever changes. A subtree always carries at
 	// least one node.
 	if leafCount == 0 {
-		return errors.NewProcessingError("[CheckBlockSubtrees][%s] subtree has zero nodes", subtreeHash.String())
+		return errors.NewNetworkInvalidResponseError("[CheckBlockSubtrees][%s] subtree has zero nodes", subtreeHash.String())
 	}
 
 	if leafCount > policyMax {
-		return errors.NewProcessingError("[CheckBlockSubtrees][%s] subtree response exceeds policy max %d nodes (got %d)",
+		return errors.NewNetworkInvalidResponseError("[CheckBlockSubtrees][%s] subtree response exceeds policy max %d nodes (got %d)",
 			subtreeHash.String(), policyMax, leafCount)
 	}
 

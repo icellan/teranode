@@ -185,7 +185,7 @@ func (u *Server) batchFetchAndDistribute(ctx context.Context, blockHeaders []*mo
 		}
 
 		if len(blocks) != len(batchHeaders) {
-			return errors.NewProcessingError("[catchup:batchFetchAndDistribute][%s] expected %d blocks, got %d", blockUpTo.Hash().String(), len(batchHeaders), len(blocks))
+			return errors.NewNetworkInvalidResponseError("[catchup:batchFetchAndDistribute][%s] expected %d blocks, got %d", blockUpTo.Hash().String(), len(batchHeaders), len(blocks))
 		}
 
 		reverseBlocks(blocks)
@@ -551,7 +551,7 @@ func (u *Server) fetchAndStoreSubtree(ctx context.Context, block *model.Block, s
 	// honest is not charged at all, which is the correct attribution because the fault was the cache's.
 	// The error the caller sees is the bypass attempt's, not this one.
 	if len(subtreeNodeBytes)%chainhash.HashSize != 0 {
-		return nil, markCacheBypassRetryable(errors.NewProcessingError("[catchup:fetchAndStoreSubtree] peer %s served %d bytes for subtree %s, not a whole number of %d-byte node hashes",
+		return nil, markCacheBypassRetryable(errors.NewNetworkInvalidResponseError("[catchup:fetchAndStoreSubtree] peer %s served %d bytes for subtree %s, not a whole number of %d-byte node hashes",
 			peerID, len(subtreeNodeBytes), subtreeHash.String(), chainhash.HashSize))
 	}
 
@@ -585,7 +585,7 @@ func (u *Server) fetchAndStoreSubtree(ctx context.Context, block *model.Block, s
 
 		// Add the node to the subtree, we do not know the fee or size yet, so we use 0
 		if err = subtree.AddNode(*nodeHash, 0, 0); err != nil {
-			return nil, errors.NewProcessingError("[catchup:fetchAndStoreSubtree] Failed to add node %s to subtree %s at index %d", nodeHash.String(), subtreeHash.String(), i, err)
+			return nil, errors.NewNetworkInvalidResponseError("[catchup:fetchAndStoreSubtree] Failed to add node %s to subtree %s at index %d", nodeHash.String(), subtreeHash.String(), i, err)
 		}
 	}
 
@@ -595,7 +595,8 @@ func (u *Server) fetchAndStoreSubtree(ctx context.Context, block *model.Block, s
 	// that served the bytes (bitcoin-sv/teranode#4692). Mirrors subtreevalidation.CheckBlockSubtrees'
 	// identical check on the RUNNING fetch branch.
 	//
-	// Deliberately a ProcessingError and NOT a BlockCorruptError, matching that precedent's class:
+	// Deliberately a NetworkInvalidResponse and NOT a BlockCorruptError, matching that precedent's class
+	// (a bare ProcessingError would be a local fault, never charged; see isLocalProcessingFault):
 	// this error travels the fetch path, and a corrupt code anywhere in the chain would hit
 	// reportCatchupFailureForError's corrupt exemption and suppress the legitimate all-peers-failed
 	// charge. It is also not IsLocalError, so tryPeerForSubtree's recordCatchupPeerFailure charge
@@ -634,7 +635,7 @@ func (u *Server) fetchAndStoreSubtree(ctx context.Context, block *model.Block, s
 		// data: the ProcessingError class is deliberate (a corrupt code here would hit
 		// reportCatchupFailureForError's corrupt exemption) and is preserved, as is non-IsLocalError so
 		// tryPeerForSubtree's peer-failure charge still lands.
-		return nil, markCacheBypassRetryable(errors.NewProcessingError("[catchup:fetchAndStoreSubtree] peer %s served subtree bytes for %s that hash to %s", peerID, subtreeHash.String(), computed))
+		return nil, markCacheBypassRetryable(errors.NewNetworkInvalidResponseError("[catchup:fetchAndStoreSubtree] peer %s served subtree bytes for %s that hash to %s", peerID, subtreeHash.String(), computed))
 	}
 
 	subtreeBytes, err := subtree.Serialize()
@@ -948,7 +949,7 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 
 	subtreeDataReader, err := u.fetchSubtreeDataFromPeer(ctx, subtreeHash, peerID, baseURL, bypassCache)
 	if err != nil {
-		return errors.NewProcessingError("[catchup:fetchAndStoreSubtreeData] Failed to fetch subtreeData for %s", subtreeHash.String(), err)
+		return errors.NewNetworkError("[catchup:fetchAndStoreSubtreeData] Failed to fetch subtreeData for %s", subtreeHash.String(), err)
 	}
 	defer subtreeDataReader.Close()
 
@@ -965,7 +966,7 @@ func (u *Server) fetchAndStoreSubtreeData(ctx context.Context, block *model.Bloc
 	// compared to the transactions in the subtree
 	subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtree, subtreeDataBufferedReader)
 	if err != nil {
-		return errors.NewProcessingError("[catchup:fetchAndStoreSubtreeData] Failed to create subtreeData for %s", subtreeHash.String(), err)
+		return errors.NewNetworkInvalidResponseError("[catchup:fetchAndStoreSubtreeData] Failed to create subtreeData for %s", subtreeHash.String(), err)
 	}
 
 	// Reject a response the subtree cannot be satisfied by, before Serialize turns it
@@ -1132,7 +1133,7 @@ func subtreeDataWriteFailure(peerID, baseURL string, subtreeHash *chainhash.Hash
 	}
 
 	if writeErr != nil {
-		return errors.NewProcessingError("[catchup:fetchAndStoreSubtreeData] Peer %s (%s) provided unusable subtree data for %s",
+		return errors.NewNetworkInvalidResponseError("[catchup:fetchAndStoreSubtreeData] Peer %s (%s) provided unusable subtree data for %s",
 			peerID, baseURL, subtreeHash.String(), writeErr)
 	}
 
@@ -1422,7 +1423,7 @@ func (u *Server) fetchBlocksBatch(ctx context.Context, hash *chainhash.Hash, n u
 
 	blocksURL, err := util.JoinPeerURL(baseURL, "blocks", hash.String())
 	if err != nil {
-		return nil, errors.NewProcessingError("[catchup:fetchBlocksBatch][%s] invalid peer base URL", hash.String(), err)
+		return nil, errors.NewNetworkInvalidResponseError("[catchup:fetchBlocksBatch][%s] invalid peer base URL", hash.String(), err)
 	}
 
 	url := fmt.Sprintf("%s?n=%d", blocksURL, n)
@@ -1446,7 +1447,7 @@ func (u *Server) fetchBlocksBatch(ctx context.Context, hash *chainhash.Hash, n u
 	// deadline, and spend at most half of it.
 	bodyReader, err := util.DoHTTPRequestBodyReaderWithRetry(reqCtx, url)
 	if err != nil {
-		return nil, errors.NewProcessingError("[catchup:fetchBlocksBatch][%s] failed to get blocks from peer", hash.String(), err)
+		return nil, errors.NewNetworkError("[catchup:fetchBlocksBatch][%s] failed to get blocks from peer", hash.String(), err)
 	}
 
 	countingReader := &countingReadCloser{
@@ -1545,14 +1546,14 @@ func (u *Server) fetchSingleBlock(ctx context.Context, hash *chainhash.Hash, pee
 
 	blockURL, err := util.JoinPeerURL(baseURL, "block", hash.String())
 	if err != nil {
-		return nil, errors.NewProcessingError("[catchup:fetchSingleBlock][%s] invalid peer base URL", hash.String(), err)
+		return nil, errors.NewNetworkInvalidResponseError("[catchup:fetchSingleBlock][%s] invalid peer base URL", hash.String(), err)
 	}
 
 	// Stream and parse incrementally rather than io.ReadAll-ing the whole response - see the
 	// comment on fetchBlocksBatch's DoHTTPRequestBodyReader call (bitcoin-sv/teranode#4742).
 	bodyReader, err := util.DoHTTPRequestBodyReader(ctx, blockURL)
 	if err != nil {
-		return nil, errors.NewProcessingError("[catchup:fetchSingleBlock][%s] failed to get block from peer", hash.String(), err)
+		return nil, errors.NewNetworkError("[catchup:fetchSingleBlock][%s] failed to get block from peer", hash.String(), err)
 	}
 
 	countingReader := &countingReadCloser{
@@ -1586,7 +1587,7 @@ func (u *Server) fetchSingleBlock(ctx context.Context, hash *chainhash.Hash, pee
 	}
 
 	if block == nil {
-		return nil, errors.NewProcessingError("[catchup:fetchSingleBlock][%s] block could not be created from peer response", hash.String())
+		return nil, errors.NewNetworkInvalidResponseError("[catchup:fetchSingleBlock][%s] block could not be created from peer response", hash.String())
 	}
 
 	// The peer chooses the response body, so a well-formed block is not necessarily the
@@ -1596,7 +1597,7 @@ func (u *Server) fetchSingleBlock(ctx context.Context, hash *chainhash.Hash, pee
 	// suppress every subsequent honest announcement of the requested hash. Reject the
 	// substitution here instead, mirroring verifyBlockHeaders on the batch path.
 	if !block.Hash().IsEqual(hash) {
-		return nil, errors.NewProcessingError("[catchup:fetchSingleBlock][%s] peer served block %s for a different hash",
+		return nil, errors.NewNetworkInvalidResponseError("[catchup:fetchSingleBlock][%s] peer served block %s for a different hash",
 			hash.String(), block.Hash().String())
 	}
 
@@ -1708,7 +1709,7 @@ func reverseBlocks(blocks []*model.Block) {
 func verifyBlockHeaders(blocks []*model.Block, headers []*model.BlockHeader, blockUpTo *model.Block) error {
 	for j, block := range blocks {
 		if !block.Hash().IsEqual(headers[j].Hash()) {
-			return errors.NewProcessingError("[catchup:batchFetchAndDistribute][%s] block hash mismatch at index %d: expected %s, got %s",
+			return errors.NewNetworkInvalidResponseError("[catchup:batchFetchAndDistribute][%s] block hash mismatch at index %d: expected %s, got %s",
 				blockUpTo.Hash().String(), j, headers[j].Hash().String(), block.Hash().String())
 		}
 	}
