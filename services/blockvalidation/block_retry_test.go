@@ -141,3 +141,18 @@ func TestFinishProcessedBlock_LabelsProcessedMetricWithPriority(t *testing.T) {
 	require.Equal(t, failuresBefore+1, testutil.ToFloat64(failures))
 	require.Equal(t, successesBefore+1, testutil.ToFloat64(successes))
 }
+
+// TestBlockRetryDelay_InvalidVerdictMentioningNetworkNotRetried pins that a final invalid verdict
+// is never retried, even when its text matches the network substring classifier. The
+// proof-of-work limit rejection says "network proof-of-work limit".
+func TestBlockRetryDelay_InvalidVerdictMentioningNetworkNotRetried(t *testing.T) {
+	server := newRetryTestServer(t, 3)
+	hash := &chainhash.Hash{1}
+
+	limitErr := errors.NewProcessingError("block nBits 1d00ffff declares target ff, which is easier than the network proof-of-work limit ff")
+	err := errors.NewServiceError("failed block validation BlockFound", errors.NewBlockInvalidError("[ValidateBlock][%s] block declares a target easier than the network proof-of-work limit", hash.String(), limitErr))
+	require.True(t, errors.IsNetworkError(err), "precondition: the verdict matches the network classifier")
+
+	_, ok := server.blockRetryDelay(hash, err)
+	require.False(t, ok)
+}

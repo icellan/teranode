@@ -15,12 +15,13 @@ import (
 // BlockProcessor gates which queued blocks may start. Get claims a block's processing slot
 // with StartProcessingBlock before removing it from the queue, so a block never leaves the
 // queue without a slot; the caller releases the slot with FinishProcessingBlock. priority is
-// the class the block was queued with.
+// the class the block was queued with. IsBlockInFlight reports whether the block is processing
+// or, by pending, queued or being fetched, reading both with slot changes held off.
 type BlockProcessor interface {
 	CanProcessBlock(ctx context.Context, hash *chainhash.Hash, priority BlockPriority) (bool, error)
 	StartProcessingBlock(hash *chainhash.Hash, priority BlockPriority) bool
 	FinishProcessingBlock(hash *chainhash.Hash)
-	IsProcessingBlock(hash *chainhash.Hash) bool
+	IsBlockInFlight(hash *chainhash.Hash, pending func(chainhash.Hash) bool) bool
 }
 
 // BlockPriority represents the priority level of a block for processing
@@ -238,7 +239,7 @@ func (pq *BlockPriorityQueue) isWaiting(bp BlockProcessor, item *PrioritizedBloc
 		return false
 	}
 
-	return pq.IsPending(*parent) || bp.IsProcessingBlock(parent)
+	return bp.IsBlockInFlight(parent, pq.IsPending)
 }
 
 func (pq *BlockPriorityQueue) Get(ctx context.Context, bp BlockProcessor) (block processBlockFound, status GetStatus) {

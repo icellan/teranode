@@ -2294,6 +2294,12 @@ func newBlockRetryAttemptsCache() *ttlcache.Cache[chainhash.Hash, int] {
 func (u *Server) blockRetryDelay(hash *chainhash.Hash, err error) (time.Duration, bool) {
 	var delay time.Duration
 
+	// A final verdict is never retried, whatever its text: the proof-of-work limit rejection
+	// says "network proof-of-work limit", which IsNetworkError matches.
+	if isUnvalidatablePeerError(err) {
+		return 0, false
+	}
+
 	// The deadline is checked first: IsNetworkError matches substrings such as "timeout"
 	// and "http", which a deadline error's message can contain.
 	switch {
@@ -2343,7 +2349,7 @@ func (u *Server) requeueBlock(blockFound processBlockFound, delay time.Duration)
 // whose parent is in flight waits in the queue for it instead of going to catchup, which
 // would move the FSM to CATCHINGBLOCKS and stop mining while the parent is still validating.
 func (u *Server) isBlockInFlight(hash *chainhash.Hash) bool {
-	return u.blockPriorityQueue.IsPending(*hash) || u.forkManager.IsProcessingBlock(hash)
+	return u.forkManager.IsBlockInFlight(hash, u.blockPriorityQueue.IsPending)
 }
 
 // inFlightPriority returns the class of a queued or processing block, so a child queued

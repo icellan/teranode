@@ -394,3 +394,56 @@ func TestProcessBlockFoundChannel_DuplicateOfInFlightBlockNotMarked(t *testing.T
 
 	require.False(t, pendingDuringFetch, "a block already being validated must not also be marked as fetching")
 }
+
+// TestIsWaiting_ParentVisibleAcrossRequeueHandoff pins that a child never sees its parent as gone
+// while the parent moves between the queue and a processing slot. A retried parent goes back on
+// the queue and then releases its slot; a reader checking the queue and then the slot without
+// holding the slot state could miss it in between and release the child to catchup.
+func TestIsWaiting_ParentVisibleAcrossRequeueHandoff(t *testing.T) {
+	initPrometheusMetrics()
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockValidation.MaxParallelForks = 4
+	fm := NewForkManager(ulogger.TestLogger{}, tSettings)
+	pq := NewBlockPriorityQueue(ulogger.TestLogger{})
+
+	parent := &chainhash.Hash{1}
+	child := &PrioritizedBlock{blockFound: processBlockFound{hash: &chainhash.Hash{2}, parentHash: parent}}
+
+	pq.Add(processBlockFound{hash: parent}, PriorityChainExtending, 10)
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
+			taken, ok := pq.claimAndTake(fm, parent, PriorityChainExtending)
+			if !ok {
+				continue
+			}
+
+			// The worker's retry path: back on the queue, then release the slot.
+			pq.RequeueAfter(taken, PriorityChainExtending, 10, 0)
+			fm.FinishProcessingBlock(parent)
+		}
+	}()
+
+	missed := 0
+	for i := 0; i < 200000; i++ {
+		if !pq.isWaiting(fm, child) {
+			missed++
+		}
+	}
+
+	close(stop)
+	<-done
+
+	require.Zero(t, missed, "the child saw its parent as neither queued nor processing")
+}

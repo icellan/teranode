@@ -24,7 +24,9 @@ func (m *mockBlockProcessor) StartProcessingBlock(hash *chainhash.Hash, _ BlockP
 	return true
 }
 
-func (m *mockBlockProcessor) IsProcessingBlock(hash *chainhash.Hash) bool { return false }
+func (m *mockBlockProcessor) IsBlockInFlight(hash *chainhash.Hash, pending func(chainhash.Hash) bool) bool {
+	return pending(*hash)
+}
 
 func (m *mockBlockProcessor) FinishProcessingBlock(hash *chainhash.Hash) {}
 
