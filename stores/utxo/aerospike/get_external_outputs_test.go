@@ -177,10 +177,10 @@ func TestGetExternalTransaction_OutputsFallbackShape(t *testing.T) {
 // tx.ReadFrom, a branch that has never fallen back. The gate itself is pinned by
 // TestGetExternalTransactionFallbackOnlyOnAbsence.
 //
-// Both damage modes are classified as storage faults, never transaction faults: the
-// blob was written from this node's own bytes, so bytes that no longer parse mean
-// this node's stored copy is torn, which is never evidence about the block or the
-// peer that served it.
+// An unparseable body is classified as a storage fault, never a transaction fault:
+// the blob was written from this node's own bytes, so bytes that no longer parse
+// mean this node's stored copy is torn, which is never evidence about the block or
+// the peer that served it.
 func TestGetExternalTransaction_CorruptTxDoesNotDegradeToOutputs(t *testing.T) {
 	t.Run("an unparseable .tx body is a storage fault, not a miss", func(t *testing.T) {
 		s, mem, tx := newOutputsOnlyStore(t, 1, 2)
