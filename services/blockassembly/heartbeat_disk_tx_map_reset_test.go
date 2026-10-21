@@ -360,3 +360,13 @@ func TestBlockAssembler_StorageTriggeredResetsArePaced(t *testing.T) {
 			"the request raised within the interval was kept and runs after it")
 	})
 }
+
+// Start loads the unmined txs outside the subtree processor's loop, so it must ask
+// the processor to check the resulting subtrees against blockmaxsize.
+func TestBlockAssembler_StartRequestsBlockMaxSizeCheck(t *testing.T) {
+	m, _ := resetTestMock(nil)
+
+	startWithMock(t, m)
+
+	m.AssertCalled(t, "RequestBlockMaxSizeCheck")
+}

@@ -1,6 +1,7 @@
 package subtreeprocessor
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -646,4 +648,119 @@ func TestEnforceBlockMaxSize_LeavesNoOrphanedMmapFiles(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, files, len(stp.chainedSubtrees)+1+len(stp.retiredSubtrees),
 		"every mmap file must belong to a chained, current or retired subtree")
+}
+
+// startOversizedProcessor starts a processor whose first queued subtree exceeds
+// blockmaxsize. The idle loop runs no blockmaxsize check, so only a trigger resizes it,
+// which shows up as announced subtrees.
+func startOversizedProcessor(t *testing.T) (*SubtreeProcessor, *blockMaxSizeHarness) {
+	t.Helper()
+
+	stp, h := newBlockMaxSizeProcessor(t, 64, model.BlockHeaderSize+blockMaxSizeTestBudget)
+	addBlockMaxSizeTestTxs(t, stp, sizes(200, blockMaxSizeTestTxSize)...)
+
+	mockClient := &blockchain.Mock{}
+	mockClient.On("SetBlockProcessedAt", mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	mockClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
+	stp.blockchainClient = mockClient
+
+	stp.Start(t.Context())
+	t.Cleanup(func() { stp.Stop(context.Background()) })
+
+	require.Never(t, func() bool { return len(h.requests()) > 0 }, 100*time.Millisecond, 10*time.Millisecond,
+		"precondition: an idle processor must not resize")
+
+	return stp, h
+}
+
+// emptyNextBlock returns a block without subtrees on top of the processor's current header.
+func emptyNextBlock(t *testing.T, stp *SubtreeProcessor) *model.Block {
+	t.Helper()
+
+	coinbaseTx, err := bt.NewTxFromString(model.CoinbaseHex)
+	require.NoError(t, err)
+
+	return &model.Block{
+		Height:     1,
+		CoinbaseTx: coinbaseTx,
+		Header: &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  stp.GetCurrentBlockHeader().Hash(),
+			HashMerkleRoot: &chainhash.Hash{},
+			Nonce:          1835,
+		},
+	}
+}
+
+// requireResized waits for the resize a trigger schedules on the next loop iteration.
+func requireResized(t *testing.T, h *blockMaxSizeHarness) {
+	t.Helper()
+
+	require.Eventually(t, func() bool { return len(h.requests()) > 0 }, 5*time.Second, 10*time.Millisecond,
+		"the trigger must schedule a blockmaxsize check")
+}
+
+// TestMoveForwardBlock_RequestsBlockMaxSizeCheck checks that a block moving forward
+// schedules a blockmaxsize check: the subtrees left after the block may not fit.
+func TestMoveForwardBlock_RequestsBlockMaxSizeCheck(t *testing.T) {
+	stp, h := startOversizedProcessor(t)
+
+	require.NoError(t, stp.MoveForwardBlock(emptyNextBlock(t, stp)))
+	requireResized(t, h)
+}
+
+// TestReorg_RequestsBlockMaxSizeCheck checks that a reorg schedules a blockmaxsize check.
+func TestReorg_RequestsBlockMaxSizeCheck(t *testing.T) {
+	stp, h := startOversizedProcessor(t)
+
+	require.NoError(t, stp.Reorg([]*model.Block{}, []*model.Block{emptyNextBlock(t, stp)}))
+	requireResized(t, h)
+}
+
+// TestReset_RequestsBlockMaxSizeCheck checks that a reset schedules a blockmaxsize check
+// for the subtrees its reload builds.
+func TestReset_RequestsBlockMaxSizeCheck(t *testing.T) {
+	stp, h := startOversizedProcessor(t)
+
+	reload := func() error {
+		parent := &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{chainhash.HashH([]byte("parent-tx"))}}
+
+		for i := 0; i < 200; i++ {
+			hash := chainhash.HashH([]byte(fmt.Sprintf("tx-%d", blockMaxSizeTestTxSeq.Add(1))))
+			if err := stp.addNode(subtreepkg.Node{Hash: hash, SizeInBytes: blockMaxSizeTestTxSize}, parent, true); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	resp := stp.Reset(stp.GetCurrentBlockHeader(), nil, nil, false, reload)
+	require.NoError(t, resp.Err)
+	requireResized(t, h)
+}
+
+// TestDequeue_ChecksBlockMaxSize checks that the dequeue loop checks blockmaxsize once
+// queued txs grew the subtrees, without any other trigger.
+func TestDequeue_ChecksBlockMaxSize(t *testing.T) {
+	stp, _ := newBlockMaxSizeProcessor(t, 64, model.BlockHeaderSize+blockMaxSizeTestBudget)
+	stp.Start(t.Context())
+	t.Cleanup(func() { stp.Stop(context.Background()) })
+
+	before := promtestutil.ToFloat64(prometheusSubtreeProcessorBlockMaxSizeResizes)
+
+	parent := &subtreepkg.TxInpoints{ParentTxHashes: []chainhash.Hash{chainhash.HashH([]byte("parent-tx"))}}
+	nodes := make([]subtreepkg.Node, 200)
+	inpoints := make([]*subtreepkg.TxInpoints, len(nodes))
+
+	for i := range nodes {
+		nodes[i] = subtreepkg.Node{Hash: chainhash.HashH([]byte(fmt.Sprintf("tx-%d", blockMaxSizeTestTxSeq.Add(1)))), SizeInBytes: blockMaxSizeTestTxSize}
+		inpoints[i] = parent
+	}
+
+	stp.AddBatch(nodes, inpoints)
+
+	require.Eventually(t, func() bool {
+		return promtestutil.ToFloat64(prometheusSubtreeProcessorBlockMaxSizeResizes) > before
+	}, 5*time.Second, 10*time.Millisecond, "the dequeue loop must resize an oversized first subtree")
 }
