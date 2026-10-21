@@ -1110,8 +1110,10 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 	}
 
 	// Count the block as in flight while it is fetched, so a child announced meanwhile waits
-	// for it instead of going to catchup. The mark is cleared after the block is queued.
-	if u.blockPriorityQueue.MarkFetching(blockFound.hash) {
+	// for it instead of going to catchup. The mark is cleared after the block is queued. A
+	// duplicate of a block already in flight is not marked: once that block is stored, its
+	// children must not wait on the duplicate's fetch.
+	if !u.isBlockInFlight(blockFound.hash) && u.blockPriorityQueue.MarkFetching(blockFound.hash) {
 		defer u.blockPriorityQueue.UnmarkFetching(blockFound.hash)
 	}
 
