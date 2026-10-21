@@ -195,3 +195,48 @@ func TestMarkCatchupFailureReported_KeepsThePeerAttribution(t *testing.T) {
 	require.True(t, catchupFailureAlreadyReported(localErr))
 	require.True(t, isLocalCatchupFault(localErr), "the marker must not turn a local cause into a peer fault")
 }
+
+// consensusSpendRejectionChain is the shape a block-context spend rejection takes when nothing
+// re-codes it: the store's code under the validator's, blessMissing's and the level loop's
+// ProcessingError wrappers.
+func consensusSpendRejectionChain(cause error) error {
+	return errors.NewProcessingError("[processTransactionsInLevels] Completed processing with 1 errors (0 missing-parent)",
+		errors.NewProcessingError("[blessMissingTransaction] failed to validate transaction",
+			errors.NewProcessingError("[Validate] error spending utxos", cause)))
+}
+
+// TestConsensusSpendRejectionIsChargedToThePeer pins that a consensus spend rule broken by a
+// block's transaction stays the peer's fault even under bare ProcessingError wrappers: it is
+// charged, not retried as local. A frozen UTXO depends on this node's alert-system state and a
+// UTXO hash mismatch on this node's own store, so both stay local.
+func TestConsensusSpendRejectionIsChargedToThePeer(t *testing.T) {
+	for name, cause := range map[string]error{
+		"coinbase immature": errors.NewTxCoinbaseImmatureError("coinbase is not spendable yet"),
+		"non final":         errors.NewUtxoNonFinalError("transaction is not final", errors.NewTxLockTimeError("lock time (1100) as block height is not less than block height (1000)")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := consensusSpendRejectionChain(cause)
+
+			require.False(t, isLocalProcessingFault(err))
+			require.False(t, isLocalCatchupFault(err))
+			require.False(t, isRecoverableBlockMessageError(err), "a consensus-invalid block must not be retried as a local fault")
+
+			client := &failureCountingP2PClient{}
+			u := &Server{p2pClient: client, logger: ulogger.TestLogger{}}
+			u.reportCatchupFailureForError(context.Background(), "peer-1", err)
+			require.Equal(t, 1, client.failures)
+		})
+	}
+
+	for name, cause := range map[string]error{
+		"frozen utxo":        errors.NewUtxoFrozenError("utxo is frozen"),
+		"utxo hash mismatch": errors.NewUtxoHashMismatchError("utxo hash mismatch"),
+	} {
+		t.Run(name+" stays local", func(t *testing.T) {
+			err := consensusSpendRejectionChain(cause)
+
+			require.True(t, isLocalProcessingFault(err))
+			require.True(t, isLocalCatchupFault(err))
+		})
+	}
+}

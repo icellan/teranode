@@ -496,6 +496,10 @@ func isLocalCatchupFault(err error) bool {
 // counter-spend already mined in the block's own ancestry, a TxInvalid, in one. A
 // chain carrying both is the peer's. ErrNotFound is a peer code because it is what a
 // peer's HTTP 404 becomes (util.buildHTTPError); ErrTxNotFound is a different code.
+// A block spend rule violation (errors.IsBlockSpendRuleViolation) is a peer code too:
+// subtree validation re-codes it as TxInvalid on the block path, and this keeps it
+// charged on any path that does not. A frozen UTXO and a UTXO hash mismatch are not,
+// so they stay local.
 //
 // A peer fault must therefore be coded as one of these, not as a bare ProcessingError.
 func isLocalProcessingFault(err error) bool {
@@ -513,7 +517,8 @@ func carriesPeerFaultCode(err error) bool {
 		errors.Is(err, errors.ErrNetworkTimeout) ||
 		errors.Is(err, errors.ErrNetworkConnectionRefused) ||
 		errors.Is(err, errors.ErrNetworkInvalidResponse) ||
-		errors.Is(err, errors.ErrNetworkPeerMalicious)
+		errors.Is(err, errors.ErrNetworkPeerMalicious) ||
+		errors.IsBlockSpendRuleViolation(err)
 }
 
 // reportCatchupMalicious reports malicious behavior to the P2P service.

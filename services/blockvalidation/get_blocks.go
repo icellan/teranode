@@ -542,7 +542,7 @@ func (u *Server) fetchAndStoreSubtree(ctx context.Context, block *model.Block, s
 	// Marked cache-bypass retryable: a truncated body is the issue-1368 signature — a caching layer in
 	// front of the peer replaying a failed or aborted on-demand generation as a 200. Without the marker
 	// no peer behind that cache can serve this subtree for the whole TTL. The marker only sets data, so
-	// the ProcessingError class and the no-strike decision above are untouched.
+	// the NetworkInvalidResponse class and the no-strike decision above are untouched.
 	//
 	// It does two things, not one. It buys one retry of this same peer with a cache-busting URL, and it
 	// DEFERS the peer-failure charge to that retry: tryPeerForSubtree takes the retryable branch, so the
@@ -632,9 +632,10 @@ func (u *Server) fetchAndStoreSubtree(ctx context.Context, block *model.Block, s
 		}
 
 		// Marked cache-bypass retryable so the bypass above is actually reached. The marker only sets
-		// data: the ProcessingError class is deliberate (a corrupt code here would hit
-		// reportCatchupFailureForError's corrupt exemption) and is preserved, as is non-IsLocalError so
-		// tryPeerForSubtree's peer-failure charge still lands.
+		// data: the NetworkInvalidResponse class is deliberate (a corrupt code here would hit
+		// reportCatchupFailureForError's corrupt exemption, a bare ProcessingError would be a local
+		// fault) and is preserved, as is non-IsLocalError so tryPeerForSubtree's peer-failure charge
+		// still lands.
 		return nil, markCacheBypassRetryable(errors.NewNetworkInvalidResponseError("[catchup:fetchAndStoreSubtree] peer %s served subtree bytes for %s that hash to %s", peerID, subtreeHash.String(), computed))
 	}
 

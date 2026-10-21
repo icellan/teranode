@@ -121,7 +121,13 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   before. Because these codes count as network errors, more failures now take the
   existing network-error retry paths. On the announced-block path, a block served for the
   wrong hash, or a block whose subtrees the peer served with bad bytes, now tries the
-  alternative sources, and the block worker re-queues it. (#2022)
+  alternative sources, and the block worker re-queues it. A block whose transaction
+  spends an immature coinbase or is non-final is now rejected as an invalid
+  transaction, not as a processing error. Catchup reports the serving peer malicious
+  for it, the direct block path strikes the peer for a corrupt body, and the legacy
+  route rejects the block as invalid. A block that spends a UTXO this node has frozen,
+  or that hits a UTXO hash mismatch in this node's store, stays a local fault.
+  (#2022)
 
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,
