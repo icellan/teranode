@@ -167,15 +167,15 @@ func TestGetExternalTransaction_OutputsFallbackShape(t *testing.T) {
 	require.True(t, (&meta.Data{Tx: tx}).TxIsSerializable())
 }
 
-// TestGetExternalTransaction_CorruptTxDoesNotDegradeToOutputs covers the behaviour
-// change this branch set out to make deliberately: a damaged .tx blob hard-fails
-// where it used to degrade to a snapshot reconstruction.
+// TestGetExternalTransaction_CorruptTxDoesNotDegradeToOutputs pins that a .tx blob
+// which is present but does not parse fails without consulting .outputs. Nothing
+// else proves a parse failure never reaches the other representation, which is why
+// it asserts read counts rather than only the returned error.
 //
-// Before the gate, the fallback triggered on any error from the .tx read, so a node
-// holding a corrupt blob silently served the UTXO-set shape in place of the
-// transaction — a wrong answer dressed as a right one. The guarantee has two halves:
-// the read fails, AND it fails without consulting the other representation. The
-// second half is why these assert read counts rather than only the returned error.
+// This is not a guard on the absence-only gate. The fallback is decided on the
+// error from opening the .tx blob; this body opens fine and fails later, in
+// tx.ReadFrom, a branch that has never fallen back. The gate itself is pinned by
+// TestGetExternalTransactionFallbackOnlyOnAbsence.
 //
 // Both damage modes are classified as storage faults, never transaction faults: the
 // blob was written from this node's own bytes, so bytes that no longer parse mean
@@ -275,5 +275,15 @@ func TestGetExternalTransaction_FallsBackOnlyOnNotFound(t *testing.T) {
 			"whose fault it is must stay visible: this is a local storage fault, got %v", err)
 		require.True(t, errors.IsTransientLocalError(err),
 			"a missing blob of ours must not be attributed to the peer that sent the block, got %v", err)
+
+		// The error also matches ErrNotFound: the memory store's not-found error is
+		// wrapped as its cause, and errors.Is matches a code anywhere in the chain.
+		// parkReadFailure and parkCommitFailure in legacy/netsync's
+		// block_park_policy.go classify it correctly only because they test
+		// IsTransientLocalError before ErrNotFound, which maps to blob-unusable and
+		// files-gone respectively. Any consumer must keep that order, or a fault of
+		// ours stops being retried.
+		require.True(t, errors.Is(err, errors.ErrNotFound),
+			"the chain carries the store's not-found cause, so consumers must test transient first, got %v", err)
 	})
 }

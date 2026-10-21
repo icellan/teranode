@@ -2457,7 +2457,9 @@ func (s *Store) retrySpendBatch(batch []*batchSpend, try func([]*batchSpend) boo
 	// Same budget as Create's lock retry (100ms, 200ms, 400ms). On sqlitememory a
 	// lock error is the engine breaking a cycle with a concurrent create, and a
 	// wave of concurrent creates re-forms that cycle faster than a 10-20ms
-	// backoff lets them finish, so the old 30ms budget failed the spend.
+	// backoff lets them finish, so the old 30ms budget failed the spend. On
+	// Postgres the same budget applies to a real deadlock (40P01), and because
+	// the batcher is serialized the spends behind it wait up to ~700ms.
 	const maxRetries = 3
 
 	for attempt := 0; ; attempt++ {
