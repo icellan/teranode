@@ -121,7 +121,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   before. Because these codes count as network errors, more failures now take the
   existing network-error retry paths. On the announced-block path, a block served for the
   wrong hash, or a block whose subtrees the peer served with bad bytes, now tries the
-  alternative sources, and the block worker re-queues it.
+  alternative sources, and the block worker re-queues it. (#2022)
 
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,
