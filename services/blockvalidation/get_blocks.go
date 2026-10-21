@@ -556,15 +556,20 @@ func (u *Server) fetchAndStoreSubtree(ctx context.Context, block *model.Block, s
 	}
 
 	// in the subtree validation, we only use the hashes of the FileTypeSubtreeToCheck, which is what is returned from the peer
+	//
+	// Every check from here to the root-hash check judges the peer's bytes, so each carries a peer
+	// code. A bare ProcessingError would be a local fault, which makes
+	// fetchAndStoreSubtreeAndSubtreeData stop asking the alternative peers. fetchSubtreeFromPeer
+	// already rejects an empty body, so the first two checks are a backstop.
 	numberOfNodes := len(subtreeNodeBytes) / chainhash.HashSize
 	subtree, err := subtreepkg.NewIncompleteTreeByLeafCount(numberOfNodes)
 	if err != nil {
-		return nil, errors.NewProcessingError("[catchup:fetchAndStoreSubtree] Failed to create subtree with %d nodes for %s", numberOfNodes, subtreeHash.String(), err)
+		return nil, errors.NewNetworkInvalidResponseError("[catchup:fetchAndStoreSubtree] Failed to create subtree with %d nodes for %s", numberOfNodes, subtreeHash.String(), err)
 	}
 
 	// Sanity check, subtrees should never be empty
 	if numberOfNodes == 0 {
-		return nil, errors.NewProcessingError("[catchup:fetchAndStoreSubtree] Subtree for %s has zero nodes", subtreeHash.String())
+		return nil, errors.NewNetworkInvalidResponseError("[catchup:fetchAndStoreSubtree] Subtree for %s has zero nodes", subtreeHash.String())
 	}
 
 	// Deserialize the subtree nodes from the bytes
@@ -573,12 +578,12 @@ func (u *Server) fetchAndStoreSubtree(ctx context.Context, block *model.Block, s
 		nodeBytes := subtreeNodeBytes[i*chainhash.HashSize : (i+1)*chainhash.HashSize]
 		nodeHash, err := chainhash.NewHash(nodeBytes)
 		if err != nil {
-			return nil, errors.NewProcessingError("[catchup:fetchAndStoreSubtree] Failed to create hash from bytes for subtree %s at index %d", subtreeHash.String(), i, err)
+			return nil, errors.NewNetworkInvalidResponseError("[catchup:fetchAndStoreSubtree] Failed to create hash from bytes for subtree %s at index %d", subtreeHash.String(), i, err)
 		}
 
 		if i == 0 && nodeHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
 			if err = subtree.AddCoinbaseNode(); err != nil {
-				return nil, errors.NewProcessingError("[catchup:fetchAndStoreSubtree] Failed to add coinbase node to subtree %s at index %d", subtreeHash.String(), i, err)
+				return nil, errors.NewNetworkInvalidResponseError("[catchup:fetchAndStoreSubtree] Failed to add coinbase node to subtree %s at index %d", subtreeHash.String(), i, err)
 			}
 			continue
 		}
@@ -1219,8 +1224,11 @@ func (u *Server) fetchAndStoreSubtreeAndSubtreeData(ctx context.Context, block *
 	}
 
 	// A local error means our own storage or context failed — another peer cannot fix
-	// that, so do not spend attempts on the rest of the fleet.
-	if errors.IsLocalError(err) {
+	// that, so do not spend attempts on the rest of the fleet. A local processing fault
+	// counts too: a subtree file on our disk that does not deserialize fails every
+	// alternative the same way, and the all-peers-failed aggregate below would charge
+	// the primary for it.
+	if errors.IsLocalError(err) || isLocalProcessingFault(err) {
 		return "", errors.NewServiceError("[catchup:fetchAndStoreSubtreeAndSubtreeData] Local error fetching subtree %s (not retrying with other peers)", subtreeHash.String(), err)
 	}
 
@@ -1256,7 +1264,7 @@ func (u *Server) fetchAndStoreSubtreeAndSubtreeData(ctx context.Context, block *
 
 				attempts = append(attempts, subtreeFetchAttempt{peerID: altPeerID, baseURL: altBaseURL, role: "alternative", err: altErr})
 
-				if errors.IsLocalError(altErr) {
+				if errors.IsLocalError(altErr) || isLocalProcessingFault(altErr) {
 					return "", errors.NewServiceError("[catchup:fetchAndStoreSubtreeAndSubtreeData] Local error fetching subtree %s (aborting peer retry)", subtreeHash.String(), altErr)
 				}
 			}
