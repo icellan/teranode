@@ -558,3 +558,49 @@ func TestForkManager_CanProcessBlock_EdgeCases(t *testing.T) {
 		assert.False(t, canProcess, "Fork already has a processing block")
 	})
 }
+
+// signalDuringScanProcessor refuses the block on both of Get's passes (front probe and full
+// scan) and, on the second, makes it processable and signals the queue before Get returns.
+// That is a retry timer or a slot release firing while the worker is between Get and
+// cond.Wait, with no worker parked.
+type signalDuringScanProcessor struct {
+	*MockBlockProcessor
+	pq    *BlockPriorityQueue
+	calls int
+}
+
+func (p *signalDuringScanProcessor) CanProcessBlock(ctx context.Context, hash *chainhash.Hash, priority BlockPriority) (bool, error) {
+	p.mu.Lock()
+	p.calls++
+	calls := p.calls
+	p.mu.Unlock()
+
+	if calls == 2 {
+		p.pq.Signal()
+	}
+
+	if calls <= 2 {
+		return false, nil
+	}
+
+	return p.MockBlockProcessor.CanProcessBlock(ctx, hash, priority)
+}
+
+// TestBlockPriorityQueue_WaitForBlock_SignalDuringGetNotLost pins that a signal sent while a
+// worker is inside Get, before it parks, still wakes it. Otherwise the block waits for the
+// next unrelated Add or slot release, which on a quiet node is the next announcement.
+func TestBlockPriorityQueue_WaitForBlock_SignalDuringGetNotLost(t *testing.T) {
+	initPrometheusMetrics()
+	pq := NewBlockPriorityQueue(ulogger.TestLogger{})
+	bp := &signalDuringScanProcessor{MockBlockProcessor: NewMockBlockProcessor(), pq: pq}
+
+	hash := &chainhash.Hash{1}
+	pq.Add(processBlockFound{hash: hash}, PriorityChainExtending, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	taken, status := pq.WaitForBlock(ctx, bp)
+	require.Equal(t, GetOK, status, "the signal sent during Get was lost")
+	require.Equal(t, hash, taken.hash)
+}
