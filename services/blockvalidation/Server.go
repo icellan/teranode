@@ -2486,17 +2486,19 @@ func newBlockRetryAttemptsCache() *ttlcache.Cache[chainhash.Hash, int] {
 func (u *Server) blockRetryDelay(hash *chainhash.Hash, err error) (time.Duration, bool) {
 	var delay time.Duration
 
-	// A final verdict is never retried, whatever its text: the proof-of-work limit rejection
-	// says "network proof-of-work limit", which IsNetworkError matches.
-	if isUnvalidatablePeerError(err) {
-		return 0, false
-	}
-
-	// The deadline is checked first: IsNetworkError matches substrings such as "timeout"
-	// and "http", which a deadline error's message can contain.
+	// Causes that cannot be a verdict come first. NewBlockFromReader wraps every read failure
+	// as ErrBlockInvalid, so a download cut short by a deadline or the connection would
+	// otherwise be taken for one. The deadline is also checked before IsNetworkError, which
+	// matches substrings such as "timeout" and "http" that a deadline error's message can contain.
+	// A final verdict is then never retried, whatever its text: the proof-of-work limit
+	// rejection says "network proof-of-work limit", which IsNetworkError matches.
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		delay = blockDeadlineRetryDelay
+	case isTransportFailure(err):
+		delay = blockFetchRetryDelay
+	case isUnvalidatablePeerError(err):
+		return 0, false
 	case errors.IsNetworkError(err) || errors.IsMaliciousResponseError(err):
 		delay = blockFetchRetryDelay
 	default:
@@ -2520,6 +2522,30 @@ func (u *Server) blockRetryDelay(hash *chainhash.Hash, err error) (time.Duration
 	u.blockRetryAttempts.Set(*hash, attempts, ttlcache.DefaultTTL)
 
 	return delay, true
+}
+
+// isTransportFailure reports whether err's root cause is a foreign error, such as one from io or
+// net, that IsNetworkError matches. A wrapped foreign error keeps only its text, so its type is
+// gone; its ERR_UNKNOWN code is what tells it apart from a verdict whose text happens to match.
+func isTransportFailure(err error) bool {
+	var current *errors.Error
+	if !errors.As(err, &current) {
+		return errors.IsNetworkError(err)
+	}
+
+	for {
+		next := current.Unwrap()
+		if next == nil {
+			return current.Code() == errors.ERR_UNKNOWN && errors.IsNetworkError(current)
+		}
+
+		wrapped, ok := next.(*errors.Error)
+		if !ok {
+			return errors.IsNetworkError(next)
+		}
+
+		current = wrapped
+	}
 }
 
 func (u *Server) clearBlockRetryAttempts(hash *chainhash.Hash) {

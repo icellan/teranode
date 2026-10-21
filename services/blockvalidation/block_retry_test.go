@@ -1,11 +1,18 @@
 package blockvalidation
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"net"
+	"syscall"
 	"testing"
+	"testing/iotest"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jellydator/ttlcache/v3"
@@ -149,10 +156,42 @@ func TestBlockRetryDelay_InvalidVerdictMentioningNetworkNotRetried(t *testing.T)
 	server := newRetryTestServer(t, 3)
 	hash := &chainhash.Hash{1}
 
-	limitErr := errors.NewProcessingError("block nBits 1d00ffff declares target ff, which is easier than the network proof-of-work limit ff")
+	limitErr := errors.NewBlockInvalidError("block nBits %s declares target %x, which is easier than the network proof-of-work limit %x", "207fffff", 255, 1)
 	err := errors.NewServiceError("failed block validation BlockFound", errors.NewBlockInvalidError("[ValidateBlock][%s] block declares a target easier than the network proof-of-work limit", hash.String(), limitErr))
 	require.True(t, errors.IsNetworkError(err), "precondition: the verdict matches the network classifier")
 
 	_, ok := server.blockRetryDelay(hash, err)
 	require.False(t, ok)
+}
+
+// TestBlockRetryDelay_BrokenDownloadIsRetried pins that a block whose download breaks mid-stream
+// is retried. NewBlockFromReader wraps every read failure as ErrBlockInvalid, so the final
+// verdict guard must not see a transport failure as a verdict.
+func TestBlockRetryDelay_BrokenDownloadIsRetried(t *testing.T) {
+	hash := &chainhash.Hash{1}
+
+	tests := []struct {
+		name   string
+		reader io.Reader
+		delay  time.Duration
+	}{
+		{"truncated body", bytes.NewReader(make([]byte, 10)), blockFetchRetryDelay},
+		{"connection reset", iotest.ErrReader(&net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}), blockFetchRetryDelay},
+		{"fetch deadline", iotest.ErrReader(context.DeadlineExceeded), blockDeadlineRetryDelay},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newRetryTestServer(t, 3)
+
+			_, readErr := model.NewBlockFromReader(tt.reader)
+			require.True(t, errors.Is(readErr, errors.ErrBlockInvalid), "precondition: the reader wraps the failure as invalid")
+
+			err := errors.NewProcessingError("[catchup:fetchSingleBlock][%s] failed to create block from bytes", hash.String(), readErr)
+
+			delay, ok := server.blockRetryDelay(hash, err)
+			require.True(t, ok)
+			require.Equal(t, tt.delay, delay)
+		})
+	}
 }
