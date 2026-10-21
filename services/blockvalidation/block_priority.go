@@ -70,9 +70,9 @@ type BlockPriorityQueue struct {
 	cond      *sync.Cond
 	logger    ulogger.Logger
 
-	// fetching counts the intake workers still fetching each announced block. A block being
+	// fetching holds announced blocks an intake worker is still fetching. A block being
 	// fetched is not queued yet, but its children must wait for it all the same.
-	fetching map[chainhash.Hash]int
+	fetching map[chainhash.Hash]struct{}
 
 	// wakeups is bumped under mu by every Signal and Broadcast. WaitForBlock compares it with
 	// the value it saw before Get, so a wake-up sent while it was not parked is not lost.
@@ -86,7 +86,7 @@ func NewBlockPriorityQueue(logger ulogger.Logger) *BlockPriorityQueue {
 		hashIndex: make(map[chainhash.Hash]*PrioritizedBlock),
 		needsSort: false,
 		logger:    logger,
-		fetching:  make(map[chainhash.Hash]int),
+		fetching:  make(map[chainhash.Hash]struct{}),
 	}
 	pq.cond = sync.NewCond(&pq.mu)
 	return pq
@@ -362,6 +362,12 @@ func (pq *BlockPriorityQueue) Signal() {
 
 func (pq *BlockPriorityQueue) WaitForBlock(ctx context.Context, bp BlockProcessor) (processBlockFound, GetStatus) {
 	for {
+		// Get answers GetEmpty on a cancelled context even with blocks queued, which the
+		// GetEmpty re-check below would read as "items appeared" and loop on.
+		if ctx.Err() != nil {
+			return processBlockFound{}, GetEmpty
+		}
+
 		pq.mu.Lock()
 		wakeupsBefore := pq.wakeups
 		pq.mu.Unlock()
@@ -449,17 +455,26 @@ func (pq *BlockPriorityQueue) IsPending(hash chainhash.Hash) bool {
 	defer pq.mu.Unlock()
 
 	_, queued := pq.hashIndex[hash]
+	_, fetching := pq.fetching[hash]
 
-	return queued || pq.fetching[hash] > 0
+	return queued || fetching
 }
 
-// MarkFetching records that an intake worker has started fetching an announced block. Every
-// call must be paired with UnmarkFetching once the block is queued or dropped.
-func (pq *BlockPriorityQueue) MarkFetching(hash *chainhash.Hash) {
+// MarkFetching records that an intake worker has started fetching an announced block, and
+// reports whether this worker holds the mark. Only the first fetcher does: a duplicate
+// announcement still fetching after the first one queued the block must not hold children
+// behind it. The holder calls UnmarkFetching once the block is queued or dropped.
+func (pq *BlockPriorityQueue) MarkFetching(hash *chainhash.Hash) bool {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 
-	pq.fetching[*hash]++
+	if _, fetching := pq.fetching[*hash]; fetching {
+		return false
+	}
+
+	pq.fetching[*hash] = struct{}{}
+
+	return true
 }
 
 // UnmarkFetching ends a fetch started with MarkFetching. A child waiting on a block whose
@@ -468,14 +483,27 @@ func (pq *BlockPriorityQueue) UnmarkFetching(hash *chainhash.Hash) {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 
-	if pq.fetching[*hash] <= 1 {
-		delete(pq.fetching, *hash)
-	} else {
-		pq.fetching[*hash]--
-	}
+	delete(pq.fetching, *hash)
 
 	pq.wakeups++
 	pq.cond.Signal()
+}
+
+// PromoteChildren gives every queued child of parent the parent's class. A child queued while
+// its parent was still being fetched was classified without it, and is held by isWaiting until
+// the parent finishes, which is when the caller promotes it.
+func (pq *BlockPriorityQueue) PromoteChildren(parent *chainhash.Hash, priority BlockPriority) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	for _, item := range pq.items {
+		if item.blockFound.parentHash != nil && item.blockFound.parentHash.IsEqual(parent) && item.priority != priority {
+			item.priority = priority
+			pq.needsSort = true
+		}
+	}
+
+	updateQueueSizeMetrics(pq.items)
 }
 
 func (pq *BlockPriorityQueue) Size() int {
