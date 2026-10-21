@@ -2839,6 +2839,10 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subt
 
 	nodeIdx := 0
 
+	// emptySt is the current subtree Phase 1 creates after completing the existing one;
+	// Phase 3 fills it rather than replacing it, which would leak its mmap backing
+	var emptySt *subtreepkg.Subtree
+
 	// Phase 1: Fill existing currentSubtree (which may already have coinbase + some nodes)
 	currentSt := stp.currentSubtree.Load()
 	if currentSt != nil {
@@ -2875,6 +2879,7 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subt
 				return err
 			}
 			stp.currentSubtree.Store(newSt)
+			emptySt = newSt
 			currentSt = nil
 		}
 	}
@@ -2946,9 +2951,12 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subt
 	// Phase 3: Handle last partial subtree (becomes new currentSubtree)
 	lastStart := numFullSubtrees * subtreeSize
 	if lastCount > 0 {
-		st, err := stp.newSubtree(subtreeSize)
-		if err != nil {
-			return err
+		st := emptySt
+		if st == nil {
+			var err error
+			if st, err = stp.newSubtree(subtreeSize); err != nil {
+				return err
+			}
 		}
 
 		for _, node := range remainingNodes[lastStart:] {
@@ -2958,7 +2966,7 @@ func (stp *SubtreeProcessor) bulkBuildSubtrees(ctx context.Context, nodes []subt
 		}
 
 		stp.currentSubtree.Store(st)
-	} else if currentSt == nil {
+	} else if currentSt == nil && emptySt == nil {
 		// All nodes consumed into full subtrees, create empty currentSubtree
 		st, err := stp.newSubtree(subtreeSize)
 		if err != nil {

@@ -3,6 +3,7 @@ package subtreeprocessor
 import (
 	"fmt"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -628,4 +629,21 @@ func TestEnforceBlockMaxSize_CountsResizes(t *testing.T) {
 	// nothing to do: not counted
 	require.NoError(t, stp.enforceBlockMaxSize(t.Context()))
 	require.Equal(t, before+1, promtestutil.ToFloat64(prometheusSubtreeProcessorBlockMaxSizeResizes))
+}
+
+// TestEnforceBlockMaxSize_LeavesNoOrphanedMmapFiles checks that a successful resize in
+// mmap mode leaves no mapping behind: every backing file belongs to a live or retired
+// subtree. bulkBuildSubtrees used to replace the empty current subtree it created after
+// completing the first one without closing it.
+func TestEnforceBlockMaxSize_LeavesNoOrphanedMmapFiles(t *testing.T) {
+	mmapDir := t.TempDir()
+	stp, _ := newBlockMaxSizeProcessor(t, 64, model.BlockHeaderSize+blockMaxSizeTestBudget, WithMmapDir(mmapDir))
+	addBlockMaxSizeTestTxs(t, stp, sizes(200, blockMaxSizeTestTxSize)...)
+
+	require.NoError(t, stp.enforceBlockMaxSize(t.Context()))
+
+	files, err := os.ReadDir(mmapDir)
+	require.NoError(t, err)
+	require.Len(t, files, len(stp.chainedSubtrees)+1+len(stp.retiredSubtrees),
+		"every mmap file must belong to a chained, current or retired subtree")
 }
