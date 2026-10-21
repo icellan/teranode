@@ -535,9 +535,10 @@ func (u *Server) blessMissing(ctx context.Context, blockHash chainhash.Hash, sub
 	}
 
 	// The validator returns a broken spend rule under a ProcessingError. With SkipPolicyChecks,
-	// which only the block paths set, the rule is measured against the block's own height and
-	// parent (selectFinalityComparisonTime), so it is a verdict on the block. Without it, it is
-	// measured against this node's tip, and a peer one block ahead is not at fault.
+	// which only the block paths set, coinbase maturity is checked at the block's height and
+	// finality against the block's parent (selectFinalityComparisonTime), so it is a verdict on
+	// the block. Without it, maturity is checked at tip+1 and finality against the tip's median
+	// time, and a peer one block ahead is not at fault.
 	if err != nil && validationOptions.SkipPolicyChecks && errors.IsBlockSpendRuleViolation(err) {
 		return nil, false, errors.NewTxInvalidError("[blessMissingTransaction][%s/%s][%s] transaction breaks a consensus spend rule", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
 	}

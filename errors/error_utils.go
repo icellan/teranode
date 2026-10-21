@@ -88,9 +88,10 @@ func IsTransientLocalError(err error) bool {
 
 // IsBlockSpendRuleViolation reports whether err carries a code the validator or UTXO
 // store puts on a spend that breaks a consensus rule: an immature coinbase or a
-// non-final transaction. When a block is validated each is measured against the
-// block's own height and parent, so it is a verdict on the block. Elsewhere both are
-// measured against this node's tip and are not.
+// non-final transaction. When a block is validated, maturity is checked at the block's
+// height and finality against its parent, so either is a verdict on the block.
+// Elsewhere maturity is checked at tip+1 and finality against the tip's median time,
+// so neither is.
 //
 // ErrFrozen is absent: it depends on this node's alert-system state. ErrUtxoHashMismatch
 // is absent: the validator re-derives every input's parent output data from this
