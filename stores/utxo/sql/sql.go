@@ -2447,6 +2447,13 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 		return
 	}
 
+	s.retrySpendBatch(batch, s.trySendSpendBatch)
+}
+
+// retrySpendBatch runs try over batch until it reports no lock error, and
+// answers every item itself when the retries run out or the store context is
+// cancelled while waiting.
+func (s *Store) retrySpendBatch(batch []*batchSpend, try func([]*batchSpend) bool) {
 	// Same budget as Create's lock retry (100ms, 200ms, 400ms). On sqlitememory a
 	// lock error is the engine breaking a cycle with a concurrent create, and a
 	// wave of concurrent creates re-forms that cycle faster than a 10-20ms
@@ -2454,7 +2461,7 @@ func (s *Store) sendSpendBatch(batch []*batchSpend) {
 	const maxRetries = 3
 
 	for attempt := 0; ; attempt++ {
-		retryable := s.trySendSpendBatch(batch)
+		retryable := try(batch)
 		if !retryable {
 			return
 		}
