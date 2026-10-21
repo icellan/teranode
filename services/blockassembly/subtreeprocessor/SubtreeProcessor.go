@@ -3588,7 +3588,10 @@ func (stp *SubtreeProcessor) removeTxFromSubtrees(ctx context.Context, hash chai
 			// the original stays safe for concurrent reads. Further processing is not needed,
 			// as the subtrees in chainedSubtrees are older than the current subtree.
 			originalSubtree := stp.currentSubtree.Load()
-			currentSubtree := duplicateKeepingCapacity(originalSubtree)
+			currentSubtree, err := duplicateKeepingCapacity(originalSubtree)
+			if err != nil {
+				return errors.NewProcessingError("[SubtreeProcessor][removeTxFromSubtrees][%s] error copying current subtree", hash.String(), err)
+			}
 
 			if err := currentSubtree.RemoveNodeAtIndex(foundIndex); err != nil {
 				return errors.NewProcessingError("[SubtreeProcessor][removeTxFromSubtrees][%s] error removing node from current subtree", hash.String(), err)
@@ -3921,16 +3924,21 @@ func subtreeLeafCount(st *subtreepkg.Subtree) int {
 // Duplicate() allocates exactly len(Nodes), and Size() and IsComplete() derive from the
 // slice capacity, so a duplicated, partly filled current subtree would complete on the
 // next add with fewer leaves than the other subtrees of the block, making it invalid.
-func duplicateKeepingCapacity(st *subtreepkg.Subtree) *subtreepkg.Subtree {
-	duplicate := st.Duplicate()
-
-	if leaves := subtreeLeafCount(st); cap(duplicate.Nodes) < leaves {
-		nodes := make([]subtreepkg.Node, len(duplicate.Nodes), leaves)
-		copy(nodes, duplicate.Nodes)
-		duplicate.Nodes = nodes
+// The nodes are allocated once, at full capacity. The root hash is not carried over:
+// it is recomputed on demand, and the caller's removal resets it anyway.
+func duplicateKeepingCapacity(st *subtreepkg.Subtree) (*subtreepkg.Subtree, error) {
+	duplicate, err := subtreepkg.NewTreeByLeafCount(subtreeLeafCount(st))
+	if err != nil {
+		return nil, err
 	}
 
-	return duplicate
+	duplicate.Fees = st.Fees
+	duplicate.SizeInBytes = st.SizeInBytes
+	duplicate.FeeHash = st.FeeHash
+	duplicate.Nodes = append(duplicate.Nodes, st.Nodes...)
+	duplicate.ConflictingNodes = append([]chainhash.Hash(nil), st.ConflictingNodes...)
+
+	return duplicate, nil
 }
 
 // blockMaxSizeBudget returns the byte budget for the subtrees of a block, with the same

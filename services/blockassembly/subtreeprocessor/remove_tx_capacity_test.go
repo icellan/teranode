@@ -1,8 +1,10 @@
 package subtreeprocessor
 
 import (
+	"fmt"
 	"testing"
 
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/stretchr/testify/require"
@@ -56,4 +58,27 @@ func TestRemoveTxFromSubtrees_RetiresReplacedChainedSubtree(t *testing.T) {
 	require.NoError(t, stp.removeTxFromSubtrees(t.Context(), hashes[70]))
 
 	require.Contains(t, stp.retiredSubtrees, original)
+}
+
+// BenchmarkDuplicateKeepingCapacity copies a 1M-leaf current subtree as a removal does,
+// nearly empty and half full.
+func BenchmarkDuplicateKeepingCapacity(b *testing.B) {
+	const leaves = 1 << 20
+
+	for _, filled := range []int{1024, leaves / 2} {
+		b.Run(fmt.Sprintf("filled=%d", filled), func(b *testing.B) {
+			st, err := subtreepkg.NewTreeByLeafCount(leaves)
+			require.NoError(b, err)
+
+			for i := 0; i < filled; i++ {
+				require.NoError(b, st.AddNode(chainhash.HashH([]byte(fmt.Sprintf("tx-%d", i))), uint64(i), 250))
+			}
+
+			b.ReportAllocs()
+
+			for b.Loop() {
+				_, _ = duplicateKeepingCapacity(st)
+			}
+		})
+	}
 }
