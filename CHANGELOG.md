@@ -114,6 +114,14 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   unknown keys, so a leftover `false` is ignored without an error and those nodes take on
   the mined-tagging write load again. Delete the key from your config. (#2019)
 
+- **Legacy peers that send BIP152 messages are no longer disconnected.** go-wire
+  is now v1.4.0, which decodes `cmpctblock`, `getblocktxn` and `blocktxn`. Until
+  now a legacy peer that sent one got a `malformed` reject and was disconnected.
+  Now the message is logged at debug level and ignored, and the peer stays
+  connected. Teranode never sends `sendcmpct`, so a well-behaved peer should not
+  send these. The bump also bounds how much the wire decoder allocates up front
+  for a declared element count. (#1996)
+
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,
   `utxo_pruner_pruned_set_size`, `utxo_pruner_pruned_set_saturated`, and
