@@ -1896,15 +1896,16 @@ func (v *Validator) sendTxMetaBatch(batch []*txmetaBatchItem) {
 	}
 
 	// A batch has no size limit of its own (validator_txmeta_kafka_batchSize, or
-	// a whole demotion cascade), so it goes out as records of bounded size.
+	// a whole demotion cascade), so it goes out as records of bounded size. In
+	// v1 every record of the batch keeps the batch's key, and so its partition.
+	key := *batch[0].hash // copied: the producer reads the key after this returns
+
 	for _, chunk := range splitTxMetaBatch(batch) {
 		if v.settings.Validator.TxMetaWireFormat == "v2" {
 			v.sendTxMetaBatchV2(chunk)
 
 			continue
 		}
-
-		key := *chunk[0].hash // copied: the producer reads the key after this returns
 
 		v.txmetaKafkaProducerClient.Publish(&kafka.Message{
 			Key:   key[:],
@@ -1927,8 +1928,10 @@ func splitTxMetaBatch(batch []*txmetaBatchItem) [][]*txmetaBatchItem {
 
 	start, size := 0, txmetacache.WireV2HeaderLen
 
-	for i, item := range batch {
-		if i > start && size+txMetaEntrySize(item) > maxTxMetaRecordBytes {
+	for i := 0; i < len(batch); i++ {
+		entry := txMetaEntrySize(batch[i])
+
+		if i > start && size+entry > maxTxMetaRecordBytes {
 			end := i
 			if end-start == txmetacache.V2LookalikeCount {
 				end-- // the item moved out starts the next chunk
@@ -1937,12 +1940,14 @@ func splitTxMetaBatch(batch []*txmetaBatchItem) [][]*txmetaBatchItem {
 			chunks = append(chunks, batch[start:end])
 			start, size = end, txmetacache.WireV2HeaderLen
 
-			for _, carried := range batch[end:i] {
-				size += txMetaEntrySize(carried)
-			}
+			// Size the next chunk again from its first item, so an item carried
+			// out by the 767 adjustment is checked against the cap like any other.
+			i = end - 1
+
+			continue
 		}
 
-		size += txMetaEntrySize(item)
+		size += entry
 	}
 
 	switch rest := batch[start:]; {

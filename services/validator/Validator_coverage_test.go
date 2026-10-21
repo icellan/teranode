@@ -1173,9 +1173,12 @@ func TestSendTxMetaDeletesToKafka_BoundsAndSplitsCascades(t *testing.T) {
 				v.sendTxMetaDeletesToKafka(hashes)
 
 				seen := map[chainhash.Hash]bool{}
+				keys := map[string]bool{}
 
 				for len(producer.PublishChannel()) > 0 {
-					value := (<-producer.PublishChannel()).Value
+					msg := <-producer.PublishChannel()
+					value := msg.Value
+					keys[string(msg.Key)] = true
 					require.LessOrEqual(t, len(value), maxRecord, "a record must fit Kafka's default message size")
 
 					isV2 := value[0] == txmetacache.WireV2Magic && value[1] == txmetacache.WireV2Version && value[2] == 0 && value[3] == 0
@@ -1203,6 +1206,10 @@ func TestSendTxMetaDeletesToKafka_BoundsAndSplitsCascades(t *testing.T) {
 				}
 
 				require.Len(t, seen, n, "every hash must be sent")
+
+				if format == "v1" {
+					require.Len(t, keys, 1, "every record of one batch keeps its key, and so its partition")
+				}
 			})
 		}
 	}
@@ -1272,23 +1279,35 @@ func TestSendTxMetaDeletesToKafka_BatchedRecordsStayBounded(t *testing.T) {
 
 			v.sendTxMetaDeletesToKafka(hashes)
 
-			total := 0
+			var (
+				records [][]byte
+				total   int
+			)
 
 			require.Eventually(t, func() bool {
 				for len(producer.PublishChannel()) > 0 {
 					value := (<-producer.PublishChannel()).Value
-					require.LessOrEqual(t, len(value), maxRecord, "a record must fit Kafka's default message size")
+					records = append(records, value)
 
 					if format == "v2" {
 						total += int(binary.LittleEndian.Uint32(value[4:]))
 					} else {
-						require.False(t, value[0] == txmetacache.WireV2Magic && value[1] == txmetacache.WireV2Version && value[2] == 0 && value[3] == 0)
 						total += int(binary.LittleEndian.Uint32(value[:4]))
 					}
 				}
 
-				return total == n
+				return total >= n
 			}, 10*time.Second, 10*time.Millisecond, "every DELETE must be sent")
+
+			require.Equal(t, n, total)
+
+			for _, value := range records {
+				require.LessOrEqual(t, len(value), maxRecord, "a record must fit Kafka's default message size")
+
+				if format == "v1" {
+					require.False(t, value[0] == txmetacache.WireV2Magic && value[1] == txmetacache.WireV2Version && value[2] == 0 && value[3] == 0)
+				}
+			}
 		})
 	}
 }
@@ -1311,6 +1330,9 @@ func TestSplitTxMetaBatch(t *testing.T) {
 		"size cut at 767":   items(2_000, 980), // 767 entries of 1,025 bytes fill a record exactly
 		"oversized item":    items(3, maxTxMetaRecordBytes),
 		"one under the cut": items(766, 980),
+		// 766 deletes and a 700 KB ADD fill 767 items; a 500 KB ADD then forces
+		// a cut, the 700 KB item is carried and must not share a record with it
+		"carried item re-checked": append(append(items(766, 0), items(1, 700*1024)...), items(1, 500*1024)...),
 	}
 
 	for name, batch := range cases {
