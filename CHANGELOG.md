@@ -117,14 +117,17 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
   The validator now also publishes every tx it rejects as conflicting, submitted ones
   included, raw on the policy-rejected topic, flagged by the new `conflicting` field
-  of `KafkaTxPolicyRejectedTopicMessage`, so that topic carries up to one extra
-  message per conflicting submission. Set `kafka_txPolicyRejectedConfig` for subtree
-  validation to use them. With it, a child in another subtree of a tx rejected as
-  conflicting is kept aside too, and the rejected txs no longer count towards the
-  fail-fast miss thresholds. Without it, conflicting txs are still kept aside within a
-  subtree. Either way, a grandchild in another subtree still fails that subtree, and
-  descendants still count towards the fail-fast thresholds. Kept-aside txs are counted
-  in `teranode_subtreevalidation_conflicting_kept_aside`.
+  of `KafkaTxPolicyRejectedTopicMessage`, and subtree validation publishes the
+  descendants it keeps aside there too, after checks that need no parent (structure,
+  money range, policy size). Every subtree validator caches them, so a descendant in
+  any later subtree is kept aside too, and the rejected txs no longer count towards
+  the fail-fast miss thresholds. That needs `kafka_txPolicyRejectedConfig` set (and
+  `subtreevalidation_txPolicyRejectedCacheEnabled`, on by default); without it,
+  conflicting txs are still kept aside within a subtree only. The topic carries up to
+  one extra message per conflicting submission and per kept-aside descendant.
+  Descendants in the same subtree as their conflicting parent still count towards the
+  fail-fast thresholds. Kept-aside txs are counted in
+  `teranode_subtreevalidation_conflicting_kept_aside`.
 
 - **Blocks whose cached subtrees hold a tx the store flags conflicting are now rejected.**
   Subtree validation used to bless a block whose subtrees it had already cached on

@@ -11,6 +11,9 @@ import (
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/util/kafka"
+	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
+	"google.golang.org/protobuf/proto"
 )
 
 // serializeConflictingTxs encodes the txs kept aside from a peer subtree, in subtree
@@ -209,9 +212,54 @@ func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash
 		return errors.NewStorageError("[storeSubtreeWithConflictingTxs][%s] failed to store subtree to check", subtreeHash.String(), err)
 	}
 
+	u.shareConflictingTxs(keptAside)
+
 	prometheusSubtreeValidationConflictingKeptAside.Add(float64(len(keptAside)))
 
 	u.logger.Infof("[storeSubtreeWithConflictingTxs][%s] kept %d conflicting txs aside until a block references the subtree", subtreeHash.String(), len(keptAside))
 
 	return nil
+}
+
+// shareConflictingTxs makes kept-aside txs that are not yet known as conflicting known:
+// cached here at once, and published on the policy-rejected topic for every other subtree
+// validator. Those are the descendants; the validators publish the txs they reject. The
+// publish is best-effort, like the validators': a dropped message only means a child in
+// another subtree fails that subtree, as before.
+func (u *Server) shareConflictingTxs(keptAside []*bt.Tx) {
+	for _, tx := range keptAside {
+		hash := *tx.TxIDChainHash()
+
+		if u.policyRejectedTxCache != nil {
+			if _, known := u.policyRejectedTxCache.Conflicting(hash); known {
+				continue
+			}
+
+			u.policyRejectedTxCache.SetConflicting(hash, tx)
+		}
+
+		if u.conflictingTxKafkaProducer == nil {
+			continue
+		}
+
+		rawTx := tx.SerializeBytes()
+		if len(rawTx) > maxCachedTxBytes {
+			continue
+		}
+
+		value, err := proto.Marshal(&kafkamessage.KafkaTxPolicyRejectedTopicMessage{
+			TxHash:      hash.CloneBytes(),
+			RawTx:       rawTx,
+			Reason:      "kept aside: spends a conflicting tx",
+			Conflicting: true,
+		})
+		if err != nil {
+			u.logger.Errorf("[shareConflictingTxs][%s] failed to marshal kept-aside conflicting tx: %v", hash.String(), err)
+			continue
+		}
+
+		if !u.conflictingTxKafkaProducer.TryPublish(&kafka.Message{Key: hash.CloneBytes(), Value: value}) {
+			u.logger.Debugf("[shareConflictingTxs][%s] dropped kept-aside conflicting tx: producer buffer full", hash.String())
+		}
+	}
 }

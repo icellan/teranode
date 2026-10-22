@@ -27,11 +27,13 @@ import (
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/kafka"
+	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"github.com/bsv-blockchain/teranode/util/test"
 	teranodetestutil "github.com/bsv-blockchain/teranode/util/testutil"
 	"github.com/jarcoal/httpmock"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 // delegatingRecorder records which transactions reached the validator, and with which
@@ -629,4 +631,79 @@ func TestValidateSubtreeInternal_KeptAsideEdgeCases(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, subtree)
 	})
+}
+
+// TestValidateSubtreeInternal_PublishesKeptAsideDescendants pins how a kept-aside
+// descendant becomes known to every subtree validator: it is published, raw and flagged
+// conflicting, on the policy-rejected topic the validators publish their conflicting
+// rejections on, and cached here at once. A tx already known as conflicting is not
+// published again.
+func TestValidateSubtreeInternal_PublishesKeptAsideDescendants(t *testing.T) {
+	f := newConflictingFixture(t)
+	server, subtreeStore := f.newServer(t)
+
+	producer := kafka.NewKafkaAsyncProducerMock()
+	server.conflictingTxKafkaProducer = producer
+
+	// the validator already published the loser
+	server.policyRejectedTxCache.SetConflicting(*f.loser.TxIDChainHash(), f.loser)
+
+	root := servePeerSubtree(t, subtreeStore, f.loser, f.child, f.other)
+
+	_, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}, 101, map[uint32]bool{})
+	require.NoError(t, err)
+
+	var published []chainhash.Hash
+
+	for len(producer.PublishChannel()) > 0 {
+		msg := <-producer.PublishChannel()
+
+		var m kafkamessage.KafkaTxPolicyRejectedTopicMessage
+		require.NoError(t, proto.Unmarshal(msg.Value, &m))
+		require.True(t, m.Conflicting)
+
+		tx, err := bt.NewTxFromBytes(m.RawTx)
+		require.NoError(t, err)
+		require.Equal(t, m.TxHash, tx.TxIDChainHash().CloneBytes())
+
+		published = append(published, *tx.TxIDChainHash())
+	}
+
+	require.Equal(t, []chainhash.Hash{*f.child.TxIDChainHash()}, published, "only the descendant is new knowledge")
+
+	_, ok := server.policyRejectedTxCache.Conflicting(*f.child.TxIDChainHash())
+	require.True(t, ok, "this validator knows the descendant without waiting for the topic")
+}
+
+// TestValidateSubtreeInternal_GrandchildInLaterSubtreeIsKeptAside pins the chain across
+// subtrees: the loser and its child kept aside in one subtree, the grandchild in a later
+// one. The child is known as conflicting once its subtree is stored, so the grandchild's
+// subtree is stored with it kept aside instead of failing.
+func TestValidateSubtreeInternal_GrandchildInLaterSubtreeIsKeptAside(t *testing.T) {
+	f := newConflictingFixture(t)
+	server, subtreeStore := f.newServer(t)
+
+	privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("CONFLICTING_KEPT_ASIDE_TEST_KEY!"))
+	grandchild := transactions.Create(t,
+		transactions.WithPrivateKey(privateKey),
+		transactions.WithInput(f.child, 0, privateKey),
+		transactions.WithP2PKHOutputs(1, 60_000, publicKey),
+	)
+
+	first := servePeerSubtree(t, subtreeStore, f.loser, f.child)
+	_, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: first, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}, 101, map[uint32]bool{})
+	require.NoError(t, err)
+
+	second := servePeerSubtree(t, subtreeStore, grandchild, f.other)
+	_, err = server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: second, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}, 101, map[uint32]bool{})
+	require.NoError(t, err, "the grandchild's subtree must not fail")
+
+	b, err := subtreeStore.Get(t.Context(), second[:], fileformat.FileTypeSubtreeConflicting)
+	require.NoError(t, err)
+
+	kept, err := readConflictingTxs(b)
+	require.NoError(t, err)
+	require.Len(t, kept, 1)
+	require.Equal(t, *grandchild.TxIDChainHash(), *kept[0].TxIDChainHash())
+	f.requireNotStored(t, grandchild)
 }
