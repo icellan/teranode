@@ -379,6 +379,24 @@ func TestValidateSubtreeInternal_BlockInsertsKeptAsideTxs(t *testing.T) {
 	conflictingNodes := subtree.ConflictingNodes
 	require.ElementsMatch(t, []chainhash.Hash{*f.loser.TxIDChainHash(), *f.child.TxIDChainHash()}, conflictingNodes,
 		"block assembly finds conflicting txs through the subtree's conflicting trailer")
+
+	// conflicting txs are never cached, neither while kept aside nor once created
+	cache, ok := server.utxoStore.(*txmetacache.TxMetaCache)
+	require.True(t, ok)
+
+	for _, tx := range []*bt.Tx{f.loser, f.child} {
+		_, cached := cache.GetMetaCached(t.Context(), *tx.TxIDChainHash())
+		require.False(t, cached, "%s is conflicting and must not be in the txmeta cache", tx.TxID())
+	}
+
+	// a second validation of the block reads the conflicting txs back through the cache path
+	_, err = server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", FromBlock: true, TxHashes: []chainhash.Hash{*f.loser.TxIDChainHash(), *f.child.TxIDChainHash(), *f.other.TxIDChainHash()}}, 101, map[uint32]bool{}, blockPathOptions()...)
+	require.NoError(t, err)
+
+	for _, tx := range []*bt.Tx{f.loser, f.child} {
+		_, cached := cache.GetMetaCached(t.Context(), *tx.TxIDChainHash())
+		require.False(t, cached, "%s is conflicting and must not be cached by a store read either", tx.TxID())
+	}
 }
 
 func (f *conflictingFixture) requireNotStored(t *testing.T, txs ...*bt.Tx) {
