@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -802,6 +803,19 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			return nil, nil
 		}
 
+		// A peer subtree already stored with its conflicting txs kept aside waits for the
+		// block that references it. Only the peer path may skip it; a block validates it.
+		if !validator.ProcessOptions(validationOptions...).CreateConflicting {
+			keptAsideExists, err := u.subtreeStore.Exists(ctx, v.SubtreeHash[:], fileformat.FileTypeSubtreeConflicting)
+			if err != nil {
+				return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check for kept-aside conflicting txs", v.SubtreeHash.String(), err)
+			}
+
+			if keptAsideExists {
+				return nil, nil
+			}
+		}
+
 		txHashes, err = u.getSubtreeTxHashes(ctx, stat, &v.SubtreeHash, v.BaseURL, v.PeerID)
 		if err != nil {
 			return nil, errors.NewServiceError("[ValidateSubtreeInternal][%s] failed to get subtree from network", v.SubtreeHash.String(), err)
@@ -838,6 +852,9 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 	// txMetaSlice will be populated with the txMeta data for each txHash
 	// in the retry attempts, only the tx hashes that are missing will be retried, not the whole subtree
 	txMetaSlice := make([]metaSliceItem, len(txHashes))
+
+	// txs of a peer subtree kept aside because they conflict with txs this node accepted
+	var keptAside []*bt.Tx
 
 	for attempt := 1; attempt <= maxRetries+1; attempt++ {
 		if attempt > 1 {
@@ -928,7 +945,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 
 			u.logger.Debugf("[ValidateSubtreeInternal][%s] [attempt #%d] processing %d missing tx for subtree instance", v.SubtreeHash.String(), attempt, len(missingTxHashesCompacted))
 
-			err = u.processMissingTransactions(
+			keptAside, err = u.processMissingTransactions(
 				ctx5,
 				v.SubtreeHash,
 				subtree,
@@ -951,6 +968,10 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 		}
 
 		break
+	}
+
+	if len(keptAside) > 0 {
+		return nil, u.storeSubtreeWithConflictingTxs(ctx, v.SubtreeHash, txHashes, keptAside)
 	}
 
 	start = gocore.CurrentTime()
@@ -1307,7 +1328,7 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 // CheckBlockSubtrees is the authoritative backstop.
 func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree,
 	missingTxHashes []utxo.UnresolvedMetaData, allTxs []chainhash.Hash, baseURL, peerID string, txMetaSlice []metaSliceItem, blockHeight uint32,
-	blockIds map[uint32]bool, validationOptions ...validator.Option) (err error) {
+	blockIds map[uint32]bool, validationOptions ...validator.Option) (keptAside []*bt.Tx, err error) {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "SubtreeValidation:processMissingTransactions",
 		tracing.WithDebugLogMessage(u.logger, "[processMissingTransactions][%s] processing %d missing txs", subtreeHash.String(), len(missingTxHashes)),
 		tracing.WithNewRoot(), // decouple tracing from the parent context, otherwise it will explode with too many spans
@@ -1319,10 +1340,23 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 
 	missingTxs, err := u.getSubtreeMissingTxs(ctx, subtreeHash, subtree, missingTxHashes, allTxs, baseURL, peerID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return u.blessMissingTransactions(ctx, subtreeHash, missingTxs, baseURL, peerID, txMetaSlice, blockHeight, blockIds, validationOptions...)
+	if err = u.blessMissingTransactions(ctx, subtreeHash, missingTxs, baseURL, peerID, txMetaSlice, blockHeight, blockIds, validationOptions...); err != nil {
+		return nil, err
+	}
+
+	// subtree order puts parents before children
+	sort.Slice(missingTxs, func(i, j int) bool { return missingTxs[i].idx < missingTxs[j].idx })
+
+	for _, mTx := range missingTxs {
+		if txMetaSlice[mTx.idx].keptAside {
+			keptAside = append(keptAside, mTx.tx)
+		}
+	}
+
+	return keptAside, nil
 }
 
 // blessMissingTransactions validates the retrieved transactions of a subtree level by level and

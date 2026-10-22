@@ -10,14 +10,23 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/validator"
+	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob"
+	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/kafka"
 	"github.com/bsv-blockchain/teranode/util/test"
+	teranodetestutil "github.com/bsv-blockchain/teranode/util/testutil"
+	"github.com/jarcoal/httpmock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -52,9 +61,12 @@ type conflictingFixture struct {
 	server   *Server
 	store    *sql.Store
 	recorder *delegatingRecorder
+	settings *settings.Settings
 	winner   *bt.Tx
 	loser    *bt.Tx
 	child    *bt.Tx
+	// other spends an unrelated mined output and conflicts with nothing
+	other *bt.Tx
 }
 
 func newConflictingFixture(t *testing.T) *conflictingFixture {
@@ -103,6 +115,19 @@ func newConflictingFixture(t *testing.T) *conflictingFixture {
 		transactions.WithP2PKHOutputs(1, 70_000, publicKey),
 	)
 
+	otherParent := transactions.Create(t,
+		transactions.WithCoinbaseData(2, "/conflicting kept aside test other/"),
+		transactions.WithP2PKHOutputs(1, 100_000, publicKey),
+	)
+	_, err = store.Create(ctx, otherParent, 2, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 2, BlockHeight: 2, SubtreeIdx: 0}))
+	require.NoError(t, err)
+
+	other := transactions.Create(t,
+		transactions.WithPrivateKey(privateKey),
+		transactions.WithInput(otherParent, 0, privateKey),
+		transactions.WithP2PKHOutputs(1, 60_000, publicKey),
+	)
+
 	realValidator, err := validator.New(ctx, logger, tSettings, store, nil, nil, nil, nil, nil)
 	require.NoError(t, err)
 
@@ -119,7 +144,100 @@ func newConflictingFixture(t *testing.T) *conflictingFixture {
 		policyRejectedTxCache: newTxPolicyRejectedCache(1024 * 1024),
 	}
 
-	return &conflictingFixture{server: server, store: store, recorder: recorder, winner: winner, loser: loser, child: child}
+	return &conflictingFixture{server: server, store: store, recorder: recorder, settings: tSettings, winner: winner, loser: loser, child: child, other: other}
+}
+
+// newServer builds a full subtree validation server over the fixture's store and real
+// validator, with an in-memory subtree store, the way the peer subtree handler runs.
+func (f *conflictingFixture) newServer(t *testing.T) (*Server, blob.Store) {
+	t.Helper()
+
+	subtreeStore := blobmemory.New()
+	nilConsumer := &kafka.KafkaConsumerGroup{}
+	blockchainClient := teranodetestutil.NewMemorySQLiteBlockchainClient(ulogger.TestLogger{}, f.settings, t)
+
+	server, err := New(newCancelCtx(t), ulogger.TestLogger{}, f.settings, subtreeStore, blobmemory.New(), f.store, f.recorder, blockchainClient, nilConsumer, nilConsumer, nil, nil)
+	require.NoError(t, err)
+
+	if server.policyRejectedTxCache == nil {
+		server.policyRejectedTxCache = newTxPolicyRejectedCache(1024 * 1024)
+	}
+
+	return server, subtreeStore
+}
+
+// servePeerSubtree serves txs as a peer's subtree: the node list over HTTP and the
+// transactions as a local subtreeData file. It returns the subtree's root hash.
+func servePeerSubtree(t *testing.T, subtreeStore blob.Store, txs ...*bt.Tx) chainhash.Hash {
+	t.Helper()
+
+	subtree, err := subtreepkg.NewIncompleteTreeByLeafCount(len(txs))
+	require.NoError(t, err)
+
+	var data []byte
+
+	for _, tx := range txs {
+		require.NoError(t, subtree.AddNode(*tx.TxIDChainHash(), 0, 0))
+		data = append(data, tx.ExtendedBytes()...)
+	}
+
+	nodeBytes, err := subtree.SerializeNodes()
+	require.NoError(t, err)
+
+	root := *subtree.RootHash()
+
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	t.Cleanup(httpmock.DeactivateAndReset)
+	httpmock.RegisterResponder("GET", `=~/subtree/[a-f0-9]{64}\z`, httpmock.NewBytesResponder(200, nodeBytes))
+
+	require.NoError(t, subtreeStore.Set(t.Context(), root[:], fileformat.FileTypeSubtreeData, data))
+
+	return root
+}
+
+// TestValidateSubtreeInternal_PeerSubtreeWithConflictingTxs pins how a peer subtree
+// with kept-aside txs is stored: never as a validated subtree, which every reader trusts
+// to have all of its txs in the UTXO store, but as a subtree still to check plus the
+// kept-aside txs next to it, for the block that references it.
+func TestValidateSubtreeInternal_PeerSubtreeWithConflictingTxs(t *testing.T) {
+	f := newConflictingFixture(t)
+	server, subtreeStore := f.newServer(t)
+
+	root := servePeerSubtree(t, subtreeStore, f.loser, f.child, f.other)
+
+	v := ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}
+
+	subtree, err := server.ValidateSubtreeInternal(t.Context(), v, 101, map[uint32]bool{})
+	require.NoError(t, err)
+	require.Nil(t, subtree, "a subtree with kept-aside txs is not a validated subtree")
+
+	exists, err := subtreeStore.Exists(t.Context(), root[:], fileformat.FileTypeSubtree)
+	require.NoError(t, err)
+	require.False(t, exists, "never stored as validated while txs are kept aside")
+
+	exists, err = subtreeStore.Exists(t.Context(), root[:], fileformat.FileTypeSubtreeToCheck)
+	require.NoError(t, err)
+	require.True(t, exists, "stored as a subtree still to check, so the block path does not fetch it again")
+
+	conflictingBytes, err := subtreeStore.Get(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting)
+	require.NoError(t, err)
+
+	kept, err := readConflictingTxs(conflictingBytes)
+	require.NoError(t, err)
+	require.Len(t, kept, 2)
+	require.Equal(t, *f.loser.TxIDChainHash(), *kept[0].TxIDChainHash(), "parents before children")
+	require.Equal(t, *f.child.TxIDChainHash(), *kept[1].TxIDChainHash())
+
+	f.requireNotStored(t, f.loser, f.child)
+	require.NoError(t, f.store.GetMeta(t.Context(), f.other.TxIDChainHash(), &meta.Data{}), "the rest of the subtree is validated as before")
+
+	// a second announcement of the same subtree is not validated again
+	calls := len(f.recorder.calls)
+
+	subtree, err = server.ValidateSubtreeInternal(t.Context(), v, 101, map[uint32]bool{})
+	require.NoError(t, err)
+	require.Nil(t, subtree)
+	require.Equal(t, calls, len(f.recorder.calls))
 }
 
 func (f *conflictingFixture) requireNotStored(t *testing.T, txs ...*bt.Tx) {

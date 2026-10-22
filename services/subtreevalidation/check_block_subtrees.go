@@ -332,33 +332,16 @@ func (u *Server) getSubtreeToCheck(ctx context.Context, request *subtreevalidati
 			return nil, err
 		}
 
-		subtreeToCheck, err = subtreepkg.NewIncompleteTreeByLeafCount(leafCount)
+		nodeHashes := make([]chainhash.Hash, leafCount)
+		for i := range nodeHashes {
+			copy(nodeHashes[i][:], subtreeNodeBytes[i*chainhash.HashSize:(i+1)*chainhash.HashSize])
+		}
+
+		var subtreeBytes []byte
+
+		subtreeToCheck, subtreeBytes, err = subtreeToCheckFromHashes(subtreeHash, nodeHashes)
 		if err != nil {
-			return nil, errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to create subtree structure", subtreeHash.String(), err)
-		}
-
-		var nodeHash chainhash.Hash
-		for i := 0; i < len(subtreeNodeBytes)/chainhash.HashSize; i++ {
-			copy(nodeHash[:], subtreeNodeBytes[i*chainhash.HashSize:(i+1)*chainhash.HashSize])
-
-			if nodeHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				if err = subtreeToCheck.AddCoinbaseNode(); err != nil {
-					return nil, errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to add coinbase node to subtree", subtreeHash.String(), err)
-				}
-			} else {
-				if err = subtreeToCheck.AddNode(nodeHash, 0, 0); err != nil {
-					return nil, errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to add node to subtree", subtreeHash.String(), err)
-				}
-			}
-		}
-
-		if !subtreeHash.Equal(*subtreeToCheck.RootHash()) {
-			return nil, errors.NewProcessingError("[CheckBlockSubtrees][%s] subtree root hash mismatch: %s", subtreeHash.String(), subtreeToCheck.RootHash().String())
-		}
-
-		subtreeBytes, err := subtreeToCheck.Serialize()
-		if err != nil {
-			return nil, errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to serialize subtree", subtreeHash.String(), err)
+			return nil, err
 		}
 
 		// Store the subtreeToCheck marker for later processing, with a DAH of

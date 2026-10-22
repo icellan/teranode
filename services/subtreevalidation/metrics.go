@@ -97,6 +97,10 @@ var (
 	// the per-level retry in unlockAcceptedTransactions did manage to unlock.
 	prometheusSubtreeValidationBlessUnlockRecovered prometheus.Counter
 
+	// prometheusSubtreeValidationConflictingKeptAside counts txs of peer subtrees kept aside
+	// because they conflict with txs this node accepted, until a block references them.
+	prometheusSubtreeValidationConflictingKeptAside prometheus.Counter
+
 	// prometheusSubtreeValidationBlessUnlockRetryFailedBatches counts unlock retry calls that
 	// returned an error. SetLocked reports the first error without per-record results, so the
 	// unit is one call, not one transaction: on a failed call some or all of its hashes stay
@@ -290,6 +294,15 @@ func _initPrometheusMetrics() {
 			Subsystem: "subtreevalidation",
 			Name:      "bless_unlock_recovered",
 			Help:      "Accepted transactions the per-level unlock retry unlocked, subset of bless_unlock_failed",
+		},
+	)
+
+	prometheusSubtreeValidationConflictingKeptAside = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "teranode",
+			Subsystem: "subtreevalidation",
+			Name:      "conflicting_kept_aside",
+			Help:      "Transactions of peer subtrees kept aside because they conflict with accepted transactions, until a block references them",
 		},
 	)
 

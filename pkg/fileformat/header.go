@@ -20,20 +20,23 @@ const (
 	FileTypeSubtreeToCheck FileType = "subtreeToCheck"
 	FileTypeSubtreeData    FileType = "subtreeData"
 	FileTypeSubtreeMeta    FileType = "subtreeMeta"
-	FileTypeTx             FileType = "tx"
-	FileTypeOutputs        FileType = "outputs"
-	FileTypeBloomFilter    FileType = "bloomfilter"
-	FileTypeDat            FileType = "dat"
-	FileTypeMsgBlock       FileType = "msgBlock"
-	FileTypeTesting        FileType = "testing"
-	FileTypeBatchData      FileType = "batch-data"
-	FileTypeBatchKeys      FileType = "batch-keys"
-	FileTypePreserveUntil  FileType = "preserveUntil"
-	FileTypePeerRegistry   FileType = "peer-registry"
-	FileTypeSeedChunk      FileType = "seed-chunk"
-	FileTypeSeedManifest   FileType = "seed-manifest"
-	FileTypeSeedCheckpoint FileType = "seed-checkpoint"
-	FileTypeUnknown        FileType = ""
+	// FileTypeSubtreeConflicting holds the txs of a peer subtree that were kept aside because
+	// they conflict with txs this node accepted, until a block references the subtree.
+	FileTypeSubtreeConflicting FileType = "subtreeConflicting"
+	FileTypeTx                 FileType = "tx"
+	FileTypeOutputs            FileType = "outputs"
+	FileTypeBloomFilter        FileType = "bloomfilter"
+	FileTypeDat                FileType = "dat"
+	FileTypeMsgBlock           FileType = "msgBlock"
+	FileTypeTesting            FileType = "testing"
+	FileTypeBatchData          FileType = "batch-data"
+	FileTypeBatchKeys          FileType = "batch-keys"
+	FileTypePreserveUntil      FileType = "preserveUntil"
+	FileTypePeerRegistry       FileType = "peer-registry"
+	FileTypeSeedChunk          FileType = "seed-chunk"
+	FileTypeSeedManifest       FileType = "seed-manifest"
+	FileTypeSeedCheckpoint     FileType = "seed-checkpoint"
+	FileTypeUnknown            FileType = ""
 )
 
 func (f FileType) String() string {
@@ -46,83 +49,86 @@ func (f FileType) ToMagicBytes() [8]byte {
 
 // Magic header types for file identification - exactly 8 ASCII characters (8 bytes)
 var (
-	magicUtxoAdditions  = [8]byte{'U', '-', 'A', '-', '1', '.', '0', ' '} // U-A-1.0
-	magicUtxoDeletions  = [8]byte{'U', '-', 'D', '-', '1', '.', '0', ' '} // U-D-1.0
-	magicUtxoHeaders    = [8]byte{'U', '-', 'H', '-', '1', '.', '0', ' '} // U-H-1.0 (legacy, without coinbase)
-	magicUtxoHeadersV2  = [8]byte{'U', '-', 'H', '-', '2', '.', '0', ' '} // U-H-2.0 (with coinbase tx)
-	magicUtxoSet        = [8]byte{'U', '-', 'S', '-', '1', '.', '0', ' '} // U-S-1.0
-	magicUtxoSetHash    = [8]byte{'U', 'S', 'H', '-', '1', '.', '0', ' '} // USH-1.0
-	magicBlock          = [8]byte{'B', '-', '1', '.', '0', ' ', ' ', ' '} // B-1.0
-	magicSubtree        = [8]byte{'S', '-', '1', '.', '0', ' ', ' ', ' '} // S-1.0
-	magicSubtreeToCheck = [8]byte{'S', 'C', '-', '1', '.', '0', ' ', ' '} // SC-1.0
-	magicSubtreeData    = [8]byte{'S', 'D', '-', '1', '.', '0', ' ', ' '} // SD-1.0
-	magicSubtreeMeta    = [8]byte{'S', 'M', '-', '1', '.', '0', ' ', ' '} // SM-1.0
-	magicTx             = [8]byte{'T', '-', '1', '.', '0', ' ', ' ', ' '} // T-1.0
-	magicOutputs        = [8]byte{'O', '-', '1', '.', '0', ' ', ' ', ' '} // O-1.0
-	magicBloomFilter    = [8]byte{'B', 'F', '-', '1', '.', '0', ' ', ' '} // BF-1.0
-	magicMsgBlock       = [8]byte{'M', 'B', '-', '1', '.', '0', ' ', ' '} // MB-1.0
-	magicDat            = [8]byte{'D', 'A', 'T', '-', '1', '.', '0', ' '} // DAT-1.0
-	magicTesting        = [8]byte{'T', 'E', 'S', 'T', 'I', 'N', 'G', ' '} // TESTING
-	magicBatchData      = [8]byte{'B', 'D', '-', '1', '.', '0', ' ', ' '} // BD-1.0
-	magicBatchKeys      = [8]byte{'B', 'K', '-', '1', '.', '0', ' ', ' '} // BK-1.0
-	magicPreserveUntil  = [8]byte{'P', 'U', '-', '1', '.', '0', ' ', ' '} // PU-1.0
-	magicPeerRegistry   = [8]byte{'P', 'R', '-', '1', '.', '0', ' ', ' '} // PR-1.0
-	magicSeedChunk      = [8]byte{'S', 'C', 'K', '-', '1', '.', '0', ' '} // SCK-1.0
-	magicSeedManifest   = [8]byte{'S', 'M', 'F', '-', '1', '.', '0', ' '} // SMF-1.0
-	magicSeedCheckpoint = [8]byte{'S', 'C', 'P', '-', '1', '.', '0', ' '} // SCP-1.0
+	magicUtxoAdditions      = [8]byte{'U', '-', 'A', '-', '1', '.', '0', ' '} // U-A-1.0
+	magicUtxoDeletions      = [8]byte{'U', '-', 'D', '-', '1', '.', '0', ' '} // U-D-1.0
+	magicUtxoHeaders        = [8]byte{'U', '-', 'H', '-', '1', '.', '0', ' '} // U-H-1.0 (legacy, without coinbase)
+	magicUtxoHeadersV2      = [8]byte{'U', '-', 'H', '-', '2', '.', '0', ' '} // U-H-2.0 (with coinbase tx)
+	magicUtxoSet            = [8]byte{'U', '-', 'S', '-', '1', '.', '0', ' '} // U-S-1.0
+	magicUtxoSetHash        = [8]byte{'U', 'S', 'H', '-', '1', '.', '0', ' '} // USH-1.0
+	magicBlock              = [8]byte{'B', '-', '1', '.', '0', ' ', ' ', ' '} // B-1.0
+	magicSubtree            = [8]byte{'S', '-', '1', '.', '0', ' ', ' ', ' '} // S-1.0
+	magicSubtreeToCheck     = [8]byte{'S', 'C', '-', '1', '.', '0', ' ', ' '} // SC-1.0
+	magicSubtreeData        = [8]byte{'S', 'D', '-', '1', '.', '0', ' ', ' '} // SD-1.0
+	magicSubtreeMeta        = [8]byte{'S', 'M', '-', '1', '.', '0', ' ', ' '} // SM-1.0
+	magicSubtreeConflicting = [8]byte{'S', 'C', 'F', '-', '1', '.', '0', ' '} // SCF-1.0
+	magicTx                 = [8]byte{'T', '-', '1', '.', '0', ' ', ' ', ' '} // T-1.0
+	magicOutputs            = [8]byte{'O', '-', '1', '.', '0', ' ', ' ', ' '} // O-1.0
+	magicBloomFilter        = [8]byte{'B', 'F', '-', '1', '.', '0', ' ', ' '} // BF-1.0
+	magicMsgBlock           = [8]byte{'M', 'B', '-', '1', '.', '0', ' ', ' '} // MB-1.0
+	magicDat                = [8]byte{'D', 'A', 'T', '-', '1', '.', '0', ' '} // DAT-1.0
+	magicTesting            = [8]byte{'T', 'E', 'S', 'T', 'I', 'N', 'G', ' '} // TESTING
+	magicBatchData          = [8]byte{'B', 'D', '-', '1', '.', '0', ' ', ' '} // BD-1.0
+	magicBatchKeys          = [8]byte{'B', 'K', '-', '1', '.', '0', ' ', ' '} // BK-1.0
+	magicPreserveUntil      = [8]byte{'P', 'U', '-', '1', '.', '0', ' ', ' '} // PU-1.0
+	magicPeerRegistry       = [8]byte{'P', 'R', '-', '1', '.', '0', ' ', ' '} // PR-1.0
+	magicSeedChunk          = [8]byte{'S', 'C', 'K', '-', '1', '.', '0', ' '} // SCK-1.0
+	magicSeedManifest       = [8]byte{'S', 'M', 'F', '-', '1', '.', '0', ' '} // SMF-1.0
+	magicSeedCheckpoint     = [8]byte{'S', 'C', 'P', '-', '1', '.', '0', ' '} // SCP-1.0
 )
 
 var fileTypeToMagic = map[FileType][8]byte{
-	FileTypeUtxoAdditions:  magicUtxoAdditions,
-	FileTypeUtxoDeletions:  magicUtxoDeletions,
-	FileTypeUtxoHeaders:    magicUtxoHeadersV2, // Default to V2 (with coinbase)
-	FileTypeUtxoSet:        magicUtxoSet,
-	FileTypeUtxoSetHash:    magicUtxoSetHash,
-	FileTypeBlock:          magicBlock,
-	FileTypeSubtree:        magicSubtree,
-	FileTypeSubtreeToCheck: magicSubtreeToCheck,
-	FileTypeSubtreeData:    magicSubtreeData,
-	FileTypeSubtreeMeta:    magicSubtreeMeta,
-	FileTypeTx:             magicTx,
-	FileTypeOutputs:        magicOutputs,
-	FileTypeBloomFilter:    magicBloomFilter,
-	FileTypeMsgBlock:       magicMsgBlock,
-	FileTypeDat:            magicDat,
-	FileTypeTesting:        magicTesting,
-	FileTypeBatchData:      magicBatchData,
-	FileTypeBatchKeys:      magicBatchKeys,
-	FileTypePreserveUntil:  magicPreserveUntil,
-	FileTypePeerRegistry:   magicPeerRegistry,
-	FileTypeSeedChunk:      magicSeedChunk,
-	FileTypeSeedManifest:   magicSeedManifest,
-	FileTypeSeedCheckpoint: magicSeedCheckpoint,
+	FileTypeUtxoAdditions:      magicUtxoAdditions,
+	FileTypeUtxoDeletions:      magicUtxoDeletions,
+	FileTypeUtxoHeaders:        magicUtxoHeadersV2, // Default to V2 (with coinbase)
+	FileTypeUtxoSet:            magicUtxoSet,
+	FileTypeUtxoSetHash:        magicUtxoSetHash,
+	FileTypeBlock:              magicBlock,
+	FileTypeSubtree:            magicSubtree,
+	FileTypeSubtreeToCheck:     magicSubtreeToCheck,
+	FileTypeSubtreeData:        magicSubtreeData,
+	FileTypeSubtreeMeta:        magicSubtreeMeta,
+	FileTypeSubtreeConflicting: magicSubtreeConflicting,
+	FileTypeTx:                 magicTx,
+	FileTypeOutputs:            magicOutputs,
+	FileTypeBloomFilter:        magicBloomFilter,
+	FileTypeMsgBlock:           magicMsgBlock,
+	FileTypeDat:                magicDat,
+	FileTypeTesting:            magicTesting,
+	FileTypeBatchData:          magicBatchData,
+	FileTypeBatchKeys:          magicBatchKeys,
+	FileTypePreserveUntil:      magicPreserveUntil,
+	FileTypePeerRegistry:       magicPeerRegistry,
+	FileTypeSeedChunk:          magicSeedChunk,
+	FileTypeSeedManifest:       magicSeedManifest,
+	FileTypeSeedCheckpoint:     magicSeedCheckpoint,
 }
 
 var magicToFileType = map[[8]byte]FileType{
-	magicUtxoAdditions:  FileTypeUtxoAdditions,
-	magicUtxoDeletions:  FileTypeUtxoDeletions,
-	magicUtxoHeaders:    FileTypeUtxoHeaders,
-	magicUtxoHeadersV2:  FileTypeUtxoHeaders, // V2 also maps to same FileType
-	magicUtxoSet:        FileTypeUtxoSet,
-	magicUtxoSetHash:    FileTypeUtxoSetHash,
-	magicBlock:          FileTypeBlock,
-	magicSubtree:        FileTypeSubtree,
-	magicSubtreeToCheck: FileTypeSubtreeToCheck,
-	magicSubtreeData:    FileTypeSubtreeData,
-	magicSubtreeMeta:    FileTypeSubtreeMeta,
-	magicTx:             FileTypeTx,
-	magicOutputs:        FileTypeOutputs,
-	magicBloomFilter:    FileTypeBloomFilter,
-	magicMsgBlock:       FileTypeMsgBlock,
-	magicDat:            FileTypeDat,
-	magicTesting:        FileTypeTesting,
-	magicBatchData:      FileTypeBatchData,
-	magicBatchKeys:      FileTypeBatchKeys,
-	magicPreserveUntil:  FileTypePreserveUntil,
-	magicPeerRegistry:   FileTypePeerRegistry,
-	magicSeedChunk:      FileTypeSeedChunk,
-	magicSeedManifest:   FileTypeSeedManifest,
-	magicSeedCheckpoint: FileTypeSeedCheckpoint,
+	magicUtxoAdditions:      FileTypeUtxoAdditions,
+	magicUtxoDeletions:      FileTypeUtxoDeletions,
+	magicUtxoHeaders:        FileTypeUtxoHeaders,
+	magicUtxoHeadersV2:      FileTypeUtxoHeaders, // V2 also maps to same FileType
+	magicUtxoSet:            FileTypeUtxoSet,
+	magicUtxoSetHash:        FileTypeUtxoSetHash,
+	magicBlock:              FileTypeBlock,
+	magicSubtree:            FileTypeSubtree,
+	magicSubtreeToCheck:     FileTypeSubtreeToCheck,
+	magicSubtreeData:        FileTypeSubtreeData,
+	magicSubtreeMeta:        FileTypeSubtreeMeta,
+	magicSubtreeConflicting: FileTypeSubtreeConflicting,
+	magicTx:                 FileTypeTx,
+	magicOutputs:            FileTypeOutputs,
+	magicBloomFilter:        FileTypeBloomFilter,
+	magicMsgBlock:           FileTypeMsgBlock,
+	magicDat:                FileTypeDat,
+	magicTesting:            FileTypeTesting,
+	magicBatchData:          FileTypeBatchData,
+	magicBatchKeys:          FileTypeBatchKeys,
+	magicPreserveUntil:      FileTypePreserveUntil,
+	magicPeerRegistry:       FileTypePeerRegistry,
+	magicSeedChunk:          FileTypeSeedChunk,
+	magicSeedManifest:       FileTypeSeedManifest,
+	magicSeedCheckpoint:     FileTypeSeedCheckpoint,
 }
 
 type Header struct {
