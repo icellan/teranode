@@ -1289,11 +1289,14 @@ func TestSendTxMetaDeletesToKafka_BatchedRecordsStayBounded(t *testing.T) {
 					value := (<-producer.PublishChannel()).Value
 					records = append(records, value)
 
+					// v1 opens with the entry count; v2 carries it after the
+					// 4-byte header signature.
+					countOffset := 0
 					if format == "v2" {
-						total += int(binary.LittleEndian.Uint32(value[4:]))
-					} else {
-						total += int(binary.LittleEndian.Uint32(value[:4]))
+						countOffset = 4
 					}
+
+					total += int(binary.LittleEndian.Uint32(value[countOffset : countOffset+4]))
 				}
 
 				return total >= n
