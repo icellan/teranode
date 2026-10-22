@@ -106,6 +106,24 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **Peer subtrees holding conflicting txs are stored instead of rejected.** A subtree
+  announced by a peer used to fail validation when it held a tx conflicting with one
+  this node accepted, and the block referencing it then fetched and validated the
+  whole subtree again. Those txs, and txs spending them, are now kept aside, not
+  written to the UTXO store, in a new `subtreeConflicting` file next to the
+  subtree, which is stored as `subtreeToCheck` with the same retention. The
+  block that references the subtree creates them as conflicting. Nothing conflicting
+  reaches the UTXO store before a block with proof of work references it.
+
+  The validator now also publishes txs it rejects as conflicting on the
+  policy-rejected topic, flagged by the new `conflicting` field of
+  `KafkaTxPolicyRejectedTopicMessage`, so that topic carries more messages under
+  conflicting load. Set `kafka_txPolicyRejectedConfig` for subtree validation to use
+  them: without it, conflicting txs are still kept aside within a subtree, but a tx
+  spending one in another subtree still fails that subtree, and the fail-fast retry
+  still waits for txs that will never arrive. Kept-aside txs are counted in
+  `teranode_subtreevalidation_conflicting_kept_aside`.
+
 - **Blocks whose cached subtrees hold a tx the store flags conflicting are now rejected.**
   Subtree validation used to bless a block whose subtrees it had already cached on
   that cache alone, so a tx demoted to conflicting after caching could still pass.
