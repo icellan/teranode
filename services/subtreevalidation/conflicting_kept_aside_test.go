@@ -300,6 +300,7 @@ func TestLoadSubtreeBatch_LoadsKeptAsideTxsInsteadOfSubtreeData(t *testing.T) {
 
 		_, _, err := server.loadSubtreeBatch(t.Context(), t.Context(), request, []chainhash.Hash{root}, "peer-1", 200)
 		require.Error(t, err, "the prewarm falls back to downloading subtreeData, which this peer does not serve")
+		require.Contains(t, err.Error(), "subtree_data", "the failure must be the download, not the file")
 	})
 }
 
@@ -529,5 +530,80 @@ func TestBlessMissingTransactions_KeepsConflictingAside(t *testing.T) {
 			require.True(t, txMetaSlice[i].isSet)
 			require.True(t, txMetaSlice[i].conflicting)
 		}
+	})
+}
+
+func TestReadConflictingTxs_TruncatedIsAnError(t *testing.T) {
+	f := newConflictingFixture(t)
+
+	b := serializeConflictingTxs([]*bt.Tx{f.loser, f.child})
+
+	txs, err := readConflictingTxs(b)
+	require.NoError(t, err)
+	require.Len(t, txs, 2)
+
+	_, err = readConflictingTxs(b[:len(b)-5])
+	require.Error(t, err, "a truncated file must not read as a shorter list")
+}
+
+// TestValidateSubtreeInternal_KeptAsideEdgeCases pins the review fixes around the
+// kept-aside path: it still rejects a corrupt subtree, it does not trust a sidecar
+// without its subtree to check, and a block falls back to the peer on an unreadable sidecar.
+func TestValidateSubtreeInternal_KeptAsideEdgeCases(t *testing.T) {
+	livePass := func(t *testing.T, server *Server, root chainhash.Hash) error {
+		_, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}, 101, map[uint32]bool{})
+		return err
+	}
+
+	t.Run("a duplicate tx is still rejected as corrupt", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		server, subtreeStore := f.newServer(t)
+
+		root := servePeerSubtree(t, subtreeStore, f.loser, f.other, f.other)
+
+		err := livePass(t, server, root)
+		require.True(t, errors.Is(err, errors.ErrBlockCorrupt), "a duplicate stays BlockCorrupt with a kept-aside tx present: %v", err)
+
+		exists, err := subtreeStore.Exists(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting)
+		require.NoError(t, err)
+		require.False(t, exists)
+	})
+
+	t.Run("a sidecar without its subtree to check is not skipped", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		server, subtreeStore := f.newServer(t)
+
+		root := servePeerSubtree(t, subtreeStore, f.loser, f.child, f.other)
+		require.NoError(t, livePass(t, server, root))
+
+		// as after a crash between the two writes
+		require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeToCheck))
+
+		calls := f.recorder.total()
+		require.NoError(t, livePass(t, server, root))
+		require.Greater(t, f.recorder.total(), calls, "the subtree is validated again")
+
+		exists, err := subtreeStore.Exists(t.Context(), root[:], fileformat.FileTypeSubtreeToCheck)
+		require.NoError(t, err)
+		require.True(t, exists)
+	})
+
+	t.Run("an unreadable sidecar falls back to the peer on the block path", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		server, subtreeStore := f.newServer(t)
+
+		root := servePeerSubtree(t, subtreeStore, f.loser, f.child, f.other)
+		require.NoError(t, livePass(t, server, root))
+
+		require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeData))
+		require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting))
+		require.NoError(t, subtreeStore.Set(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting, []byte{0x01, 0x00, 0x00}))
+
+		httpmock.RegisterResponder("POST", `=~/subtree/[a-f0-9]{64}/txs\z`,
+			httpmock.NewBytesResponder(200, append(f.loser.ExtendedBytes(), f.child.ExtendedBytes()...)))
+
+		subtree, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", FromBlock: true}, 101, map[uint32]bool{}, blockPathOptions()...)
+		require.NoError(t, err)
+		require.NotNil(t, subtree)
 	})
 }

@@ -3,7 +3,6 @@ package subtreevalidation
 import (
 	"bytes"
 	"context"
-	"io"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -35,13 +34,10 @@ func readConflictingTxs(b []byte) ([]*bt.Tx, error) {
 	reader := bytes.NewReader(b)
 	txs := make([]*bt.Tx, 0, 8)
 
+	// bytes remain whenever a read starts, so any error, EOF included, means a truncated file
 	for reader.Len() > 0 {
 		tx := &bt.Tx{}
 		if _, err := tx.ReadFrom(reader); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-
 			return nil, errors.NewProcessingError("[readConflictingTxs] failed to read transaction", err)
 		}
 
@@ -64,14 +60,17 @@ func (u *Server) lookupConflictingTxs(ctx context.Context, subtreeHash chainhash
 		return nil, missingTxHashes, nil
 	}
 
+	// The file only spares a peer request: when it cannot be read, ask the peer as before.
 	b, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting)
 	if err != nil {
-		return nil, nil, errors.NewStorageError("[lookupConflictingTxs][%s] failed to read kept-aside conflicting txs", subtreeHash.String(), err)
+		u.logger.Warnf("[lookupConflictingTxs][%s] ignoring kept-aside conflicting txs that could not be read: %v", subtreeHash.String(), err)
+		return nil, missingTxHashes, nil
 	}
 
 	txs, err := readConflictingTxs(b)
 	if err != nil {
-		return nil, nil, err
+		u.logger.Warnf("[lookupConflictingTxs][%s] ignoring unreadable kept-aside conflicting txs: %v", subtreeHash.String(), err)
+		return nil, missingTxHashes, nil
 	}
 
 	byHash := make(map[chainhash.Hash]*bt.Tx, len(txs))
@@ -131,6 +130,40 @@ func (u *Server) subtreeConflictingTxs(ctx context.Context, subtree *subtreepkg.
 	}
 
 	return txs, true, nil
+}
+
+// checkKeptAsideSubtreeNodes runs the node checks a validated subtree gets before it is
+// stored, for a peer subtree stored with kept-aside txs: no duplicate tx, the coinbase
+// placeholder only at index 0, and every tx that was not kept aside validated.
+func checkKeptAsideSubtreeNodes(subtreeHash chainhash.Hash, txHashes []chainhash.Hash, txMetaSlice []metaSliceItem) error {
+	seenSet := getSeenSet(len(txHashes))
+	defer putSeenSet(seenSet)
+
+	for idx, txHash := range txHashes {
+		if idx == 0 && txHash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+			continue
+		}
+
+		if _, dup := seenSet.m[txHash]; dup {
+			return errors.NewBlockCorruptError("[ValidateSubtreeInternal][%s] duplicate transaction in subtree at index %d: %s", subtreeHash.String(), idx, txHash.String())
+		}
+
+		seenSet.m[txHash] = struct{}{}
+
+		if txMetaSlice[idx].keptAside {
+			continue
+		}
+
+		if !txMetaSlice[idx].isSet {
+			return errors.NewProcessingError("[ValidateSubtreeInternal][%s] tx meta not found in txMetaSlice at index %d: %s", subtreeHash.String(), idx, txHash.String())
+		}
+
+		if txMetaSlice[idx].coinbase {
+			return errors.NewTxInvalidError("[ValidateSubtreeInternal][%s] invalid subtree index for coinbase tx %d: %s", subtreeHash.String(), idx, txHash.String())
+		}
+	}
+
+	return nil
 }
 
 // subtreeToCheckFromHashes builds the FileTypeSubtreeToCheck form of a subtree from its

@@ -812,7 +812,15 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			}
 
 			if keptAsideExists {
-				return nil, nil
+				// the subtree to check is written second; without it the first pass did not finish
+				toCheckExists, err := u.subtreeStore.Exists(ctx, v.SubtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+				if err != nil {
+					return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check for the subtree to check", v.SubtreeHash.String(), err)
+				}
+
+				if toCheckExists {
+					return nil, nil
+				}
 			}
 		}
 
@@ -978,6 +986,10 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 	}
 
 	if len(keptAside) > 0 {
+		if err = checkKeptAsideSubtreeNodes(v.SubtreeHash, txHashes, txMetaSlice); err != nil {
+			return nil, err
+		}
+
 		return nil, u.storeSubtreeWithConflictingTxs(ctx, v.SubtreeHash, txHashes, keptAside)
 	}
 
