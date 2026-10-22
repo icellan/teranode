@@ -90,6 +90,49 @@ func (u *Server) lookupConflictingTxs(ctx context.Context, subtreeHash chainhash
 	return found, stillMissing, nil
 }
 
+// subtreeConflictingTxs returns the txs kept aside next to subtree, if there are any and
+// every one of them is a node of subtree. Otherwise ok is false and the caller loads the
+// subtree's txs the usual way.
+func (u *Server) subtreeConflictingTxs(ctx context.Context, subtree *subtreepkg.Subtree) (txs []*bt.Tx, ok bool, err error) {
+	subtreeHash := subtree.RootHash()
+
+	exists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting)
+	if err != nil {
+		return nil, false, errors.NewStorageError("[subtreeConflictingTxs][%s] failed to check for kept-aside conflicting txs", subtreeHash.String(), err)
+	}
+
+	if !exists {
+		return nil, false, nil
+	}
+
+	b, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting)
+	if err != nil {
+		return nil, false, errors.NewStorageError("[subtreeConflictingTxs][%s] failed to read kept-aside conflicting txs", subtreeHash.String(), err)
+	}
+
+	txs, err = readConflictingTxs(b)
+	if err != nil {
+		u.logger.Warnf("[subtreeConflictingTxs][%s] ignoring unreadable kept-aside conflicting txs: %v", subtreeHash.String(), err)
+		return nil, false, nil
+	}
+
+	pending := make(map[chainhash.Hash]struct{}, len(txs))
+	for _, tx := range txs {
+		pending[*tx.TxIDChainHash()] = struct{}{}
+	}
+
+	for _, node := range subtree.Nodes {
+		delete(pending, node.Hash)
+	}
+
+	if len(pending) > 0 {
+		u.logger.Warnf("[subtreeConflictingTxs][%s] ignoring kept-aside conflicting txs: %d are not in the subtree", subtreeHash.String(), len(pending))
+		return nil, false, nil
+	}
+
+	return txs, true, nil
+}
+
 // subtreeToCheckFromHashes builds the FileTypeSubtreeToCheck form of a subtree from its
 // node hashes and checks it against the subtree's root.
 func subtreeToCheckFromHashes(subtreeHash chainhash.Hash, txHashes []chainhash.Hash) (*subtreepkg.Subtree, []byte, error) {

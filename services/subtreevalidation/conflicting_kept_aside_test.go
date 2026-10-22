@@ -12,7 +12,9 @@ import (
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/pkg/adaptivefetch"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
 	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
@@ -238,6 +240,52 @@ func TestValidateSubtreeInternal_PeerSubtreeWithConflictingTxs(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, subtree)
 	require.Equal(t, calls, len(f.recorder.calls))
+}
+
+// TestLoadSubtreeBatch_LoadsKeptAsideTxsInsteadOfSubtreeData pins that the block path's
+// prewarm does not download a peer subtree's whole subtreeData when the subtree was stored
+// with kept-aside txs: the rest of its txs were validated when it arrived, so only the
+// kept-aside txs need loading. Validation of every tx still happens afterwards, per subtree.
+func TestLoadSubtreeBatch_LoadsKeptAsideTxsInsteadOfSubtreeData(t *testing.T) {
+	f := newConflictingFixture(t)
+	server, subtreeStore := f.newServer(t)
+
+	root := servePeerSubtree(t, subtreeStore, f.loser, f.child, f.other)
+
+	_, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}, 101, map[uint32]bool{})
+	require.NoError(t, err)
+	require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeData))
+
+	require.Equal(t, adaptivefetch.ModePessimistic, server.adaptiveFetch.Mode(), "the prewarm only loads subtreeData when pessimistic")
+
+	// no subtree_data responder: a download fails the call
+	request := &subtreevalidation_api.CheckBlockSubtreesRequest{BaseUrl: "http://peer.invalid"}
+
+	txs, arenas, err := server.loadSubtreeBatch(t.Context(), t.Context(), request, []chainhash.Hash{root}, "peer-1", 200)
+	require.NoError(t, err)
+
+	defer func() {
+		for _, arena := range arenas {
+			if arena != nil {
+				putSubtreeArena(arena)
+			}
+		}
+	}()
+
+	hashes := make([]chainhash.Hash, len(txs))
+	for i, tx := range txs {
+		hashes[i] = *tx.TxIDChainHash()
+	}
+
+	require.Equal(t, []chainhash.Hash{*f.loser.TxIDChainHash(), *f.child.TxIDChainHash()}, hashes)
+
+	t.Run("a file with a tx that is not in the subtree is ignored", func(t *testing.T) {
+		require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting))
+		require.NoError(t, subtreeStore.Set(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting, serializeConflictingTxs([]*bt.Tx{f.winner})))
+
+		_, _, err := server.loadSubtreeBatch(t.Context(), t.Context(), request, []chainhash.Hash{root}, "peer-1", 200)
+		require.Error(t, err, "the prewarm falls back to downloading subtreeData, which this peer does not serve")
+	})
 }
 
 // blockPathOptions are the options CheckBlockSubtrees validates a referenced subtree with.
