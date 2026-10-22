@@ -504,6 +504,29 @@ func TestBlessMissingTransactions_KeepsConflictingAside(t *testing.T) {
 		require.NoError(t, f.store.GetMeta(t.Context(), winnerChild.TxIDChainHash(), &meta.Data{}))
 	})
 
+	t.Run("a malformed descendant is not kept aside", func(t *testing.T) {
+		for _, parentCached := range []bool{false, true} {
+			f := newConflictingFixture(t)
+
+			badChild := f.child.Clone()
+			dup := *badChild.Inputs[0]
+			badChild.Inputs = append(badChild.Inputs, &dup)
+
+			missing := []missingTx{{tx: badChild, idx: 0}}
+			if parentCached {
+				f.server.policyRejectedTxCache.SetConflicting(*f.loser.TxIDChainHash(), f.loser)
+			} else {
+				missing = []missingTx{{tx: f.loser, idx: 0}, {tx: badChild, idx: 1}}
+			}
+
+			txMetaSlice := make([]metaSliceItem, len(missing))
+
+			err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{})
+			require.True(t, errors.Is(err, errors.ErrTxInvalid), "parentCached=%v: a malformed descendant fails the subtree as invalid: %v", parentCached, err)
+			require.False(t, txMetaSlice[len(missing)-1].keptAside)
+		}
+	})
+
 	t.Run("child whose parent is unknown still fails", func(t *testing.T) {
 		f := newConflictingFixture(t)
 

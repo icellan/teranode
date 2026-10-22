@@ -1481,12 +1481,22 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 
 			// process each transaction in the background, since the transactions are all batched into the utxo store
 			g.Go(func() error {
-				if keepAside && hasKeptAsideParent(tx) {
-					setKeptAside(tx, txIdx)
-					return nil
-				}
+				var (
+					txMeta       *meta.Data
+					unlockFailed bool
+					err          error
+				)
 
-				txMeta, unlockFailed, err := u.blessMissing(gCtx, chainhash.Hash{}, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
+				if keepAside && hasKeptAsideParent(tx) {
+					// A descendant cannot be validated without its parent in the store, so it
+					// only gets the checks that need no parent before it is kept aside.
+					if err = validator.CheckTransactionContextFree(tx, u.settings.Policy); err == nil {
+						setKeptAside(tx, txIdx)
+						return nil
+					}
+				} else {
+					txMeta, unlockFailed, err = u.blessMissing(gCtx, chainhash.Hash{}, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
+				}
 
 				// Queue an accepted-but-locked parent for this level's unlock retry BEFORE
 				// handling err. blessMissing only ever sets unlockFailed on the accepted path,
@@ -1501,10 +1511,17 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 					lockedMu.Unlock()
 				}
 
-				if err != nil && keepAside && (errors.Is(err, errors.ErrSpent) || errors.Is(err, errors.ErrTxConflicting) ||
-					(errors.Is(err, errors.ErrTxMissingParent) && hasConflictingParent(tx))) {
+				if err != nil && keepAside && (errors.Is(err, errors.ErrSpent) || errors.Is(err, errors.ErrTxConflicting)) {
 					setKeptAside(tx, txIdx)
 					return nil
+				}
+
+				if err != nil && keepAside && errors.Is(err, errors.ErrTxMissingParent) && hasConflictingParent(tx) {
+					// as for a descendant above: only the checks that need no parent
+					if err = validator.CheckTransactionContextFree(tx, u.settings.Policy); err == nil {
+						setKeptAside(tx, txIdx)
+						return nil
+					}
 				}
 
 				if err != nil {
