@@ -133,22 +133,14 @@ func (u *Server) subtreeConflictingTxs(ctx context.Context, subtree *subtreepkg.
 }
 
 // checkKeptAsideSubtreeNodes runs the node checks a validated subtree gets before it is
-// stored, for a peer subtree stored with kept-aside txs: no duplicate tx, the coinbase
-// placeholder only at index 0, and every tx that was not kept aside validated.
+// stored, for a peer subtree stored with kept-aside txs: the coinbase placeholder only at
+// index 0, and every tx that was not kept aside validated. Duplicates were rejected before
+// validation.
 func checkKeptAsideSubtreeNodes(subtreeHash chainhash.Hash, txHashes []chainhash.Hash, txMetaSlice []metaSliceItem) error {
-	seenSet := getSeenSet(len(txHashes))
-	defer putSeenSet(seenSet)
-
 	for idx, txHash := range txHashes {
 		if idx == 0 && txHash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
 			continue
 		}
-
-		if _, dup := seenSet.m[txHash]; dup {
-			return errors.NewBlockCorruptError("[ValidateSubtreeInternal][%s] duplicate transaction in subtree at index %d: %s", subtreeHash.String(), idx, txHash.String())
-		}
-
-		seenSet.m[txHash] = struct{}{}
 
 		if txMetaSlice[idx].keptAside {
 			continue

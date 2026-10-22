@@ -830,6 +830,13 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 		}
 	}
 
+	// Reject a duplicate tx before validating anything: it would otherwise be validated twice,
+	// concurrently, through the same *bt.Tx, and the subtree's txs written to the UTXO store
+	// before the subtree is rejected.
+	if err = checkSubtreeDuplicates(v.SubtreeHash, txHashes); err != nil {
+		return nil, err
+	}
+
 	// create the empty subtree
 	height := math.Ceil(math.Log2(float64(len(txHashes))))
 
@@ -997,11 +1004,6 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 
 	u.logger.Debugf("[ValidateSubtreeInternal][%s] adding %d nodes to subtree instance", v.SubtreeHash.String(), len(txHashes))
 
-	seenSet := getSeenSet(len(txHashes))
-	defer putSeenSet(seenSet)
-
-	seen := seenSet.m
-
 	for idx, txHash := range txHashes {
 		// if placeholder just add it and continue
 		if idx == 0 && txHash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
@@ -1012,15 +1014,6 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 
 			continue
 		}
-
-		if _, dup := seen[txHash]; dup {
-			// Body-derived (CVE-2012-2459 duplicate in the received tx set) and detected before
-			// the body is bound to the header: classify corrupt so the block is re-downloaded and
-			// the serving peer struck, never persisted invalid=true (bitcoin-sv/teranode#4692).
-			return nil, errors.NewBlockCorruptError("[ValidateSubtreeInternal][%s] duplicate transaction in subtree at index %d: %s", v.SubtreeHash.String(), idx, txHash.String())
-		}
-
-		seen[txHash] = struct{}{}
 
 		if !txMetaSlice[idx].isSet {
 			return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] tx meta not found in txMetaSlice at index %d: %s", v.SubtreeHash.String(), idx, txHash.String())
@@ -2371,4 +2364,27 @@ func (u *Server) isPrioritySubtreeCheckActive(subtreeHash string) bool {
 	active, ok := u.prioritySubtreeCheckActiveMap[subtreeHash]
 
 	return ok && active
+}
+
+// checkSubtreeDuplicates rejects a subtree that lists the same tx twice.
+func checkSubtreeDuplicates(subtreeHash chainhash.Hash, txHashes []chainhash.Hash) error {
+	seenSet := getSeenSet(len(txHashes))
+	defer putSeenSet(seenSet)
+
+	for idx, txHash := range txHashes {
+		if idx == 0 && txHash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
+			continue
+		}
+
+		if _, dup := seenSet.m[txHash]; dup {
+			// Body-derived (CVE-2012-2459 duplicate in the received tx set) and detected before
+			// the body is bound to the header: classify corrupt so the block is re-downloaded and
+			// the serving peer struck, never persisted invalid=true (bitcoin-sv/teranode#4692).
+			return errors.NewBlockCorruptError("[ValidateSubtreeInternal][%s] duplicate transaction in subtree at index %d: %s", subtreeHash.String(), idx, txHash.String())
+		}
+
+		seenSet.m[txHash] = struct{}{}
+	}
+
+	return nil
 }
