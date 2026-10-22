@@ -85,6 +85,22 @@ func (c *txPolicyRejectedCache) Conflicting(hash chainhash.Hash) (*bt.Tx, bool) 
 	return e.tx, true
 }
 
+// ConflictingCount returns how many of hashes are cached as rejected for conflicting.
+func (c *txPolicyRejectedCache) ConflictingCount(hashes []chainhash.Hash) int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	n := 0
+
+	for i := range hashes {
+		if e, ok := c.entries[hashes[i]]; ok && e.conflicting {
+			n++
+		}
+	}
+
+	return n
+}
+
 func (c *txPolicyRejectedCache) Set(hash chainhash.Hash, tx *bt.Tx) {
 	c.set(hash, tx, false)
 }

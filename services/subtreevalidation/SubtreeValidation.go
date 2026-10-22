@@ -849,6 +849,13 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 	// TODO document, what is the logic here?
 	failFast := v.AllowFailFast && failFastValidation && u.subtreeCount.Add(1) > subtreeWarmupCountInt32
 
+	// txs the validator rejected as conflicting are never in the txmeta cache, so their
+	// misses must not make the fail-fast check wait for them to arrive
+	var missAllowance uint32
+	if failFast && u.policyRejectedTxCache != nil {
+		missAllowance = uint32(u.policyRejectedTxCache.ConflictingCount(txHashes)) // nolint: gosec // G115: a subtree is far below 2^32 transactions
+	}
+
 	// txMetaSlice will be populated with the txMeta data for each txHash
 	// in the retry attempts, only the tx hashes that are missing will be retried, not the whole subtree
 	txMetaSlice := make([]metaSliceItem, len(txHashes))
@@ -884,7 +891,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			probePool = &u.blockProbePool
 		}
 
-		missed, err := u.probeTxMetaCache(ctx, probePool, txHashes, txMetaSlice, failFast)
+		missed, err := u.probeTxMetaCache(ctx, probePool, txHashes, txMetaSlice, failFast, missAllowance)
 		if err != nil {
 			if errors.Is(err, errors.ErrThresholdExceeded) {
 				u.logger.Warnf("[ValidateSubtreeInternal][%s] [attempt #%d] too many missing txmeta entries in cache (fail fast check only, will retry)", v.SubtreeHash.String(), attempt)
@@ -908,7 +915,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			batched := u.settings.SubtreeValidation.BatchMissingTransactions
 
 			// 2. ...then attempt to load the txMeta from the store (i.e - aerospike in production)
-			missed, err = u.processTxMetaUsingStore(ctx, txHashes, txMetaSlice, blockIds, batched, failFast, false)
+			missed, err = u.processTxMetaUsingStoreAllowing(ctx, txHashes, txMetaSlice, blockIds, batched, failFast, false, int(missAllowance))
 			if err != nil {
 				// Only fail fast can exceed the threshold, and fail fast is off on the final attempt, so
 				// retrying here ends in the network fetch below instead of dropping the subtree.

@@ -19,6 +19,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/txmetacache"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
@@ -29,6 +30,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/test"
 	teranodetestutil "github.com/bsv-blockchain/teranode/util/testutil"
 	"github.com/jarcoal/httpmock"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -285,6 +287,49 @@ func TestLoadSubtreeBatch_LoadsKeptAsideTxsInsteadOfSubtreeData(t *testing.T) {
 
 		_, _, err := server.loadSubtreeBatch(t.Context(), t.Context(), request, []chainhash.Hash{root}, "peer-1", 200)
 		require.Error(t, err, "the prewarm falls back to downloading subtreeData, which this peer does not serve")
+	})
+}
+
+// TestValidateSubtreeInternal_KnownConflictingTxsDoNotTriggerRetryWait pins the retry
+// fix: a peer subtree's txs that the validator rejected as conflicting are never in the
+// txmeta cache, and waiting for them to arrive is pointless, so they do not count towards
+// the fail-fast miss threshold. Other misses still do.
+func TestValidateSubtreeInternal_KnownConflictingTxsDoNotTriggerRetryWait(t *testing.T) {
+	f := newConflictingFixture(t)
+
+	f.settings.Block.FailFastValidation = true
+	f.settings.BlockValidation.ValidationWarmupCount = 0
+	f.settings.BlockValidation.ValidationMaxRetries = 2
+	f.settings.BlockValidation.RetrySleep = 50 * time.Millisecond
+	f.settings.SubtreeValidation.ProcessTxMetaUsingCacheMissingTxThreshold = 1
+
+	// New wraps the UTXO store in the txmeta cache, which the fail-fast probe reads
+	server, subtreeStore := f.newServer(t)
+	_, isCache := server.utxoStore.(*txmetacache.TxMetaCache)
+	require.True(t, isCache)
+
+	// two misses against a threshold of one: the loser, rejected as conflicting, and its child
+	root := servePeerSubtree(t, subtreeStore, f.loser, f.child)
+
+	t.Run("unexplained misses still wait", func(t *testing.T) {
+		retries := testutil.ToFloat64(prometheusSubtreeValidationValidateSubtreeRetry)
+
+		_, _ = server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}, 101, map[uint32]bool{})
+		require.Greater(t, testutil.ToFloat64(prometheusSubtreeValidationValidateSubtreeRetry), retries)
+
+		// the kept-aside result of this run must not short-circuit the next one
+		require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting))
+		require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeToCheck))
+	})
+
+	t.Run("with the loser known as conflicting", func(t *testing.T) {
+		server.policyRejectedTxCache.SetConflicting(*f.loser.TxIDChainHash(), f.loser)
+
+		retries := testutil.ToFloat64(prometheusSubtreeValidationValidateSubtreeRetry)
+
+		_, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}, 101, map[uint32]bool{})
+		require.NoError(t, err)
+		require.Equal(t, retries, testutil.ToFloat64(prometheusSubtreeValidationValidateSubtreeRetry), "known conflicting txs must not cause a retry wait")
 	})
 }
 
