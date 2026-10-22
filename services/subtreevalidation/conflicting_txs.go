@@ -11,6 +11,7 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
 )
 
 // serializeConflictingTxs encodes the txs kept aside from a peer subtree, in subtree
@@ -48,6 +49,45 @@ func readConflictingTxs(b []byte) ([]*bt.Tx, error) {
 	}
 
 	return txs, nil
+}
+
+// lookupConflictingTxs resolves missing txs from the txs kept aside next to the subtree,
+// if any. A tx only matches the hash it hashes to, so the file cannot substitute one tx
+// for another; every tx it supplies is still validated.
+func (u *Server) lookupConflictingTxs(ctx context.Context, subtreeHash chainhash.Hash, missingTxHashes []utxo.UnresolvedMetaData) (found []missingTx, stillMissing []utxo.UnresolvedMetaData, err error) {
+	exists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting)
+	if err != nil {
+		return nil, nil, errors.NewStorageError("[lookupConflictingTxs][%s] failed to check for kept-aside conflicting txs", subtreeHash.String(), err)
+	}
+
+	if !exists {
+		return nil, missingTxHashes, nil
+	}
+
+	b, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting)
+	if err != nil {
+		return nil, nil, errors.NewStorageError("[lookupConflictingTxs][%s] failed to read kept-aside conflicting txs", subtreeHash.String(), err)
+	}
+
+	txs, err := readConflictingTxs(b)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	byHash := make(map[chainhash.Hash]*bt.Tx, len(txs))
+	for _, tx := range txs {
+		byHash[*tx.TxIDChainHash()] = tx
+	}
+
+	for _, h := range missingTxHashes {
+		if tx, ok := byHash[h.Hash]; ok {
+			found = append(found, missingTx{tx: tx, idx: h.Idx})
+		} else {
+			stillMissing = append(stillMissing, h)
+		}
+	}
+
+	return found, stillMissing, nil
 }
 
 // subtreeToCheckFromHashes builds the FileTypeSubtreeToCheck form of a subtree from its

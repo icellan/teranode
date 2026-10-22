@@ -240,6 +240,54 @@ func TestValidateSubtreeInternal_PeerSubtreeWithConflictingTxs(t *testing.T) {
 	require.Equal(t, calls, len(f.recorder.calls))
 }
 
+// blockPathOptions are the options CheckBlockSubtrees validates a referenced subtree with.
+func blockPathOptions() []validator.Option {
+	return []validator.Option{
+		validator.WithSkipPolicyChecks(true),
+		validator.WithInBlock(true),
+		validator.WithCreateConflicting(true),
+		validator.WithIgnoreLocked(true),
+		validator.WithUnconfirmedParentsAtCandidateHeight(true),
+		validator.WithAddTXToBlockAssembly(false),
+	}
+}
+
+// TestValidateSubtreeInternal_BlockInsertsKeptAsideTxs pins the other half: when a block
+// references a peer subtree stored with kept-aside txs, the block path creates them as
+// conflicting from the file next to the subtree, without asking the peer, and only then
+// stores the subtree as validated, with the kept-aside txs in its conflicting trailer.
+func TestValidateSubtreeInternal_BlockInsertsKeptAsideTxs(t *testing.T) {
+	f := newConflictingFixture(t)
+	server, subtreeStore := f.newServer(t)
+
+	root := servePeerSubtree(t, subtreeStore, f.loser, f.child, f.other)
+
+	_, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}, 101, map[uint32]bool{})
+	require.NoError(t, err)
+
+	// the kept-aside txs must come from the file next to the subtree: no subtreeData, no
+	// policy-rejected cache entry, and no peer that serves transactions
+	require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeData))
+
+	subtree, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", FromBlock: true}, 101, map[uint32]bool{}, blockPathOptions()...)
+	require.NoError(t, err)
+	require.NotNil(t, subtree)
+
+	exists, err := subtreeStore.Exists(t.Context(), root[:], fileformat.FileTypeSubtree)
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	for _, tx := range []*bt.Tx{f.loser, f.child} {
+		stored := &meta.Data{}
+		require.NoError(t, f.store.GetMeta(t.Context(), tx.TxIDChainHash(), stored))
+		require.True(t, stored.Conflicting, "%s is created as conflicting behind the block", tx.TxID())
+	}
+
+	conflictingNodes := subtree.ConflictingNodes
+	require.ElementsMatch(t, []chainhash.Hash{*f.loser.TxIDChainHash(), *f.child.TxIDChainHash()}, conflictingNodes,
+		"block assembly finds conflicting txs through the subtree's conflicting trailer")
+}
+
 func (f *conflictingFixture) requireNotStored(t *testing.T, txs ...*bt.Tx) {
 	t.Helper()
 

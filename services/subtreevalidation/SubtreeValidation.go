@@ -1806,6 +1806,17 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 			}
 		}
 
+		// Then the txs kept aside next to a peer subtree stored with conflicting txs.
+		if len(remainingHashes) > 0 {
+			keptAside, stillMissing, keptAsideErr := u.lookupConflictingTxs(ctx, subtreeHash, remainingHashes)
+			if keptAsideErr != nil {
+				return nil, keptAsideErr
+			}
+
+			missingTxs = append(missingTxs, keptAside...)
+			remainingHashes = stillMissing
+		}
+
 		if len(remainingHashes) > 0 {
 			u.logger.Debugf("[validateSubtree][%s] fetching %d missing txs from peer", subtreeHash.String(), len(remainingHashes))
 
