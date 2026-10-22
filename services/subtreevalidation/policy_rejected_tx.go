@@ -37,6 +37,9 @@ import (
 type cacheEntry struct {
 	tx   *bt.Tx
 	size int
+	// conflicting is set when the validator rejected the tx because an input is already
+	// spent by a different tx, rather than on policy.
+	conflicting bool
 }
 
 type txPolicyRejectedCache struct {
@@ -68,12 +71,41 @@ func (c *txPolicyRejectedCache) Get(hash chainhash.Hash) (*bt.Tx, bool) {
 	return e.tx, ok
 }
 
+// Conflicting returns the tx if it is cached as rejected for conflicting with a tx
+// the validator already accepted.
+func (c *txPolicyRejectedCache) Conflicting(hash chainhash.Hash) (*bt.Tx, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	e, ok := c.entries[hash]
+	if !ok || !e.conflicting {
+		return nil, false
+	}
+
+	return e.tx, true
+}
+
 func (c *txPolicyRejectedCache) Set(hash chainhash.Hash, tx *bt.Tx) {
+	c.set(hash, tx, false)
+}
+
+// SetConflicting caches a tx the validator rejected as conflicting.
+func (c *txPolicyRejectedCache) SetConflicting(hash chainhash.Hash, tx *bt.Tx) {
+	c.set(hash, tx, true)
+}
+
+func (c *txPolicyRejectedCache) set(hash chainhash.Hash, tx *bt.Tx, conflicting bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if _, exists := c.entries[hash]; exists {
-		// Already cached; the stored bytes are unchanged so leave the budget alone.
+	if e, exists := c.entries[hash]; exists {
+		// Already cached; the stored bytes are unchanged so leave the budget alone. A
+		// conflicting rejection upgrades an earlier policy rejection, never the reverse.
+		if conflicting && !e.conflicting {
+			e.conflicting = true
+			c.entries[hash] = e
+		}
+
 		return
 	}
 
@@ -87,7 +119,7 @@ func (c *txPolicyRejectedCache) Set(hash chainhash.Hash, tx *bt.Tx) {
 		c.evictOne()
 	}
 
-	c.entries[hash] = cacheEntry{tx: tx, size: size}
+	c.entries[hash] = cacheEntry{tx: tx, size: size, conflicting: conflicting}
 	c.curBytes += size
 }
 
@@ -174,7 +206,11 @@ func (u *Server) policyRejectedTxMessageHandler(_ context.Context) func(msg *kaf
 			return nil
 		}
 
-		u.policyRejectedTxCache.Set(hash, tx)
+		if m.Conflicting {
+			u.policyRejectedTxCache.SetConflicting(hash, tx)
+		} else {
+			u.policyRejectedTxCache.Set(hash, tx)
+		}
 
 		return nil
 	}

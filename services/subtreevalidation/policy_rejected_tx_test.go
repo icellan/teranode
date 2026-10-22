@@ -163,6 +163,71 @@ func TestPolicyRejectedTxMessageHandler(t *testing.T) {
 	assert.Equal(t, tx.TxID(), got.TxID())
 }
 
+// TestTxPolicyRejectedCache_Conflicting pins that the cache tells a transaction the
+// validator rejected as conflicting apart from a policy-rejected one: subtree validation
+// keeps only the former aside instead of failing the subtree.
+func TestTxPolicyRejectedCache_Conflicting(t *testing.T) {
+	tx, err := bt.NewTxFromString("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0104ffffffff0100f2052a0100000043410496b538e853519c726a2c91e61ec11600ae1390813a627c66fb8be7947be63c52da7589379515d4e0a604f8141781e62294721166bf621e73a82cbf2342c858eeac00000000")
+	require.NoError(t, err)
+
+	var policyHash, conflictingHash, upgradedHash chainhash.Hash
+	policyHash[0] = 1
+	conflictingHash[0] = 2
+	upgradedHash[0] = 3
+
+	cache := newTxPolicyRejectedCache(1024 * 1024)
+
+	cache.Set(policyHash, tx)
+	cache.SetConflicting(conflictingHash, tx)
+
+	_, ok := cache.Conflicting(policyHash)
+	require.False(t, ok, "a policy-rejected tx is not conflicting")
+
+	got, ok := cache.Conflicting(conflictingHash)
+	require.True(t, ok)
+	require.Equal(t, tx.TxID(), got.TxID())
+
+	_, ok = cache.Get(conflictingHash)
+	require.True(t, ok, "a conflicting tx still serves the missing-tx lookup")
+
+	// A tx first cached as policy-rejected and later rejected as conflicting is upgraded,
+	// without counting its bytes twice.
+	cache.Set(upgradedHash, tx)
+	bytesBefore := cache.Bytes()
+
+	cache.SetConflicting(upgradedHash, tx)
+
+	_, ok = cache.Conflicting(upgradedHash)
+	require.True(t, ok)
+	require.Equal(t, bytesBefore, cache.Bytes())
+}
+
+func TestPolicyRejectedTxMessageHandler_Conflicting(t *testing.T) {
+	cache := newTxPolicyRejectedCache(1024 * 1024)
+
+	tx, err := bt.NewTxFromString("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0104ffffffff0100f2052a0100000043410496b538e853519c726a2c91e61ec11600ae1390813a627c66fb8be7947be63c52da7589379515d4e0a604f8141781e62294721166bf621e73a82cbf2342c858eeac00000000")
+	require.NoError(t, err)
+
+	value, err := proto.Marshal(&kafkamessage.KafkaTxPolicyRejectedTopicMessage{
+		TxHash:      tx.TxIDChainHash().CloneBytes(),
+		RawTx:       tx.SerializeBytes(),
+		Reason:      "utxo already spent",
+		Conflicting: true,
+	})
+	require.NoError(t, err)
+
+	server := &Server{
+		policyRejectedTxCache: cache,
+		logger:                ulogger.New("test"),
+	}
+
+	require.NoError(t, server.policyRejectedTxMessageHandler(context.Background())(&kafka.KafkaMessage{Value: value}))
+
+	got, ok := cache.Conflicting(*tx.TxIDChainHash())
+	require.True(t, ok)
+	require.Equal(t, tx.TxID(), got.TxID())
+}
+
 func TestPolicyRejectedTxMessageHandler_InvalidProto(t *testing.T) {
 	cache := newTxPolicyRejectedCache(1024 * 1024)
 
