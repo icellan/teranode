@@ -117,17 +117,19 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
   The validator now also publishes every tx it rejects as conflicting, submitted ones
   included, raw on the policy-rejected topic, flagged by the new `conflicting` field
-  of `KafkaTxPolicyRejectedTopicMessage`, and subtree validation publishes the
-  descendants it keeps aside there too, after checks that need no parent (structure,
-  money range, policy size). Every subtree validator caches them, so a descendant in
-  any later subtree is kept aside too, and the rejected txs no longer count towards
-  the fail-fast miss thresholds. That needs `kafka_txPolicyRejectedConfig` set (and
-  `subtreevalidation_txPolicyRejectedCacheEnabled`, on by default); without it,
-  conflicting txs are still kept aside within a subtree only. The topic carries up to
-  one extra message per conflicting submission and per kept-aside descendant.
-  Descendants in the same subtree as their conflicting parent still count towards the
-  fail-fast thresholds. Kept-aside txs are counted in
-  `teranode_subtreevalidation_conflicting_kept_aside`.
+  of `KafkaTxPolicyRejectedTopicMessage`. Subtree validation publishes the txs it keeps
+  aside that are not yet known as conflicting there too, flagged `keptAside`, after
+  checks that need no parent (structure, money range, policy size). Every subtree
+  validator caches them, kept-aside entries in a separate cache with their own budget
+  (`subtreevalidation_txPolicyRejectedCacheMaxMB` each), so a descendant in any later
+  subtree is kept aside too, and the rejected txs no longer count towards the
+  fail-fast miss thresholds. Without `kafka_txPolicyRejectedConfig`, each subtree
+  validator still learns the descendants it keeps aside itself, but not those another
+  one kept aside, nor the validators' rejections. With
+  `subtreevalidation_txPolicyRejectedCacheEnabled` off (it is on by default), conflicting
+  txs are kept aside within a subtree only. Descendants in the same subtree as their
+  conflicting parent still count towards the fail-fast thresholds. Kept-aside txs are
+  counted in `teranode_subtreevalidation_conflicting_kept_aside`.
 
 - **Blocks whose cached subtrees hold a tx the store flags conflicting are now rejected.**
   Subtree validation used to bless a block whose subtrees it had already cached on

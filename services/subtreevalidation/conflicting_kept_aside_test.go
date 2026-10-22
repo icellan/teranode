@@ -182,6 +182,10 @@ func (f *conflictingFixture) newServer(t *testing.T) (*Server, blob.Store) {
 		server.policyRejectedTxCache = newTxPolicyRejectedCache(1024 * 1024)
 	}
 
+	if server.keptAsideTxCache == nil {
+		server.keptAsideTxCache = newTxPolicyRejectedCache(1024 * 1024)
+	}
+
 	return server, subtreeStore
 }
 
@@ -529,6 +533,29 @@ func TestBlessMissingTransactions_KeepsConflictingAside(t *testing.T) {
 		}
 	})
 
+	t.Run("a stale flag on a stored parent does not explain another missing parent", func(t *testing.T) {
+		f := newConflictingFixture(t)
+
+		// the winner is stored, but carries a stale conflicting flag
+		f.server.policyRejectedTxCache.SetConflicting(*f.winner.TxIDChainHash(), f.winner)
+
+		// unknown spends the winner and a parent nobody knows: the child (not stored)
+		privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("CONFLICTING_KEPT_ASIDE_TEST_KEY!"))
+		mixed := transactions.Create(t,
+			transactions.WithPrivateKey(privateKey),
+			transactions.WithInput(f.winner, 0, privateKey),
+			transactions.WithInput(f.child, 0, privateKey),
+			transactions.WithP2PKHOutputs(1, 100_000, publicKey),
+		)
+
+		missing := []missingTx{{tx: mixed, idx: 0}}
+		txMetaSlice := make([]metaSliceItem, len(missing))
+
+		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{})
+		require.Error(t, err, "the missing parent is not known to conflict, so the subtree fails as before")
+		require.False(t, txMetaSlice[0].keptAside)
+	})
+
 	t.Run("child whose parent is unknown still fails", func(t *testing.T) {
 		f := newConflictingFixture(t)
 
@@ -567,7 +594,9 @@ func TestReadConflictingTxs_TruncatedIsAnError(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, txs, 2)
 
-	_, err = readConflictingTxs(b[:len(b)-5])
+	// cutting the 4-byte locktime ends the last tx at a field boundary, where the reader
+	// sees a bare io.EOF
+	_, err = readConflictingTxs(b[:len(b)-4])
 	require.Error(t, err, "a truncated file must not read as a shorter list")
 }
 
@@ -661,6 +690,7 @@ func TestValidateSubtreeInternal_PublishesKeptAsideDescendants(t *testing.T) {
 		var m kafkamessage.KafkaTxPolicyRejectedTopicMessage
 		require.NoError(t, proto.Unmarshal(msg.Value, &m))
 		require.True(t, m.Conflicting)
+		require.True(t, m.KeptAside, "a descendant is flagged so it lands in the kept-aside budget")
 
 		tx, err := bt.NewTxFromBytes(m.RawTx)
 		require.NoError(t, err)
@@ -671,8 +701,11 @@ func TestValidateSubtreeInternal_PublishesKeptAsideDescendants(t *testing.T) {
 
 	require.Equal(t, []chainhash.Hash{*f.child.TxIDChainHash()}, published, "only the descendant is new knowledge")
 
-	_, ok := server.policyRejectedTxCache.Conflicting(*f.child.TxIDChainHash())
-	require.True(t, ok, "this validator knows the descendant without waiting for the topic")
+	_, ok := server.keptAsideTxCache.Conflicting(*f.child.TxIDChainHash())
+	require.True(t, ok, "this validator knows the descendant without waiting for the topic, in the kept-aside budget")
+
+	_, ok = server.policyRejectedTxCache.Conflicting(*f.child.TxIDChainHash())
+	require.False(t, ok, "a descendant never takes space from the validators' entries")
 }
 
 // TestValidateSubtreeInternal_GrandchildInLaterSubtreeIsKeptAside pins the chain across
@@ -706,4 +739,30 @@ func TestValidateSubtreeInternal_GrandchildInLaterSubtreeIsKeptAside(t *testing.
 	require.Len(t, kept, 1)
 	require.Equal(t, *grandchild.TxIDChainHash(), *kept[0].TxIDChainHash())
 	f.requireNotStored(t, grandchild)
+}
+
+// TestValidateSubtreeInternal_DuplicateRejectedBeforeValidation pins that a subtree listing
+// a tx twice is rejected before any of its txs is validated, on the peer path and on the
+// block path, even when another of its txs is invalid.
+func TestValidateSubtreeInternal_DuplicateRejectedBeforeValidation(t *testing.T) {
+	for _, fromBlock := range []bool{false, true} {
+		f := newConflictingFixture(t)
+		server, subtreeStore := f.newServer(t)
+
+		invalid := f.other.Clone()
+		invalid.Outputs[0].Satoshis = 21_000_000*100_000_000 + 1
+
+		root := servePeerSubtree(t, subtreeStore, invalid, f.loser, f.loser)
+
+		v := ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: !fromBlock, FromBlock: fromBlock}
+
+		var opts []validator.Option
+		if fromBlock {
+			opts = blockPathOptions()
+		}
+
+		_, err := server.ValidateSubtreeInternal(t.Context(), v, 101, map[uint32]bool{}, opts...)
+		require.True(t, errors.Is(err, errors.ErrBlockCorrupt), "fromBlock=%v: the duplicate decides, not the invalid tx: %v", fromBlock, err)
+		require.Zero(t, f.recorder.total(), "fromBlock=%v: nothing is validated before the duplicate is found", fromBlock)
+	}
 }

@@ -63,11 +63,11 @@ func (u *Server) lookupConflictingTxs(ctx context.Context, subtreeHash chainhash
 		return nil, missingTxHashes, nil
 	}
 
-	// The file only spares a peer request: when it cannot be read, ask the peer as before.
+	// A storage error halts; unreadable content only spares a peer request, so then the
+	// peer is asked as before.
 	b, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting)
 	if err != nil {
-		u.logger.Warnf("[lookupConflictingTxs][%s] ignoring kept-aside conflicting txs that could not be read: %v", subtreeHash.String(), err)
-		return nil, missingTxHashes, nil
+		return nil, nil, errors.NewStorageError("[lookupConflictingTxs][%s] failed to read kept-aside conflicting txs", subtreeHash.String(), err)
 	}
 
 	txs, err := readConflictingTxs(b)
@@ -204,8 +204,14 @@ func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash
 
 	dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
 
-	if err = u.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting, serializeConflictingTxs(keptAside), options.WithDeleteAt(dah)); err != nil && !errors.Is(err, errors.ErrBlobAlreadyExists) {
-		return errors.NewStorageError("[storeSubtreeWithConflictingTxs][%s] failed to store conflicting txs", subtreeHash.String(), err)
+	newlyKeptAside := true
+
+	if err = u.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting, serializeConflictingTxs(keptAside), options.WithDeleteAt(dah)); err != nil {
+		if !errors.Is(err, errors.ErrBlobAlreadyExists) {
+			return errors.NewStorageError("[storeSubtreeWithConflictingTxs][%s] failed to store conflicting txs", subtreeHash.String(), err)
+		}
+
+		newlyKeptAside = false
 	}
 
 	if err = u.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes, options.WithDeleteAt(dah)); err != nil && !errors.Is(err, errors.ErrBlobAlreadyExists) {
@@ -214,7 +220,9 @@ func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash
 
 	u.shareConflictingTxs(keptAside)
 
-	prometheusSubtreeValidationConflictingKeptAside.Add(float64(len(keptAside)))
+	if newlyKeptAside {
+		prometheusSubtreeValidationConflictingKeptAside.Add(float64(len(keptAside)))
+	}
 
 	u.logger.Infof("[storeSubtreeWithConflictingTxs][%s] kept %d conflicting txs aside until a block references the subtree", subtreeHash.String(), len(keptAside))
 
@@ -222,20 +230,21 @@ func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash
 }
 
 // shareConflictingTxs makes kept-aside txs that are not yet known as conflicting known:
-// cached here at once, and published on the policy-rejected topic for every other subtree
-// validator. Those are the descendants; the validators publish the txs they reject. The
-// publish is best-effort, like the validators': a dropped message only means a child in
-// another subtree fails that subtree, as before.
+// cached here at once in the kept-aside cache, and published on the policy-rejected topic,
+// flagged keptAside, for every other subtree validator. Mostly these are descendants; a
+// loser whose validator publish this pod has not consumed yet goes out again, which the
+// consumer ignores. The publish is best-effort, like the validators': a dropped message
+// only means a child in another subtree fails that subtree, as before.
 func (u *Server) shareConflictingTxs(keptAside []*bt.Tx) {
 	for _, tx := range keptAside {
 		hash := *tx.TxIDChainHash()
 
-		if u.policyRejectedTxCache != nil {
-			if _, known := u.policyRejectedTxCache.Conflicting(hash); known {
-				continue
-			}
+		if _, known := u.conflictingTx(hash); known {
+			continue
+		}
 
-			u.policyRejectedTxCache.SetConflicting(hash, tx)
+		if u.keptAsideTxCache != nil {
+			u.keptAsideTxCache.SetConflicting(hash, tx)
 		}
 
 		if u.conflictingTxKafkaProducer == nil {
@@ -252,6 +261,7 @@ func (u *Server) shareConflictingTxs(keptAside []*bt.Tx) {
 			RawTx:       rawTx,
 			Reason:      "kept aside: spends a conflicting tx",
 			Conflicting: true,
+			KeptAside:   true,
 		})
 		if err != nil {
 			u.logger.Errorf("[shareConflictingTxs][%s] failed to marshal kept-aside conflicting tx: %v", hash.String(), err)

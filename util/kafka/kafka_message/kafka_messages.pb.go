@@ -569,6 +569,7 @@ type KafkaTxPolicyRejectedTopicMessage struct {
 	RawTx         []byte                 `protobuf:"bytes,2,opt,name=rawTx,proto3" json:"rawTx,omitempty"`              // Full serialized transaction bytes
 	Reason        string                 `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`            // Policy rejection reason
 	Conflicting   bool                   `protobuf:"varint,4,opt,name=conflicting,proto3" json:"conflicting,omitempty"` // Rejected because an input is already spent by a different tx (not a policy rejection)
+	KeptAside     bool                   `protobuf:"varint,5,opt,name=keptAside,proto3" json:"keptAside,omitempty"`     // Kept aside by subtree validation as a descendant of a conflicting tx; only context-free checked
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -627,6 +628,13 @@ func (x *KafkaTxPolicyRejectedTopicMessage) GetReason() string {
 func (x *KafkaTxPolicyRejectedTopicMessage) GetConflicting() bool {
 	if x != nil {
 		return x.Conflicting
+	}
+	return false
+}
+
+func (x *KafkaTxPolicyRejectedTopicMessage) GetKeptAside() bool {
+	if x != nil {
+		return x.KeptAside
 	}
 	return false
 }
@@ -914,12 +922,13 @@ const file_util_kafka_kafka_message_kafka_messages_proto_rawDesc = "" +
 	"\x1bKafkaRejectedTxTopicMessage\x12\x16\n" +
 	"\x06txHash\x18\x01 \x01(\tR\x06txHash\x12\x16\n" +
 	"\x06reason\x18\x02 \x01(\tR\x06reason\x12\x17\n" +
-	"\apeer_id\x18\x03 \x01(\tR\x06peerId\"\x8b\x01\n" +
+	"\apeer_id\x18\x03 \x01(\tR\x06peerId\"\xa9\x01\n" +
 	"!KafkaTxPolicyRejectedTopicMessage\x12\x16\n" +
 	"\x06txHash\x18\x01 \x01(\fR\x06txHash\x12\x14\n" +
 	"\x05rawTx\x18\x02 \x01(\fR\x05rawTx\x12\x16\n" +
 	"\x06reason\x18\x03 \x01(\tR\x06reason\x12 \n" +
-	"\vconflicting\x18\x04 \x01(\bR\vconflicting\"\x88\x01\n" +
+	"\vconflicting\x18\x04 \x01(\bR\vconflicting\x12\x1c\n" +
+	"\tkeptAside\x18\x05 \x01(\bR\tkeptAside\"\x88\x01\n" +
 	"\x17KafkaTxMetaTopicMessage\x12\x16\n" +
 	"\x06txHash\x18\x01 \x01(\tR\x06txHash\x12;\n" +
 	"\x06action\x18\x02 \x01(\x0e2#.kafkamessage.KafkaTxMetaActionTypeR\x06action\x12\x18\n" +

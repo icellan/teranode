@@ -867,8 +867,8 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 	// txs the validator rejected as conflicting are never in the txmeta cache, so their
 	// misses must not make the fail-fast check wait for them to arrive
 	var missAllowance uint32
-	if failFast && u.policyRejectedTxCache != nil {
-		missAllowance = uint32(u.policyRejectedTxCache.ConflictingCount(txHashes)) // nolint: gosec // G115: a subtree is far below 2^32 transactions
+	if failFast {
+		missAllowance = uint32(u.conflictingCount(txHashes)) // nolint: gosec // G115: a subtree is far below 2^32 transactions
 	}
 
 	// txMetaSlice will be populated with the txMeta data for each txHash
@@ -1437,21 +1437,31 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 		return false
 	}
 
-	// hasConflictingParent reports whether tx spends a tx the validator rejected as
-	// conflicting. It is only asked once the validator found a parent missing: the cache
-	// is never cleared, so a parent that later won is in the store and must decide.
-	hasConflictingParent := func(tx *bt.Tx) bool {
-		if u.policyRejectedTxCache == nil {
-			return false
-		}
-
+	// hasConflictingParent reports whether a missing parent of tx is known as conflicting.
+	// It is only asked once the validator found a parent missing. The cache is never
+	// cleared, so a parent counts only if it is also absent from the store: a parent that
+	// later won is in the store and decides.
+	hasConflictingParent := func(ctx context.Context, tx *bt.Tx) (bool, error) {
 		for _, input := range tx.Inputs {
-			if _, ok := u.policyRejectedTxCache.Conflicting(*input.PreviousTxIDChainHash()); ok {
-				return true
+			parentHash := input.PreviousTxIDChainHash()
+
+			if _, ok := u.conflictingTx(*parentHash); !ok {
+				continue
 			}
+
+			err := u.utxoStore.GetMeta(ctx, parentHash, &meta.Data{})
+			if err == nil {
+				continue
+			}
+
+			if errors.Is(err, errors.ErrTxNotFound) {
+				return true, nil
+			}
+
+			return false, errors.NewStorageError("[validateSubtree][%s] failed to read parent %s", tx.TxIDChainHash().String(), parentHash.String(), err)
 		}
 
-		return false
+		return false, nil
 	}
 
 	// Pre-warm the MTP store once before spawning per-transaction goroutines, so each goroutine
@@ -1516,11 +1526,18 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 					return nil
 				}
 
-				if err != nil && keepAside && errors.Is(err, errors.ErrTxMissingParent) && hasConflictingParent(tx) {
-					// as for a descendant above: only the checks that need no parent
-					if err = validator.CheckTransactionContextFree(tx, u.settings.Policy); err == nil {
-						setKeptAside(tx, txIdx)
-						return nil
+				if err != nil && keepAside && errors.Is(err, errors.ErrTxMissingParent) {
+					conflictingParent, parentErr := hasConflictingParent(gCtx, tx)
+					if parentErr != nil {
+						return parentErr
+					}
+
+					if conflictingParent {
+						// as for a descendant above: only the checks that need no parent
+						if err = validator.CheckTransactionContextFree(tx, u.settings.Policy); err == nil {
+							setKeptAside(tx, txIdx)
+							return nil
+						}
 					}
 				}
 

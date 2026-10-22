@@ -267,3 +267,45 @@ func TestPolicyRejectedTxMessageHandler_EmptyRawTx(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, cache.Len(), "should skip messages with empty rawTx")
 }
+
+// TestPolicyRejectedTxMessageHandler_KeptAsideHasItsOwnBudget pins the flood guard:
+// descendants a subtree validator kept aside are only context-free checked, so they get
+// their own byte budget and cannot evict the txs the validators rejected.
+func TestPolicyRejectedTxMessageHandler_KeptAsideHasItsOwnBudget(t *testing.T) {
+	tx, err := bt.NewTxFromString("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0104ffffffff0100f2052a0100000043410496b538e853519c726a2c91e61ec11600ae1390813a627c66fb8be7947be63c52da7589379515d4e0a604f8141781e62294721166bf621e73a82cbf2342c858eeac00000000")
+	require.NoError(t, err)
+
+	server := &Server{
+		policyRejectedTxCache: newTxPolicyRejectedCache(2 * tx.Size()),
+		keptAsideTxCache:      newTxPolicyRejectedCache(2 * tx.Size()),
+		logger:                ulogger.New("test"),
+	}
+
+	handler := server.policyRejectedTxMessageHandler(context.Background())
+
+	publish := func(tx *bt.Tx, conflicting, keptAside bool) {
+		value, err := proto.Marshal(&kafkamessage.KafkaTxPolicyRejectedTopicMessage{
+			TxHash: tx.TxIDChainHash().CloneBytes(), RawTx: tx.SerializeBytes(), Conflicting: conflicting, KeptAside: keptAside,
+		})
+		require.NoError(t, err)
+		require.NoError(t, handler(&kafka.KafkaMessage{Value: value}))
+	}
+
+	real := *tx.TxIDChainHash()
+	publish(tx, true, false)
+
+	// a flood of distinct kept-aside descendants, each the same size as the real entry
+	for i := 0; i < 50; i++ {
+		variant := tx.Clone()
+		variant.Outputs[0].Satoshis = uint64(1000 + i)
+		require.Equal(t, tx.Size(), variant.Size())
+		publish(variant, true, true)
+	}
+
+	_, ok := server.policyRejectedTxCache.Conflicting(real)
+	require.True(t, ok, "the validator's entry survives a flood of kept-aside entries")
+	require.LessOrEqual(t, server.keptAsideTxCache.Bytes(), 2*tx.Size())
+
+	_, ok = server.conflictingTx(real)
+	require.True(t, ok)
+}

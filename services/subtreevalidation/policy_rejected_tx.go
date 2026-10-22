@@ -30,10 +30,12 @@ import (
 // entries are evicted until it fits. This is acceptable because the cache is best-effort;
 // a miss falls back to an HTTP fetch from the originating miner. LRU or FIFO would not
 // materially improve hit rate in the adversarial case (a flood of all-distinct hashes
-// defeats any eviction strategy equally), and the upstream gate is the validator itself —
-// every entry in the topic must be a consensus-valid tx that was fully processed and
-// policy-rejected, so the fill rate is bounded by the validator's own throughput rather
-// than an unconstrained peer-facing API.
+// defeats any eviction strategy equally). In the policy-rejected cache the upstream gate is
+// the validator itself: every entry is a tx it fully processed and rejected on policy or as
+// conflicting, so the fill rate is bounded by the validator's own throughput. Descendants
+// kept aside by subtree validation come from peer subtrees and are only context-free
+// checked, so they live in a separate instance (keptAsideTxCache) with its own budget and
+// cannot evict the validators' entries.
 type cacheEntry struct {
 	tx   *bt.Tx
 	size int
@@ -63,12 +65,18 @@ func newTxPolicyRejectedCache(maxBytes int) *txPolicyRejectedCache {
 	}
 }
 
+// Get returns a copy of the cached tx: validation extends a tx's inputs in place, and two
+// subtrees can validate the same cached tx at the same time.
 func (c *txPolicyRejectedCache) Get(hash chainhash.Hash) (*bt.Tx, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	e, ok := c.entries[hash]
-	return e.tx, ok
+	if !ok {
+		return nil, false
+	}
+
+	return e.tx.Clone(), true
 }
 
 // Conflicting returns the tx if it is cached as rejected for conflicting with a tx
@@ -222,7 +230,11 @@ func (u *Server) policyRejectedTxMessageHandler(_ context.Context) func(msg *kaf
 			return nil
 		}
 
-		if m.Conflicting {
+		if m.KeptAside {
+			if u.keptAsideTxCache != nil {
+				u.keptAsideTxCache.SetConflicting(hash, tx)
+			}
+		} else if m.Conflicting {
 			u.policyRejectedTxCache.SetConflicting(hash, tx)
 		} else {
 			u.policyRejectedTxCache.Set(hash, tx)
@@ -235,14 +247,14 @@ func (u *Server) policyRejectedTxMessageHandler(_ context.Context) func(msg *kaf
 // lookupPolicyRejectedTxs checks the policy-rejected cache for missing transactions
 // and returns any that were found, along with the hashes that are still missing.
 func (u *Server) lookupPolicyRejectedTxs(missingTxHashes []missingTxHash) (found []missingTx, stillMissing []missingTxHash) {
-	if u.policyRejectedTxCache == nil {
+	if u.policyRejectedTxCache == nil && u.keptAsideTxCache == nil {
 		return nil, missingTxHashes
 	}
 
 	stillMissing = make([]missingTxHash, 0, len(missingTxHashes))
 
 	for _, mth := range missingTxHashes {
-		tx, ok := u.policyRejectedTxCache.Get(mth.hash)
+		tx, ok := u.cachedRejectedTx(mth.hash)
 		if ok {
 			found = append(found, missingTx{tx: tx, idx: mth.idx})
 		} else {
@@ -257,4 +269,50 @@ func (u *Server) lookupPolicyRejectedTxs(missingTxHashes []missingTxHash) (found
 type missingTxHash struct {
 	hash chainhash.Hash
 	idx  int
+}
+
+// cachedRejectedTx returns a copy of a tx from the policy-rejected or the kept-aside cache.
+func (u *Server) cachedRejectedTx(hash chainhash.Hash) (*bt.Tx, bool) {
+	if u.policyRejectedTxCache != nil {
+		if tx, ok := u.policyRejectedTxCache.Get(hash); ok {
+			return tx, true
+		}
+	}
+
+	if u.keptAsideTxCache != nil {
+		return u.keptAsideTxCache.Get(hash)
+	}
+
+	return nil, false
+}
+
+// conflictingTx reports whether hash is known as conflicting: rejected as conflicting by a
+// validator, or kept aside by subtree validation as a descendant of one.
+func (u *Server) conflictingTx(hash chainhash.Hash) (*bt.Tx, bool) {
+	if u.policyRejectedTxCache != nil {
+		if tx, ok := u.policyRejectedTxCache.Conflicting(hash); ok {
+			return tx, true
+		}
+	}
+
+	if u.keptAsideTxCache != nil {
+		return u.keptAsideTxCache.Conflicting(hash)
+	}
+
+	return nil, false
+}
+
+// conflictingCount returns how many of hashes are known as conflicting.
+func (u *Server) conflictingCount(hashes []chainhash.Hash) int {
+	n := 0
+
+	if u.policyRejectedTxCache != nil {
+		n += u.policyRejectedTxCache.ConflictingCount(hashes)
+	}
+
+	if u.keptAsideTxCache != nil {
+		n += u.keptAsideTxCache.ConflictingCount(hashes)
+	}
+
+	return n
 }
