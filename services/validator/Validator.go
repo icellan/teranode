@@ -789,6 +789,14 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 		if errors.Is(err, errors.ErrTxPolicy) {
 			v.publishPolicyRejectedTx(ctx, ctxLogger, tx, err)
 		}
+
+		// Publish a transaction rejected as conflicting on the same topic, flagged, so
+		// subtree validation can keep it aside when a peer subtree contains it, instead
+		// of writing it to the UTXO store before a block with proof of work references
+		// it. txMetaData is set when the block path stored it as conflicting; skip those.
+		if txMetaData == nil && (errors.Is(err, errors.ErrSpent) || errors.Is(err, errors.ErrTxConflicting)) {
+			v.publishRejectedTx(ctx, ctxLogger, tx, err, true)
+		}
 	}
 
 	return txMetaData, err
@@ -799,6 +807,13 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 // to populate a local cache, avoiding expensive HTTP fetches when a subtree from another
 // miner contains transactions our node rejected on policy grounds.
 func (v *Validator) publishPolicyRejectedTx(ctx context.Context, ctxLogger ulogger.Logger, tx *bt.Tx, validationErr error) {
+	v.publishRejectedTx(ctx, ctxLogger, tx, validationErr, false)
+}
+
+// publishRejectedTx publishes a rejected transaction's raw bytes on the policy-rejected
+// topic. conflicting marks a transaction rejected because an input is already spent by
+// a different transaction, rather than one rejected on policy.
+func (v *Validator) publishRejectedTx(ctx context.Context, ctxLogger ulogger.Logger, tx *bt.Tx, validationErr error, conflicting bool) {
 	if v.policyRejectedTxKafkaProducerClient == nil {
 		return
 	}
@@ -834,8 +849,9 @@ func (v *Validator) publishPolicyRejectedTx(ctx context.Context, ctxLogger ulogg
 
 	m := &kafkamessage.KafkaTxPolicyRejectedTopicMessage{
 		TxHash: txHash.CloneBytes(),
-		RawTx:  tx.SerializeBytes(),
-		Reason: validationErr.Error(),
+		RawTx:       tx.SerializeBytes(),
+		Reason:      validationErr.Error(),
+		Conflicting: conflicting,
 	}
 
 	value, marshalErr := proto.Marshal(m)
