@@ -565,9 +565,10 @@ func (u *Server) blessMissing(ctx context.Context, blockHash chainhash.Hash, sub
 		u.logger.Warnf("[blessMissingTransaction][%s/%s][%s] transaction is conflicting", blockHash.String(), subtreeHash.String(), tx.TxID())
 	}
 
-	// Not recoverable, returning processing error
+	// Not recoverable, returning processing error. A conflicting rejection reaches this
+	// point with err set; wrap it so callers can still tell it apart.
 	if txMeta == nil {
-		return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] tx meta is nil", blockHash.String(), subtreeHash.String(), tx.TxID())
+		return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] tx meta is nil", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
 	}
 
 	// check whether this transaction was already mined on our chain by comparing the block ids
@@ -715,6 +716,9 @@ type metaSliceItem struct {
 	creating    bool
 	isSet       bool
 	txInpoints  subtreepkg.TxInpoints
+	// keptAside marks a tx of a peer subtree that conflicts with a tx this node accepted,
+	// or descends from one. It is not validated or stored until a block references it.
+	keptAside bool
 }
 
 // ValidateSubtreeInternal performs the actual validation of a subtree.
@@ -1353,6 +1357,49 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 		firstErrorOnce sync.Once
 	)
 
+	// Without CreateConflicting this is a peer subtree with no proof of work behind it, so a
+	// tx that conflicts with one this node accepted must not be written to the UTXO store.
+	// It is kept aside, with its descendants, until a block references the subtree.
+	keepAside := !processedValidatorOptions.CreateConflicting
+
+	var (
+		keptAsideMu sync.Mutex
+		keptAside   = make(map[chainhash.Hash]struct{})
+	)
+
+	setKeptAside := func(tx *bt.Tx, txIdx int) {
+		keptAsideMu.Lock()
+		keptAside[*tx.TxIDChainHash()] = struct{}{}
+		keptAsideMu.Unlock()
+
+		txMetaSlice[txIdx] = metaSliceItem{keptAside: true}
+	}
+
+	// hasKeptAsideParent reports whether tx spends a tx kept aside in an earlier level of this
+	// subtree, or one the validator rejected as conflicting. Parents are always in an earlier
+	// level, so the set is complete for this tx's inputs.
+	hasKeptAsideParent := func(tx *bt.Tx) bool {
+		for _, input := range tx.Inputs {
+			parentHash := *input.PreviousTxIDChainHash()
+
+			keptAsideMu.Lock()
+			_, ok := keptAside[parentHash]
+			keptAsideMu.Unlock()
+
+			if ok {
+				return true
+			}
+
+			if u.policyRejectedTxCache != nil {
+				if _, ok = u.policyRejectedTxCache.Conflicting(parentHash); ok {
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+
 	// Pre-warm the MTP store once before spawning per-transaction goroutines, so each goroutine
 	// can read mtpStore[h] without locking and without making gRPC calls.
 	if err = u.validatorClient.EnsureMTPLoaded(ctx, blockHeight); err != nil {
@@ -1380,6 +1427,11 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 
 			// process each transaction in the background, since the transactions are all batched into the utxo store
 			g.Go(func() error {
+				if keepAside && hasKeptAsideParent(tx) {
+					setKeptAside(tx, txIdx)
+					return nil
+				}
+
 				txMeta, unlockFailed, err := u.blessMissing(gCtx, chainhash.Hash{}, subtreeHash, tx, blockHeight, blockIds, processedValidatorOptions)
 
 				// Queue an accepted-but-locked parent for this level's unlock retry BEFORE
@@ -1393,6 +1445,11 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 					lockedMu.Lock()
 					lockedHashes = append(lockedHashes, *tx.TxIDChainHash())
 					lockedMu.Unlock()
+				}
+
+				if err != nil && keepAside && (errors.Is(err, errors.ErrSpent) || errors.Is(err, errors.ErrTxConflicting)) {
+					setKeptAside(tx, txIdx)
+					return nil
 				}
 
 				if err != nil {
