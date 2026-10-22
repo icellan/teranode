@@ -907,14 +907,14 @@ var checkedRowsPerDoc = map[string]int{
 	"legacy_settings.md":            28,
 	"p2p_settings.md":               46,
 	"propagation_settings.md":       13,
-	"pruner_settings.md":            26,
+	"pruner_settings.md":            25,
 	"rpc_settings.md":               11,
 	"subtreevalidation_settings.md": 25,
 	"utxopersister_settings.md":     2,
 	"validator_settings.md":         17,
 	"aerospike_settings.md":         13,
 	"blob_settings.md":              1,
-	"utxo_settings.md":              39,
+	"utxo_settings.md":              38,
 }
 
 // exampleKeyRe matches a `key = value` or `key=value` assignment inside the

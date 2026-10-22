@@ -199,9 +199,9 @@ func NewSettings(alternativeContext ...string) *Settings {
 		Alert: AlertSettings{
 			GenesisKeys:              getMultiString("alert_genesis_keys", "|", []string{}, alternativeContext...),
 			P2PPrivateKey:            getString("alert_p2p_private_key", "", alternativeContext...),
-			ProtocolID:               getString("alert_protocol_id", "/bitcoin/alert-system/1.0.0", alternativeContext...),
+			ProtocolID:               getString("alert_protocol_id", "", alternativeContext...),
 			StoreURL:                 getURL("alert_store", "sqlite:///alert", alternativeContext...),
-			TopicName:                getString("alert_topic_name", "bitcoin_alert_system", alternativeContext...),
+			TopicName:                getString("alert_topic_name", "", alternativeContext...),
 			P2PPort:                  getPort("ALERT_P2P_PORT", 9908, alternativeContext...),
 			P2PBootstrapPeer:         getString("alert_p2p_bootstrap_peer", "", alternativeContext...),
 			P2PAllowPrivateIPs:       getBool("alert_p2p_allow_private_ips", false, alternativeContext...),
@@ -559,7 +559,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			ExternalStoreConcurrency:                getInt("utxostore_externalStoreConcurrency", 16, alternativeContext...),
 			PostgresPool:                            getPostgresPoolSettings("utxostore", alternativeContext...),
 			VerboseDebug:                            getBool("utxostore_verbose_debug", false, alternativeContext...),
-			UpdateTxMinedStatus:                     getBool("utxostore_updateTxMinedStatus", true, alternativeContext...),
 			MaxMinedRoutines:                        getInt("utxostore_maxMinedRoutines", 128, alternativeContext...),
 			MaxMinedBatchSize:                       getInt("utxostore_maxMinedBatchSize", 1024, alternativeContext...),
 			BlockHeightRetentionAdjustment:          getInt32("utxostore_blockHeightRetentionAdjustment", 0, alternativeContext...),
@@ -702,7 +701,6 @@ func NewSettings(alternativeContext ...string) *Settings {
 			SkipProcessExpiredPreservations: getBool("pruner_skipProcessExpiredPreservations", false, alternativeContext...),      // Skip Phase 1b: expire old parent preservations
 			SkipDeletions:                   getBool("pruner_skipDeletions", false, alternativeContext...),                        // Skip deletions for performance
 			MinBlockHeight:                  getUint32("pruner_min_block_height", 0, alternativeContext...),                       // Do not prune blocks at or below this height
-			UTXOPrunedSetMaxEntries:         getInt("pruner_utxoPrunedSetMaxEntries", 10_000_000, alternativeContext...),          // Soft cap on PrunedTxSet entries; 0 = use built-in 2B default (NOT unlimited)
 		},
 		SubtreeValidation: SubtreeValidationSettings{
 			QuorumAbsoluteTimeout:                     getDuration("subtree_quorum_absolute_timeout", 30*time.Second, alternativeContext...),

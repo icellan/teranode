@@ -18,6 +18,11 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — action required before upgrading
 
+- **`CheckBlockSubtrees` gRPC errors keep Teranode error codes.** Storage and
+  consensus errors include gRPC status metadata. Invalid URLs give `InvalidArgument`
+  status. External clients must use `errors.UnwrapGRPC` to read the error chain
+  and must accept these status codes. Teranode clients can read this format. (#1650)
+
 - **`grpc_admin_api_key` is now mandatory for the Blockchain service.** The service
   validates it at startup and refuses to start when it is empty, is a well-known
   placeholder (`testkey`, `changeme`, …), or is shorter than 16 characters. A value
@@ -81,6 +86,24 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   until it is reimaged. No chain state is corrupted. Upgrade Blockchain last, or raise
   `blockchain_maxMedianTimePastHeights` for the duration of the rollout. (#1776)
 
+- **The alert service now picks its network identity by `network`, and validates
+  `alert_genesis_keys`.** `alert_genesis_keys`, `alert_protocol_id` and `alert_topic_name`
+  default to empty, and each empty one takes the go-alert-system default for the
+  configured network: testnet and stn nodes now join their own alert network
+  (`/bitcoin-testnet/alert-system/0.0.1`, testnet genesis keys) instead of the mainnet
+  protocol and keys. Mainnet resolves to the same values as before. Regtest, teratestnet
+  and tstn keep the mainnet keys and protocol on `bitcoin_alert_system_<network>` and log
+  a warning. A non-empty `alert_topic_name` is now honoured on every network.
+
+  Affects testnet/stn nodes and any deployment that sets these keys. Clear values copied
+  from the old mainnet defaults into `settings_local.conf`, helm values or env, or a
+  testnet node stays on the mainnet alert network. An explicit `alert_genesis_keys` must
+  now hold 3 to 10 hex-encoded compressed public keys (blank entries are dropped, repeats
+  kept once), or the alert service fails to start with a configuration error. An alert
+  store that holds only the genesis alert and was seeded with other keys (a testnet or stn
+  store from v0.16.x or earlier) has its active keys reset to the resolved genesis keys on
+  first start, with a warning; there is no need to delete `alert.db`. (#1955)
+
 ### Breaking — behaviour changes on upgrade
 
 - **Blocks whose cached subtrees hold a tx the store flags conflicting are now rejected.**
@@ -104,6 +127,20 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   Subtree validation now refuses to start when the txmeta cache cannot be built
   (including a non-positive `subtreevalidation_txMetaTombstoneWindow`). It used to
   log the failure and run with no store, then panic on first use.
+
+- **`utxostore_updateTxMinedStatus` is removed, and it was live.** Affects only nodes that
+  set it to `false`. Mined-tagging, the step after `AddBlock` that writes a block's ID onto
+  each of its transactions, now always runs. So does the check it carries, which rejects a
+  block that re-includes a transaction an ancestor block already mined. With the key at
+  `false`, neither ran, yet the block was still flagged as mined. The loader does not report
+  unknown keys, so a leftover `false` is ignored without an error and those nodes take on
+  the mined-tagging write load again. Delete the key from your config. (#2019)
+
+- **This release removes four Aerospike pruner metrics.** External monitoring systems must
+  remove queries for `utxo_pruner_parents_skipped_pruned_total`,
+  `utxo_pruner_pruned_set_size`, `utxo_pruner_pruned_set_saturated`, and
+  `utxo_pruner_pruned_set_rotations`. These metrics reported zero because the pruner
+  no longer skipped parents. After this upgrade, their queries give no data. (#1969)
 
 - **Peer-announced subtrees are validated at most 32 at a time.** The new
   `subtreevalidation_peerSubtreeConcurrency` (default 32) bounds how many peer
@@ -398,6 +435,13 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `ERR_SERVICE_ERROR` (59). The new code is retryable and is not a transient local error. Code
   matching `ErrServiceError` on a 429, or log alerts on `SERVICE_ERROR (59)`, will miss it; an older
   service receiving it over gRPC sees an unknown enum value. Upgrade services together. (#1802)
+
+- **A peer's 429 on an announced block is free only 3 times per 10 minutes.** When a peer announces
+  a block and its `/block/:hash` answers 429, that 429 is not charged to its reputation up to 3 times
+  per peer in a fixed 10-minute window; past that it is charged like any other failed fetch. Within
+  the allowance, the block is fetched instead from up to 2 other peers whose advertised tip is that
+  block, so those peers can see `/block/:hash` requests for blocks they did not announce to us.
+  (#1942)
 
 - **Catchup fetches retry a peer's 429.** `POST /subtree/:hash/txs` and `GET /subtree_data` retry 429
   and 503 up to 6 times with backoff (honouring `Retry-After` up to 5s) instead of reporting the
