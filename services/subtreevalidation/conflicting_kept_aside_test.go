@@ -51,6 +51,19 @@ func (r *delegatingRecorder) ValidateWithOptions(ctx context.Context, tx *bt.Tx,
 	return r.Interface.ValidateWithOptions(ctx, tx, blockHeight, opts)
 }
 
+// total returns how many validator calls were made, over all transactions.
+func (r *delegatingRecorder) total() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	n := 0
+	for _, calls := range r.calls {
+		n += len(calls)
+	}
+
+	return n
+}
+
 func (r *delegatingRecorder) validated(h chainhash.Hash) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -236,12 +249,12 @@ func TestValidateSubtreeInternal_PeerSubtreeWithConflictingTxs(t *testing.T) {
 	require.NoError(t, f.store.GetMeta(t.Context(), f.other.TxIDChainHash(), &meta.Data{}), "the rest of the subtree is validated as before")
 
 	// a second announcement of the same subtree is not validated again
-	calls := len(f.recorder.calls)
+	calls := f.recorder.total()
 
 	subtree, err = server.ValidateSubtreeInternal(t.Context(), v, 101, map[uint32]bool{})
 	require.NoError(t, err)
 	require.Nil(t, subtree)
-	require.Equal(t, calls, len(f.recorder.calls))
+	require.Equal(t, calls, f.recorder.total())
 }
 
 // TestLoadSubtreeBatch_LoadsKeptAsideTxsInsteadOfSubtreeData pins that the block path's
@@ -302,6 +315,8 @@ func TestValidateSubtreeInternal_KnownConflictingTxsDoNotTriggerRetryWait(t *tes
 	f.settings.BlockValidation.ValidationMaxRetries = 2
 	f.settings.BlockValidation.RetrySleep = 50 * time.Millisecond
 	f.settings.SubtreeValidation.ProcessTxMetaUsingCacheMissingTxThreshold = 1
+	f.settings.BlockValidation.ProcessTxMetaUsingStoreMissingTxThreshold = 1
+	f.settings.BlockValidation.SubtreeValidationAbandonThreshold = 1
 
 	// New wraps the UTXO store in the txmeta cache, which the fail-fast probe reads
 	server, subtreeStore := f.newServer(t)
@@ -445,7 +460,6 @@ func TestBlessMissingTransactions_KeepsConflictingAside(t *testing.T) {
 		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{})
 		require.NoError(t, err)
 		require.True(t, txMetaSlice[0].keptAside)
-		require.False(t, f.recorder.validated(*f.child.TxIDChainHash()))
 		f.requireNotStored(t, f.child)
 	})
 
@@ -463,6 +477,30 @@ func TestBlessMissingTransactions_KeepsConflictingAside(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, txMetaSlice[0].keptAside)
 		f.requireNotStored(t, f.child)
+	})
+
+	t.Run("a stale conflicting flag does not keep a valid child aside", func(t *testing.T) {
+		f := newConflictingFixture(t)
+
+		// the winner is accepted in the store, but cached as conflicting, as after a
+		// reorg made a cached loser win
+		f.server.policyRejectedTxCache.SetConflicting(*f.winner.TxIDChainHash(), f.winner)
+
+		privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("CONFLICTING_KEPT_ASIDE_TEST_KEY!"))
+		winnerChild := transactions.Create(t,
+			transactions.WithPrivateKey(privateKey),
+			transactions.WithInput(f.winner, 0, privateKey),
+			transactions.WithP2PKHOutputs(1, 85_000, publicKey),
+		)
+
+		missing := []missingTx{{tx: winnerChild, idx: 0}}
+		txMetaSlice := make([]metaSliceItem, len(missing))
+
+		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{})
+		require.NoError(t, err)
+		require.False(t, txMetaSlice[0].keptAside, "a child whose parent is in the store is validated, whatever the cache says")
+		require.True(t, txMetaSlice[0].isSet)
+		require.NoError(t, f.store.GetMeta(t.Context(), winnerChild.TxIDChainHash(), &meta.Data{}))
 	})
 
 	t.Run("child whose parent is unknown still fails", func(t *testing.T) {

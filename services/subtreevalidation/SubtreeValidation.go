@@ -906,7 +906,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			return nil, err
 		}
 
-		if failFast && abandonTxThreshold > 0 && missed > abandonTxThreshold {
+		if failFast && abandonTxThreshold > 0 && missed > abandonTxThreshold+int(missAllowance) {
 			// Not recoverable, returning processing error
 			return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] [attempt #%d] failed to get tx meta from cache", v.SubtreeHash.String(), attempt, err)
 		}
@@ -1417,24 +1417,32 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 	}
 
 	// hasKeptAsideParent reports whether tx spends a tx kept aside in an earlier level of this
-	// subtree, or one the validator rejected as conflicting. Parents are always in an earlier
-	// level, so the set is complete for this tx's inputs.
+	// subtree. Parents are always in an earlier level, so the set is complete for this tx's
+	// inputs, and such a parent is never in the UTXO store.
 	hasKeptAsideParent := func(tx *bt.Tx) bool {
+		keptAsideMu.Lock()
+		defer keptAsideMu.Unlock()
+
 		for _, input := range tx.Inputs {
-			parentHash := *input.PreviousTxIDChainHash()
-
-			keptAsideMu.Lock()
-			_, ok := keptAside[parentHash]
-			keptAsideMu.Unlock()
-
-			if ok {
+			if _, ok := keptAside[*input.PreviousTxIDChainHash()]; ok {
 				return true
 			}
+		}
 
-			if u.policyRejectedTxCache != nil {
-				if _, ok = u.policyRejectedTxCache.Conflicting(parentHash); ok {
-					return true
-				}
+		return false
+	}
+
+	// hasConflictingParent reports whether tx spends a tx the validator rejected as
+	// conflicting. It is only asked once the validator found a parent missing: the cache
+	// is never cleared, so a parent that later won is in the store and must decide.
+	hasConflictingParent := func(tx *bt.Tx) bool {
+		if u.policyRejectedTxCache == nil {
+			return false
+		}
+
+		for _, input := range tx.Inputs {
+			if _, ok := u.policyRejectedTxCache.Conflicting(*input.PreviousTxIDChainHash()); ok {
+				return true
 			}
 		}
 
@@ -1488,7 +1496,8 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 					lockedMu.Unlock()
 				}
 
-				if err != nil && keepAside && (errors.Is(err, errors.ErrSpent) || errors.Is(err, errors.ErrTxConflicting)) {
+				if err != nil && keepAside && (errors.Is(err, errors.ErrSpent) || errors.Is(err, errors.ErrTxConflicting) ||
+					(errors.Is(err, errors.ErrTxMissingParent) && hasConflictingParent(tx))) {
 					setKeptAside(tx, txIdx)
 					return nil
 				}

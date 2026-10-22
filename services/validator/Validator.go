@@ -848,7 +848,7 @@ func (v *Validator) publishRejectedTx(ctx context.Context, ctxLogger ulogger.Log
 	txHash := tx.TxIDChainHash()
 
 	m := &kafkamessage.KafkaTxPolicyRejectedTopicMessage{
-		TxHash: txHash.CloneBytes(),
+		TxHash:      txHash.CloneBytes(),
 		RawTx:       tx.SerializeBytes(),
 		Reason:      validationErr.Error(),
 		Conflicting: conflicting,
