@@ -15,6 +15,7 @@ import (
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/adaptivefetch"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation/subtreevalidation_api"
@@ -1198,4 +1199,126 @@ func TestBlessMissingTransactions_ConflictingParentReadOncePerParent(t *testing.
 	_ = f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, []missingTx{{tx: tx, idx: 0}}, "", "", txMetaSlice, 101, map[uint32]bool{}, true)
 
 	require.Equal(t, int32(1), counter.n.Load())
+}
+
+// TestBlockPathValidatesKeptAsideSubtree pins the half of the design that makes keeping txs
+// aside safe: every block entry point validates a peer subtree stored with kept-aside txs,
+// creates them as conflicting and stores the subtree as validated. A block caller that lost
+// FromBlock or WithCreateConflicting would return success here with the subtree still
+// unvalidated.
+func TestBlockPathValidatesKeptAsideSubtree(t *testing.T) {
+	// withChild adds a child of the loser; only the paths that resolve same-block parents
+	// at the candidate height can validate it
+	keptAsideSubtree := func(t *testing.T, withChild bool, fetchMode string) (*conflictingFixture, *Server, blob.Store, chainhash.Hash) {
+		f := newConflictingFixture(t)
+		f.settings.AdaptiveFetch.BootstrapMode = fetchMode
+		server, subtreeStore := f.newServer(t)
+
+		// a node arms adaptive fetch once its FSM reaches RUNNING
+		server.adaptiveFetch.Arm()
+		require.Equal(t, fetchMode, server.adaptiveFetch.Mode().String())
+
+		txs := []*bt.Tx{f.loser, f.other}
+		if withChild {
+			txs = []*bt.Tx{f.loser, f.child, f.other}
+		}
+
+		root := servePeerSubtree(t, subtreeStore, txs...)
+		require.NoError(t, livePassFor(t, server, root))
+
+		exists, err := subtreeStore.Exists(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting)
+		require.NoError(t, err)
+		require.True(t, exists, "precondition: the peer pass kept txs aside")
+
+		// the kept-aside file is then the only local source of the kept-aside txs, as on a
+		// pod that did not run the peer pass, and the peer cannot serve them either
+		require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeData))
+		server.policyRejectedTxCache.clearForTest()
+		server.keptAsideTxCache.clearForTest()
+		httpmock.RegisterResponder("GET", `=~/subtree_data/[a-f0-9]{64}\z`, httpmock.NewStringResponder(404, "not found"))
+		httpmock.RegisterResponder("POST", `=~/subtree/[a-f0-9]{64}/txs\z`, httpmock.NewStringResponder(404, "not found"))
+
+		return f, server, subtreeStore, root
+	}
+
+	requireValidated := func(t *testing.T, f *conflictingFixture, subtreeStore blob.Store, root chainhash.Hash, withChild bool) {
+		exists, err := subtreeStore.Exists(t.Context(), root[:], fileformat.FileTypeSubtree)
+		require.NoError(t, err)
+		require.True(t, exists, "the block path stores the subtree as validated")
+
+		created := []*bt.Tx{f.loser}
+		if withChild {
+			created = append(created, f.child)
+		}
+
+		for _, tx := range created {
+			data := &meta.Data{}
+			require.NoError(t, f.store.GetMeta(t.Context(), tx.TxIDChainHash(), data), "the block path creates %s", tx.TxIDChainHash())
+			require.True(t, data.Conflicting, "%s is created as conflicting", tx.TxIDChainHash())
+		}
+	}
+
+	genesis := func(f *conflictingFixture) *chainhash.Hash {
+		return f.settings.ChainCfgParams.GenesisHash
+	}
+
+	// the peer-facing branch does not resolve same-block parents at the candidate height, by
+	// design, so its subtree holds no child; the legacy branch and CheckBlockSubtrees do
+	for _, baseURL := range []string{"http://peer.invalid", "legacy"} {
+		t.Run("checkSubtreeFromBlock "+baseURL, func(t *testing.T) {
+			withChild := baseURL == "legacy"
+			f, server, subtreeStore, root := keptAsideSubtree(t, withChild, "pessimistic")
+
+			blockHash := chainhash.HashH([]byte("kept aside block"))
+
+			ok, err := server.checkSubtreeFromBlock(t.Context(), &subtreevalidation_api.CheckSubtreeFromBlockRequest{
+				Hash:              root[:],
+				BaseUrl:           baseURL,
+				BlockHeight:       101,
+				BlockHash:         blockHash[:],
+				PreviousBlockHash: genesis(f)[:],
+			})
+			require.NoError(t, err)
+			require.True(t, ok)
+
+			requireValidated(t, f, subtreeStore, root, withChild)
+		})
+	}
+
+	// optimistic fetch skips the prewarm, so the kept-aside txs are created by the
+	// per-subtree validation instead
+	for _, fetchMode := range []string{"pessimistic", "optimistic"} {
+		t.Run("CheckBlockSubtrees "+fetchMode, func(t *testing.T) {
+			f, server, subtreeStore, root := keptAsideSubtree(t, true, fetchMode)
+
+			header := &model.BlockHeader{
+				Version:        1,
+				HashPrevBlock:  genesis(f),
+				HashMerkleRoot: &chainhash.Hash{},
+				Timestamp:      uint32(time.Now().Unix()), //nolint:gosec
+				Bits:           model.NBit{},
+			}
+
+			block, err := model.NewBlock(header, &bt.Tx{Version: 1}, []*chainhash.Hash{&root}, 4, 1000, 101, 0)
+			require.NoError(t, err)
+
+			blockBytes, err := block.Bytes()
+			require.NoError(t, err)
+
+			resp, err := server.CheckBlockSubtrees(t.Context(), &subtreevalidation_api.CheckBlockSubtreesRequest{Block: blockBytes, BaseUrl: "http://peer.invalid"})
+			require.NoError(t, err)
+			require.True(t, resp.Blessed)
+
+			requireValidated(t, f, subtreeStore, root, true)
+		})
+	}
+}
+
+// clearForTest empties the cache, as on a pod that never saw its entries.
+func (c *txPolicyRejectedCache) clearForTest() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.entries = make(map[chainhash.Hash]cacheEntry)
+	c.curBytes = 0
 }
