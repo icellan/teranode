@@ -1521,7 +1521,9 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 					lockedMu.Unlock()
 				}
 
-				if err != nil && keepAside && (errors.Is(err, errors.ErrSpent) || errors.Is(err, errors.ErrTxConflicting)) {
+				// The validator marks a rejection conflicting only when every failed input is
+				// spent by a different tx; a tx with an input that is invalid otherwise fails.
+				if err != nil && keepAside && errors.Is(err, errors.ErrTxConflicting) {
 					setKeptAside(tx, txIdx)
 					return nil
 				}

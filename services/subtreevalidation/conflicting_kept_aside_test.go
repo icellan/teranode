@@ -87,6 +87,9 @@ type conflictingFixture struct {
 	child    *bt.Tx
 	// other spends an unrelated mined output and conflicts with nothing
 	other *bt.Tx
+	// parent is the mined tx winner and loser both spend
+	parent     *bt.Tx
+	privateKey *bec.PrivateKey
 }
 
 func newConflictingFixture(t *testing.T) *conflictingFixture {
@@ -164,7 +167,7 @@ func newConflictingFixture(t *testing.T) *conflictingFixture {
 		policyRejectedTxCache: newTxPolicyRejectedCache(1024 * 1024),
 	}
 
-	return &conflictingFixture{server: server, store: store, recorder: recorder, settings: tSettings, winner: winner, loser: loser, child: child, other: other}
+	return &conflictingFixture{server: server, store: store, recorder: recorder, settings: tSettings, winner: winner, loser: loser, child: child, other: other, parent: parent, privateKey: privateKey}
 }
 
 // newServer builds a full subtree validation server over the fixture's store and real
@@ -641,6 +644,40 @@ func TestValidateSubtreeInternal_KeptAsideEdgeCases(t *testing.T) {
 		exists, err := subtreeStore.Exists(t.Context(), root[:], fileformat.FileTypeSubtreeToCheck)
 		require.NoError(t, err)
 		require.True(t, exists)
+	})
+
+	t.Run("a tx with a frozen input besides the spent one is not kept aside", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		server, subtreeStore := f.newServer(t)
+
+		frozenParent := transactions.Create(t,
+			transactions.WithCoinbaseData(3, "/conflicting kept aside test frozen/"),
+			transactions.WithP2PKHOutputs(1, 100_000, f.privateKey.PubKey()),
+		)
+		_, err := f.store.Create(t.Context(), frozenParent, 3, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 3, BlockHeight: 3, SubtreeIdx: 0}))
+		require.NoError(t, err)
+
+		utxoHash, err := util.UTXOHashFromOutput(frozenParent.TxIDChainHash(), frozenParent.Outputs[0], 0)
+		require.NoError(t, err)
+		require.NoError(t, f.store.FreezeUTXOs(t.Context(), []*utxostore.Spend{{TxID: frozenParent.TxIDChainHash(), Vout: 0, UTXOHash: utxoHash}}, f.settings))
+
+		invalid := transactions.Create(t,
+			transactions.WithPrivateKey(f.privateKey),
+			transactions.WithInput(f.parent, 0, f.privateKey),
+			transactions.WithInput(frozenParent, 0, f.privateKey),
+			transactions.WithP2PKHOutputs(1, 150_000, f.privateKey.PubKey()),
+		)
+
+		root := servePeerSubtree(t, subtreeStore, invalid, f.other)
+
+		require.Error(t, livePass(t, server, root), "the subtree fails as before kept-aside txs existed")
+
+		exists, err := subtreeStore.Exists(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting)
+		require.NoError(t, err)
+		require.False(t, exists)
+
+		_, known := server.conflictingTx(*invalid.TxIDChainHash())
+		require.False(t, known, "an invalid tx is not cached as conflicting")
 	})
 
 	t.Run("a stale sidecar left by an interrupted pass is replaced", func(t *testing.T) {

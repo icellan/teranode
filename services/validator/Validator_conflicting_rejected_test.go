@@ -12,6 +12,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/bsv-blockchain/teranode/ulogger"
+	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -105,5 +106,104 @@ func TestConflictingRejectionIsPublished(t *testing.T) {
 			t.Fatalf("a tx stored as conflicting must not be published, got %d bytes", len(msg.Value))
 		default:
 		}
+	})
+}
+
+// TestConflictingRejectionNeedsEveryFailedSpendToConflict pins that a rejection is only
+// marked conflicting when every input that failed to spend is spent by a different tx.
+// A tx that also spends a frozen output is invalid, not merely a double spend: it is not
+// published as conflicting, so subtree validation does not keep it aside.
+func TestConflictingRejectionNeedsEveryFailedSpendToConflict(t *testing.T) {
+	newFixture := func(t *testing.T, name string) (*Validator, *kafka.KafkaAsyncProducerMock, *bt.Tx, *bec.PrivateKey, *bec.PublicKey) {
+		ctx := t.Context()
+		logger := ulogger.NewErrorTestLogger(t)
+		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockAssembly.Disabled = true
+
+		utxoStoreURL, err := url.Parse("sqlitememory:///" + name)
+		require.NoError(t, err)
+
+		utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+		require.NoError(t, err)
+		utxoStore.RawDB().SetMaxOpenConns(1)
+		require.NoError(t, utxoStore.SetBlockHeight(100))
+		require.NoError(t, utxoStore.SetMedianBlockTime(uint32(time.Now().Unix()))) //nolint:gosec
+
+		privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("CONFLICTING_FROZEN_TEST_KEY!!!!!"))
+		parentTx := transactions.Create(t,
+			transactions.WithCoinbaseData(1, "/conflicting frozen test/"),
+			transactions.WithP2PKHOutputs(2, 100_000, publicKey),
+		)
+		_, err = utxoStore.Create(ctx, parentTx, 1, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 1, BlockHeight: 1, SubtreeIdx: 0}))
+		require.NoError(t, err)
+
+		utxoHash, err := util.UTXOHashFromOutput(parentTx.TxIDChainHash(), parentTx.Outputs[1], 1)
+		require.NoError(t, err)
+		require.NoError(t, utxoStore.FreezeUTXOs(ctx, []*utxostore.Spend{{TxID: parentTx.TxIDChainHash(), Vout: 1, UTXOHash: utxoHash}}, tSettings))
+
+		producer := kafka.NewKafkaAsyncProducerMock()
+
+		validator, err := New(ctx, logger, tSettings, utxoStore, nil, nil, producer, nil, nil)
+		require.NoError(t, err)
+
+		v := validator.(*Validator)
+
+		winner := transactions.Create(t,
+			transactions.WithPrivateKey(privateKey),
+			transactions.WithInput(parentTx, 0, privateKey),
+			transactions.WithP2PKHOutputs(1, 90_000, publicKey),
+		)
+		_, err = v.Validate(ctx, winner, 100)
+		require.NoError(t, err)
+
+		return v, producer, parentTx, privateKey, publicKey
+	}
+
+	requireNotPublished := func(t *testing.T, producer *kafka.KafkaAsyncProducerMock) {
+		select {
+		case msg := <-producer.PublishChannel():
+			t.Fatalf("expected nothing published, got %d bytes", len(msg.Value))
+		default:
+		}
+	}
+
+	t.Run("only conflicting spends", func(t *testing.T) {
+		v, producer, parentTx, privateKey, publicKey := newFixture(t, "conflicting_only")
+
+		loser := transactions.Create(t,
+			transactions.WithPrivateKey(privateKey),
+			transactions.WithInput(parentTx, 0, privateKey),
+			transactions.WithP2PKHOutputs(1, 80_000, publicKey),
+		)
+
+		_, err := v.Validate(t.Context(), loser, 100)
+		require.True(t, errors.Is(err, errors.ErrTxConflicting), "every failed spend conflicts: %v", err)
+
+		select {
+		case msg := <-producer.PublishChannel():
+			var m kafkamessage.KafkaTxPolicyRejectedTopicMessage
+			require.NoError(t, proto.Unmarshal(msg.Value, &m))
+			require.True(t, m.Conflicting)
+		default:
+			t.Fatal("expected the rejected conflicting tx to be published")
+		}
+	})
+
+	t.Run("a conflicting and a frozen spend", func(t *testing.T) {
+		v, producer, parentTx, privateKey, publicKey := newFixture(t, "conflicting_and_frozen")
+
+		loser := transactions.Create(t,
+			transactions.WithPrivateKey(privateKey),
+			transactions.WithInput(parentTx, 0, privateKey),
+			transactions.WithInput(parentTx, 1, privateKey),
+			transactions.WithP2PKHOutputs(1, 180_000, publicKey),
+		)
+
+		_, err := v.Validate(t.Context(), loser, 100)
+		require.True(t, errors.Is(err, errors.ErrFrozen), "the frozen input fails: %v", err)
+		require.True(t, errors.Is(err, errors.ErrSpent), "the spent input fails: %v", err)
+		require.False(t, errors.Is(err, errors.ErrTxConflicting), "a frozen input makes the tx invalid, not merely conflicting: %v", err)
+
+		requireNotPublished(t, producer)
 	})
 }
