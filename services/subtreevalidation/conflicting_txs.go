@@ -50,29 +50,38 @@ func readConflictingTxs(b []byte) ([]*bt.Tx, error) {
 	return txs, nil
 }
 
+// readKeptAside reads the txs kept aside next to subtreeHash. found is false when there is
+// no such file, or when it is unreadable: content that cannot be read only spares a peer
+// request, so the caller then fetches the txs as before. A storage error halts.
+func (u *Server) readKeptAside(ctx context.Context, subtreeHash chainhash.Hash) (txs []*bt.Tx, found bool, err error) {
+	b, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting)
+	if err != nil {
+		if errors.Is(err, errors.ErrNotFound) {
+			return nil, false, nil
+		}
+
+		return nil, false, errors.NewStorageError("[readKeptAside][%s] failed to read kept-aside conflicting txs", subtreeHash.String(), err)
+	}
+
+	txs, err = readConflictingTxs(b)
+	if err != nil {
+		u.logger.Warnf("[readKeptAside][%s] ignoring unreadable kept-aside conflicting txs: %v", subtreeHash.String(), err)
+		return nil, false, nil
+	}
+
+	return txs, true, nil
+}
+
 // lookupConflictingTxs resolves missing txs from the txs kept aside next to the subtree,
 // if any. A tx only matches the hash it hashes to, so the file cannot substitute one tx
 // for another; every tx it supplies is still validated.
 func (u *Server) lookupConflictingTxs(ctx context.Context, subtreeHash chainhash.Hash, missingTxHashes []utxo.UnresolvedMetaData) (found []missingTx, stillMissing []utxo.UnresolvedMetaData, err error) {
-	exists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting)
+	txs, ok, err := u.readKeptAside(ctx, subtreeHash)
 	if err != nil {
-		return nil, nil, errors.NewStorageError("[lookupConflictingTxs][%s] failed to check for kept-aside conflicting txs", subtreeHash.String(), err)
+		return nil, nil, err
 	}
 
-	if !exists {
-		return nil, missingTxHashes, nil
-	}
-
-	// A storage error halts; unreadable content only spares a peer request, so then the
-	// peer is asked as before.
-	b, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting)
-	if err != nil {
-		return nil, nil, errors.NewStorageError("[lookupConflictingTxs][%s] failed to read kept-aside conflicting txs", subtreeHash.String(), err)
-	}
-
-	txs, err := readConflictingTxs(b)
-	if err != nil {
-		u.logger.Warnf("[lookupConflictingTxs][%s] ignoring unreadable kept-aside conflicting txs: %v", subtreeHash.String(), err)
+	if !ok {
 		return nil, missingTxHashes, nil
 	}
 
@@ -96,26 +105,11 @@ func (u *Server) lookupConflictingTxs(ctx context.Context, subtreeHash chainhash
 // every one of them is a node of subtree. Otherwise ok is false and the caller loads the
 // subtree's txs the usual way.
 func (u *Server) subtreeConflictingTxs(ctx context.Context, subtree *subtreepkg.Subtree) (txs []*bt.Tx, ok bool, err error) {
-	subtreeHash := subtree.RootHash()
+	subtreeHash := *subtree.RootHash()
 
-	exists, err := u.subtreeStore.Exists(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting)
-	if err != nil {
-		return nil, false, errors.NewStorageError("[subtreeConflictingTxs][%s] failed to check for kept-aside conflicting txs", subtreeHash.String(), err)
-	}
-
-	if !exists {
-		return nil, false, nil
-	}
-
-	b, err := u.subtreeStore.Get(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting)
-	if err != nil {
-		return nil, false, errors.NewStorageError("[subtreeConflictingTxs][%s] failed to read kept-aside conflicting txs", subtreeHash.String(), err)
-	}
-
-	txs, err = readConflictingTxs(b)
-	if err != nil {
-		u.logger.Warnf("[subtreeConflictingTxs][%s] ignoring unreadable kept-aside conflicting txs: %v", subtreeHash.String(), err)
-		return nil, false, nil
+	txs, ok, err = u.readKeptAside(ctx, subtreeHash)
+	if err != nil || !ok {
+		return nil, false, err
 	}
 
 	pending := make(map[chainhash.Hash]struct{}, len(txs))

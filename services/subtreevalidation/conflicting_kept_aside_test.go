@@ -1345,3 +1345,142 @@ func TestBlessMissingTransactions_KeptAsideTxsAreKnownAtOnce(t *testing.T) {
 		require.False(t, cached.IsExtended())
 	}
 }
+
+// faultySubtreeStore fails the calls for chosen file types.
+type faultySubtreeStore struct {
+	blob.Store
+	existsErr map[fileformat.FileType]error
+	getErr    map[fileformat.FileType]error
+	setErr    map[fileformat.FileType]error
+	// existsTrue reports these file types as present, whatever the store holds
+	existsTrue map[fileformat.FileType]bool
+}
+
+func (s *faultySubtreeStore) Exists(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (bool, error) {
+	if err := s.existsErr[fileType]; err != nil {
+		return false, err
+	}
+
+	if s.existsTrue[fileType] {
+		return true, nil
+	}
+
+	return s.Store.Exists(ctx, key, fileType, opts...)
+}
+
+func (s *faultySubtreeStore) Get(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) ([]byte, error) {
+	if err := s.getErr[fileType]; err != nil {
+		return nil, err
+	}
+
+	return s.Store.Get(ctx, key, fileType, opts...)
+}
+
+func (s *faultySubtreeStore) Set(ctx context.Context, key []byte, fileType fileformat.FileType, value []byte, opts ...options.FileOption) error {
+	if err := s.setErr[fileType]; err != nil {
+		return err
+	}
+
+	return s.Store.Set(ctx, key, fileType, value, opts...)
+}
+
+// TestKeptAsideStoreErrorsHalt pins the contract every kept-aside read and write states: a
+// storage error halts the operation, and only a missing or unreadable file means "none".
+func TestKeptAsideStoreErrorsHalt(t *testing.T) {
+	storageErr := errors.NewStorageError("disk on fire")
+
+	t.Run("a failed kept-aside write fails the subtree and writes no subtree to check", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		faulty := &faultySubtreeStore{Store: blobmemory.New(), setErr: map[fileformat.FileType]error{fileformat.FileTypeSubtreeConflicting: storageErr}}
+		server, subtreeStore := f.newServerWithStore(t, faulty)
+
+		root := servePeerSubtree(t, subtreeStore, f.loser, f.child, f.other)
+
+		require.True(t, errors.Is(livePassFor(t, server, root), errors.ErrStorageError))
+
+		exists, err := faulty.Store.Exists(t.Context(), root[:], fileformat.FileTypeSubtreeToCheck)
+		require.NoError(t, err)
+		require.False(t, exists)
+	})
+
+	t.Run("a failed kept-aside check on the peer path fails the subtree", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		faulty := &faultySubtreeStore{Store: blobmemory.New(), existsErr: map[fileformat.FileType]error{fileformat.FileTypeSubtreeConflicting: storageErr}}
+		server, subtreeStore := f.newServerWithStore(t, faulty)
+
+		root := servePeerSubtree(t, subtreeStore, f.other)
+
+		require.True(t, errors.Is(livePassFor(t, server, root), errors.ErrStorageError))
+	})
+
+	t.Run("a failed kept-aside read halts both lookups", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		faulty := &faultySubtreeStore{
+			Store:      blobmemory.New(),
+			getErr:     map[fileformat.FileType]error{fileformat.FileTypeSubtreeConflicting: storageErr},
+			existsTrue: map[fileformat.FileType]bool{fileformat.FileTypeSubtreeConflicting: true},
+		}
+		server, _ := f.newServerWithStore(t, faulty)
+
+		subtree, err := subtreepkg.NewIncompleteTreeByLeafCount(1)
+		require.NoError(t, err)
+		require.NoError(t, subtree.AddNode(*f.loser.TxIDChainHash(), 0, 0))
+
+		_, _, err = server.lookupConflictingTxs(t.Context(), *subtree.RootHash(), []utxostore.UnresolvedMetaData{{Hash: *f.loser.TxIDChainHash()}})
+		require.True(t, errors.Is(err, errors.ErrStorageError), "%v", err)
+
+		_, _, err = server.subtreeConflictingTxs(t.Context(), subtree)
+		require.True(t, errors.Is(err, errors.ErrStorageError), "%v", err)
+	})
+
+	t.Run("a kept-aside file pruned between check and read is none", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		faulty := &faultySubtreeStore{
+			Store:      blobmemory.New(),
+			getErr:     map[fileformat.FileType]error{fileformat.FileTypeSubtreeConflicting: errors.ErrNotFound},
+			existsTrue: map[fileformat.FileType]bool{fileformat.FileTypeSubtreeConflicting: true},
+		}
+		server, _ := f.newServerWithStore(t, faulty)
+
+		subtree, err := subtreepkg.NewIncompleteTreeByLeafCount(1)
+		require.NoError(t, err)
+		require.NoError(t, subtree.AddNode(*f.loser.TxIDChainHash(), 0, 0))
+
+		missing := []utxostore.UnresolvedMetaData{{Hash: *f.loser.TxIDChainHash()}}
+
+		found, stillMissing, err := server.lookupConflictingTxs(t.Context(), *subtree.RootHash(), missing)
+		require.NoError(t, err)
+		require.Empty(t, found)
+		require.Equal(t, missing, stillMissing)
+
+		_, ok, err := server.subtreeConflictingTxs(t.Context(), subtree)
+		require.NoError(t, err)
+		require.False(t, ok)
+	})
+
+	t.Run("a failed conflicting-parent read halts the subtree", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		f.server.policyRejectedTxCache.SetConflicting(*f.loser.TxIDChainHash(), f.loser)
+		f.server.utxoStore = &failingGetStore{Store: f.store, hash: *f.loser.TxIDChainHash(), err: storageErr}
+
+		txMetaSlice := make([]metaSliceItem, 1)
+		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, []missingTx{{tx: f.child, idx: 0}}, "", "", txMetaSlice, 101, map[uint32]bool{}, true)
+		require.True(t, errors.Is(err, errors.ErrStorageError), "%v", err)
+		require.False(t, txMetaSlice[0].keptAside)
+	})
+}
+
+// failingGetStore fails the Get of one tx.
+type failingGetStore struct {
+	utxostore.Store
+	hash chainhash.Hash
+	err  error
+}
+
+func (s *failingGetStore) Get(ctx context.Context, hash *chainhash.Hash, f ...fields.FieldName) (*meta.Data, error) {
+	if *hash == s.hash {
+		return nil, s.err
+	}
+
+	return s.Store.Get(ctx, hash, f...)
+}
