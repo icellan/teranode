@@ -139,8 +139,8 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   A tx rejected because every input that failed to spend is already spent by another
   tx now also carries `TX_CONFLICTING` in its error chain; one with an input that
   failed for another reason, frozen for example, does not. The code clients see is
-  unchanged (`UTXO_SPENT`, HTTP 409). The legacy service now drops such a tx from its
-  orphan pool when its parent arrives, as it already did for txs rejected as
+  unchanged (`UTXO_SPENT`, HTTP 409). The legacy service no longer logs such an orphan
+  as an error when its parent arrives, as it already did not for txs rejected as
   conflicting.
 
 - **Blocks whose cached subtrees hold a tx the store flags conflicting are now rejected.**

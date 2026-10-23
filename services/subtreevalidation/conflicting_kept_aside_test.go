@@ -724,6 +724,43 @@ func TestValidateSubtreeInternal_KeptAsideEdgeCases(t *testing.T) {
 		}
 	})
 
+	// The sidecar holds some of the missing txs, the rest are fetched: both must be validated.
+	partialSidecar := func(t *testing.T, subtreeDataStatus int) {
+		f := newConflictingFixture(t)
+		server, subtreeStore := f.newServer(t)
+
+		root := servePeerSubtree(t, subtreeStore, f.loser, f.child, f.other)
+		require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeData))
+		require.NoError(t, subtreeStore.Set(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting, serializeConflictingTxs([]*bt.Tx{f.loser, f.child})))
+
+		// other is a third of the subtree, above the full-data threshold
+		server.settings.SubtreeValidation.PercentageMissingGetFullData = 20
+
+		var data []byte
+		for _, tx := range []*bt.Tx{f.loser, f.child, f.other} {
+			data = append(data, tx.ExtendedBytes()...)
+		}
+
+		httpmock.RegisterResponder("GET", `=~/subtree_data/[a-f0-9]{64}\z`, httpmock.NewBytesResponder(subtreeDataStatus, data))
+		httpmock.RegisterResponder("POST", `=~/subtree/[a-f0-9]{64}/txs\z`, httpmock.NewBytesResponder(200, f.other.ExtendedBytes()))
+
+		subtree, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", FromBlock: true}, 101, map[uint32]bool{}, blockPathOptions()...)
+		require.NoError(t, err)
+		require.NotNil(t, subtree)
+
+		for _, tx := range []*bt.Tx{f.loser, f.child, f.other} {
+			require.True(t, f.recorder.validated(*tx.TxIDChainHash()), "every missing tx is validated: %s", tx.TxIDChainHash())
+		}
+	}
+
+	t.Run("a partial sidecar plus downloaded subtree data", func(t *testing.T) {
+		partialSidecar(t, 200)
+	})
+
+	t.Run("a partial sidecar plus txs from the peer when it has no subtree data", func(t *testing.T) {
+		partialSidecar(t, 404)
+	})
+
 	t.Run("an unreadable sidecar falls back to the peer on the block path", func(t *testing.T) {
 		f := newConflictingFixture(t)
 		server, subtreeStore := f.newServer(t)
