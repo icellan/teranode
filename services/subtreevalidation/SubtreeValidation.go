@@ -798,12 +798,37 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 	txHashes := v.TxHashes
 
 	if txHashes == nil {
-		subtreeExists, err := u.GetSubtreeExists(ctx, &v.SubtreeHash)
+		var subtreeExists, keptAsideExists bool
+
+		// A peer subtree already stored with its conflicting txs kept aside waits for the
+		// block that references it. Only the peer path may skip it; a block validates it.
+		// Checked alongside the subtree, so a new subtree pays no extra round trip.
+		existsGroup, existsCtx := errgroup.WithContext(ctx)
+
+		existsGroup.Go(func() (err error) {
+			if subtreeExists, err = u.GetSubtreeExists(existsCtx, &v.SubtreeHash); err != nil {
+				return errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check if subtree exists in store", v.SubtreeHash.String(), err)
+			}
+
+			return nil
+		})
+
+		if !v.FromBlock && u.subtreeStore != nil {
+			existsGroup.Go(func() (err error) {
+				if keptAsideExists, err = u.subtreeStore.Exists(existsCtx, v.SubtreeHash[:], fileformat.FileTypeSubtreeConflicting); err != nil {
+					return errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check for kept-aside conflicting txs", v.SubtreeHash.String(), err)
+				}
+
+				return nil
+			})
+		}
+
+		err = existsGroup.Wait()
 
 		stat.NewStat("1. subtreeExists").AddTime(start)
 
 		if err != nil {
-			return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check if subtree exists in store", v.SubtreeHash.String(), err)
+			return nil, err
 		}
 
 		if subtreeExists {
@@ -812,24 +837,15 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			return nil, nil
 		}
 
-		// A peer subtree already stored with its conflicting txs kept aside waits for the
-		// block that references it. Only the peer path may skip it; a block validates it.
-		if !v.FromBlock {
-			keptAsideExists, err := u.subtreeStore.Exists(ctx, v.SubtreeHash[:], fileformat.FileTypeSubtreeConflicting)
+		if keptAsideExists {
+			// the subtree to check is written second; without it the first pass did not finish
+			toCheckExists, err := u.subtreeStore.Exists(ctx, v.SubtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 			if err != nil {
-				return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check for kept-aside conflicting txs", v.SubtreeHash.String(), err)
+				return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check for the subtree to check", v.SubtreeHash.String(), err)
 			}
 
-			if keptAsideExists {
-				// the subtree to check is written second; without it the first pass did not finish
-				toCheckExists, err := u.subtreeStore.Exists(ctx, v.SubtreeHash[:], fileformat.FileTypeSubtreeToCheck)
-				if err != nil {
-					return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check for the subtree to check", v.SubtreeHash.String(), err)
-				}
-
-				if toCheckExists {
-					return nil, nil
-				}
+			if toCheckExists {
+				return nil, nil
 			}
 		}
 
@@ -1362,7 +1378,7 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 		deferFn(err)
 	}()
 
-	missingTxs, err := u.getSubtreeMissingTxs(ctx, subtreeHash, subtree, missingTxHashes, allTxs, baseURL, peerID)
+	missingTxs, err := u.getSubtreeMissingTxs(ctx, subtreeHash, subtree, missingTxHashes, allTxs, baseURL, peerID, !keepAside)
 	if err != nil {
 		return nil, err
 	}
@@ -1713,12 +1729,14 @@ func (u *Server) unlockAcceptedTransactions(ctx context.Context, subtreeHash cha
 //   - allTxs: Complete list of all transaction hashes in the subtree
 //   - baseURL: Base URL for network-based transaction retrieval
 //   - peerID: ID of the peer that owns baseURL, for invalid-subtree attribution (may be empty)
+//   - readKeptAside: Whether to read the txs kept aside next to the subtree. Only a block
+//     reads them; a peer subtree has a kept-aside file only after an interrupted pass.
 //
 // Returns:
 //   - []missingTx: Slice of retrieved transactions paired with their indices
 //   - error: Any error encountered during the retrieval process
 func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree,
-	missingTxHashes []utxo.UnresolvedMetaData, allTxs []chainhash.Hash, baseURL, peerID string) ([]missingTx, error) {
+	missingTxHashes []utxo.UnresolvedMetaData, allTxs []chainhash.Hash, baseURL, peerID string, readKeptAside bool) ([]missingTx, error) {
 	// first check whether we have the subtreeData file for this subtree and use that for the missing transactions
 	subtreeDataExists, err := u.subtreeStore.Exists(ctx,
 		subtreeHash[:],
@@ -1732,21 +1750,23 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 
 	// The txs kept aside next to a peer subtree stored with conflicting txs are local, so
 	// they are resolved before deciding how much of the subtree to ask the peer for.
-	keptAsideChecked := false
+	keptAsideToRead := readKeptAside
 
 	if !subtreeDataExists {
-		keptAside, stillMissing, keptAsideErr := u.lookupConflictingTxs(ctx, subtreeHash, missingTxHashes)
-		if keptAsideErr != nil {
-			return nil, keptAsideErr
-		}
+		if readKeptAside {
+			keptAside, stillMissing, keptAsideErr := u.lookupConflictingTxs(ctx, subtreeHash, missingTxHashes)
+			if keptAsideErr != nil {
+				return nil, keptAsideErr
+			}
 
-		if len(stillMissing) == 0 {
-			return keptAside, nil
-		}
+			if len(stillMissing) == 0 {
+				return keptAside, nil
+			}
 
-		keptAsideChecked = true
-		missingTxs = keptAside
-		missingTxHashes = stillMissing
+			keptAsideToRead = false
+			missingTxs = keptAside
+			missingTxHashes = stillMissing
+		}
 
 		subtreeSize := subtree.Size()
 		missingTxLength := len(missingTxHashes)
@@ -1906,7 +1926,7 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 
 		// Then the txs kept aside next to a peer subtree stored with conflicting txs, unless
 		// they were looked up before the subtree data.
-		if len(remainingHashes) > 0 && !keptAsideChecked {
+		if len(remainingHashes) > 0 && keptAsideToRead {
 			keptAside, stillMissing, keptAsideErr := u.lookupConflictingTxs(ctx, subtreeHash, remainingHashes)
 			if keptAsideErr != nil {
 				return nil, keptAsideErr

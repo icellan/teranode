@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
 	blobmemory "github.com/bsv-blockchain/teranode/stores/blob/memory"
+	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
@@ -899,4 +901,38 @@ func TestValidateSubtreeInternal_DuplicateRejectedBeforeValidation(t *testing.T)
 		require.True(t, errors.Is(err, errors.ErrBlockCorrupt), "fromBlock=%v: the duplicate decides, not the invalid tx: %v", fromBlock, err)
 		require.Zero(t, f.recorder.total(), "fromBlock=%v: nothing is validated before the duplicate is found", fromBlock)
 	}
+}
+
+// sidecarExistsCounter counts Exists calls for kept-aside conflicting txs.
+type sidecarExistsCounter struct {
+	blob.Store
+	n atomic.Int32
+}
+
+func (c *sidecarExistsCounter) Exists(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...options.FileOption) (bool, error) {
+	if fileType == fileformat.FileTypeSubtreeConflicting {
+		c.n.Add(1)
+	}
+
+	return c.Store.Exists(ctx, key, fileType, opts...)
+}
+
+// TestValidateSubtreeInternal_PeerPathChecksForKeptAsideTxsOnce pins the store round trips a
+// new peer subtree pays for kept-aside txs: one check, alongside the subtree's own, and none
+// when its missing txs are fetched.
+func TestValidateSubtreeInternal_PeerPathChecksForKeptAsideTxsOnce(t *testing.T) {
+	f := newConflictingFixture(t)
+	server, subtreeStore := f.newServer(t)
+
+	root := servePeerSubtree(t, subtreeStore, f.other)
+	require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeData))
+
+	httpmock.RegisterResponder("GET", `=~/subtree_data/[a-f0-9]{64}\z`, httpmock.NewBytesResponder(200, f.other.ExtendedBytes()))
+
+	counter := &sidecarExistsCounter{Store: subtreeStore}
+	server.subtreeStore = counter
+
+	_, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}, 101, map[uint32]bool{})
+	require.NoError(t, err)
+	require.Equal(t, int32(1), counter.n.Load())
 }
