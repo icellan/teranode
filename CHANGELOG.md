@@ -129,9 +129,11 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   aside that are not yet known as conflicting there too, flagged `keptAside`, after
   checks that need no parent (structure, money range, policy size). Every subtree
   validator caches them, kept-aside entries in a separate cache with their own budget
-  (`subtreevalidation_txPolicyRejectedCacheMaxMB` each), so a descendant in any later
-  subtree is kept aside too, and the rejected txs no longer count towards the
-  fail-fast miss thresholds. Without `kafka_txPolicyRejectedConfig`, each subtree
+  (`subtreevalidation_txPolicyRejectedCacheMaxMB` each), so a descendant in a later
+  subtree is kept aside too, once its parent is known: on the pod that kept the parent
+  aside as soon as it did, on the others once the publish arrives. A descendant whose
+  subtree reaches it before that still fails the subtree, as before. The rejected txs no
+  longer count towards the fail-fast miss thresholds. Without `kafka_txPolicyRejectedConfig`, each subtree
   validator still learns the descendants it keeps aside itself, but not those another
   one kept aside, nor the validators' rejections. With
   `subtreevalidation_txPolicyRejectedCacheEnabled` off (it is on by default), conflicting

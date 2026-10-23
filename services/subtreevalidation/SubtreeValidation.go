@@ -1464,12 +1464,16 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 		keptAside   = make(map[chainhash.Hash]struct{})
 	)
 
+	// setKeptAside also makes the tx known on this pod at once, not when its subtree is
+	// stored, so a child in a sibling subtree validated at the same time is kept aside too.
 	setKeptAside := func(tx *bt.Tx, txIdx int) {
 		keptAsideMu.Lock()
 		keptAside[*tx.TxIDChainHash()] = struct{}{}
 		keptAsideMu.Unlock()
 
 		txMetaSlice[txIdx] = metaSliceItem{keptAside: true}
+
+		u.cacheKeptAside(tx)
 	}
 
 	// hasKeptAsideParent reports whether tx spends a tx kept aside in an earlier level of this

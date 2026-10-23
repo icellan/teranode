@@ -1322,3 +1322,26 @@ func (c *txPolicyRejectedCache) clearForTest() {
 	c.entries = make(map[chainhash.Hash]cacheEntry)
 	c.curBytes = 0
 }
+
+// TestBlessMissingTransactions_KeptAsideTxsAreKnownAtOnce pins the sibling-subtree window:
+// a kept-aside tx is known as conflicting on this pod as soon as it is kept aside, not once
+// its subtree is stored, so a child in a sibling subtree validated at the same time is kept
+// aside too. The cached copy carries no extended data.
+func TestBlessMissingTransactions_KeptAsideTxsAreKnownAtOnce(t *testing.T) {
+	f := newConflictingFixture(t)
+	f.server.keptAsideTxCache = newTxPolicyRejectedCache(1024 * 1024)
+
+	missing := []missingTx{{tx: f.loser, idx: 0}, {tx: f.child, idx: 1}}
+	txMetaSlice := make([]metaSliceItem, len(missing))
+
+	require.NoError(t, f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{}, true))
+	require.True(t, txMetaSlice[1].keptAside)
+
+	for _, tx := range []*bt.Tx{f.loser, f.child} {
+		require.True(t, f.server.knownConflicting(*tx.TxIDChainHash()), "%s is known before its subtree is stored", tx.TxIDChainHash())
+
+		cached, ok := f.server.keptAsideTxCache.Get(*tx.TxIDChainHash())
+		require.True(t, ok)
+		require.False(t, cached.IsExtended())
+	}
+}

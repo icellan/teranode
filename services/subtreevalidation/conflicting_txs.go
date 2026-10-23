@@ -262,18 +262,36 @@ func withoutExtendedData(txs []*bt.Tx) ([]*bt.Tx, error) {
 	return plain, nil
 }
 
-// shareConflictingTxs makes kept-aside txs that are not yet known as conflicting known:
-// cached here at once in the kept-aside cache, and published on the policy-rejected topic,
-// flagged keptAside, for every other subtree validator. Mostly these are descendants; a
-// loser whose validator publish this pod has not consumed yet goes out again. A consumer
-// that already has the validator's message skips it, and one that gets it first counts
-// the tx once when both arrive. The publish is best-effort, like the validators': a
+// cacheKeptAside caches a kept-aside tx on this pod, in plain format and under the size cap
+// the consumers apply, unless the validator already reported it.
+func (u *Server) cacheKeptAside(tx *bt.Tx) {
+	hash := *tx.TxIDChainHash()
+
+	if u.keptAsideTxCache == nil || u.policyRejectedTxCache.Conflicting(hash) {
+		return
+	}
+
+	plain, err := bt.NewTxFromBytes(tx.Bytes())
+	if err != nil || plain.Size() > maxCachedTxBytes {
+		return
+	}
+
+	u.keptAsideTxCache.SetConflicting(hash, plain)
+}
+
+// shareConflictingTxs publishes kept-aside txs on the policy-rejected topic, flagged
+// keptAside, for every other subtree validator, and caches them here. A tx the validator
+// already reported is skipped. Mostly these are descendants; a loser whose validator
+// publish this pod has not consumed yet goes out again. A consumer that already has the
+// validator's message skips it, and one that gets it first counts the tx once when both
+// arrive. A tx another subtree validator already published can go out again too; the
+// consumer's insert is then a no-op. The publish is best-effort, like the validators': a
 // dropped message only means a child in another subtree fails that subtree, as before.
 func (u *Server) shareConflictingTxs(keptAside []*bt.Tx) {
 	for _, tx := range keptAside {
 		hash := *tx.TxIDChainHash()
 
-		if u.knownConflicting(hash) {
+		if u.policyRejectedTxCache.Conflicting(hash) {
 			continue
 		}
 
