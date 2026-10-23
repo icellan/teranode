@@ -1705,7 +1705,26 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 		return nil, errors.NewProcessingError("[validateSubtree][%s] failed to check if subtreeData exists", subtreeHash.String(), err)
 	}
 
+	var missingTxs []missingTx
+
+	// The txs kept aside next to a peer subtree stored with conflicting txs are local, so
+	// they are resolved before deciding how much of the subtree to ask the peer for.
+	keptAsideChecked := false
+
 	if !subtreeDataExists {
+		keptAside, stillMissing, keptAsideErr := u.lookupConflictingTxs(ctx, subtreeHash, missingTxHashes)
+		if keptAsideErr != nil {
+			return nil, keptAsideErr
+		}
+
+		if len(stillMissing) == 0 {
+			return keptAside, nil
+		}
+
+		keptAsideChecked = true
+		missingTxs = keptAside
+		missingTxHashes = stillMissing
+
 		subtreeSize := subtree.Size()
 		missingTxLength := len(missingTxHashes)
 		percentageMissing := 100 * float64(missingTxLength) / float64(subtreeSize)
@@ -1824,14 +1843,15 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 		}
 	}
 
-	var missingTxs []missingTx
-
 	err = nil
 
 	if subtreeDataExists {
 		u.logger.Debugf("[validateSubtree][%s] fetching %d missing txs from subtreeData file", subtreeHash.String(), len(missingTxHashes))
 
-		missingTxs, err = u.getMissingTransactionsFromFile(ctx, subtreeHash, missingTxHashes, allTxs)
+		var fileTxs []missingTx
+
+		fileTxs, err = u.getMissingTransactionsFromFile(ctx, subtreeHash, missingTxHashes, allTxs)
+		missingTxs = append(missingTxs, fileTxs...)
 	}
 
 	if !subtreeDataExists || err != nil {
@@ -1861,8 +1881,9 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 			}
 		}
 
-		// Then the txs kept aside next to a peer subtree stored with conflicting txs.
-		if len(remainingHashes) > 0 {
+		// Then the txs kept aside next to a peer subtree stored with conflicting txs, unless
+		// they were looked up before the subtree data.
+		if len(remainingHashes) > 0 && !keptAsideChecked {
 			keptAside, stillMissing, keptAsideErr := u.lookupConflictingTxs(ctx, subtreeHash, remainingHashes)
 			if keptAsideErr != nil {
 				return nil, keptAsideErr

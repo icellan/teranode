@@ -3,6 +3,7 @@ package subtreevalidation
 import (
 	"context"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -660,6 +661,30 @@ func TestValidateSubtreeInternal_KeptAsideEdgeCases(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, kept, 2, "the sidecar next to the subtree to check is this pass's kept-aside set")
 		require.Equal(t, *f.child.TxIDChainHash(), *kept[1].TxIDChainHash())
+	})
+
+	t.Run("the block path reads the sidecar before asking the peer for subtree data", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		server, subtreeStore := f.newServer(t)
+
+		root := servePeerSubtree(t, subtreeStore, f.loser, f.child, f.other)
+		require.NoError(t, livePass(t, server, root))
+
+		// the kept-aside txs are two thirds of the subtree, far above the full-data threshold
+		server.settings.SubtreeValidation.PercentageMissingGetFullData = 20
+		require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeData))
+
+		httpmock.RegisterResponder("GET", `=~/subtree_data/[a-f0-9]{64}\z`, httpmock.NewStringResponder(404, "not found"))
+
+		subtree, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", FromBlock: true}, 101, map[uint32]bool{}, blockPathOptions()...)
+		require.NoError(t, err)
+		require.NotNil(t, subtree)
+
+		for call, n := range httpmock.GetCallCountInfo() {
+			if strings.Contains(call, "subtree_data") {
+				require.Zero(t, n, "every missing tx is in the local sidecar: %s", call)
+			}
+		}
 	})
 
 	t.Run("an unreadable sidecar falls back to the peer on the block path", func(t *testing.T) {
