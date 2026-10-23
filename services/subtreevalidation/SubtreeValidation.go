@@ -1018,14 +1018,6 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 		break
 	}
 
-	if len(keptAside) > 0 {
-		if err = checkKeptAsideSubtreeNodes(v.SubtreeHash, txHashes, txMetaSlice); err != nil {
-			return nil, err
-		}
-
-		return nil, u.storeSubtreeWithConflictingTxs(ctx, v.SubtreeHash, txHashes, keptAside)
-	}
-
 	start = gocore.CurrentTime()
 
 	u.logger.Debugf("[ValidateSubtreeInternal][%s] adding %d nodes to subtree instance", v.SubtreeHash.String(), len(txHashes))
@@ -1038,6 +1030,11 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 				return nil, errors.NewProcessingError("[ValidateSubtreeInternal][%s] failed to add coinbase placeholder node to subtree", v.SubtreeHash.String(), err)
 			}
 
+			continue
+		}
+
+		// a kept-aside tx is not validated; the subtree is stored with it set aside below
+		if txMetaSlice[idx].keptAside {
 			continue
 		}
 
@@ -1071,6 +1068,11 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 	}
 
 	stat.NewStat("6. addAllTxHashFeeSizesToSubtree").AddTime(start)
+
+	// every node passed the checks above; a subtree with kept-aside txs is never stored as validated
+	if len(keptAside) > 0 {
+		return nil, u.storeSubtreeWithConflictingTxs(ctx, v.SubtreeHash, txHashes, keptAside)
+	}
 
 	if err = u.storeSubtreeFiles(ctx, stat, &v.SubtreeHash, subtree, subtreeMeta); err != nil {
 		return nil, err
@@ -1798,86 +1800,69 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 			} else {
 				// Build subtree structure from allTxs for deserialization
 				// We cannot use the empty 'subtree' parameter as it has no nodes yet
-				subtreeForData, buildErr := subtreepkg.NewIncompleteTreeByLeafCount(len(allTxs))
+				subtreeForData, buildErr := incompleteTreeFromNodes(len(allTxs), func(i int) chainhash.Hash { return allTxs[i] })
 				if buildErr != nil {
-					u.logger.Errorf("[validateSubtree][%s] failed to create subtree for data: %v", subtreeHash.String(), buildErr)
+					u.logger.Errorf("[validateSubtree][%s] failed to build subtree for data: %v", subtreeHash.String(), buildErr)
 					_ = body.Close()
 				} else {
-					// Add all transaction hashes to the subtree structure
-					for _, txHash := range allTxs {
-						if txHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-							buildErr = subtreeForData.AddCoinbaseNode()
-						} else {
-							buildErr = subtreeForData.AddNode(txHash, 0, 0)
-						}
-						if buildErr != nil {
-							u.logger.Errorf("[validateSubtree][%s] failed to add node to subtree: %v", subtreeHash.String(), buildErr)
-							break
-						}
-					}
-
-					if buildErr != nil {
-						_ = body.Close()
+					// load the subtree data, making sure to validate it against the subtree txs
+					// this is less efficient than reading straight to disk with SetFromReader, but we need to validate the
+					// data before storing it on disk
+					// Use pooled buffered reader to reduce syscalls and avoid per-call 1MB buffer allocation.
+					// defer the pool return so a panic / future early return still releases the reader,
+					// matching the pattern used at check_block_subtrees.go:201 and the second callsite below.
+					bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
+					bufferedReader.Reset(body)
+					defer func() {
+						bufferedReader.Reset(nil) // clear reference before returning to pool
+						bufioReaderPool.Put(bufferedReader)
+					}()
+					subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtreeForData, bufferedReader)
+					_ = body.Close()
+					if err != nil {
+						u.logger.Errorf("[validateSubtree][%s] failed to create subtree data from reader: %v", subtreeHash.String(), err)
+						// Can't proceed without valid subtree data, skip to next steps
+					} else if subtreeData == nil || len(subtreeData.Txs) == 0 || subtreeData.Txs[len(subtreeData.Txs)-1] == nil {
+						u.logger.Errorf("[validateSubtree][%s] subtree data is nil or empty", subtreeHash.String())
+						// Invalid subtree data, skip to next steps
+					} else if !subtreeForData.Nodes[len(subtreeForData.Nodes)-1].Hash.Equal(*subtreeData.Txs[len(subtreeData.Txs)-1].TxIDChainHash()) {
+						return nil, errors.NewProcessingError("[validateSubtree][%s] subtree data does not match subtree", subtreeHash.String())
 					} else {
-						// load the subtree data, making sure to validate it against the subtree txs
-						// this is less efficient than reading straight to disk with SetFromReader, but we need to validate the
-						// data before storing it on disk
-						// Use pooled buffered reader to reduce syscalls and avoid per-call 1MB buffer allocation.
-						// defer the pool return so a panic / future early return still releases the reader,
-						// matching the pattern used at check_block_subtrees.go:201 and the second callsite below.
-						bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
-						bufferedReader.Reset(body)
-						defer func() {
-							bufferedReader.Reset(nil) // clear reference before returning to pool
-							bufioReaderPool.Put(bufferedReader)
-						}()
-						subtreeData, err := subtreepkg.NewSubtreeDataFromReader(subtreeForData, bufferedReader)
-						_ = body.Close()
+						// Valid subtree data - proceed with serialization and storage
+						subtreeDataBytes, err := subtreeData.Serialize()
 						if err != nil {
-							u.logger.Errorf("[validateSubtree][%s] failed to create subtree data from reader: %v", subtreeHash.String(), err)
-							// Can't proceed without valid subtree data, skip to next steps
-						} else if subtreeData == nil || len(subtreeData.Txs) == 0 || subtreeData.Txs[len(subtreeData.Txs)-1] == nil {
-							u.logger.Errorf("[validateSubtree][%s] subtree data is nil or empty", subtreeHash.String())
-							// Invalid subtree data, skip to next steps
-						} else if !subtreeForData.Nodes[len(subtreeForData.Nodes)-1].Hash.Equal(*subtreeData.Txs[len(subtreeData.Txs)-1].TxIDChainHash()) {
-							return nil, errors.NewProcessingError("[validateSubtree][%s] subtree data does not match subtree", subtreeHash.String())
+							u.logger.Errorf("[validateSubtree][%s] failed to serialize subtree data: %v", subtreeHash.String(), err)
 						} else {
-							// Valid subtree data - proceed with serialization and storage
-							subtreeDataBytes, err := subtreeData.Serialize()
-							if err != nil {
-								u.logger.Errorf("[validateSubtree][%s] failed to serialize subtree data: %v", subtreeHash.String(), err)
+							dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
+
+							if subtreeDataErr = u.subtreeStore.Set(ctx,
+								subtreeHash[:],
+								fileformat.FileTypeSubtreeData,
+								subtreeDataBytes,
+								options.WithDeleteAt(dah),
+							); subtreeDataErr != nil && errors.Is(subtreeDataErr, errors.ErrBlobAlreadyExists) {
+								// Between the Exists check above and this Set a whole subtree_data fetch
+								// went by, and another writer of this key (processSubtreeDataStream for a
+								// sibling block, the block persister, the asset service's on-demand
+								// writer) published first, so the store refused this Set. Their file
+								// holds this subtree's transactions, so it is read below like a file
+								// found at the Exists check; the per-transaction fallback is not taken.
+								u.logger.Infof("[validateSubtree][%s] subtree data from %s was published by another writer first; reading theirs", subtreeHash.String(), url)
+								subtreeDataExists = true
+							} else if subtreeDataErr != nil {
+								u.logger.Errorf("[validateSubtree][%s] failed to store subtree data: %v", subtreeHash.String(), subtreeDataErr)
 							} else {
-								dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
+								u.logger.Infof("[validateSubtree][%s] stored subtree data from %s", subtreeHash.String(), url)
+								subtreeDataExists = true
 
-								if subtreeDataErr = u.subtreeStore.Set(ctx,
-									subtreeHash[:],
-									fileformat.FileTypeSubtreeData,
-									subtreeDataBytes,
-									options.WithDeleteAt(dah),
-								); subtreeDataErr != nil && errors.Is(subtreeDataErr, errors.ErrBlobAlreadyExists) {
-									// Between the Exists check above and this Set a whole subtree_data fetch
-									// went by, and another writer of this key (processSubtreeDataStream for a
-									// sibling block, the block persister, the asset service's on-demand
-									// writer) published first, so the store refused this Set. Their file
-									// holds this subtree's transactions, so it is read below like a file
-									// found at the Exists check; the per-transaction fallback is not taken.
-									u.logger.Infof("[validateSubtree][%s] subtree data from %s was published by another writer first; reading theirs", subtreeHash.String(), url)
-									subtreeDataExists = true
-								} else if subtreeDataErr != nil {
-									u.logger.Errorf("[validateSubtree][%s] failed to store subtree data: %v", subtreeHash.String(), subtreeDataErr)
-								} else {
-									u.logger.Infof("[validateSubtree][%s] stored subtree data from %s", subtreeHash.String(), url)
-									subtreeDataExists = true
-
-									// TODO: Report successful subtree data fetch to improve peer reputation
-									// Cannot call ReportValidSubtree here because we don't have peer ID, only baseURL (HTTP URL)
-									// Need to track peer ID through the call chain if we want to enable this
-									// if u.p2pClient != nil {
-									// 	if err := u.p2pClient.ReportValidSubtree(ctx, peerID, subtreeHash.String()); err != nil {
-									// 		u.logger.Warnf("[validateSubtree][%s] failed to report valid subtree: %v", subtreeHash.String(), err)
-									// 	}
-									// }
-								}
+								// TODO: Report successful subtree data fetch to improve peer reputation
+								// Cannot call ReportValidSubtree here because we don't have peer ID, only baseURL (HTTP URL)
+								// Need to track peer ID through the call chain if we want to enable this
+								// if u.p2pClient != nil {
+								// 	if err := u.p2pClient.ReportValidSubtree(ctx, peerID, subtreeHash.String()); err != nil {
+								// 		u.logger.Warnf("[validateSubtree][%s] failed to report valid subtree: %v", subtreeHash.String(), err)
+								// 	}
+								// }
 							}
 						}
 					}

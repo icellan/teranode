@@ -347,14 +347,12 @@ func (u *Server) getSubtreeToCheck(ctx context.Context, request *subtreevalidati
 			return nil, err
 		}
 
-		nodeHashes := make([]chainhash.Hash, leafCount)
-		for i := range nodeHashes {
-			copy(nodeHashes[i][:], subtreeNodeBytes[i*chainhash.HashSize:(i+1)*chainhash.HashSize])
-		}
-
 		var subtreeBytes []byte
 
-		subtreeToCheck, subtreeBytes, err = subtreeToCheckFromHashes(subtreeHash, nodeHashes)
+		subtreeToCheck, subtreeBytes, err = subtreeToCheckFromNodes(subtreeHash, leafCount, func(i int) (nodeHash chainhash.Hash) {
+			copy(nodeHash[:], subtreeNodeBytes[i*chainhash.HashSize:(i+1)*chainhash.HashSize])
+			return nodeHash
+		})
 		if err != nil {
 			return nil, err
 		}

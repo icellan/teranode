@@ -135,57 +135,44 @@ func (u *Server) subtreeConflictingTxs(ctx context.Context, subtree *subtreepkg.
 	return txs, true, nil
 }
 
-// checkKeptAsideSubtreeNodes runs the node checks a validated subtree gets before it is
-// stored, for a peer subtree stored with kept-aside txs: the coinbase placeholder only at
-// index 0, and every tx that was not kept aside validated. Duplicates were rejected before
-// validation.
-func checkKeptAsideSubtreeNodes(subtreeHash chainhash.Hash, txHashes []chainhash.Hash, txMetaSlice []metaSliceItem) error {
-	for idx, txHash := range txHashes {
-		if idx == 0 && txHash.Equal(*subtreepkg.CoinbasePlaceholderHash) {
-			continue
-		}
+// incompleteTreeFromNodes builds a subtree of leafCount nodes from their hashes, node(i)
+// returning the i-th, with the coinbase placeholder added as the coinbase node.
+func incompleteTreeFromNodes(leafCount int, node func(i int) chainhash.Hash) (*subtreepkg.Subtree, error) {
+	tree, err := subtreepkg.NewIncompleteTreeByLeafCount(leafCount)
+	if err != nil {
+		return nil, errors.NewProcessingError("failed to create subtree structure", err)
+	}
 
-		if txMetaSlice[idx].keptAside {
-			continue
-		}
+	for i := 0; i < leafCount; i++ {
+		nodeHash := node(i)
 
-		if !txMetaSlice[idx].isSet {
-			return errors.NewProcessingError("[ValidateSubtreeInternal][%s] tx meta not found in txMetaSlice at index %d: %s", subtreeHash.String(), idx, txHash.String())
-		}
-
-		if txMetaSlice[idx].coinbase {
-			return errors.NewTxInvalidError("[ValidateSubtreeInternal][%s] invalid subtree index for coinbase tx %d: %s", subtreeHash.String(), idx, txHash.String())
+		if nodeHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			if err = tree.AddCoinbaseNode(); err != nil {
+				return nil, errors.NewProcessingError("failed to add coinbase node to subtree", err)
+			}
+		} else if err = tree.AddNode(nodeHash, 0, 0); err != nil {
+			return nil, errors.NewProcessingError("failed to add node to subtree", err)
 		}
 	}
 
-	return nil
+	return tree, nil
 }
 
-// subtreeToCheckFromHashes builds the FileTypeSubtreeToCheck form of a subtree from its
-// node hashes and checks it against the subtree's root.
-func subtreeToCheckFromHashes(subtreeHash chainhash.Hash, txHashes []chainhash.Hash) (*subtreepkg.Subtree, []byte, error) {
-	subtreeToCheck, err := subtreepkg.NewIncompleteTreeByLeafCount(len(txHashes))
+// subtreeToCheckFromNodes builds the FileTypeSubtreeToCheck form of a subtree from its
+// leafCount node hashes, node(i) returning the i-th, and checks it against the subtree's root.
+func subtreeToCheckFromNodes(subtreeHash chainhash.Hash, leafCount int, node func(i int) chainhash.Hash) (*subtreepkg.Subtree, []byte, error) {
+	subtreeToCheck, err := incompleteTreeFromNodes(leafCount, node)
 	if err != nil {
-		return nil, nil, errors.NewProcessingError("[subtreeToCheckFromHashes][%s] failed to create subtree structure", subtreeHash.String(), err)
-	}
-
-	for _, nodeHash := range txHashes {
-		if nodeHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-			if err = subtreeToCheck.AddCoinbaseNode(); err != nil {
-				return nil, nil, errors.NewProcessingError("[subtreeToCheckFromHashes][%s] failed to add coinbase node to subtree", subtreeHash.String(), err)
-			}
-		} else if err = subtreeToCheck.AddNode(nodeHash, 0, 0); err != nil {
-			return nil, nil, errors.NewProcessingError("[subtreeToCheckFromHashes][%s] failed to add node to subtree", subtreeHash.String(), err)
-		}
+		return nil, nil, errors.NewProcessingError("[subtreeToCheckFromNodes][%s] failed to build subtree", subtreeHash.String(), err)
 	}
 
 	if !subtreeHash.Equal(*subtreeToCheck.RootHash()) {
-		return nil, nil, errors.NewProcessingError("[subtreeToCheckFromHashes][%s] subtree root hash mismatch: %s", subtreeHash.String(), subtreeToCheck.RootHash().String())
+		return nil, nil, errors.NewProcessingError("[subtreeToCheckFromNodes][%s] subtree root hash mismatch: %s", subtreeHash.String(), subtreeToCheck.RootHash().String())
 	}
 
 	subtreeBytes, err := subtreeToCheck.Serialize()
 	if err != nil {
-		return nil, nil, errors.NewProcessingError("[subtreeToCheckFromHashes][%s] failed to serialize subtree", subtreeHash.String(), err)
+		return nil, nil, errors.NewProcessingError("[subtreeToCheckFromNodes][%s] failed to serialize subtree", subtreeHash.String(), err)
 	}
 
 	return subtreeToCheck, subtreeBytes, nil
@@ -199,7 +186,7 @@ func subtreeToCheckFromHashes(subtreeHash chainhash.Hash, txHashes []chainhash.H
 // this pass may have kept a different set aside. The block that references the subtree
 // validates it, kept-aside txs included.
 func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash chainhash.Hash, txHashes []chainhash.Hash, keptAside []*bt.Tx) error {
-	_, subtreeBytes, err := subtreeToCheckFromHashes(subtreeHash, txHashes)
+	_, subtreeBytes, err := subtreeToCheckFromNodes(subtreeHash, len(txHashes), func(i int) chainhash.Hash { return txHashes[i] })
 	if err != nil {
 		return err
 	}
