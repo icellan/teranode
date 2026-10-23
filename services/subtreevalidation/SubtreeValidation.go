@@ -1564,7 +1564,7 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 				if keepAside && hasKeptAsideParent(tx) {
 					// A descendant cannot be validated without its parent in the store, so it
 					// only gets the checks that need no parent before it is kept aside.
-					if err = validator.CheckTransactionContextFree(tx, u.settings.Policy); err == nil {
+					if err = validator.CheckTransactionContextFree(tx, u.settings, blockHeight); err == nil {
 						setKeptAside(tx, txIdx)
 						return nil
 					}
@@ -1596,7 +1596,7 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 				if err != nil && keepAside && errors.Is(err, errors.ErrTxMissingParent) {
 					// as for a descendant above: only the checks that need no parent, and those
 					// first, so a malformed tx fails as invalid without a store read
-					if ctxFreeErr := validator.CheckTransactionContextFree(tx, u.settings.Policy); ctxFreeErr != nil {
+					if ctxFreeErr := validator.CheckTransactionContextFree(tx, u.settings, blockHeight); ctxFreeErr != nil {
 						err = ctxFreeErr
 					} else {
 						conflictingParent, parentErr := hasConflictingParent(gCtx, tx)

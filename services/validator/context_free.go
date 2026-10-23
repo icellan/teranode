@@ -4,24 +4,25 @@ import (
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/settings"
 )
 
 // CheckTransactionContextFree runs the checks on a transaction that need no parent data
-// and no chain state: not a coinbase, at least one input and one output, no null or
-// duplicate prevout, output values in the money range, and the policy size limit. It is
-// for a transaction that cannot be fully validated yet; it never replaces full validation.
-func CheckTransactionContextFree(tx *bt.Tx, policy *settings.PolicySettings) error {
+// and no chain state: not a coinbase, bitcoin-sv's CheckTransactionCommon for the era of
+// blockHeight (at least one input and one output, the consensus size limit, output values
+// in the money range, and before Genesis the sigop limit), no null or duplicate prevout,
+// and the policy size limit. It is for a transaction that cannot be fully validated yet;
+// it never replaces full validation.
+func CheckTransactionContextFree(tx *bt.Tx, tSettings *settings.Settings, blockHeight uint32) error {
 	if tx.IsCoinbase() {
 		return errors.NewTxInvalidError("coinbase transactions are not supported")
 	}
 
-	if len(tx.Inputs) == 0 {
-		return errors.NewTxInvalidError("bad-txns-vin-empty")
-	}
-
-	if len(tx.Outputs) == 0 {
-		return errors.NewTxInvalidError("bad-txns-vout-empty")
+	// CheckTransactionCommon is the same for every transaction; model ports it for the
+	// coinbase, which never goes through BDK
+	if reason := model.CoinbaseCommonRuleViolation(tx, blockHeight, tSettings.ChainCfgParams); reason != "" {
+		return errors.NewTxInvalidError(reason)
 	}
 
 	type outpoint struct {
@@ -45,12 +46,7 @@ func CheckTransactionContextFree(tx *bt.Tx, policy *settings.PolicySettings) err
 		seen[op] = struct{}{}
 	}
 
-	// checkOutputValues reads no validator state
-	if _, err := (&TxValidator{}).checkOutputValues(tx); err != nil {
-		return err
-	}
-
-	if policy != nil && policy.MaxTxSizePolicy > 0 && tx.Size() > policy.MaxTxSizePolicy {
+	if policy := tSettings.Policy; policy != nil && policy.MaxTxSizePolicy > 0 && tx.Size() > policy.MaxTxSizePolicy {
 		return errors.NewTxPolicyError("tx-size")
 	}
 
