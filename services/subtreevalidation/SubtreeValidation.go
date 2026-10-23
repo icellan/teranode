@@ -563,13 +563,22 @@ func (u *Server) blessMissing(ctx context.Context, blockHash chainhash.Hash, sub
 		return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to validate transaction", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
 	}
 	if err != nil {
-		u.logger.Warnf("[blessMissingTransaction][%s/%s][%s] transaction is conflicting", blockHash.String(), subtreeHash.String(), tx.TxID())
+		// a peer subtree's conflicting tx is expected and kept aside; a block's is stored as conflicting
+		if validationOptions.CreateConflicting {
+			u.logger.Warnf("[blessMissingTransaction][%s/%s][%s] transaction is conflicting", blockHash.String(), subtreeHash.String(), tx.TxID())
+		} else {
+			u.logger.Debugf("[blessMissingTransaction][%s/%s][%s] transaction is conflicting", blockHash.String(), subtreeHash.String(), tx.TxID())
+		}
 	}
 
 	// Not recoverable, returning processing error. A conflicting rejection reaches this
 	// point with err set; wrap it so callers can still tell it apart.
 	if txMeta == nil {
-		return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] tx meta is nil", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
+		if err != nil {
+			return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] tx meta is nil", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
+		}
+
+		return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] tx meta is nil", blockHash.String(), subtreeHash.String(), tx.TxID())
 	}
 
 	// check whether this transaction was already mined on our chain by comparing the block ids

@@ -160,6 +160,20 @@ func TestBlessMissingTransaction_UnlockFailureStillRejectsRealFailures(t *testin
 	require.False(t, errors.Is(err, errors.ErrTxUnlockFailed))
 }
 
+// TestBlessMissingTransaction_NilMetaWithoutErrorRendersCleanly pins that a validator
+// answering (nil, nil) gives a plain "tx meta is nil" error, without a stray nil argument
+// rendered into the message.
+func TestBlessMissingTransaction_NilMetaWithoutErrorRendersCleanly(t *testing.T) {
+	server, _, txs, _ := newUnlockFailureServer(t, true, alwaysFail)
+
+	server.validatorClient = &failingValidator{Interface: server.validatorClient}
+
+	_, err := server.blessMissingTransaction(context.Background(), chainhash.Hash{}, chainhash.Hash{}, txs[1], 2, map[uint32]bool{}, validator.ProcessOptions())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "tx meta is nil")
+	require.NotContains(t, err.Error(), "%!")
+}
+
 type failingValidator struct {
 	validator.Interface
 	err error
