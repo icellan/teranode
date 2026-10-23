@@ -359,3 +359,27 @@ func TestPolicyRejectedTxMessageHandler_KeptAsideSkipsAKnownLoser(t *testing.T) 
 	require.Equal(t, 0, server.keptAsideTxCache.Len())
 	require.Equal(t, 1, server.conflictingCount([]chainhash.Hash{*tx.TxIDChainHash()}))
 }
+
+// TestTxPolicyRejectedCache_ConflictingCountAcrossScanChunks pins that the chunked scan,
+// which releases the lock between chunks, still sees every hash, chunk edges included.
+func TestTxPolicyRejectedCache_ConflictingCountAcrossScanChunks(t *testing.T) {
+	tx, err := bt.NewTxFromString("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0104ffffffff0100f2052a0100000043410496b538e853519c726a2c91e61ec11600ae1390813a627c66fb8be7947be63c52da7589379515d4e0a604f8141781e62294721166bf621e73a82cbf2342c858eeac00000000")
+	require.NoError(t, err)
+
+	hashes := make([]chainhash.Hash, 2*conflictingScanChunk+1)
+	for i := range hashes {
+		hashes[i][0] = byte(i)
+		hashes[i][1] = byte(i >> 8)
+		hashes[i][2] = 1
+	}
+
+	cache := newTxPolicyRejectedCache(1024 * 1024)
+
+	conflictingAt := []int{0, conflictingScanChunk - 1, conflictingScanChunk, len(hashes) - 1}
+	for _, i := range conflictingAt {
+		cache.SetConflicting(hashes[i], tx)
+	}
+
+	require.Equal(t, len(conflictingAt), cache.ConflictingCount(hashes))
+	require.Len(t, cache.conflictingIn(hashes), len(conflictingAt))
+}

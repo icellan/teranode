@@ -94,42 +94,48 @@ func (c *txPolicyRejectedCache) Conflicting(hash chainhash.Hash) bool {
 	return ok && e.conflicting
 }
 
+// conflictingScanChunk bounds how many hashes a scan looks up under one read lock. A
+// scan covers a whole subtree, up to millions of hashes; holding the lock throughout
+// would hold off the Kafka consumer's writes, and behind them every other reader.
+const conflictingScanChunk = 4096
+
+// scanConflicting calls found for each of hashes cached as rejected for conflicting,
+// under the read lock. found must not use the cache.
+func (c *txPolicyRejectedCache) scanConflicting(hashes []chainhash.Hash, found func(chainhash.Hash)) {
+	for start := 0; start < len(hashes); start += conflictingScanChunk {
+		end := min(start+conflictingScanChunk, len(hashes))
+
+		c.mu.RLock()
+
+		if len(c.entries) == 0 {
+			c.mu.RUnlock()
+			return
+		}
+
+		for i := start; i < end; i++ {
+			if e, ok := c.entries[hashes[i]]; ok && e.conflicting {
+				found(hashes[i])
+			}
+		}
+
+		c.mu.RUnlock()
+	}
+}
+
 // ConflictingCount returns how many of hashes are cached as rejected for conflicting.
 func (c *txPolicyRejectedCache) ConflictingCount(hashes []chainhash.Hash) int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if len(c.entries) == 0 {
-		return 0
-	}
-
 	n := 0
 
-	for i := range hashes {
-		if e, ok := c.entries[hashes[i]]; ok && e.conflicting {
-			n++
-		}
-	}
+	c.scanConflicting(hashes, func(chainhash.Hash) { n++ })
 
 	return n
 }
 
 // conflictingIn returns the hashes of hashes that are cached as rejected for conflicting.
 func (c *txPolicyRejectedCache) conflictingIn(hashes []chainhash.Hash) []chainhash.Hash {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if len(c.entries) == 0 {
-		return nil
-	}
-
 	var found []chainhash.Hash
 
-	for i := range hashes {
-		if e, ok := c.entries[hashes[i]]; ok && e.conflicting {
-			found = append(found, hashes[i])
-		}
-	}
+	c.scanConflicting(hashes, func(hash chainhash.Hash) { found = append(found, hash) })
 
 	return found
 }
@@ -320,7 +326,8 @@ func (u *Server) knownConflicting(hash chainhash.Hash) bool {
 
 // conflictingCount returns how many of hashes are known as conflicting. A tx can be in
 // both caches, since a kept-aside message can arrive before the validator's for the same
-// loser; it counts once.
+// loser; it counts once. The caches are read chunk by chunk while the Kafka consumer
+// writes, so the count is a snapshot for the fail-fast allowance, not an exact figure.
 func (u *Server) conflictingCount(hashes []chainhash.Hash) int {
 	n := 0
 
