@@ -191,6 +191,14 @@ func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash
 		return err
 	}
 
+	// A kept-aside tx is not fully validated, so the previous-output data a peer attached to
+	// it in extended format was never checked; it is dropped before the tx is kept anywhere.
+	// The block path validates the plain tx, reading its parents from the UTXO store.
+	keptAside, err = withoutExtendedData(keptAside)
+	if err != nil {
+		return errors.NewProcessingError("[storeSubtreeWithConflictingTxs][%s] failed to drop extended data of kept-aside txs", subtreeHash.String(), err)
+	}
+
 	dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
 
 	if err = u.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting, serializeConflictingTxs(keptAside), options.WithDeleteAt(dah), options.WithAllowOverwrite(true)); err != nil {
@@ -210,6 +218,23 @@ func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash
 	return nil
 }
 
+// withoutExtendedData returns txs in plain format, without the previous output data an
+// extended tx carries.
+func withoutExtendedData(txs []*bt.Tx) ([]*bt.Tx, error) {
+	plain := make([]*bt.Tx, len(txs))
+
+	for i, tx := range txs {
+		p, err := bt.NewTxFromBytes(tx.Bytes())
+		if err != nil {
+			return nil, err
+		}
+
+		plain[i] = p
+	}
+
+	return plain, nil
+}
+
 // shareConflictingTxs makes kept-aside txs that are not yet known as conflicting known:
 // cached here at once in the kept-aside cache, and published on the policy-rejected topic,
 // flagged keptAside, for every other subtree validator. Mostly these are descendants; a
@@ -225,16 +250,17 @@ func (u *Server) shareConflictingTxs(keptAside []*bt.Tx) {
 			continue
 		}
 
+		// the cap the consumers apply, here too: one large tx would evict every other entry
+		rawTx := tx.SerializeBytes()
+		if len(rawTx) > maxCachedTxBytes {
+			continue
+		}
+
 		if u.keptAsideTxCache != nil {
 			u.keptAsideTxCache.SetConflicting(hash, tx)
 		}
 
 		if u.conflictingTxKafkaProducer == nil {
-			continue
-		}
-
-		rawTx := tx.SerializeBytes()
-		if len(rawTx) > maxCachedTxBytes {
 			continue
 		}
 

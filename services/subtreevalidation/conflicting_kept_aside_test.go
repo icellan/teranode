@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
@@ -228,6 +229,15 @@ func servePeerSubtree(t *testing.T, subtreeStore blob.Store, txs ...*bt.Tx) chai
 	require.NoError(t, subtreeStore.Set(t.Context(), root[:], fileformat.FileTypeSubtreeData, data))
 
 	return root
+}
+
+// livePassFor validates root the way the peer subtree handler does.
+func livePassFor(t *testing.T, server *Server, root chainhash.Hash) error {
+	t.Helper()
+
+	_, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}, 101, map[uint32]bool{})
+
+	return err
 }
 
 // TestValidateSubtreeInternal_PeerSubtreeWithConflictingTxs pins how a peer subtree
@@ -1027,4 +1037,51 @@ func TestBlessMissing_RemoteValidatorConflictingCreateReadsMetaBack(t *testing.T
 	require.NoError(t, err)
 	require.NotNil(t, txMeta)
 	require.True(t, txMeta.Conflicting)
+}
+
+// TestValidateSubtreeInternal_KeptAsideTxsDropPeerExtendedData pins the kept-aside memory
+// bound: a descendant is only context-free checked, so the previous-output data a peer
+// attaches to it in extended format is never checked against anything. It is dropped
+// before the tx is cached, published or written next to the subtree, and the caches count
+// what an entry can retain, not just its plain size.
+func TestValidateSubtreeInternal_KeptAsideTxsDropPeerExtendedData(t *testing.T) {
+	f := newConflictingFixture(t)
+	server, subtreeStore := f.newServer(t)
+
+	padded := f.child.Clone()
+	padded.Inputs[0].PreviousTxScript = bscript.NewFromBytes(make([]byte, 200_000))
+	require.True(t, padded.IsExtended())
+
+	root := servePeerSubtree(t, subtreeStore, f.loser, padded, f.other)
+	require.NoError(t, livePassFor(t, server, root))
+
+	b, err := subtreeStore.Get(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting)
+	require.NoError(t, err)
+	require.Less(t, len(b), 10_000, "the sidecar holds the kept-aside txs without the peer's extended data")
+
+	kept, err := readConflictingTxs(b)
+	require.NoError(t, err)
+	require.Len(t, kept, 2)
+	require.Equal(t, *f.child.TxIDChainHash(), *kept[1].TxIDChainHash())
+	require.False(t, kept[1].IsExtended())
+
+	require.Less(t, server.keptAsideTxCache.Bytes(), 10_000, "the cached descendant is stripped too")
+
+	cached, ok := server.keptAsideTxCache.Get(*f.child.TxIDChainHash())
+	require.True(t, ok)
+	require.False(t, cached.IsExtended())
+}
+
+// TestTxPolicyRejectedCache_CountsExtendedData pins that an entry is budgeted by what it
+// can retain: an extended tx holds every input's previous output.
+func TestTxPolicyRejectedCache_CountsExtendedData(t *testing.T) {
+	f := newConflictingFixture(t)
+
+	padded := f.child.Clone()
+	padded.Inputs[0].PreviousTxScript = bscript.NewFromBytes(make([]byte, 200_000))
+
+	cache := newTxPolicyRejectedCache(1024 * 1024)
+	cache.SetConflicting(*padded.TxIDChainHash(), padded)
+
+	require.GreaterOrEqual(t, cache.Bytes(), 200_000)
 }

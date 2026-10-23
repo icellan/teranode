@@ -2,6 +2,7 @@ package subtreevalidation
 
 import (
 	"context"
+	"math"
 	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2"
@@ -18,13 +19,14 @@ import (
 // The cache is populated from the KAFKA_TX_POLICY_REJECTED topic and consulted by
 // subtree validation before making an HTTP request to another miner for a missing tx.
 //
-// Bound: the cache is bounded by the cumulative raw size (tx.Size()) of the stored
-// transactions, NOT by entry count. This matters because a single entry can be up to
-// maxCachedTxBytes (1 MB); an entry-count bound derived from an assumed average size
+// Bound: the cache is bounded by the cumulative extended size (tx.ExtendedSize()) of the
+// stored transactions, NOT by entry count. This matters because a single entry can be up
+// to maxCachedTxBytes (1 MB); an entry-count bound derived from an assumed average size
 // would let an adversarial flood of large policy-rejected txs blow past the configured
-// memory budget and OOM the pod. tx.Size() (the serialized byte length) is used as the
-// accounting unit; it undercounts the *bt.Tx object-graph overhead but tracks the
-// configured "memory in MB" budget far more faithfully than an entry count.
+// memory budget and OOM the pod. The extended size is used because a tx parsed from
+// extended format also retains every input's previous output, which tx.Size() leaves out;
+// it undercounts the *bt.Tx object-graph overhead but tracks the configured "memory in MB"
+// budget far more faithfully than an entry count.
 //
 // Eviction policy: when adding an entry would exceed the byte budget, arbitrary (random)
 // entries are evicted until it fits. This is acceptable because the cache is best-effort;
@@ -164,7 +166,7 @@ func (c *txPolicyRejectedCache) set(hash chainhash.Hash, tx *bt.Tx, conflicting 
 		return
 	}
 
-	size := tx.Size()
+	size := cachedSize(tx)
 
 	// Evict arbitrary entries until the new one fits within the byte budget. The
 	// len > 0 guard guarantees forward progress (and lets a single oversized tx still
@@ -176,6 +178,12 @@ func (c *txPolicyRejectedCache) set(hash chainhash.Hash, tx *bt.Tx, conflicting 
 
 	c.entries[hash] = cacheEntry{tx: tx, size: size, conflicting: conflicting}
 	c.curBytes += size
+}
+
+// cachedSize is what a cached tx can retain: the extended size, which also counts each
+// input's previous output.
+func cachedSize(tx *bt.Tx) int {
+	return int(min(tx.ExtendedSize(), uint64(math.MaxInt))) // nolint: gosec // G115: bounded by MaxInt
 }
 
 // evictOne removes one arbitrary entry and reclaims its bytes. Called under write lock.
