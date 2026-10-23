@@ -309,3 +309,58 @@ func TestPolicyRejectedTxMessageHandler_KeptAsideHasItsOwnBudget(t *testing.T) {
 	_, ok = server.conflictingTx(real)
 	require.True(t, ok)
 }
+
+// TestConflictingCount_CountsATxInBothCachesOnce pins that a tx cached as conflicting in
+// both caches is one miss explained, not two. The handler cannot keep the caches disjoint:
+// a kept-aside message can arrive before the validator's message for the same loser.
+func TestConflictingCount_CountsATxInBothCachesOnce(t *testing.T) {
+	tx, err := bt.NewTxFromString("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0104ffffffff0100f2052a0100000043410496b538e853519c726a2c91e61ec11600ae1390813a627c66fb8be7947be63c52da7589379515d4e0a604f8141781e62294721166bf621e73a82cbf2342c858eeac00000000")
+	require.NoError(t, err)
+
+	var both, policyOnly, keptAsideOnly, policyRejected, unknown chainhash.Hash
+	both[0] = 1
+	policyOnly[0] = 2
+	keptAsideOnly[0] = 3
+	policyRejected[0] = 4
+	unknown[0] = 5
+
+	server := &Server{
+		policyRejectedTxCache: newTxPolicyRejectedCache(1024 * 1024),
+		keptAsideTxCache:      newTxPolicyRejectedCache(1024 * 1024),
+	}
+
+	server.keptAsideTxCache.SetConflicting(both, tx)
+	server.policyRejectedTxCache.SetConflicting(both, tx)
+	server.policyRejectedTxCache.SetConflicting(policyOnly, tx)
+	server.keptAsideTxCache.SetConflicting(keptAsideOnly, tx)
+	server.policyRejectedTxCache.Set(policyRejected, tx)
+
+	require.Equal(t, 3, server.conflictingCount([]chainhash.Hash{both, policyOnly, keptAsideOnly, policyRejected, unknown}))
+}
+
+// TestPolicyRejectedTxMessageHandler_KeptAsideSkipsAKnownLoser pins that a kept-aside
+// message for a tx the validator already reported as conflicting does not spend the
+// kept-aside budget on it.
+func TestPolicyRejectedTxMessageHandler_KeptAsideSkipsAKnownLoser(t *testing.T) {
+	tx, err := bt.NewTxFromString("01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0704ffff001d0104ffffffff0100f2052a0100000043410496b538e853519c726a2c91e61ec11600ae1390813a627c66fb8be7947be63c52da7589379515d4e0a604f8141781e62294721166bf621e73a82cbf2342c858eeac00000000")
+	require.NoError(t, err)
+
+	server := &Server{
+		policyRejectedTxCache: newTxPolicyRejectedCache(1024 * 1024),
+		keptAsideTxCache:      newTxPolicyRejectedCache(1024 * 1024),
+		logger:                ulogger.New("test"),
+	}
+
+	handler := server.policyRejectedTxMessageHandler(context.Background())
+
+	for _, keptAside := range []bool{false, true} {
+		value, err := proto.Marshal(&kafkamessage.KafkaTxPolicyRejectedTopicMessage{
+			TxHash: tx.TxIDChainHash().CloneBytes(), RawTx: tx.SerializeBytes(), Conflicting: true, KeptAside: keptAside,
+		})
+		require.NoError(t, err)
+		require.NoError(t, handler(&kafka.KafkaMessage{Value: value}))
+	}
+
+	require.Equal(t, 0, server.keptAsideTxCache.Len())
+	require.Equal(t, 1, server.conflictingCount([]chainhash.Hash{*tx.TxIDChainHash()}))
+}

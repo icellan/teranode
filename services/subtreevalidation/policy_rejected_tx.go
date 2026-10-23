@@ -93,10 +93,26 @@ func (c *txPolicyRejectedCache) Conflicting(hash chainhash.Hash) (*bt.Tx, bool) 
 	return e.tx, true
 }
 
+// isConflicting reports whether hash is cached as rejected for conflicting. A nil cache
+// holds nothing.
+func (c *txPolicyRejectedCache) isConflicting(hash chainhash.Hash) bool {
+	if c == nil {
+		return false
+	}
+
+	_, ok := c.Conflicting(hash)
+
+	return ok
+}
+
 // ConflictingCount returns how many of hashes are cached as rejected for conflicting.
 func (c *txPolicyRejectedCache) ConflictingCount(hashes []chainhash.Hash) int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
+	if len(c.entries) == 0 {
+		return 0
+	}
 
 	n := 0
 
@@ -107,6 +123,26 @@ func (c *txPolicyRejectedCache) ConflictingCount(hashes []chainhash.Hash) int {
 	}
 
 	return n
+}
+
+// conflictingIn returns the hashes of hashes that are cached as rejected for conflicting.
+func (c *txPolicyRejectedCache) conflictingIn(hashes []chainhash.Hash) []chainhash.Hash {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if len(c.entries) == 0 {
+		return nil
+	}
+
+	var found []chainhash.Hash
+
+	for i := range hashes {
+		if e, ok := c.entries[hashes[i]]; ok && e.conflicting {
+			found = append(found, hashes[i])
+		}
+	}
+
+	return found
 }
 
 func (c *txPolicyRejectedCache) Set(hash chainhash.Hash, tx *bt.Tx) {
@@ -231,7 +267,8 @@ func (u *Server) policyRejectedTxMessageHandler(_ context.Context) func(msg *kaf
 		}
 
 		if m.KeptAside {
-			if u.keptAsideTxCache != nil {
+			// a loser the validator already reported needs no kept-aside budget
+			if u.keptAsideTxCache != nil && !u.policyRejectedTxCache.isConflicting(hash) {
 				u.keptAsideTxCache.SetConflicting(hash, tx)
 			}
 		} else if m.Conflicting {
@@ -302,7 +339,9 @@ func (u *Server) conflictingTx(hash chainhash.Hash) (*bt.Tx, bool) {
 	return nil, false
 }
 
-// conflictingCount returns how many of hashes are known as conflicting.
+// conflictingCount returns how many of hashes are known as conflicting. A tx can be in
+// both caches, since a kept-aside message can arrive before the validator's for the same
+// loser; it counts once.
 func (u *Server) conflictingCount(hashes []chainhash.Hash) int {
 	n := 0
 
@@ -311,7 +350,11 @@ func (u *Server) conflictingCount(hashes []chainhash.Hash) int {
 	}
 
 	if u.keptAsideTxCache != nil {
-		n += u.keptAsideTxCache.ConflictingCount(hashes)
+		for _, hash := range u.keptAsideTxCache.conflictingIn(hashes) {
+			if !u.policyRejectedTxCache.isConflicting(hash) {
+				n++
+			}
+		}
 	}
 
 	return n

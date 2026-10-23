@@ -232,9 +232,10 @@ func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash
 // shareConflictingTxs makes kept-aside txs that are not yet known as conflicting known:
 // cached here at once in the kept-aside cache, and published on the policy-rejected topic,
 // flagged keptAside, for every other subtree validator. Mostly these are descendants; a
-// loser whose validator publish this pod has not consumed yet goes out again, which the
-// consumer ignores. The publish is best-effort, like the validators': a dropped message
-// only means a child in another subtree fails that subtree, as before.
+// loser whose validator publish this pod has not consumed yet goes out again. A consumer
+// that already has the validator's message skips it, and one that gets it first counts
+// the tx once when both arrive. The publish is best-effort, like the validators': a
+// dropped message only means a child in another subtree fails that subtree, as before.
 func (u *Server) shareConflictingTxs(keptAside []*bt.Tx) {
 	for _, tx := range keptAside {
 		hash := *tx.TxIDChainHash()
