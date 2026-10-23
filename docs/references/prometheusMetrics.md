@@ -345,7 +345,7 @@ The download gauges and the `download_*_total` counters are published from the 3
 | `teranode_subtreevalidation_bless_missing_transaction`      | Histogram | Duration of bless missing transaction             |
 | `teranode_subtreevalidation_bless_unlock_failed`            | Counter   | Accepted transactions blessed although their two-phase-commit unlock failed |
 | `teranode_subtreevalidation_bless_unlock_recovered`         | Counter   | Subset of `bless_unlock_failed` that the per-level unlock retry made spendable |
-| `teranode_subtreevalidation_conflicting_kept_aside`         | Counter   | Transactions of peer subtrees kept aside because they conflict with accepted transactions, until a block references them |
+| `teranode_subtreevalidation_conflicting_kept_aside`         | Counter   | Transactions of peer subtrees kept aside because they conflict with accepted transactions, until a block references them, counted per validation pass |
 | `teranode_subtreevalidation_bless_unlock_retry_failed_batches` | Counter | Unlock retry calls that returned an error; counted per call, not per transaction, because the store reports no per-record result |
 | `teranode_subtreevalidation_set_tx_meta_cache_kafka_batch`  | Histogram | Duration of one SetCacheMulti batch from a Kafka txmeta message (per Kafka message, not per entry) |
 | `teranode_subtreevalidation_set_tx_meta_cache_kafka_count`  | Counter   | Number of ADD entries processed from Kafka (per-entry; mirrors the pre-batching histogram count)   |

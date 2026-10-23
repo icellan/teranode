@@ -98,7 +98,8 @@ var (
 	prometheusSubtreeValidationBlessUnlockRecovered prometheus.Counter
 
 	// prometheusSubtreeValidationConflictingKeptAside counts txs of peer subtrees kept aside
-	// because they conflict with txs this node accepted, until a block references them.
+	// because they conflict with txs this node accepted, until a block references them. It
+	// counts per validation pass: a subtree validated again after an interrupted pass counts again.
 	prometheusSubtreeValidationConflictingKeptAside prometheus.Counter
 
 	// prometheusSubtreeValidationBlessUnlockRetryFailedBatches counts unlock retry calls that
@@ -302,7 +303,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "subtreevalidation",
 			Name:      "conflicting_kept_aside",
-			Help:      "Transactions of peer subtrees kept aside because they conflict with accepted transactions, until a block references them",
+			Help:      "Transactions of peer subtrees kept aside because they conflict with accepted transactions, until a block references them, counted per validation pass",
 		},
 	)
 
