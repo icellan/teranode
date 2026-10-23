@@ -195,7 +195,9 @@ func subtreeToCheckFromHashes(subtreeHash chainhash.Hash, txHashes []chainhash.H
 // never stored as FileTypeSubtree: readers trust that file to have every tx in the UTXO
 // store. The kept-aside txs are stored first and the subtree as FileTypeSubtreeToCheck
 // second, so a subtree to check from this path always has its kept-aside txs next to it.
-// The block that references the subtree validates it, kept-aside txs included.
+// A kept-aside file left by a pass that stopped before the subtree to check is replaced:
+// this pass may have kept a different set aside. The block that references the subtree
+// validates it, kept-aside txs included.
 func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash chainhash.Hash, txHashes []chainhash.Hash, keptAside []*bt.Tx) error {
 	_, subtreeBytes, err := subtreeToCheckFromHashes(subtreeHash, txHashes)
 	if err != nil {
@@ -204,14 +206,8 @@ func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash
 
 	dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
 
-	newlyKeptAside := true
-
-	if err = u.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting, serializeConflictingTxs(keptAside), options.WithDeleteAt(dah)); err != nil {
-		if !errors.Is(err, errors.ErrBlobAlreadyExists) {
-			return errors.NewStorageError("[storeSubtreeWithConflictingTxs][%s] failed to store conflicting txs", subtreeHash.String(), err)
-		}
-
-		newlyKeptAside = false
+	if err = u.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting, serializeConflictingTxs(keptAside), options.WithDeleteAt(dah), options.WithAllowOverwrite(true)); err != nil {
+		return errors.NewStorageError("[storeSubtreeWithConflictingTxs][%s] failed to store conflicting txs", subtreeHash.String(), err)
 	}
 
 	if err = u.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes, options.WithDeleteAt(dah)); err != nil && !errors.Is(err, errors.ErrBlobAlreadyExists) {
@@ -220,9 +216,7 @@ func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash
 
 	u.shareConflictingTxs(keptAside)
 
-	if newlyKeptAside {
-		prometheusSubtreeValidationConflictingKeptAside.Add(float64(len(keptAside)))
-	}
+	prometheusSubtreeValidationConflictingKeptAside.Add(float64(len(keptAside)))
 
 	u.logger.Infof("[storeSubtreeWithConflictingTxs][%s] kept %d conflicting txs aside until a block references the subtree", subtreeHash.String(), len(keptAside))
 

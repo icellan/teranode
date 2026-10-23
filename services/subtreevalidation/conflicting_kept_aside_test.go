@@ -642,6 +642,26 @@ func TestValidateSubtreeInternal_KeptAsideEdgeCases(t *testing.T) {
 		require.True(t, exists)
 	})
 
+	t.Run("a stale sidecar left by an interrupted pass is replaced", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		server, subtreeStore := f.newServer(t)
+
+		root := servePeerSubtree(t, subtreeStore, f.loser, f.child, f.other)
+
+		// as after a pass that kept only the loser aside and stopped before the subtree to check
+		require.NoError(t, subtreeStore.Set(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting, serializeConflictingTxs([]*bt.Tx{f.loser})))
+
+		require.NoError(t, livePass(t, server, root))
+
+		b, err := subtreeStore.Get(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting)
+		require.NoError(t, err)
+
+		kept, err := readConflictingTxs(b)
+		require.NoError(t, err)
+		require.Len(t, kept, 2, "the sidecar next to the subtree to check is this pass's kept-aside set")
+		require.Equal(t, *f.child.TxIDChainHash(), *kept[1].TxIDChainHash())
+	})
+
 	t.Run("an unreadable sidecar falls back to the peer on the block path", func(t *testing.T) {
 		f := newConflictingFixture(t)
 		server, subtreeStore := f.newServer(t)
