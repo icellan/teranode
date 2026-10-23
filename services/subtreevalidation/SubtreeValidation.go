@@ -56,7 +56,6 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
-	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
@@ -750,6 +749,56 @@ type metaSliceItem struct {
 	keptAside bool
 }
 
+// subtreeAlreadyHandled reports whether the subtree needs no validation: it is stored as
+// validated, or, on the peer path, stored with its conflicting txs kept aside, waiting for the
+// block that references it. A block validates such a subtree. The kept-aside check runs
+// alongside the subtree's own, so a new subtree pays no extra round trip.
+func (u *Server) subtreeAlreadyHandled(ctx context.Context, v ValidateSubtree) (bool, error) {
+	var (
+		subtreeExists, keptAsideExists bool
+		subtreeExistsErr, keptAsideErr error
+		existsWg                       sync.WaitGroup
+	)
+
+	existsWg.Go(func() {
+		subtreeExists, subtreeExistsErr = u.GetSubtreeExists(ctx, &v.SubtreeHash)
+	})
+
+	if !v.FromBlock && u.subtreeStore != nil {
+		existsWg.Go(func() {
+			keptAsideExists, keptAsideErr = u.subtreeStore.Exists(ctx, v.SubtreeHash[:], fileformat.FileTypeSubtreeConflicting)
+		})
+	}
+
+	existsWg.Wait()
+
+	if subtreeExistsErr != nil {
+		return false, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check if subtree exists in store", v.SubtreeHash.String(), subtreeExistsErr)
+	}
+
+	if subtreeExists {
+		// If the subtree is already in the store, it means it is already validated.
+		return true, nil
+	}
+
+	// only consulted once the subtree is known not to be stored
+	if keptAsideErr != nil {
+		return false, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check for kept-aside conflicting txs", v.SubtreeHash.String(), keptAsideErr)
+	}
+
+	if !keptAsideExists {
+		return false, nil
+	}
+
+	// the subtree to check is written second; without it the first pass did not finish
+	toCheckExists, err := u.subtreeStore.Exists(ctx, v.SubtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+	if err != nil {
+		return false, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check for the subtree to check", v.SubtreeHash.String(), err)
+	}
+
+	return toCheckExists, nil
+}
+
 // ValidateSubtreeInternal performs the actual validation of a subtree.
 //
 // This is the core method of the subtree validation service, responsible for the
@@ -817,54 +866,14 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 	txHashes := v.TxHashes
 
 	if txHashes == nil {
-		var (
-			subtreeExists, keptAsideExists bool
-			subtreeExistsErr, keptAsideErr error
-			existsWg                       sync.WaitGroup
-		)
+		var handled bool
 
-		// A peer subtree already stored with its conflicting txs kept aside waits for the
-		// block that references it. Only the peer path may skip it; a block validates it.
-		// Checked alongside the subtree, so a new subtree pays no extra round trip.
-		existsWg.Go(func() {
-			subtreeExists, subtreeExistsErr = u.GetSubtreeExists(ctx, &v.SubtreeHash)
-		})
-
-		if !v.FromBlock && u.subtreeStore != nil {
-			existsWg.Go(func() {
-				keptAsideExists, keptAsideErr = u.subtreeStore.Exists(ctx, v.SubtreeHash[:], fileformat.FileTypeSubtreeConflicting)
-			})
-		}
-
-		existsWg.Wait()
+		handled, err = u.subtreeAlreadyHandled(ctx, v)
 
 		stat.NewStat("1. subtreeExists").AddTime(start)
 
-		if subtreeExistsErr != nil {
-			return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check if subtree exists in store", v.SubtreeHash.String(), subtreeExistsErr)
-		}
-
-		if subtreeExists {
-			// If the subtree is already in the store, it means it is already validated.
-			// Therefore, we finish processing of the subtree.
-			return nil, nil
-		}
-
-		// only consulted once the subtree is known not to be stored
-		if keptAsideErr != nil {
-			return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check for kept-aside conflicting txs", v.SubtreeHash.String(), keptAsideErr)
-		}
-
-		if keptAsideExists {
-			// the subtree to check is written second; without it the first pass did not finish
-			toCheckExists, err := u.subtreeStore.Exists(ctx, v.SubtreeHash[:], fileformat.FileTypeSubtreeToCheck)
-			if err != nil {
-				return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check for the subtree to check", v.SubtreeHash.String(), err)
-			}
-
-			if toCheckExists {
-				return nil, nil
-			}
+		if err != nil || handled {
+			return nil, err
 		}
 
 		txHashes, err = u.getSubtreeTxHashes(ctx, stat, &v.SubtreeHash, v.BaseURL, v.PeerID)
@@ -1459,74 +1468,8 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 		firstErrorOnce sync.Once
 	)
 
-	var (
-		keptAsideMu sync.Mutex
-		keptAside   = make(map[chainhash.Hash]struct{})
-	)
-
-	// setKeptAside also makes the tx known on this pod at once, not when its subtree is
-	// stored, so a child in a sibling subtree validated at the same time is kept aside too.
-	setKeptAside := func(tx *bt.Tx, txIdx int) {
-		keptAsideMu.Lock()
-		keptAside[*tx.TxIDChainHash()] = struct{}{}
-		keptAsideMu.Unlock()
-
-		txMetaSlice[txIdx] = metaSliceItem{keptAside: true}
-
-		u.cacheKeptAside(tx)
-	}
-
-	// hasKeptAsideParent reports whether tx spends a tx kept aside in an earlier level of this
-	// subtree. Parents are always in an earlier level, so the set is complete for this tx's
-	// inputs, and such a parent is never in the UTXO store.
-	hasKeptAsideParent := func(tx *bt.Tx) bool {
-		keptAsideMu.Lock()
-		defer keptAsideMu.Unlock()
-
-		for _, input := range tx.Inputs {
-			if _, ok := keptAside[*input.PreviousTxIDChainHash()]; ok {
-				return true
-			}
-		}
-
-		return false
-	}
-
-	// hasConflictingParent reports whether a missing parent of tx is known as conflicting.
-	// It is only asked once the validator found a parent missing. The cache is never
-	// cleared, so a parent counts only if it is also absent from the store: a parent that
-	// later won is in the store and decides. Each distinct parent is read once, straight
-	// from the store: a miss is the expected answer, not a cache miss to warn about.
-	hasConflictingParent := func(ctx context.Context, tx *bt.Tx) (bool, error) {
-		checked := make(map[chainhash.Hash]struct{}, len(tx.Inputs))
-
-		for _, input := range tx.Inputs {
-			parentHash := input.PreviousTxIDChainHash()
-
-			if _, done := checked[*parentHash]; done {
-				continue
-			}
-
-			checked[*parentHash] = struct{}{}
-
-			if !u.knownConflicting(*parentHash) {
-				continue
-			}
-
-			_, err := u.utxoStore.Get(ctx, parentHash, fields.Conflicting)
-			if err == nil {
-				continue
-			}
-
-			if errors.Is(err, errors.ErrTxNotFound) {
-				return true, nil
-			}
-
-			return false, errors.NewStorageError("[validateSubtree][%s] failed to read parent %s", tx.TxIDChainHash().String(), parentHash.String(), err)
-		}
-
-		return false, nil
-	}
+	// txs of a peer subtree kept aside because they conflict with txs this node accepted
+	kept := &keptAsideSet{u: u, txMetaSlice: txMetaSlice, blockHeight: blockHeight, hashes: make(map[chainhash.Hash]struct{})}
 
 	// Pre-warm the MTP store once before spawning per-transaction goroutines, so each goroutine
 	// can read mtpStore[h] without locking and without making gRPC calls.
@@ -1561,11 +1504,8 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 					err          error
 				)
 
-				if keepAside && hasKeptAsideParent(tx) {
-					// A descendant cannot be validated without its parent in the store, so it
-					// only gets the checks that need no parent before it is kept aside.
-					if err = validator.CheckTransactionContextFree(tx, u.settings, blockHeight); err == nil {
-						setKeptAside(tx, txIdx)
+				if keepAside && kept.hasParentIn(tx) {
+					if err = kept.keepDescendant(tx, txIdx); err == nil {
 						return nil
 					}
 				} else {
@@ -1585,30 +1525,17 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 					lockedMu.Unlock()
 				}
 
-				// The validator marks a rejection conflicting only when every failed input is
-				// spent by a different tx; a tx with an input that is invalid otherwise fails.
-				// The stores' per-input TX_CONFLICTING does not count.
-				if err != nil && keepAside && errors.Is(err, errors.ErrTxRejectedConflicting) {
-					setKeptAside(tx, txIdx)
-					return nil
-				}
-
-				if err != nil && keepAside && errors.Is(err, errors.ErrTxMissingParent) {
-					// as for a descendant above: only the checks that need no parent, and those
-					// first, so a malformed tx fails as invalid without a store read
-					if ctxFreeErr := validator.CheckTransactionContextFree(tx, u.settings, blockHeight); ctxFreeErr != nil {
-						err = ctxFreeErr
-					} else {
-						conflictingParent, parentErr := hasConflictingParent(gCtx, tx)
-						if parentErr != nil {
-							return parentErr
-						}
-
-						if conflictingParent {
-							setKeptAside(tx, txIdx)
-							return nil
-						}
+				if err != nil && keepAside {
+					keptAside, blessErr, fatalErr := kept.afterFailedBless(gCtx, tx, txIdx, err)
+					if fatalErr != nil {
+						return fatalErr
 					}
+
+					if keptAside {
+						return nil
+					}
+
+					err = blessErr
 				}
 
 				if err != nil {

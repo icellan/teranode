@@ -3,14 +3,17 @@ package subtreevalidation
 import (
 	"bytes"
 	"context"
+	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/validator"
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
 	"google.golang.org/protobuf/proto"
@@ -48,6 +51,16 @@ func readConflictingTxs(b []byte) ([]*bt.Tx, error) {
 	}
 
 	return txs, nil
+}
+
+// keptAsideToPrewarm returns the txs kept aside next to subtree when its subtree data is
+// not stored, the only txs of it a block needs to prewarm; see subtreeConflictingTxs.
+func (u *Server) keptAsideToPrewarm(ctx context.Context, subtree *subtreepkg.Subtree, subtreeDataExists bool) ([]*bt.Tx, bool, error) {
+	if subtreeDataExists {
+		return nil, false, nil
+	}
+
+	return u.subtreeConflictingTxs(ctx, subtree)
 }
 
 // readKeptAside reads the txs kept aside next to subtreeHash. found is false when there is
@@ -319,4 +332,129 @@ func (u *Server) shareConflictingTxs(keptAside []*bt.Tx) {
 			u.logger.Debugf("[shareConflictingTxs][%s] dropped kept-aside conflicting tx: producer buffer full", hash.String())
 		}
 	}
+}
+
+// keptAsideSet tracks the txs of one peer subtree kept aside while its missing txs are
+// blessed level by level, and decides which txs are kept aside.
+type keptAsideSet struct {
+	u           *Server
+	txMetaSlice []metaSliceItem
+	blockHeight uint32
+
+	mu     sync.Mutex
+	hashes map[chainhash.Hash]struct{}
+}
+
+// set keeps tx aside. It also makes the tx known on this pod at once, not when its subtree
+// is stored, so a child in a sibling subtree validated at the same time is kept aside too.
+func (k *keptAsideSet) set(tx *bt.Tx, txIdx int) {
+	k.mu.Lock()
+	k.hashes[*tx.TxIDChainHash()] = struct{}{}
+	k.mu.Unlock()
+
+	k.txMetaSlice[txIdx] = metaSliceItem{keptAside: true}
+
+	k.u.cacheKeptAside(tx)
+}
+
+// hasParentIn reports whether tx spends a tx kept aside in an earlier level of this subtree.
+// Parents are always in an earlier level, so the set is complete for this tx's inputs, and
+// such a parent is never in the UTXO store.
+func (k *keptAsideSet) hasParentIn(tx *bt.Tx) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	for _, input := range tx.Inputs {
+		if _, ok := k.hashes[*input.PreviousTxIDChainHash()]; ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+// keepDescendant keeps aside a tx spending a kept-aside tx. It cannot be validated without
+// its parent in the store, so it only gets the checks that need no parent; their failure
+// is returned and the tx is not kept aside.
+func (k *keptAsideSet) keepDescendant(tx *bt.Tx, txIdx int) error {
+	if err := validator.CheckTransactionContextFree(tx, k.u.settings, k.blockHeight); err != nil {
+		return err
+	}
+
+	k.set(tx, txIdx)
+
+	return nil
+}
+
+// afterFailedBless keeps aside a tx whose bless failed with blessErr, when the validator
+// rejected it as conflicting, or reported a missing parent that is known as conflicting.
+// The validator marks a rejection conflicting only when every failed input is spent by a
+// different tx, so a tx with an input that is invalid otherwise fails; the stores' per-input
+// TX_CONFLICTING does not count. err is the error the bless now fails with, when the tx is
+// not kept aside: a context-free failure replaces a missing parent. fatal is a store error,
+// which halts the subtree.
+func (k *keptAsideSet) afterFailedBless(ctx context.Context, tx *bt.Tx, txIdx int, blessErr error) (keptAside bool, err error, fatal error) {
+	if errors.Is(blessErr, errors.ErrTxRejectedConflicting) {
+		k.set(tx, txIdx)
+		return true, nil, nil
+	}
+
+	if !errors.Is(blessErr, errors.ErrTxMissingParent) {
+		return false, blessErr, nil
+	}
+
+	// as for a descendant: only the checks that need no parent, and those first, so a
+	// malformed tx fails as invalid without a store read
+	if ctxFreeErr := validator.CheckTransactionContextFree(tx, k.u.settings, k.blockHeight); ctxFreeErr != nil {
+		return false, ctxFreeErr, nil
+	}
+
+	conflictingParent, parentErr := k.u.hasConflictingParent(ctx, tx)
+	if parentErr != nil {
+		return false, nil, parentErr
+	}
+
+	if !conflictingParent {
+		return false, blessErr, nil
+	}
+
+	k.set(tx, txIdx)
+
+	return true, nil, nil
+}
+
+// hasConflictingParent reports whether a missing parent of tx is known as conflicting. It
+// is only asked once the validator found a parent missing. The caches are never cleared,
+// so a parent counts only if it is also absent from the store: a parent that later won is
+// in the store and decides. Each distinct parent is read once, straight from the store: a
+// miss is the expected answer, not a cache miss to warn about.
+func (u *Server) hasConflictingParent(ctx context.Context, tx *bt.Tx) (bool, error) {
+	checked := make(map[chainhash.Hash]struct{}, len(tx.Inputs))
+
+	for _, input := range tx.Inputs {
+		parentHash := input.PreviousTxIDChainHash()
+
+		if _, done := checked[*parentHash]; done {
+			continue
+		}
+
+		checked[*parentHash] = struct{}{}
+
+		if !u.knownConflicting(*parentHash) {
+			continue
+		}
+
+		_, err := u.utxoStore.Get(ctx, parentHash, fields.Conflicting)
+		if err == nil {
+			continue
+		}
+
+		if errors.Is(err, errors.ErrTxNotFound) {
+			return true, nil
+		}
+
+		return false, errors.NewStorageError("[validateSubtree][%s] failed to read parent %s", tx.TxIDChainHash().String(), parentHash.String(), err)
+	}
+
+	return false, nil
 }

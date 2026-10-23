@@ -146,17 +146,11 @@ func (u *Server) loadSubtreeBatch(ctx, fetchCtx context.Context, request *subtre
 					return errors.NewProcessingError("[CheckBlockSubtrees][%s] failed to check if subtree data exists in store", subtreeHash.String(), err)
 				}
 
-				var keptAside []*bt.Tx
-
-				keptAsideLoaded := false
-
-				if !subtreeDataExists {
-					// A peer subtree stored with conflicting txs kept aside had its other txs
-					// validated when it arrived; only the kept-aside txs need prewarming.
-					keptAside, keptAsideLoaded, err = u.subtreeConflictingTxs(gCtx, subtreeToCheck)
-					if err != nil {
-						return err
-					}
+				// A peer subtree stored with conflicting txs kept aside had its other txs
+				// validated when it arrived; only the kept-aside txs need prewarming.
+				keptAside, keptAsideLoaded, err := u.keptAsideToPrewarm(gCtx, subtreeToCheck, subtreeDataExists)
+				if err != nil {
+					return err
 				}
 
 				if keptAsideLoaded {
