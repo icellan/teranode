@@ -129,7 +129,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `subtreevalidation_txPolicyRejectedCacheEnabled` off (it is on by default), conflicting
   txs are kept aside within a subtree only. Descendants in the same subtree as their
   conflicting parent still count towards the fail-fast thresholds. Kept-aside txs are
-  counted in `teranode_subtreevalidation_conflicting_kept_aside`.
+  counted in `teranode_subtreevalidation_conflicting_kept_aside`. (#2038)
 
 - **Blocks whose cached subtrees hold a tx the store flags conflicting are now rejected.**
   Subtree validation used to bless a block whose subtrees it had already cached on
