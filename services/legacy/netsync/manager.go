@@ -2028,8 +2028,8 @@ func (sm *SyncManager) processOrphanTransactions(ctx context.Context, txHash *ch
 			}
 
 			if errors.Is(err, errors.ErrTxConflicting) {
-				// remove the tx from the orphan pool, it is a double spend
-				sm.orphanTxs.Delete(*txHash)
+				// remove the orphan from the orphan pool, it is a double spend
+				sm.orphanTxs.Delete(*orphanTx.tx.TxIDChainHash())
 				continue
 			}
 
