@@ -798,43 +798,42 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 	txHashes := v.TxHashes
 
 	if txHashes == nil {
-		var subtreeExists, keptAsideExists bool
+		var (
+			subtreeExists, keptAsideExists bool
+			subtreeExistsErr, keptAsideErr error
+			existsWg                       sync.WaitGroup
+		)
 
 		// A peer subtree already stored with its conflicting txs kept aside waits for the
 		// block that references it. Only the peer path may skip it; a block validates it.
 		// Checked alongside the subtree, so a new subtree pays no extra round trip.
-		existsGroup, existsCtx := errgroup.WithContext(ctx)
-
-		existsGroup.Go(func() (err error) {
-			if subtreeExists, err = u.GetSubtreeExists(existsCtx, &v.SubtreeHash); err != nil {
-				return errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check if subtree exists in store", v.SubtreeHash.String(), err)
-			}
-
-			return nil
+		existsWg.Go(func() {
+			subtreeExists, subtreeExistsErr = u.GetSubtreeExists(ctx, &v.SubtreeHash)
 		})
 
 		if !v.FromBlock && u.subtreeStore != nil {
-			existsGroup.Go(func() (err error) {
-				if keptAsideExists, err = u.subtreeStore.Exists(existsCtx, v.SubtreeHash[:], fileformat.FileTypeSubtreeConflicting); err != nil {
-					return errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check for kept-aside conflicting txs", v.SubtreeHash.String(), err)
-				}
-
-				return nil
+			existsWg.Go(func() {
+				keptAsideExists, keptAsideErr = u.subtreeStore.Exists(ctx, v.SubtreeHash[:], fileformat.FileTypeSubtreeConflicting)
 			})
 		}
 
-		err = existsGroup.Wait()
+		existsWg.Wait()
 
 		stat.NewStat("1. subtreeExists").AddTime(start)
 
-		if err != nil {
-			return nil, err
+		if subtreeExistsErr != nil {
+			return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check if subtree exists in store", v.SubtreeHash.String(), subtreeExistsErr)
 		}
 
 		if subtreeExists {
 			// If the subtree is already in the store, it means it is already validated.
 			// Therefore, we finish processing of the subtree.
 			return nil, nil
+		}
+
+		// only consulted once the subtree is known not to be stored
+		if keptAsideErr != nil {
+			return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check for kept-aside conflicting txs", v.SubtreeHash.String(), keptAsideErr)
 		}
 
 		if keptAsideExists {
@@ -2302,23 +2301,9 @@ func (u *Server) getMissingTransactionsFromFile(ctx context.Context, subtreeHash
 			return nil, err
 		}
 	} else {
-		subtree, err = subtreepkg.NewIncompleteTreeByLeafCount(len(allTxs))
+		subtree, err = incompleteTreeFromNodes(len(allTxs), func(i int) chainhash.Hash { return allTxs[i] })
 		if err != nil {
 			return nil, errors.NewProcessingError("[getMissingTransactionsFromFile] failed to create new subtree from txs in memory", err)
-		}
-
-		for _, txHash := range allTxs {
-			if txHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				if err = subtree.AddCoinbaseNode(); err != nil {
-					return nil, errors.NewProcessingError("[getMissingTransactionsFromFile] failed to add coinbase placeholder node to subtree", err)
-				}
-
-				continue
-			}
-
-			if err = subtree.AddNode(txHash, 0, 0); err != nil {
-				return nil, errors.NewProcessingError("[getMissingTransactionsFromFile] failed to add node to subtree", err)
-			}
 		}
 	}
 
