@@ -195,8 +195,9 @@ func subtreeToCheckFromNodes(subtreeHash chainhash.Hash, leafCount int, node fun
 //
 // Only the kept-aside txs the peer sent are written. Those this node resolved from its own
 // caches are resolved again when the block needs them; writing them would let a peer fill
-// the subtree store with txs it never sent, at 32 bytes a tx. Over the per-subtree cap the
-// subtree fails, as it did before txs were kept aside.
+// the subtree store with txs it never sent, at 32 bytes a tx. The cost: if the caches have
+// evicted such a tx by then and the peer cannot serve it, the block's subtree fails and is
+// retried. Over the per-subtree cap the subtree fails, as it did before txs were kept aside.
 func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash chainhash.Hash, txHashes []chainhash.Hash, keptAside []missingTx) error {
 	_, subtreeBytes, err := subtreeToCheckFromNodes(subtreeHash, len(txHashes), func(i int) chainhash.Hash { return txHashes[i] })
 	if err != nil {
@@ -347,6 +348,8 @@ type keptAsideSet struct {
 
 // set keeps tx aside. It also makes the tx known on this pod at once, not when its subtree
 // is stored, so a child in a sibling subtree validated at the same time is kept aside too.
+// If the subtree then fails, the entry stays: a child of it elsewhere is kept aside instead
+// of failing, which only moves its validation to the block, as for any kept-aside tx.
 func (k *keptAsideSet) set(tx *bt.Tx, txIdx int) {
 	k.mu.Lock()
 	k.hashes[*tx.TxIDChainHash()] = struct{}{}
