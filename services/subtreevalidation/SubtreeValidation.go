@@ -562,6 +562,21 @@ func (u *Server) blessMissing(ctx context.Context, blockHash chainhash.Hash, sub
 	if err != nil && !errors.Is(err, errors.ErrTxConflicting) {
 		return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to validate transaction", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
 	}
+
+	// A remote validator's metadata does not survive a gRPC error, so a block's tx it has just
+	// created as conflicting arrives without it; read the record back, as for an unlock failure.
+	if err != nil && txMeta == nil && validationOptions.CreateConflicting {
+		stored := &meta.Data{}
+		if getErr := u.utxoStore.GetMeta(ctx, tx.TxIDChainHash(), stored); getErr != nil {
+			return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to read meta of transaction created as conflicting", blockHash.String(), subtreeHash.String(), tx.TxID(), getErr)
+		}
+
+		if !stored.Conflicting {
+			return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] transaction created as conflicting is not stored as conflicting", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
+		}
+
+		txMeta = stored
+	}
 	if err != nil {
 		// a peer subtree's conflicting tx is expected and kept aside; a block's is stored as conflicting
 		if validationOptions.CreateConflicting {

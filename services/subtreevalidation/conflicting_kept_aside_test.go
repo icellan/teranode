@@ -1009,3 +1009,22 @@ func TestGetSubtreeMissingTxs_SubtreeOrderAcrossSources(t *testing.T) {
 	require.Equal(t, 0, missingTxs[0].idx, "the fetched parent comes first")
 	require.Equal(t, 1, missingTxs[1].idx)
 }
+
+// TestBlessMissing_RemoteValidatorConflictingCreateReadsMetaBack pins the remote-validator
+// case: a gRPC error drops the response metadata, so a block's tx the validator has just
+// created as conflicting arrives as (nil, TX_CONFLICTING). The record is read back instead
+// of failing the block's subtree as "tx meta is nil".
+func TestBlessMissing_RemoteValidatorConflictingCreateReadsMetaBack(t *testing.T) {
+	f := newConflictingFixture(t)
+
+	_, err := f.recorder.Interface.Validate(t.Context(), f.loser, 101, validator.WithCreateConflicting(true))
+	require.True(t, errors.Is(err, errors.ErrTxConflicting), "%v", err)
+
+	f.server.validatorClient = &failingValidator{Interface: f.recorder.Interface, err: errors.NewTxConflictingError("tx is conflicting")}
+
+	txMeta, err := f.server.blessMissingTransaction(t.Context(), chainhash.Hash{}, chainhash.Hash{}, f.loser, 101, map[uint32]bool{},
+		validator.ProcessOptions(validator.WithCreateConflicting(true)))
+	require.NoError(t, err)
+	require.NotNil(t, txMeta)
+	require.True(t, txMeta.Conflicting)
+}
