@@ -1116,8 +1116,6 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 		}
 
 		if errors.Is(err, errors.ErrUtxoError) {
-			saveAsConflicting := false
-
 			// Collect failed spends and attach a capped aggregate to the
 			// returned error. The failure count scales with the tx's input
 			// count; an uncapped chain makes every subsequent errors.Is on it
@@ -1130,19 +1128,18 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 
 			for _, spend := range spentUtxos {
 				if spend.Err != nil {
-					conflicts := spendConflicts(spend.Err)
-
-					if validationOptions.CreateConflicting && conflicts {
-						saveAsConflicting = true
-					}
-
-					if !conflicts {
+					if !spendConflicts(spend.Err) {
 						everyFailedSpendConflicts = false
 					}
 
 					failedSpends = append(failedSpends, spend.Err)
 				}
 			}
+
+			// A block's tx is created as conflicting only when it is a double spend and nothing
+			// else: any other failed spend (an immature coinbase, a frozen or mismatched output)
+			// makes it invalid, and creating it as conflicting would drop that failure.
+			saveAsConflicting := validationOptions.CreateConflicting && len(failedSpends) > 0 && everyFailedSpendConflicts
 
 			if len(failedSpends) > 0 {
 				if errors.As(err, &tErr) {

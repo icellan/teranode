@@ -106,6 +106,14 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **A block's tx is created as conflicting only when it is a double spend and nothing
+  else.** Block validation used to create a tx as conflicting as soon as one of its inputs
+  was already spent by another tx, dropping every other failed input. A block holding a
+  tx that double-spent a mempool tx and also spent an immature coinbase, or a frozen or
+  mismatched output, was accepted where SV nodes reject it. Such a block now fails
+  validation instead. Each input is classified by its own error, whatever its position in
+  the tx. (#2038)
+
 - **Peer subtrees holding conflicting txs are stored instead of rejected.** A subtree
   announced by a peer used to fail validation when it held a tx conflicting with one
   this node accepted, and the block referencing it then fetched and validated the

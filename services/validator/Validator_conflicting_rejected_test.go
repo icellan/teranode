@@ -10,6 +10,7 @@ import (
 	bec "github.com/bsv-blockchain/go-sdk/primitives/ec"
 	"github.com/bsv-blockchain/teranode/errors"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -214,6 +215,82 @@ func TestConflictingRejectionNeedsEveryFailedSpendToConflict(t *testing.T) {
 			require.False(t, errors.Is(err, errors.ErrTxConflicting), "a frozen input makes the tx invalid, not merely conflicting: %v", err)
 
 			requireNotPublished(t, producer)
+		})
+	}
+}
+
+// TestBlockPathCreatesConflictingOnlyWhenEveryFailedSpendConflicts pins the block path:
+// a tx in a block whose only failed spends are double spends is created as conflicting,
+// but one that also spends an immature coinbase is invalid and must not be created at all,
+// whatever the order of its inputs. Creating it as conflicting dropped the maturity failure
+// and let the block through.
+func TestBlockPathCreatesConflictingOnlyWhenEveryFailedSpendConflicts(t *testing.T) {
+	for _, immatureFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("immature first %v", immatureFirst), func(t *testing.T) {
+			ctx := t.Context()
+			logger := ulogger.NewErrorTestLogger(t)
+			tSettings := test.CreateBaseTestSettings(t)
+			tSettings.BlockAssembly.Disabled = true
+
+			utxoStoreURL, err := url.Parse(fmt.Sprintf("sqlitememory:///block_path_immature_%v", immatureFirst))
+			require.NoError(t, err)
+
+			utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+			require.NoError(t, err)
+			utxoStore.RawDB().SetMaxOpenConns(1)
+			require.NoError(t, utxoStore.SetBlockHeight(100))
+			require.NoError(t, utxoStore.SetMedianBlockTime(uint32(time.Now().Unix()))) //nolint:gosec
+
+			privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("BLOCK_PATH_IMMATURE_TEST_KEY!!!!"))
+
+			parentTx := transactions.Create(t,
+				transactions.WithCoinbaseData(1, "/block path immature parent/"),
+				transactions.WithP2PKHOutputs(1, 100_000, publicKey),
+			)
+			_, err = utxoStore.Create(ctx, parentTx, 1, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 1, BlockHeight: 1, SubtreeIdx: 0}))
+			require.NoError(t, err)
+
+			// mined at the current height, so it matures only after the next block
+			immatureCoinbase := transactions.Create(t,
+				transactions.WithCoinbaseData(100, "/block path immature coinbase/"),
+				transactions.WithP2PKHOutputs(1, 100_000, publicKey),
+			)
+			_, err = utxoStore.Create(ctx, immatureCoinbase, 100, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 100, BlockHeight: 100, SubtreeIdx: 0}))
+			require.NoError(t, err)
+
+			validator, err := New(ctx, logger, tSettings, utxoStore, nil, nil, nil, nil, nil)
+			require.NoError(t, err)
+
+			winner := transactions.Create(t,
+				transactions.WithPrivateKey(privateKey),
+				transactions.WithInput(parentTx, 0, privateKey),
+				transactions.WithP2PKHOutputs(1, 90_000, publicKey),
+			)
+			_, err = validator.Validate(ctx, winner, 100)
+			require.NoError(t, err)
+
+			first := transactions.WithInput(parentTx, 0, privateKey)
+			second := transactions.WithInput(immatureCoinbase, 0, privateKey)
+
+			if immatureFirst {
+				first, second = second, first
+			}
+
+			tx := transactions.Create(t,
+				transactions.WithPrivateKey(privateKey),
+				first,
+				second,
+				transactions.WithP2PKHOutputs(1, 180_000, publicKey),
+			)
+
+			txMeta, err := validator.Validate(ctx, tx, 100, WithCreateConflicting(true))
+			require.Error(t, err)
+			require.True(t, errors.Is(err, errors.ErrTxCoinbaseImmature), "the immature input fails: %v", err)
+			require.False(t, errors.Is(err, errors.ErrTxConflicting), "an immature coinbase spend is not merely conflicting: %v", err)
+			require.Nil(t, txMeta)
+
+			err = utxoStore.GetMeta(ctx, tx.TxIDChainHash(), &meta.Data{})
+			require.True(t, errors.Is(err, errors.ErrTxNotFound), "the tx is not created, as conflicting or otherwise: %v", err)
 		})
 	}
 }
