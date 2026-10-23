@@ -854,48 +854,77 @@ func TestValidateSubtreeInternal_KeptAsideEdgeCases(t *testing.T) {
 
 // TestValidateSubtreeInternal_PublishesKeptAsideDescendants pins how a kept-aside
 // descendant becomes known to every subtree validator: it is published, raw and flagged
-// conflicting, on the policy-rejected topic the validators publish their conflicting
-// rejections on, and cached here at once. A tx already known as conflicting is not
-// published again.
+// keptAside, on the policy-rejected topic the validators publish their conflicting
+// rejections on, and another subtree validator caches it in its kept-aside budget. A tx the
+// validator already reported is not published again. The producer is the one Server.New
+// builds from kafka_txPolicyRejectedConfig, over the in-memory broker.
 func TestValidateSubtreeInternal_PublishesKeptAsideDescendants(t *testing.T) {
-	f := newConflictingFixture(t)
-	server, subtreeStore := f.newServer(t)
+	topic := "tx-policy-rejected-kept-aside-publish"
 
-	producer := kafka.NewKafkaAsyncProducerMock()
-	server.conflictingTxKafkaProducer = producer
+	topicURL, err := url.Parse("memory://localhost:9092/" + topic)
+	require.NoError(t, err)
+
+	f := newConflictingFixture(t)
+	f.settings.Kafka.TxPolicyRejected = topic
+	f.settings.Kafka.TxPolicyRejectedConfig = topicURL
+
+	server, subtreeStore := f.newServer(t)
+	require.NotNil(t, server.conflictingTxKafkaProducer, "New builds the kept-aside producer from the topic config")
+
+	// another subtree validator, consuming the topic
+	other := &Server{
+		logger:                ulogger.TestLogger{},
+		policyRejectedTxCache: newTxPolicyRejectedCache(1024 * 1024),
+		keptAsideTxCache:      newTxPolicyRejectedCache(1024 * 1024),
+	}
+
+	var (
+		publishedMu sync.Mutex
+		published   []chainhash.Hash
+	)
+
+	consumer := setupMemoryKafkaConsumer(t, topic)
+	defer consumer.Close()
+
+	handler := other.policyRejectedTxMessageHandler(t.Context())
+	consumer.Start(t.Context(), func(msg *kafka.KafkaMessage) error {
+		var m kafkamessage.KafkaTxPolicyRejectedTopicMessage
+		if err := proto.Unmarshal(msg.Value, &m); err == nil && m.KeptAside {
+			publishedMu.Lock()
+			published = append(published, chainhash.Hash(m.TxHash))
+			publishedMu.Unlock()
+		}
+
+		return handler(msg)
+	}, kafka.WithLogErrorAndMoveOn())
+
+	// in-memory consumer registration is async
+	time.Sleep(50 * time.Millisecond)
 
 	// the validator already published the loser
 	server.policyRejectedTxCache.SetConflicting(*f.loser.TxIDChainHash(), f.loser)
 
 	root := servePeerSubtree(t, subtreeStore, f.loser, f.child, f.other)
 
-	_, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}, 101, map[uint32]bool{})
+	_, err = server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}, 101, map[uint32]bool{})
 	require.NoError(t, err)
 
-	var published []chainhash.Hash
+	require.Eventually(t, func() bool {
+		return other.keptAsideTxCache.Conflicting(*f.child.TxIDChainHash())
+	}, 5*time.Second, 10*time.Millisecond, "the other subtree validator learns the descendant from the topic")
 
-	for len(producer.PublishChannel()) > 0 {
-		msg := <-producer.PublishChannel()
+	require.False(t, other.policyRejectedTxCache.Conflicting(*f.child.TxIDChainHash()), "a descendant never takes space from the validators' entries")
 
-		var m kafkamessage.KafkaTxPolicyRejectedTopicMessage
-		require.NoError(t, proto.Unmarshal(msg.Value, &m))
-		require.True(t, m.Conflicting)
-		require.True(t, m.KeptAside, "a descendant is flagged so it lands in the kept-aside budget")
+	require.True(t, server.keptAsideTxCache.Conflicting(*f.child.TxIDChainHash()), "this validator knows the descendant without waiting for the topic")
+	require.False(t, server.policyRejectedTxCache.Conflicting(*f.child.TxIDChainHash()))
 
-		tx, err := bt.NewTxFromBytes(m.RawTx)
-		require.NoError(t, err)
-		require.Equal(t, m.TxHash, tx.TxIDChainHash().CloneBytes())
+	// give a stray publish of the loser time to arrive
+	time.Sleep(100 * time.Millisecond)
 
-		published = append(published, *tx.TxIDChainHash())
-	}
+	publishedMu.Lock()
+	defer publishedMu.Unlock()
 
 	require.Equal(t, []chainhash.Hash{*f.child.TxIDChainHash()}, published, "only the descendant is new knowledge")
-
-	ok := server.keptAsideTxCache.Conflicting(*f.child.TxIDChainHash())
-	require.True(t, ok, "this validator knows the descendant without waiting for the topic, in the kept-aside budget")
-
-	ok = server.policyRejectedTxCache.Conflicting(*f.child.TxIDChainHash())
-	require.False(t, ok, "a descendant never takes space from the validators' entries")
 }
 
 // TestValidateSubtreeInternal_GrandchildInLaterSubtreeIsKeptAside pins the chain across
