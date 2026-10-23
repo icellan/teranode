@@ -678,7 +678,7 @@ func TestValidateSubtreeInternal_KeptAsideEdgeCases(t *testing.T) {
 		require.NoError(t, err)
 		require.False(t, exists)
 
-		_, known := server.conflictingTx(*invalid.TxIDChainHash())
+		known := server.knownConflicting(*invalid.TxIDChainHash())
 		require.False(t, known, "an invalid tx is not cached as conflicting")
 	})
 
@@ -837,10 +837,10 @@ func TestValidateSubtreeInternal_PublishesKeptAsideDescendants(t *testing.T) {
 
 	require.Equal(t, []chainhash.Hash{*f.child.TxIDChainHash()}, published, "only the descendant is new knowledge")
 
-	_, ok := server.keptAsideTxCache.Conflicting(*f.child.TxIDChainHash())
+	ok := server.keptAsideTxCache.Conflicting(*f.child.TxIDChainHash())
 	require.True(t, ok, "this validator knows the descendant without waiting for the topic, in the kept-aside budget")
 
-	_, ok = server.policyRejectedTxCache.Conflicting(*f.child.TxIDChainHash())
+	ok = server.policyRejectedTxCache.Conflicting(*f.child.TxIDChainHash())
 	require.False(t, ok, "a descendant never takes space from the validators' entries")
 }
 

@@ -180,15 +180,12 @@ func TestTxPolicyRejectedCache_Conflicting(t *testing.T) {
 	cache.Set(policyHash, tx)
 	cache.SetConflicting(conflictingHash, tx)
 
-	_, ok := cache.Conflicting(policyHash)
-	require.False(t, ok, "a policy-rejected tx is not conflicting")
+	require.False(t, cache.Conflicting(policyHash), "a policy-rejected tx is not conflicting")
+	require.True(t, cache.Conflicting(conflictingHash))
 
-	got, ok := cache.Conflicting(conflictingHash)
-	require.True(t, ok)
-	require.Equal(t, tx.TxID(), got.TxID())
-
-	_, ok = cache.Get(conflictingHash)
+	got, ok := cache.Get(conflictingHash)
 	require.True(t, ok, "a conflicting tx still serves the missing-tx lookup")
+	require.Equal(t, tx.TxID(), got.TxID())
 
 	// A tx first cached as policy-rejected and later rejected as conflicting is upgraded,
 	// without counting its bytes twice.
@@ -197,8 +194,7 @@ func TestTxPolicyRejectedCache_Conflicting(t *testing.T) {
 
 	cache.SetConflicting(upgradedHash, tx)
 
-	_, ok = cache.Conflicting(upgradedHash)
-	require.True(t, ok)
+	require.True(t, cache.Conflicting(upgradedHash))
 	require.Equal(t, bytesBefore, cache.Bytes())
 }
 
@@ -223,7 +219,9 @@ func TestPolicyRejectedTxMessageHandler_Conflicting(t *testing.T) {
 
 	require.NoError(t, server.policyRejectedTxMessageHandler(context.Background())(&kafka.KafkaMessage{Value: value}))
 
-	got, ok := cache.Conflicting(*tx.TxIDChainHash())
+	require.True(t, cache.Conflicting(*tx.TxIDChainHash()))
+
+	got, ok := cache.Get(*tx.TxIDChainHash())
 	require.True(t, ok)
 	require.Equal(t, tx.TxID(), got.TxID())
 }
@@ -302,12 +300,9 @@ func TestPolicyRejectedTxMessageHandler_KeptAsideHasItsOwnBudget(t *testing.T) {
 		publish(variant, true, true)
 	}
 
-	_, ok := server.policyRejectedTxCache.Conflicting(real)
-	require.True(t, ok, "the validator's entry survives a flood of kept-aside entries")
+	require.True(t, server.policyRejectedTxCache.Conflicting(real), "the validator's entry survives a flood of kept-aside entries")
 	require.LessOrEqual(t, server.keptAsideTxCache.Bytes(), 2*tx.Size())
-
-	_, ok = server.conflictingTx(real)
-	require.True(t, ok)
+	require.True(t, server.knownConflicting(real))
 }
 
 // TestConflictingCount_CountsATxInBothCachesOnce pins that a tx cached as conflicting in

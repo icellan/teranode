@@ -1484,7 +1484,7 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 		for _, input := range tx.Inputs {
 			parentHash := input.PreviousTxIDChainHash()
 
-			if _, ok := u.conflictingTx(*parentHash); !ok {
+			if !u.knownConflicting(*parentHash) {
 				continue
 			}
 

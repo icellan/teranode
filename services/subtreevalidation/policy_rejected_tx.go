@@ -79,30 +79,19 @@ func (c *txPolicyRejectedCache) Get(hash chainhash.Hash) (*bt.Tx, bool) {
 	return e.tx.Clone(), true
 }
 
-// Conflicting returns the tx if it is cached as rejected for conflicting with a tx
-// the validator already accepted.
-func (c *txPolicyRejectedCache) Conflicting(hash chainhash.Hash) (*bt.Tx, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	e, ok := c.entries[hash]
-	if !ok || !e.conflicting {
-		return nil, false
-	}
-
-	return e.tx, true
-}
-
-// isConflicting reports whether hash is cached as rejected for conflicting. A nil cache
-// holds nothing.
-func (c *txPolicyRejectedCache) isConflicting(hash chainhash.Hash) bool {
+// Conflicting reports whether hash is cached as rejected for conflicting with a tx the
+// validator already accepted. A nil cache holds nothing.
+func (c *txPolicyRejectedCache) Conflicting(hash chainhash.Hash) bool {
 	if c == nil {
 		return false
 	}
 
-	_, ok := c.Conflicting(hash)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 
-	return ok
+	e, ok := c.entries[hash]
+
+	return ok && e.conflicting
 }
 
 // ConflictingCount returns how many of hashes are cached as rejected for conflicting.
@@ -268,7 +257,7 @@ func (u *Server) policyRejectedTxMessageHandler(_ context.Context) func(msg *kaf
 
 		if m.KeptAside {
 			// a loser the validator already reported needs no kept-aside budget
-			if u.keptAsideTxCache != nil && !u.policyRejectedTxCache.isConflicting(hash) {
+			if u.keptAsideTxCache != nil && !u.policyRejectedTxCache.Conflicting(hash) {
 				u.keptAsideTxCache.SetConflicting(hash, tx)
 			}
 		} else if m.Conflicting {
@@ -323,20 +312,10 @@ func (u *Server) cachedRejectedTx(hash chainhash.Hash) (*bt.Tx, bool) {
 	return nil, false
 }
 
-// conflictingTx reports whether hash is known as conflicting: rejected as conflicting by a
-// validator, or kept aside by subtree validation as a descendant of one.
-func (u *Server) conflictingTx(hash chainhash.Hash) (*bt.Tx, bool) {
-	if u.policyRejectedTxCache != nil {
-		if tx, ok := u.policyRejectedTxCache.Conflicting(hash); ok {
-			return tx, true
-		}
-	}
-
-	if u.keptAsideTxCache != nil {
-		return u.keptAsideTxCache.Conflicting(hash)
-	}
-
-	return nil, false
+// knownConflicting reports whether hash is known as conflicting: rejected as conflicting
+// by a validator, or kept aside by subtree validation as a descendant of one.
+func (u *Server) knownConflicting(hash chainhash.Hash) bool {
+	return u.policyRejectedTxCache.Conflicting(hash) || u.keptAsideTxCache.Conflicting(hash)
 }
 
 // conflictingCount returns how many of hashes are known as conflicting. A tx can be in
@@ -351,7 +330,7 @@ func (u *Server) conflictingCount(hashes []chainhash.Hash) int {
 
 	if u.keptAsideTxCache != nil {
 		for _, hash := range u.keptAsideTxCache.conflictingIn(hashes) {
-			if !u.policyRejectedTxCache.isConflicting(hash) {
+			if !u.policyRejectedTxCache.Conflicting(hash) {
 				n++
 			}
 		}

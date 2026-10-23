@@ -221,7 +221,7 @@ func (u *Server) shareConflictingTxs(keptAside []*bt.Tx) {
 	for _, tx := range keptAside {
 		hash := *tx.TxIDChainHash()
 
-		if _, known := u.conflictingTx(hash); known {
+		if u.knownConflicting(hash) {
 			continue
 		}
 
