@@ -445,7 +445,7 @@ func TestBlessMissingTransactions_KeepsConflictingAside(t *testing.T) {
 		missing := []missingTx{{tx: f.loser, idx: 0}, {tx: f.child, idx: 1}}
 		txMetaSlice := make([]metaSliceItem, len(missing))
 
-		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{})
+		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{}, true)
 		require.NoError(t, err, "a subtree whose only failures are conflicting txs must not fail")
 
 		require.True(t, txMetaSlice[0].keptAside)
@@ -468,7 +468,7 @@ func TestBlessMissingTransactions_KeepsConflictingAside(t *testing.T) {
 		missing := []missingTx{{tx: f.child, idx: 0}}
 		txMetaSlice := make([]metaSliceItem, len(missing))
 
-		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{})
+		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{}, true)
 		require.NoError(t, err)
 		require.True(t, txMetaSlice[0].keptAside)
 		f.requireNotStored(t, f.child)
@@ -484,7 +484,7 @@ func TestBlessMissingTransactions_KeepsConflictingAside(t *testing.T) {
 		missing := []missingTx{{tx: f.child, idx: 0}}
 		txMetaSlice := make([]metaSliceItem, len(missing))
 
-		err = f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{})
+		err = f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{}, true)
 		require.NoError(t, err)
 		require.True(t, txMetaSlice[0].keptAside)
 		f.requireNotStored(t, f.child)
@@ -507,7 +507,7 @@ func TestBlessMissingTransactions_KeepsConflictingAside(t *testing.T) {
 		missing := []missingTx{{tx: winnerChild, idx: 0}}
 		txMetaSlice := make([]metaSliceItem, len(missing))
 
-		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{})
+		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{}, true)
 		require.NoError(t, err)
 		require.False(t, txMetaSlice[0].keptAside, "a child whose parent is in the store is validated, whatever the cache says")
 		require.True(t, txMetaSlice[0].isSet)
@@ -531,7 +531,7 @@ func TestBlessMissingTransactions_KeepsConflictingAside(t *testing.T) {
 
 			txMetaSlice := make([]metaSliceItem, len(missing))
 
-			err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{})
+			err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{}, true)
 			require.True(t, errors.Is(err, errors.ErrTxInvalid), "parentCached=%v: a malformed descendant fails the subtree as invalid: %v", parentCached, err)
 			require.False(t, txMetaSlice[len(missing)-1].keptAside)
 		}
@@ -555,7 +555,7 @@ func TestBlessMissingTransactions_KeepsConflictingAside(t *testing.T) {
 		missing := []missingTx{{tx: mixed, idx: 0}}
 		txMetaSlice := make([]metaSliceItem, len(missing))
 
-		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{})
+		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{}, true)
 		require.Error(t, err, "the missing parent is not known to conflict, so the subtree fails as before")
 		require.False(t, txMetaSlice[0].keptAside)
 	})
@@ -566,7 +566,7 @@ func TestBlessMissingTransactions_KeepsConflictingAside(t *testing.T) {
 		missing := []missingTx{{tx: f.child, idx: 0}}
 		txMetaSlice := make([]metaSliceItem, len(missing))
 
-		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{})
+		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{}, true)
 		require.Error(t, err, "a missing parent that is not known to conflict keeps failing the subtree")
 		require.False(t, txMetaSlice[0].keptAside)
 	})
@@ -577,7 +577,7 @@ func TestBlessMissingTransactions_KeepsConflictingAside(t *testing.T) {
 		missing := []missingTx{{tx: f.loser, idx: 0}, {tx: f.child, idx: 1}}
 		txMetaSlice := make([]metaSliceItem, len(missing))
 
-		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{},
+		err := f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, missing, "", "", txMetaSlice, 101, map[uint32]bool{}, false,
 			validator.WithCreateConflicting(true))
 		require.NoError(t, err)
 
@@ -678,6 +678,21 @@ func TestValidateSubtreeInternal_KeptAsideEdgeCases(t *testing.T) {
 
 		_, known := server.conflictingTx(*invalid.TxIDChainHash())
 		require.False(t, known, "an invalid tx is not cached as conflicting")
+	})
+
+	t.Run("the block path never keeps txs aside, whatever its validator options", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		server, subtreeStore := f.newServer(t)
+
+		root := servePeerSubtree(t, subtreeStore, f.loser, f.child, f.other)
+
+		// a block-path caller that forgot WithCreateConflicting
+		_, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", FromBlock: true}, 101, map[uint32]bool{}, validator.WithSkipPolicyChecks(true))
+		require.Error(t, err, "a block's conflicting tx fails the subtree instead of being kept aside")
+
+		exists, err := subtreeStore.Exists(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting)
+		require.NoError(t, err)
+		require.False(t, exists)
 	})
 
 	t.Run("a stale sidecar left by an interrupted pass is replaced", func(t *testing.T) {

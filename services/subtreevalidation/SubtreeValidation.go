@@ -814,7 +814,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 
 		// A peer subtree already stored with its conflicting txs kept aside waits for the
 		// block that references it. Only the peer path may skip it; a block validates it.
-		if !validator.ProcessOptions(validationOptions...).CreateConflicting {
+		if !v.FromBlock {
 			keptAsideExists, err := u.subtreeStore.Exists(ctx, v.SubtreeHash[:], fileformat.FileTypeSubtreeConflicting)
 			if err != nil {
 				return nil, errors.NewStorageError("[ValidateSubtreeInternal][%s] failed to check for kept-aside conflicting txs", v.SubtreeHash.String(), err)
@@ -987,6 +987,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 				txMetaSlice,
 				blockHeight,
 				blockIds,
+				!v.FromBlock,
 				validationOptions...,
 			)
 			if err != nil {
@@ -1334,9 +1335,11 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 //   - txMetaSlice: Pre-allocated slice to store transaction metadata results
 //   - blockHeight: Height of the block containing the subtree
 //   - blockIds: Map of block IDs to check if transactions are already mined
+//   - keepAside: Whether conflicting txs are kept aside, which only a peer subtree does
 //   - validationOptions: Additional options for transaction validation behavior
 //
 // Returns:
+//   - []*bt.Tx: The txs kept aside, in subtree order
 //   - error: Any error encountered during retrieval or validation
 //
 // processMissingTransactions validates each missing tx in dependency-level
@@ -1349,7 +1352,7 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 // CheckBlockSubtrees is the authoritative backstop.
 func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree,
 	missingTxHashes []utxo.UnresolvedMetaData, allTxs []chainhash.Hash, baseURL, peerID string, txMetaSlice []metaSliceItem, blockHeight uint32,
-	blockIds map[uint32]bool, validationOptions ...validator.Option) (keptAside []*bt.Tx, err error) {
+	blockIds map[uint32]bool, keepAside bool, validationOptions ...validator.Option) (keptAside []*bt.Tx, err error) {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "SubtreeValidation:processMissingTransactions",
 		tracing.WithDebugLogMessage(u.logger, "[processMissingTransactions][%s] processing %d missing txs", subtreeHash.String(), len(missingTxHashes)),
 		tracing.WithNewRoot(), // decouple tracing from the parent context, otherwise it will explode with too many spans
@@ -1364,17 +1367,27 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 		return nil, err
 	}
 
-	if err = u.blessMissingTransactions(ctx, subtreeHash, missingTxs, baseURL, peerID, txMetaSlice, blockHeight, blockIds, validationOptions...); err != nil {
+	if err = u.blessMissingTransactions(ctx, subtreeHash, missingTxs, baseURL, peerID, txMetaSlice, blockHeight, blockIds, keepAside, validationOptions...); err != nil {
 		return nil, err
 	}
 
-	// subtree order puts parents before children
-	sort.Slice(missingTxs, func(i, j int) bool { return missingTxs[i].idx < missingTxs[j].idx })
+	if !keepAside {
+		return nil, nil
+	}
+
+	keptAsideTxs := make([]missingTx, 0, 8)
 
 	for _, mTx := range missingTxs {
 		if txMetaSlice[mTx.idx].keptAside {
-			keptAside = append(keptAside, mTx.tx)
+			keptAsideTxs = append(keptAsideTxs, mTx)
 		}
+	}
+
+	// subtree order puts parents before children
+	sort.Slice(keptAsideTxs, func(i, j int) bool { return keptAsideTxs[i].idx < keptAsideTxs[j].idx })
+
+	for _, mTx := range keptAsideTxs {
+		keptAside = append(keptAside, mTx.tx)
 	}
 
 	return keptAside, nil
@@ -1383,8 +1396,12 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 // blessMissingTransactions validates the retrieved transactions of a subtree level by level and
 // records their metadata in txMetaSlice. Parents are always validated in an earlier level than
 // their children. It returns an error when any transaction fails to bless.
+//
+// keepAside is set for a peer subtree, which has no proof of work behind it: a tx that
+// conflicts with one this node accepted must not be written to the UTXO store, so it is
+// kept aside, with its descendants, until a block references the subtree.
 func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chainhash.Hash, missingTxs []missingTx, baseURL, peerID string,
-	txMetaSlice []metaSliceItem, blockHeight uint32, blockIds map[uint32]bool, validationOptions ...validator.Option) (err error) {
+	txMetaSlice []metaSliceItem, blockHeight uint32, blockIds map[uint32]bool, keepAside bool, validationOptions ...validator.Option) (err error) {
 	u.logger.Debugf("[validateSubtree][%s] blessing %d missing txs", subtreeHash.String(), len(missingTxs))
 
 	var (
@@ -1411,11 +1428,6 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 		firstError     error
 		firstErrorOnce sync.Once
 	)
-
-	// Without CreateConflicting this is a peer subtree with no proof of work behind it, so a
-	// tx that conflicts with one this node accepted must not be written to the UTXO store.
-	// It is kept aside, with its descendants, until a block references the subtree.
-	keepAside := !processedValidatorOptions.CreateConflicting
 
 	var (
 		keptAsideMu sync.Mutex
