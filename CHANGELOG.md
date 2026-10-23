@@ -139,6 +139,13 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   conflicting parent still count towards the fail-fast thresholds. Kept-aside txs are
   counted in `teranode_subtreevalidation_conflicting_kept_aside`. (#2038)
 
+  Only the kept-aside txs the peer sent are written next to the subtree, without the
+  previous-output data of extended format; those this node already held in its caches are
+  resolved again when the block needs them. The new
+  `subtreevalidation_keptAsideMaxBytesPerSubtree` (16 MB by default) caps what one subtree
+  keeps aside: over it, the subtree fails as before. There is no per-peer cap: a peer can
+  still announce many subtrees, each under the cap, of txs it sends itself.
+
   Upgrade every subtree validator together. One without this change ignores the
   `keptAside` field and caches kept-aside txs, which a peer can fabricate, in its
   policy-rejected cache, where they evict the validators' entries until it is

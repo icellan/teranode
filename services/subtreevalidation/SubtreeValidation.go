@@ -92,6 +92,9 @@ type missingTx struct {
 
 	// idx is the original position of this transaction in the subtree's transaction list
 	idx int
+
+	// cached is set when the tx came from this node's own caches, not from the peer
+	cached bool
 }
 
 // SetSubtreeExists marks a subtree as existing in the local storage.
@@ -915,7 +918,7 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 	txMetaSlice := make([]metaSliceItem, len(txHashes))
 
 	// txs of a peer subtree kept aside because they conflict with txs this node accepted
-	var keptAside []*bt.Tx
+	var keptAside []missingTx
 
 	for attempt := 1; attempt <= maxRetries+1; attempt++ {
 		if attempt > 1 {
@@ -1371,7 +1374,7 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 //   - validationOptions: Additional options for transaction validation behavior
 //
 // Returns:
-//   - []*bt.Tx: The txs kept aside, in subtree order
+//   - []missingTx: The txs kept aside, in subtree order
 //   - error: Any error encountered during retrieval or validation
 //
 // processMissingTransactions validates each missing tx in dependency-level
@@ -1384,7 +1387,7 @@ func (u *Server) getSubtreeTxHashes(spanCtx context.Context, stat *gocore.Stat, 
 // CheckBlockSubtrees is the authoritative backstop.
 func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash chainhash.Hash, subtree *subtreepkg.Subtree,
 	missingTxHashes []utxo.UnresolvedMetaData, allTxs []chainhash.Hash, baseURL, peerID string, txMetaSlice []metaSliceItem, blockHeight uint32,
-	blockIds map[uint32]bool, keepAside bool, validationOptions ...validator.Option) (keptAside []*bt.Tx, err error) {
+	blockIds map[uint32]bool, keepAside bool, validationOptions ...validator.Option) (keptAside []missingTx, err error) {
 	ctx, _, deferFn := tracing.Tracer("subtreevalidation").Start(ctx, "SubtreeValidation:processMissingTransactions",
 		tracing.WithDebugLogMessage(u.logger, "[processMissingTransactions][%s] processing %d missing txs", subtreeHash.String(), len(missingTxHashes)),
 		tracing.WithNewRoot(), // decouple tracing from the parent context, otherwise it will explode with too many spans
@@ -1407,20 +1410,14 @@ func (u *Server) processMissingTransactions(ctx context.Context, subtreeHash cha
 		return nil, nil
 	}
 
-	keptAsideTxs := make([]missingTx, 0, 8)
-
 	for _, mTx := range missingTxs {
 		if txMetaSlice[mTx.idx].keptAside {
-			keptAsideTxs = append(keptAsideTxs, mTx)
+			keptAside = append(keptAside, mTx)
 		}
 	}
 
 	// subtree order puts parents before children
-	sort.Slice(keptAsideTxs, func(i, j int) bool { return keptAsideTxs[i].idx < keptAsideTxs[j].idx })
-
-	for _, mTx := range keptAsideTxs {
-		keptAside = append(keptAside, mTx.tx)
-	}
+	sort.Slice(keptAside, func(i, j int) bool { return keptAside[i].idx < keptAside[j].idx })
 
 	return keptAside, nil
 }

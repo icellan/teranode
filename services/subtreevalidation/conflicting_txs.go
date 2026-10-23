@@ -185,23 +185,50 @@ func subtreeToCheckFromNodes(subtreeHash chainhash.Hash, leafCount int, node fun
 // A kept-aside file left by a pass that stopped before the subtree to check is replaced:
 // this pass may have kept a different set aside. The block that references the subtree
 // validates it, kept-aside txs included.
-func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash chainhash.Hash, txHashes []chainhash.Hash, keptAside []*bt.Tx) error {
+//
+// Only the kept-aside txs the peer sent are written. Those this node resolved from its own
+// caches are resolved again when the block needs them; writing them would let a peer fill
+// the subtree store with txs it never sent, at 32 bytes a tx. Over the per-subtree cap the
+// subtree fails, as it did before txs were kept aside.
+func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash chainhash.Hash, txHashes []chainhash.Hash, keptAside []missingTx) error {
 	_, subtreeBytes, err := subtreeToCheckFromNodes(subtreeHash, len(txHashes), func(i int) chainhash.Hash { return txHashes[i] })
 	if err != nil {
 		return err
 	}
 
+	sent := make([]*bt.Tx, 0, len(keptAside))
+	all := make([]*bt.Tx, 0, len(keptAside))
+	sentBytes := 0
+
+	for _, mTx := range keptAside {
+		all = append(all, mTx.tx)
+
+		if !mTx.cached {
+			sent = append(sent, mTx.tx)
+			sentBytes += mTx.tx.Size()
+		}
+	}
+
+	if maxBytes := u.settings.SubtreeValidation.KeptAsideMaxBytesPerSubtree; sentBytes > maxBytes {
+		return errors.NewProcessingError("[storeSubtreeWithConflictingTxs][%s] %d bytes of conflicting txs kept aside, over the %d byte limit", subtreeHash.String(), sentBytes, maxBytes)
+	}
+
 	// A kept-aside tx is not fully validated, so the previous-output data a peer attached to
 	// it in extended format was never checked; it is dropped before the tx is kept anywhere.
 	// The block path validates the plain tx, reading its parents from the UTXO store.
-	keptAside, err = withoutExtendedData(keptAside)
+	sent, err = withoutExtendedData(sent)
+	if err != nil {
+		return errors.NewProcessingError("[storeSubtreeWithConflictingTxs][%s] failed to drop extended data of kept-aside txs", subtreeHash.String(), err)
+	}
+
+	all, err = withoutExtendedData(all)
 	if err != nil {
 		return errors.NewProcessingError("[storeSubtreeWithConflictingTxs][%s] failed to drop extended data of kept-aside txs", subtreeHash.String(), err)
 	}
 
 	dah := u.utxoStore.GetBlockHeight() + u.settings.GetSubtreeValidationBlockHeightRetention()
 
-	if err = u.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting, serializeConflictingTxs(keptAside), options.WithDeleteAt(dah), options.WithAllowOverwrite(true)); err != nil {
+	if err = u.subtreeStore.Set(ctx, subtreeHash[:], fileformat.FileTypeSubtreeConflicting, serializeConflictingTxs(sent), options.WithDeleteAt(dah), options.WithAllowOverwrite(true)); err != nil {
 		return errors.NewStorageError("[storeSubtreeWithConflictingTxs][%s] failed to store conflicting txs", subtreeHash.String(), err)
 	}
 
@@ -209,11 +236,11 @@ func (u *Server) storeSubtreeWithConflictingTxs(ctx context.Context, subtreeHash
 		return errors.NewStorageError("[storeSubtreeWithConflictingTxs][%s] failed to store subtree to check", subtreeHash.String(), err)
 	}
 
-	u.shareConflictingTxs(keptAside)
+	u.shareConflictingTxs(all)
 
 	prometheusSubtreeValidationConflictingKeptAside.Add(float64(len(keptAside)))
 
-	u.logger.Infof("[storeSubtreeWithConflictingTxs][%s] kept %d conflicting txs aside until a block references the subtree", subtreeHash.String(), len(keptAside))
+	u.logger.Infof("[storeSubtreeWithConflictingTxs][%s] kept %d conflicting txs aside until a block references the subtree, %d of them sent by the peer", subtreeHash.String(), len(keptAside), len(sent))
 
 	return nil
 }

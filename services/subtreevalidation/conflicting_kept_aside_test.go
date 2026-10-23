@@ -1085,3 +1085,55 @@ func TestTxPolicyRejectedCache_CountsExtendedData(t *testing.T) {
 
 	require.GreaterOrEqual(t, cache.Bytes(), 200_000)
 }
+
+// TestValidateSubtreeInternal_CachedKeptAsideTxsAreNotWrittenNextToTheSubtree pins the
+// replay guard: a peer can announce fresh subtrees of hashes this node already holds in
+// its caches, at 32 bytes a tx. Only the kept-aside txs the peer sent are written next to
+// the subtree; those resolved from the caches are resolved again when a block needs them.
+func TestValidateSubtreeInternal_CachedKeptAsideTxsAreNotWrittenNextToTheSubtree(t *testing.T) {
+	f := newConflictingFixture(t)
+	server, subtreeStore := f.newServer(t)
+
+	// the validator's publish of the loser
+	server.policyRejectedTxCache.SetConflicting(*f.loser.TxIDChainHash(), f.loser)
+
+	root := servePeerSubtree(t, subtreeStore, f.loser, f.child)
+	require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeData))
+
+	// the peer serves no subtree data and only the child's bytes
+	httpmock.RegisterResponder("GET", `=~/subtree_data/[a-f0-9]{64}\z`, httpmock.NewBytesResponder(200, nil))
+	httpmock.RegisterResponder("POST", `=~/subtree/[a-f0-9]{64}/txs\z`, httpmock.NewBytesResponder(200, f.child.ExtendedBytes()))
+
+	require.NoError(t, livePassFor(t, server, root))
+
+	b, err := subtreeStore.Get(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting)
+	require.NoError(t, err)
+
+	kept, err := readConflictingTxs(b)
+	require.NoError(t, err)
+	require.Len(t, kept, 1, "only the tx the peer sent")
+	require.Equal(t, *f.child.TxIDChainHash(), *kept[0].TxIDChainHash())
+
+	exists, err := subtreeStore.Exists(t.Context(), root[:], fileformat.FileTypeSubtreeToCheck)
+	require.NoError(t, err)
+	require.True(t, exists, "the subtree waits for its block as before")
+}
+
+// TestValidateSubtreeInternal_KeptAsideOverTheCapFailsTheSubtree pins the per-subtree cap
+// on kept-aside bytes: over it, the subtree fails as it did before txs were kept aside.
+func TestValidateSubtreeInternal_KeptAsideOverTheCapFailsTheSubtree(t *testing.T) {
+	f := newConflictingFixture(t)
+	server, subtreeStore := f.newServer(t)
+
+	server.settings.SubtreeValidation.KeptAsideMaxBytesPerSubtree = f.loser.Size()
+
+	root := servePeerSubtree(t, subtreeStore, f.loser, f.child, f.other)
+
+	require.Error(t, livePassFor(t, server, root))
+
+	for _, fileType := range []fileformat.FileType{fileformat.FileTypeSubtreeConflicting, fileformat.FileTypeSubtreeToCheck} {
+		exists, err := subtreeStore.Exists(t.Context(), root[:], fileType)
+		require.NoError(t, err)
+		require.False(t, exists, fileType)
+	}
+}

@@ -296,7 +296,7 @@ func (u *Server) lookupPolicyRejectedTxs(missingTxHashes []missingTxHash) (found
 	for _, mth := range missingTxHashes {
 		tx, ok := u.cachedRejectedTx(mth.hash)
 		if ok {
-			found = append(found, missingTx{tx: tx, idx: mth.idx})
+			found = append(found, missingTx{tx: tx, idx: mth.idx, cached: true})
 		} else {
 			stillMissing = append(stillMissing, mth)
 		}
