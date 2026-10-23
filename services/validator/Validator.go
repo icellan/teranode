@@ -803,6 +803,19 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 	return txMetaData, err
 }
 
+// spendConflicts reports whether a spend failed only because its output is already spent
+// by a different tx, or is an output of a tx stored as conflicting. It reads the spend's
+// own code: the stores join the failed spends' errors into the first one's chain, so
+// errors.Is on one spend's error also matches the inputs after it.
+func spendConflicts(err error) bool {
+	var spendErr *errors.Error
+	if !errors.As(err, &spendErr) {
+		return false
+	}
+
+	return spendErr.Code() == errors.ERR_UTXO_SPENT || spendErr.Code() == errors.ERR_TX_CONFLICTING
+}
+
 // publishPolicyRejectedTx publishes the raw bytes of a policy-rejected transaction to
 // the KAFKA_TX_POLICY_REJECTED topic. Subtree validation pods consume from this topic
 // to populate a local cache, avoiding expensive HTTP fetches when a subtree from another
@@ -1117,7 +1130,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 
 			for _, spend := range spentUtxos {
 				if spend.Err != nil {
-					conflicts := errors.Is(spend.Err, errors.ErrSpent) || errors.Is(spend.Err, errors.ErrTxConflicting)
+					conflicts := spendConflicts(spend.Err)
 
 					if validationOptions.CreateConflicting && conflicts {
 						saveAsConflicting = true

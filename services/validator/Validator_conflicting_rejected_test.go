@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"fmt"
 	"net/url"
 	"testing"
 	"time"
@@ -189,21 +190,30 @@ func TestConflictingRejectionNeedsEveryFailedSpendToConflict(t *testing.T) {
 		}
 	})
 
-	t.Run("a conflicting and a frozen spend", func(t *testing.T) {
-		v, producer, parentTx, privateKey, publicKey := newFixture(t, "conflicting_and_frozen")
+	// the stores join the per-input errors in place, so whichever input fails first carries
+	// the others in its chain: both orders must be classified by each input's own error
+	for _, frozenFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("a conflicting and a frozen spend, frozen first %v", frozenFirst), func(t *testing.T) {
+			v, producer, parentTx, privateKey, publicKey := newFixture(t, fmt.Sprintf("conflicting_and_frozen_%v", frozenFirst))
 
-		loser := transactions.Create(t,
-			transactions.WithPrivateKey(privateKey),
-			transactions.WithInput(parentTx, 0, privateKey),
-			transactions.WithInput(parentTx, 1, privateKey),
-			transactions.WithP2PKHOutputs(1, 180_000, publicKey),
-		)
+			first, second := uint32(0), uint32(1)
+			if frozenFirst {
+				first, second = 1, 0
+			}
 
-		_, err := v.Validate(t.Context(), loser, 100)
-		require.True(t, errors.Is(err, errors.ErrFrozen), "the frozen input fails: %v", err)
-		require.True(t, errors.Is(err, errors.ErrSpent), "the spent input fails: %v", err)
-		require.False(t, errors.Is(err, errors.ErrTxConflicting), "a frozen input makes the tx invalid, not merely conflicting: %v", err)
+			loser := transactions.Create(t,
+				transactions.WithPrivateKey(privateKey),
+				transactions.WithInput(parentTx, first, privateKey),
+				transactions.WithInput(parentTx, second, privateKey),
+				transactions.WithP2PKHOutputs(1, 180_000, publicKey),
+			)
 
-		requireNotPublished(t, producer)
-	})
+			_, err := v.Validate(t.Context(), loser, 100)
+			require.True(t, errors.Is(err, errors.ErrFrozen), "the frozen input fails: %v", err)
+			require.True(t, errors.Is(err, errors.ErrSpent), "the spent input fails: %v", err)
+			require.False(t, errors.Is(err, errors.ErrTxConflicting), "a frozen input makes the tx invalid, not merely conflicting: %v", err)
+
+			requireNotPublished(t, producer)
+		})
+	}
 }
