@@ -179,7 +179,7 @@ func TestConflictingRejectionNeedsEveryFailedSpendToConflict(t *testing.T) {
 		)
 
 		_, err := v.Validate(t.Context(), loser, 100)
-		require.True(t, errors.Is(err, errors.ErrTxConflicting), "every failed spend conflicts: %v", err)
+		require.True(t, errors.Is(err, errors.ErrTxRejectedConflicting), "every failed spend conflicts: %v", err)
 
 		select {
 		case msg := <-producer.PublishChannel():
@@ -189,6 +189,39 @@ func TestConflictingRejectionNeedsEveryFailedSpendToConflict(t *testing.T) {
 		default:
 			t.Fatal("expected the rejected conflicting tx to be published")
 		}
+	})
+
+	t.Run("an output of a conflicting tx and a frozen spend", func(t *testing.T) {
+		v, producer, parentTx, privateKey, publicKey := newFixture(t, "conflicting_parent_and_frozen")
+
+		// stored as conflicting, the way the block path stores a loser
+		loser := transactions.Create(t,
+			transactions.WithPrivateKey(privateKey),
+			transactions.WithInput(parentTx, 0, privateKey),
+			transactions.WithP2PKHOutputs(1, 80_000, publicKey),
+		)
+		_, err := v.Validate(t.Context(), loser, 100, WithCreateConflicting(true))
+		require.True(t, errors.Is(err, errors.ErrTxConflicting), "%v", err)
+
+		select {
+		case <-producer.PublishChannel():
+			t.Fatal("a tx stored as conflicting is not published")
+		default:
+		}
+
+		tx := transactions.Create(t,
+			transactions.WithPrivateKey(privateKey),
+			transactions.WithInput(loser, 0, privateKey),
+			transactions.WithInput(parentTx, 1, privateKey),
+			transactions.WithP2PKHOutputs(1, 170_000, publicKey),
+		)
+
+		_, err = v.Validate(t.Context(), tx, 100)
+		require.True(t, errors.Is(err, errors.ErrFrozen), "the frozen input fails: %v", err)
+		require.True(t, errors.Is(err, errors.ErrTxConflicting), "the store reports the conflicting parent's output: %v", err)
+		require.False(t, errors.Is(err, errors.ErrTxRejectedConflicting), "a frozen input makes the tx invalid, not merely conflicting: %v", err)
+
+		requireNotPublished(t, producer)
 	})
 
 	// the stores join the per-input errors in place, so whichever input fails first carries
@@ -212,7 +245,7 @@ func TestConflictingRejectionNeedsEveryFailedSpendToConflict(t *testing.T) {
 			_, err := v.Validate(t.Context(), loser, 100)
 			require.True(t, errors.Is(err, errors.ErrFrozen), "the frozen input fails: %v", err)
 			require.True(t, errors.Is(err, errors.ErrSpent), "the spent input fails: %v", err)
-			require.False(t, errors.Is(err, errors.ErrTxConflicting), "a frozen input makes the tx invalid, not merely conflicting: %v", err)
+			require.False(t, errors.Is(err, errors.ErrTxRejectedConflicting), "a frozen input makes the tx invalid, not merely conflicting: %v", err)
 
 			requireNotPublished(t, producer)
 		})

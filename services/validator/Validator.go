@@ -794,8 +794,9 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 		// subtree validation can keep it aside when a peer subtree contains it, instead
 		// of writing it to the UTXO store before a block with proof of work references
 		// it. txMetaData is set when the block path stored it as conflicting; skip those.
-		// A tx with another input that failed for a different reason is not conflicting.
-		if txMetaData == nil && errors.Is(err, errors.ErrTxConflicting) {
+		// A tx with another input that failed for a different reason is not conflicting. The
+		// stores emit TX_CONFLICTING per input, so only the validator's own verdict counts.
+		if txMetaData == nil && errors.Is(err, errors.ErrTxRejectedConflicting) {
 			v.publishRejectedTx(ctx, ctxLogger, tx, err, true)
 		}
 	}
@@ -1211,7 +1212,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			// A double spend and nothing else: marked conflicting, so subtree validation can
 			// keep it aside without mistaking a tx with an invalid input for one.
 			if len(failedSpends) > 0 && everyFailedSpendConflicts {
-				err = errors.NewTxConflictingError("[Validate][%s] every failed spend conflicts with a spent output", txID, err)
+				err = errors.NewTxRejectedConflictingError("[Validate][%s] every failed spend conflicts with a spent output", txID, err)
 			}
 		} else if errors.Is(err, errors.ErrTxNotFound) {
 			// PHASE ASSUMPTION: this branch (and the ErrUtxoError branch above) assumes the

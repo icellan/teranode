@@ -688,6 +688,42 @@ func TestValidateSubtreeInternal_KeptAsideEdgeCases(t *testing.T) {
 		require.False(t, known, "an invalid tx is not cached as conflicting")
 	})
 
+	t.Run("a tx spending a conflicting tx's output and a frozen output is not kept aside", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		server, subtreeStore := f.newServer(t)
+
+		// the loser stored as conflicting, the way a block stores it
+		_, err := f.recorder.Interface.Validate(t.Context(), f.loser, 101, validator.WithCreateConflicting(true))
+		require.True(t, errors.Is(err, errors.ErrTxConflicting), "%v", err)
+
+		frozenParent := transactions.Create(t,
+			transactions.WithCoinbaseData(4, "/conflicting kept aside test frozen 2/"),
+			transactions.WithP2PKHOutputs(1, 100_000, f.privateKey.PubKey()),
+		)
+		_, err = f.store.Create(t.Context(), frozenParent, 4, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 4, BlockHeight: 4, SubtreeIdx: 0}))
+		require.NoError(t, err)
+
+		utxoHash, err := util.UTXOHashFromOutput(frozenParent.TxIDChainHash(), frozenParent.Outputs[0], 0)
+		require.NoError(t, err)
+		require.NoError(t, f.store.FreezeUTXOs(t.Context(), []*utxostore.Spend{{TxID: frozenParent.TxIDChainHash(), Vout: 0, UTXOHash: utxoHash}}, f.settings))
+
+		invalid := transactions.Create(t,
+			transactions.WithPrivateKey(f.privateKey),
+			transactions.WithInput(f.loser, 0, f.privateKey),
+			transactions.WithInput(frozenParent, 0, f.privateKey),
+			transactions.WithP2PKHOutputs(1, 150_000, f.privateKey.PubKey()),
+		)
+
+		root := servePeerSubtree(t, subtreeStore, invalid, f.other)
+
+		require.Error(t, livePass(t, server, root), "the subtree fails as before kept-aside txs existed")
+
+		exists, err := subtreeStore.Exists(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting)
+		require.NoError(t, err)
+		require.False(t, exists)
+		require.False(t, server.knownConflicting(*invalid.TxIDChainHash()))
+	})
+
 	t.Run("the block path never keeps txs aside, whatever its validator options", func(t *testing.T) {
 		f := newConflictingFixture(t)
 		server, subtreeStore := f.newServer(t)

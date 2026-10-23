@@ -209,22 +209,29 @@ func TestProcessOrphanTransactions_ConflictingOrphanIsDropped(t *testing.T) {
 	tracing.SetupMockTracer()
 	initPrometheusMetrics()
 
-	sm, _ := newUnlockSyncManager(t, &validator.MockValidator{Errors: []error{errors.NewTxConflictingError("double spend")}})
+	for name, rejection := range map[string]error{
+		"stored as conflicting":   errors.NewTxConflictingError("double spend"),
+		"rejected as conflicting": errors.NewTxRejectedConflictingError("double spend"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			sm, _ := newUnlockSyncManager(t, &validator.MockValidator{Errors: []error{rejection}})
 
-	txs := transactions.CreateTestTransactionChainWithCount(t, 3)
-	parent, orphan := txs[0], txs[1]
+			txs := transactions.CreateTestTransactionChainWithCount(t, 3)
+			parent, orphan := txs[0], txs[1]
 
-	parents := txmap.NewSyncedMap[chainhash.Hash, struct{}]()
-	parents.Set(*parent.TxIDChainHash(), struct{}{})
+			parents := txmap.NewSyncedMap[chainhash.Hash, struct{}]()
+			parents.Set(*parent.TxIDChainHash(), struct{}{})
 
-	sm.orphanTxs.Set(*orphan.TxIDChainHash(), &orphanTxAndParents{tx: orphan, parents: parents, addedAt: time.Now()})
+			sm.orphanTxs.Set(*orphan.TxIDChainHash(), &orphanTxAndParents{tx: orphan, parents: parents, addedAt: time.Now()})
 
-	var accepted []*TxHashAndFee
+			var accepted []*TxHashAndFee
 
-	sm.processOrphanTransactions(t.Context(), parent.TxIDChainHash(), &accepted)
+			sm.processOrphanTransactions(t.Context(), parent.TxIDChainHash(), &accepted)
 
-	require.Empty(t, accepted)
+			require.Empty(t, accepted)
 
-	_, stillOrphan := sm.orphanTxs.Get(*orphan.TxIDChainHash())
-	require.False(t, stillOrphan, "a conflicting orphan is dropped from the pool")
+			_, stillOrphan := sm.orphanTxs.Get(*orphan.TxIDChainHash())
+			require.False(t, stillOrphan, "a conflicting orphan is dropped from the pool")
+		})
+	}
 }

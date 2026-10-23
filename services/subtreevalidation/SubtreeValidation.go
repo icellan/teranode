@@ -1561,7 +1561,8 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 
 				// The validator marks a rejection conflicting only when every failed input is
 				// spent by a different tx; a tx with an input that is invalid otherwise fails.
-				if err != nil && keepAside && errors.Is(err, errors.ErrTxConflicting) {
+				// The stores' per-input TX_CONFLICTING does not count.
+				if err != nil && keepAside && errors.Is(err, errors.ErrTxRejectedConflicting) {
 					setKeptAside(tx, txIdx)
 					return nil
 				}

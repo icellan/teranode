@@ -145,12 +145,15 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   upgraded.
 
   A tx rejected because every input that failed to spend is already spent by another
-  tx now also carries `TX_CONFLICTING` in its error chain; one with an input that
-  failed for another reason, frozen for example, does not. The code clients see is
-  unchanged (`UTXO_SPENT`, HTTP 409). The legacy service drops an orphan rejected as
-  conflicting from its orphan pool when its parent arrives; it used to delete the
-  parent's key instead, so the orphan stayed until it expired and was validated again
-  for each further parent that arrived.
+  tx, or is an output of a conflicting tx, now also carries the new error code
+  `TX_REJECTED_CONFLICTING` (43, gRPC `FailedPrecondition`) in its error chain; one with
+  an input that failed for another reason, frozen for example, does not, in whatever
+  order its inputs come. The code clients see is unchanged (`UTXO_SPENT`, HTTP 409): the
+  new code is not a public cause. A gRPC client built before this change that receives
+  the code reads it as an unknown `ERR` value. The legacy service drops an orphan
+  rejected as conflicting from its orphan pool when its parent arrives; it used to
+  delete the parent's key instead, so the orphan stayed until it expired and was
+  validated again for each further parent that arrived.
 
 - **Blocks whose cached subtrees hold a tx the store flags conflicting are now rejected.**
   Subtree validation used to bless a block whose subtrees it had already cached on
