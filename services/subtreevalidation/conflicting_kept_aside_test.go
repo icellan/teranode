@@ -25,6 +25,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/test/utils/transactions"
@@ -1136,4 +1137,65 @@ func TestValidateSubtreeInternal_KeptAsideOverTheCapFailsTheSubtree(t *testing.T
 		require.NoError(t, err)
 		require.False(t, exists, fileType)
 	}
+}
+
+// parentReadCounter counts the UTXO store reads of one tx.
+type parentReadCounter struct {
+	utxostore.Store
+	hash chainhash.Hash
+	n    atomic.Int32
+}
+
+func (c *parentReadCounter) GetMeta(ctx context.Context, hash *chainhash.Hash, data *meta.Data) error {
+	if *hash == c.hash {
+		c.n.Add(1)
+	}
+
+	return c.Store.GetMeta(ctx, hash, data)
+}
+
+func (c *parentReadCounter) Get(ctx context.Context, hash *chainhash.Hash, f ...fields.FieldName) (*meta.Data, error) {
+	if *hash == c.hash {
+		c.n.Add(1)
+	}
+
+	return c.Store.Get(ctx, hash, f...)
+}
+
+// TestBlessMissingTransactions_ConflictingParentReadOncePerParent pins the cost of the
+// conflicting-parent check: one store read per distinct parent known as conflicting, not
+// one per input spending it.
+func TestBlessMissingTransactions_ConflictingParentReadOncePerParent(t *testing.T) {
+	f := newConflictingFixture(t)
+
+	// a parent known as conflicting that is nevertheless in the store, with five outputs
+	parent := transactions.Create(t,
+		transactions.WithCoinbaseData(5, "/conflicting parent read once/"),
+		transactions.WithP2PKHOutputs(5, 10_000, f.privateKey.PubKey()),
+	)
+	_, err := f.store.Create(t.Context(), parent, 5, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 5, BlockHeight: 5, SubtreeIdx: 0}))
+	require.NoError(t, err)
+
+	f.server.policyRejectedTxCache.SetConflicting(*parent.TxIDChainHash(), parent)
+
+	// an absent parent makes the validator report a missing parent
+	absent := transactions.Create(t,
+		transactions.WithCoinbaseData(6, "/conflicting parent read once absent/"),
+		transactions.WithP2PKHOutputs(1, 10_000, f.privateKey.PubKey()),
+	)
+
+	opts := []transactions.TxOption{transactions.WithPrivateKey(f.privateKey), transactions.WithInput(absent, 0, f.privateKey)}
+	for vout := uint32(0); vout < 5; vout++ {
+		opts = append(opts, transactions.WithInput(parent, vout, f.privateKey))
+	}
+
+	tx := transactions.Create(t, append(opts, transactions.WithP2PKHOutputs(1, 40_000, f.privateKey.PubKey()))...)
+
+	counter := &parentReadCounter{Store: f.store, hash: *parent.TxIDChainHash()}
+	f.server.utxoStore = counter
+
+	txMetaSlice := make([]metaSliceItem, 1)
+	_ = f.server.blessMissingTransactions(t.Context(), chainhash.Hash{}, []missingTx{{tx: tx, idx: 0}}, "", "", txMetaSlice, 101, map[uint32]bool{}, true)
+
+	require.Equal(t, int32(1), counter.n.Load())
 }

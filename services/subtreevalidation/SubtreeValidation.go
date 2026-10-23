@@ -56,6 +56,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/blob/options"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
@@ -1490,16 +1491,25 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 	// hasConflictingParent reports whether a missing parent of tx is known as conflicting.
 	// It is only asked once the validator found a parent missing. The cache is never
 	// cleared, so a parent counts only if it is also absent from the store: a parent that
-	// later won is in the store and decides.
+	// later won is in the store and decides. Each distinct parent is read once, straight
+	// from the store: a miss is the expected answer, not a cache miss to warn about.
 	hasConflictingParent := func(ctx context.Context, tx *bt.Tx) (bool, error) {
+		checked := make(map[chainhash.Hash]struct{}, len(tx.Inputs))
+
 		for _, input := range tx.Inputs {
 			parentHash := input.PreviousTxIDChainHash()
+
+			if _, done := checked[*parentHash]; done {
+				continue
+			}
+
+			checked[*parentHash] = struct{}{}
 
 			if !u.knownConflicting(*parentHash) {
 				continue
 			}
 
-			err := u.utxoStore.GetMeta(ctx, parentHash, &meta.Data{})
+			_, err := u.utxoStore.Get(ctx, parentHash, fields.Conflicting)
 			if err == nil {
 				continue
 			}
@@ -1580,14 +1590,17 @@ func (u *Server) blessMissingTransactions(ctx context.Context, subtreeHash chain
 				}
 
 				if err != nil && keepAside && errors.Is(err, errors.ErrTxMissingParent) {
-					conflictingParent, parentErr := hasConflictingParent(gCtx, tx)
-					if parentErr != nil {
-						return parentErr
-					}
+					// as for a descendant above: only the checks that need no parent, and those
+					// first, so a malformed tx fails as invalid without a store read
+					if ctxFreeErr := validator.CheckTransactionContextFree(tx, u.settings.Policy); ctxFreeErr != nil {
+						err = ctxFreeErr
+					} else {
+						conflictingParent, parentErr := hasConflictingParent(gCtx, tx)
+						if parentErr != nil {
+							return parentErr
+						}
 
-					if conflictingParent {
-						// as for a descendant above: only the checks that need no parent
-						if err = validator.CheckTransactionContextFree(tx, u.settings.Policy); err == nil {
+						if conflictingParent {
 							setKeptAside(tx, txIdx)
 							return nil
 						}
