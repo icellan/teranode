@@ -131,6 +131,18 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   conflicting parent still count towards the fail-fast thresholds. Kept-aside txs are
   counted in `teranode_subtreevalidation_conflicting_kept_aside`. (#2038)
 
+  Upgrade every subtree validator together. One without this change ignores the
+  `keptAside` field and caches kept-aside txs, which a peer can fabricate, in its
+  policy-rejected cache, where they evict the validators' entries until it is
+  upgraded.
+
+  A tx rejected because every input that failed to spend is already spent by another
+  tx now also carries `TX_CONFLICTING` in its error chain; one with an input that
+  failed for another reason, frozen for example, does not. The code clients see is
+  unchanged (`UTXO_SPENT`, HTTP 409). The legacy service now drops such a tx from its
+  orphan pool when its parent arrives, as it already did for txs rejected as
+  conflicting.
+
 - **Blocks whose cached subtrees hold a tx the store flags conflicting are now rejected.**
   Subtree validation used to bless a block whose subtrees it had already cached on
   that cache alone, so a tx demoted to conflicting after caching could still pass.
