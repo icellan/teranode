@@ -1933,6 +1933,12 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 		}
 	}
 
+	// Txs resolved from more than one source are appended source by source, but the level
+	// builder relies on subtree order, which puts parents before children.
+	if !sort.SliceIsSorted(missingTxs, func(i, j int) bool { return missingTxs[i].idx < missingTxs[j].idx }) {
+		sort.Slice(missingTxs, func(i, j int) bool { return missingTxs[i].idx < missingTxs[j].idx })
+	}
+
 	return missingTxs, nil
 }
 

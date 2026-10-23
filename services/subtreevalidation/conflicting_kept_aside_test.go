@@ -936,3 +936,36 @@ func TestValidateSubtreeInternal_PeerPathChecksForKeptAsideTxsOnce(t *testing.T)
 	require.NoError(t, err)
 	require.Equal(t, int32(1), counter.n.Load())
 }
+
+// TestGetSubtreeMissingTxs_SubtreeOrderAcrossSources pins that missing txs resolved from
+// different sources come back in subtree order: the level builder relies on parents
+// coming before children, and here a kept-aside child's parent is fetched.
+func TestGetSubtreeMissingTxs_SubtreeOrderAcrossSources(t *testing.T) {
+	f := newConflictingFixture(t)
+	server, subtreeStore := f.newServer(t)
+
+	otherChild := transactions.Create(t,
+		transactions.WithPrivateKey(f.privateKey),
+		transactions.WithInput(f.other, 0, f.privateKey),
+		transactions.WithP2PKHOutputs(1, 50_000, f.privateKey.PubKey()),
+	)
+
+	root := servePeerSubtree(t, subtreeStore, f.other, otherChild)
+	require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeData))
+	require.NoError(t, subtreeStore.Set(t.Context(), root[:], fileformat.FileTypeSubtreeConflicting, serializeConflictingTxs([]*bt.Tx{otherChild})))
+
+	httpmock.RegisterResponder("POST", `=~/subtree/[a-f0-9]{64}/txs\z`, httpmock.NewBytesResponder(200, f.other.ExtendedBytes()))
+	server.settings.SubtreeValidation.PercentageMissingGetFullData = 100
+
+	allTxs := []chainhash.Hash{*f.other.TxIDChainHash(), *otherChild.TxIDChainHash()}
+	missing := []utxostore.UnresolvedMetaData{{Hash: allTxs[0], Idx: 0}, {Hash: allTxs[1], Idx: 1}}
+
+	subtree, err := subtreepkg.NewIncompleteTreeByLeafCount(2)
+	require.NoError(t, err)
+
+	missingTxs, err := server.getSubtreeMissingTxs(t.Context(), root, subtree, missing, allTxs, "http://peer.invalid", "peer-1", true)
+	require.NoError(t, err)
+	require.Len(t, missingTxs, 2)
+	require.Equal(t, 0, missingTxs[0].idx, "the fetched parent comes first")
+	require.Equal(t, 1, missingTxs[1].idx)
+}
