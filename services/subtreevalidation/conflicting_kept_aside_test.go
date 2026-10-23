@@ -177,7 +177,13 @@ func newConflictingFixture(t *testing.T) *conflictingFixture {
 func (f *conflictingFixture) newServer(t *testing.T) (*Server, blob.Store) {
 	t.Helper()
 
-	subtreeStore := blobmemory.New()
+	return f.newServerWithStore(t, blobmemory.New())
+}
+
+// newServerWithStore is newServer over the given subtree store.
+func (f *conflictingFixture) newServerWithStore(t *testing.T, subtreeStore blob.Store) (*Server, blob.Store) {
+	t.Helper()
+
 	nilConsumer := &kafka.KafkaConsumerGroup{}
 	blockchainClient := teranodetestutil.NewMemorySQLiteBlockchainClient(ulogger.TestLogger{}, f.settings, t)
 
@@ -922,15 +928,13 @@ func (c *sidecarExistsCounter) Exists(ctx context.Context, key []byte, fileType 
 // when its missing txs are fetched.
 func TestValidateSubtreeInternal_PeerPathChecksForKeptAsideTxsOnce(t *testing.T) {
 	f := newConflictingFixture(t)
-	server, subtreeStore := f.newServer(t)
+	counter := &sidecarExistsCounter{Store: blobmemory.New()}
+	server, subtreeStore := f.newServerWithStore(t, counter)
 
 	root := servePeerSubtree(t, subtreeStore, f.other)
 	require.NoError(t, subtreeStore.Del(t.Context(), root[:], fileformat.FileTypeSubtreeData))
 
 	httpmock.RegisterResponder("GET", `=~/subtree_data/[a-f0-9]{64}\z`, httpmock.NewBytesResponder(200, f.other.ExtendedBytes()))
-
-	counter := &sidecarExistsCounter{Store: subtreeStore}
-	server.subtreeStore = counter
 
 	_, err := server.ValidateSubtreeInternal(t.Context(), ValidateSubtree{SubtreeHash: root, BaseURL: "http://peer.invalid", PeerID: "peer-1", AllowFailFast: true}, 101, map[uint32]bool{})
 	require.NoError(t, err)
