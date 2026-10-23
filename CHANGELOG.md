@@ -148,6 +148,9 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   keeps aside: over it, the subtree fails as before. There is no per-peer cap: a peer can
   still announce many subtrees, each under the cap, of txs it sends itself.
 
+  Subtree validation now also produces on the policy-rejected topic: with Kafka topic
+  ACLs, grant it write access.
+
   Upgrade every subtree validator together. One without this change ignores the
   `keptAside` field and caches kept-aside txs, which a peer can fabricate, in its
   policy-rejected cache, where they evict the validators' entries until it is

@@ -1912,8 +1912,9 @@ func (u *Server) getSubtreeMissingTxs(ctx context.Context, subtreeHash chainhash
 	}
 
 	if !subtreeDataExists || err != nil {
-		// Check the policy-rejected tx cache before requesting from peer over HTTP.
-		// Transactions here were consensus-valid but rejected by our local policy.
+		// Check the policy-rejected and kept-aside caches before requesting from peer over
+		// HTTP. Their txs were rejected by local policy, rejected as conflicting, or kept
+		// aside after context-free checks only: every one is still validated below.
 		remainingHashes := missingTxHashes
 
 		if u.policyRejectedTxCache != nil {
