@@ -146,7 +146,8 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   resolved again when the block needs them; if they have been evicted by then and the peer
   cannot serve them, the block's subtree fails and is retried. The new
   `subtreevalidation_keptAsideMaxBytesPerSubtree` (16 MB by default) caps what one subtree
-  keeps aside: over it, the subtree fails as before. There is no per-peer cap: a peer can
+  keeps aside: over it, the subtree fails as before, though the txs it kept aside stay in
+  the kept-aside cache, within that cache's budget. There is no per-peer cap: a peer can
   still announce many subtrees, each under the cap, of txs it sends itself.
 
   Subtree validation now also produces on the policy-rejected topic: with Kafka topic

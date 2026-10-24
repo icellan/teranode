@@ -1169,6 +1169,60 @@ func TestValidateSubtreeInternal_KeptAsideOverTheCapFailsTheSubtree(t *testing.T
 	}
 }
 
+// TestBlessMissing_ReadBackOnlyOnTheValidatorsConflictingVerdict pins that the read-back
+// never turns a rejection into success. A block's tx spending an output of a conflicting tx
+// and an immature coinbase is rejected, with the store's per-input TX_CONFLICTING inside the
+// error. Another candidate block, at a height where the coinbase is mature, may create the
+// same tx as conflicting meanwhile; that record must not stand in for this rejection.
+func TestBlessMissing_ReadBackOnlyOnTheValidatorsConflictingVerdict(t *testing.T) {
+	f := newConflictingFixture(t)
+	realValidator := f.recorder.Interface
+
+	// the loser stored as conflicting, the way a block stores it
+	_, err := realValidator.Validate(t.Context(), f.loser, 101, validator.WithCreateConflicting(true))
+	require.True(t, errors.Is(err, errors.ErrTxConflicting), "%v", err)
+
+	// a coinbase that matures one block after 101
+	coinbase := transactions.Create(t,
+		transactions.WithCoinbaseData(101, "/read back immature coinbase/"),
+		transactions.WithP2PKHOutputs(1, 100_000, f.privateKey.PubKey()),
+	)
+	_, err = f.store.Create(t.Context(), coinbase, 101, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 101, BlockHeight: 101, SubtreeIdx: 0}))
+	require.NoError(t, err)
+
+	tx := transactions.Create(t,
+		transactions.WithPrivateKey(f.privateKey),
+		transactions.WithInput(f.loser, 0, f.privateKey),
+		transactions.WithInput(coinbase, 0, f.privateKey),
+		transactions.WithP2PKHOutputs(1, 150_000, f.privateKey.PubKey()),
+	)
+
+	// at 101 the validator rejects it: the coinbase is immature
+	_, rejection := realValidator.Validate(t.Context(), tx.Clone(), 101, validator.WithCreateConflicting(true))
+	require.True(t, errors.Is(rejection, errors.ErrTxCoinbaseImmature), "%v", rejection)
+	require.True(t, errors.Is(rejection, errors.ErrTxConflicting), "the store's per-input TX_CONFLICTING is in the chain: %v", rejection)
+
+	// another candidate, at a height where the coinbase is mature, creates it as conflicting
+	_, created := realValidator.Validate(t.Context(), tx.Clone(), 102, validator.WithCreateConflicting(true))
+	require.True(t, errors.Is(created, errors.ErrTxConflicting), "%v", created)
+
+	// the verdicts as a remote validator's client hands them back
+	require.True(t, validatorCreatedConflicting(errors.UnwrapGRPC(errors.WrapGRPC(created))), "created as conflicting: %v", created)
+	require.False(t, validatorCreatedConflicting(errors.UnwrapGRPC(errors.WrapGRPC(rejection))), "rejected: %v", rejection)
+
+	stored := &meta.Data{}
+	require.NoError(t, f.store.GetMeta(t.Context(), tx.TxIDChainHash(), stored))
+	require.True(t, stored.Conflicting, "precondition: the record the read-back would find")
+
+	// this candidate's validator answer arrives after that
+	f.server.validatorClient = &failingValidator{Interface: realValidator, err: rejection}
+
+	txMeta, err := f.server.blessMissingTransaction(t.Context(), chainhash.Hash{}, chainhash.Hash{}, tx, 101, map[uint32]bool{},
+		validator.ProcessOptions(validator.WithCreateConflicting(true)))
+	require.Error(t, err, "the rejection stands")
+	require.Nil(t, txMeta)
+}
+
 // parentReadCounter counts the UTXO store reads of one tx.
 type parentReadCounter struct {
 	utxostore.Store

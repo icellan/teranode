@@ -513,6 +513,16 @@ func (u *Server) blessMissingTransaction(ctx context.Context, blockHash chainhas
 	return txMeta, err
 }
 
+// validatorCreatedConflicting reports whether err is the validator's verdict that it created
+// the tx as conflicting: TX_CONFLICTING at the top of the error. A store reports TX_CONFLICTING
+// deeper in the chain, for an input spending an output of a conflicting tx, beside the input
+// failures that rejected the tx.
+func validatorCreatedConflicting(err error) bool {
+	var verdict *errors.Error
+
+	return errors.As(err, &verdict) && verdict.Code() == errors.ERR_TX_CONFLICTING
+}
+
 // blessMissing implements blessMissingTransaction. unlockFailed is true when the validator accepted
 // the transaction but its two-phase-commit unlock failed, so the record is still locked.
 func (u *Server) blessMissing(ctx context.Context, blockHash chainhash.Hash, subtreeHash chainhash.Hash, tx *bt.Tx, blockHeight uint32,
@@ -568,7 +578,9 @@ func (u *Server) blessMissing(ctx context.Context, blockHash chainhash.Hash, sub
 
 	// A remote validator's metadata does not survive a gRPC error, so a block's tx it has just
 	// created as conflicting arrives without it; read the record back, as for an unlock failure.
-	if err != nil && txMeta == nil && validationOptions.CreateConflicting {
+	// Only on that verdict: a rejection also carries the stores' per-input TX_CONFLICTING, and
+	// a record another candidate block created meanwhile must not stand in for it.
+	if err != nil && txMeta == nil && validationOptions.CreateConflicting && validatorCreatedConflicting(err) {
 		stored := &meta.Data{}
 		if getErr := u.utxoStore.GetMeta(ctx, tx.TxIDChainHash(), stored); getErr != nil {
 			return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to read meta of transaction created as conflicting", blockHash.String(), subtreeHash.String(), tx.TxID(), getErr)
