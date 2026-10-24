@@ -572,15 +572,19 @@ func (u *Server) blessMissing(ctx context.Context, blockHash chainhash.Hash, sub
 		err = nil
 	}
 
-	if err != nil && !errors.Is(err, errors.ErrTxConflicting) {
+	// Only the validator's created-as-conflicting verdict gets past here: a rejection also
+	// carries the stores' per-input TX_CONFLICTING, deeper in the chain.
+	if err != nil && !validatorCreatedConflicting(err) {
 		return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to validate transaction", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
 	}
 
 	// A remote validator's metadata does not survive a gRPC error, so a block's tx it has just
 	// created as conflicting arrives without it; read the record back, as for an unlock failure.
-	// Only on that verdict: a rejection also carries the stores' per-input TX_CONFLICTING, and
-	// a record another candidate block created meanwhile must not stand in for it.
-	if err != nil && txMeta == nil && validationOptions.CreateConflicting && validatorCreatedConflicting(err) {
+	// A record another candidate block created meanwhile must not stand in for a rejection,
+	// which the gate above already turned away. That relies on the verdict's own code being on
+	// top: the gRPC client keeps the whole chain, and the HTTP fallback, which reports only the
+	// deepest public cause, refuses createConflicting (validator http_options_guard.go).
+	if err != nil && txMeta == nil && validationOptions.CreateConflicting {
 		stored := &meta.Data{}
 		if getErr := u.utxoStore.GetMeta(ctx, tx.TxIDChainHash(), stored); getErr != nil {
 			return nil, false, errors.NewProcessingError("[blessMissingTransaction][%s/%s][%s] failed to read meta of transaction created as conflicting", blockHash.String(), subtreeHash.String(), tx.TxID(), getErr)
