@@ -15,13 +15,15 @@ import (
 // and the policy size limit. It is for a transaction that cannot be fully validated yet;
 // it never replaces full validation.
 func CheckTransactionContextFree(tx *bt.Tx, tSettings *settings.Settings, blockHeight uint32) error {
+	if tSettings == nil || tSettings.ChainCfgParams == nil {
+		return errors.NewProcessingError("context-free check needs settings with chain params")
+	}
+
 	if tx.IsCoinbase() {
 		return errors.NewTxInvalidError("coinbase transactions are not supported")
 	}
 
-	// CheckTransactionCommon is the same for every transaction; model ports it for the
-	// coinbase, which never goes through BDK
-	if reason := model.CoinbaseCommonRuleViolation(tx, blockHeight, tSettings.ChainCfgParams); reason != "" {
+	if reason := model.TxCommonRuleViolation(tx, blockHeight, tSettings.ChainCfgParams); reason != "" {
 		return errors.NewTxInvalidError(reason)
 	}
 

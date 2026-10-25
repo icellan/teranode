@@ -105,4 +105,14 @@ func TestCheckTransactionContextFree(t *testing.T) {
 		require.True(t, errors.Is(CheckTransactionContextFree(tx, &unlimitedPolicy, preGenesis), errors.ErrTxInvalid))
 		require.NoError(t, CheckTransactionContextFree(tx, &unlimitedPolicy, postGenesis))
 	})
+
+	t.Run("no settings or chain params is a processing error, not a panic", func(t *testing.T) {
+		tx := valid(t)
+
+		require.True(t, errors.Is(CheckTransactionContextFree(tx, nil, postGenesis), errors.ErrProcessing))
+
+		noParams := *tSettings
+		noParams.ChainCfgParams = nil
+		require.True(t, errors.Is(CheckTransactionContextFree(tx, &noParams, postGenesis), errors.ErrProcessing))
+	})
 }

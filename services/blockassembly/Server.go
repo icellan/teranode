@@ -2080,7 +2080,7 @@ func (ba *BlockAssembly) submitMiningSolution(ctx context.Context, req *BlockSub
 		TransactionCount: transactionCount,
 		SizeInBytes:      blockSize,
 		// The height this candidate was issued for (GetMiningCandidate sets it to best+1).
-		// block.Valid below is height-dependent and reads it: CoinbaseCommonRuleViolation picks the
+		// block.Valid below is height-dependent and reads it: TxCommonRuleViolation picks the
 		// pre- or post-Genesis coinbase limits from it, and the BIP34 and reward checks are guarded
 		// on it being non-zero. Leaving it unset judged every submitted block at height 0, which is
 		// below every network's Genesis activation, so a coinbase over 1MB or over the pre-Genesis
