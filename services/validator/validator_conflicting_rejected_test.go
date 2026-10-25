@@ -320,10 +320,138 @@ func TestBlockPathCreatesConflictingOnlyWhenEveryFailedSpendConflicts(t *testing
 			require.Error(t, err)
 			require.True(t, errors.Is(err, errors.ErrTxCoinbaseImmature), "the immature input fails: %v", err)
 			require.False(t, errors.Is(err, errors.ErrTxConflicting), "an immature coinbase spend is not merely conflicting: %v", err)
+			require.True(t, errors.Is(err, errors.ErrTxInvalid), "the block's tx is invalid at the block's height: %v", err)
 			require.Nil(t, txMeta)
 
 			err = utxoStore.GetMeta(ctx, tx.TxIDChainHash(), &meta.Data{})
 			require.True(t, errors.Is(err, errors.ErrTxNotFound), "the tx is not created, as conflicting or otherwise: %v", err)
+		})
+	}
+}
+
+// TestBlockPathSpendOfImmatureOrFrozenOutputIsInvalid pins the verdict for a block's tx that
+// spends an immature coinbase or a frozen output, alone or next to a double spend: the tx is
+// invalid at the block's height, so the block is. Without TX_INVALID in the error, subtree and
+// block validation saw a processing error and retried the block forever instead of marking it
+// invalid. The same spend outside a block is not invalid: the coinbase matures and a freeze can
+// be lifted, so a later block may include it.
+func TestBlockPathSpendOfImmatureOrFrozenOutputIsInvalid(t *testing.T) {
+	type fixture struct {
+		v                  *Validator
+		parentTx, coinbase *bt.Tx
+		privateKey         *bec.PrivateKey
+		publicKey          *bec.PublicKey
+	}
+
+	newFixture := func(t *testing.T, name string) fixture {
+		ctx := t.Context()
+		logger := ulogger.NewErrorTestLogger(t)
+		tSettings := test.CreateBaseTestSettings(t)
+		tSettings.BlockAssembly.Disabled = true
+
+		utxoStoreURL, err := url.Parse("sqlitememory:///" + name)
+		require.NoError(t, err)
+
+		utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+		require.NoError(t, err)
+		utxoStore.RawDB().SetMaxOpenConns(1)
+		require.NoError(t, utxoStore.SetBlockHeight(100))
+		require.NoError(t, utxoStore.SetMedianBlockTime(uint32(time.Now().Unix()))) //nolint:gosec
+
+		privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("BLOCK_PATH_INVALID_SPEND_KEY!!!!"))
+
+		// output 0 is double spent by the winner below, output 1 is frozen
+		parentTx := transactions.Create(t,
+			transactions.WithCoinbaseData(1, "/block path invalid spend parent/"),
+			transactions.WithP2PKHOutputs(2, 100_000, publicKey),
+		)
+		_, err = utxoStore.Create(ctx, parentTx, 1, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 1, BlockHeight: 1, SubtreeIdx: 0}))
+		require.NoError(t, err)
+
+		utxoHash, err := util.UTXOHashFromOutput(parentTx.TxIDChainHash(), parentTx.Outputs[1], 1)
+		require.NoError(t, err)
+		require.NoError(t, utxoStore.FreezeUTXOs(ctx, []*utxostore.Spend{{TxID: parentTx.TxIDChainHash(), Vout: 1, UTXOHash: utxoHash}}, tSettings))
+
+		// mined at the current height, so it matures only after the next block
+		coinbase := transactions.Create(t,
+			transactions.WithCoinbaseData(100, "/block path invalid spend coinbase/"),
+			transactions.WithP2PKHOutputs(1, 100_000, publicKey),
+		)
+		_, err = utxoStore.Create(ctx, coinbase, 100, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 100, BlockHeight: 100, SubtreeIdx: 0}))
+		require.NoError(t, err)
+
+		validator, err := New(ctx, logger, tSettings, utxoStore, nil, nil, nil, nil, nil)
+		require.NoError(t, err)
+
+		v := validator.(*Validator)
+
+		winner := transactions.Create(t,
+			transactions.WithPrivateKey(privateKey),
+			transactions.WithInput(parentTx, 0, privateKey),
+			transactions.WithP2PKHOutputs(1, 90_000, publicKey),
+		)
+		_, err = v.Validate(ctx, winner, 100)
+		require.NoError(t, err)
+
+		return fixture{v: v, parentTx: parentTx, coinbase: coinbase, privateKey: privateKey, publicKey: publicKey}
+	}
+
+	spending := func(t *testing.T, f fixture, immature, frozen, doubleSpend bool) *bt.Tx {
+		opts := []transactions.TxOption{transactions.WithPrivateKey(f.privateKey)}
+
+		if doubleSpend {
+			opts = append(opts, transactions.WithInput(f.parentTx, 0, f.privateKey))
+		}
+
+		if immature {
+			opts = append(opts, transactions.WithInput(f.coinbase, 0, f.privateKey))
+		}
+
+		if frozen {
+			opts = append(opts, transactions.WithInput(f.parentTx, 1, f.privateKey))
+		}
+
+		return transactions.Create(t, append(opts, transactions.WithP2PKHOutputs(1, 50_000, f.publicKey))...)
+	}
+
+	cases := []struct {
+		name                          string
+		immature, frozen, doubleSpend bool
+	}{
+		{name: "immature", immature: true},
+		{name: "frozen", frozen: true},
+		{name: "immature and double spend", immature: true, doubleSpend: true},
+		{name: "frozen and double spend", frozen: true, doubleSpend: true},
+	}
+
+	for i, c := range cases {
+		t.Run(c.name+" in a block", func(t *testing.T) {
+			f := newFixture(t, fmt.Sprintf("block_invalid_spend_%d", i))
+			tx := spending(t, f, c.immature, c.frozen, c.doubleSpend)
+
+			txMeta, err := f.v.Validate(t.Context(), tx, 100, WithCreateConflicting(true), WithSkipPolicyChecks(true))
+			require.True(t, errors.Is(err, errors.ErrTxInvalid), "%v", err)
+			require.False(t, errors.Is(err, errors.ErrTxPolicy), "a policy error is never charged as invalid: %v", err)
+			require.Nil(t, txMeta)
+		})
+
+		t.Run(c.name+" below a checkpoint", func(t *testing.T) {
+			f := newFixture(t, fmt.Sprintf("checkpoint_invalid_spend_%d", i))
+			tx := spending(t, f, c.immature, c.frozen, c.doubleSpend)
+
+			// a checkpointed block is valid by definition; a failure there is ours
+			_, err := f.v.Validate(t.Context(), tx, 100, WithCreateConflicting(true), WithSkipPolicyChecks(true), WithSkipScriptValidation(true))
+			require.Error(t, err)
+			require.False(t, errors.Is(err, errors.ErrTxInvalid), "%v", err)
+		})
+
+		t.Run(c.name+" outside a block", func(t *testing.T) {
+			f := newFixture(t, fmt.Sprintf("mempool_invalid_spend_%d", i))
+			tx := spending(t, f, c.immature, c.frozen, c.doubleSpend)
+
+			_, err := f.v.Validate(t.Context(), tx, 100)
+			require.Error(t, err)
+			require.False(t, errors.Is(err, errors.ErrTxInvalid), "%v", err)
 		})
 	}
 }

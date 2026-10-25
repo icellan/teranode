@@ -817,6 +817,18 @@ func spendConflicts(err error) bool {
 	return spendErr.Code() == errors.ERR_UTXO_SPENT || spendErr.Code() == errors.ERR_TX_CONFLICTING
 }
 
+// spendForbiddenAtHeight reports whether a spend failed because the output may not be spent at the
+// spending height at all: an immature coinbase, or a frozen output. Like spendConflicts, it reads the
+// spend's own top-level code.
+func spendForbiddenAtHeight(err error) bool {
+	var spendErr *errors.Error
+	if !errors.As(err, &spendErr) {
+		return false
+	}
+
+	return spendErr.Code() == errors.ERR_TX_COINBASE_IMMATURE || spendErr.Code() == errors.ERR_UTXO_FROZEN
+}
+
 // publishPolicyRejectedTx publishes the raw bytes of a policy-rejected transaction to
 // the KAFKA_TX_POLICY_REJECTED topic. Subtree validation pods consume from this topic
 // to populate a local cache, avoiding expensive HTTP fetches when a subtree from another
@@ -1127,10 +1139,17 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			// frozen or mismatched output, so it is decided here over every failed spend
 			everyFailedSpendConflicts := true
 
+			// a spend no block at this height may make, as opposed to one that failed here
+			var forbiddenSpend error
+
 			for _, spend := range spentUtxos {
 				if spend.Err != nil {
 					if !spendConflicts(spend.Err) {
 						everyFailedSpendConflicts = false
+					}
+
+					if forbiddenSpend == nil && spendForbiddenAtHeight(spend.Err) {
+						forbiddenSpend = spend.Err
 					}
 
 					failedSpends = append(failedSpends, spend.Err)
@@ -1213,6 +1232,14 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			// keep it aside without mistaking a tx with an invalid input for one.
 			if len(failedSpends) > 0 && everyFailedSpendConflicts {
 				err = errors.NewTxRejectedConflictingError("[Validate][%s] every failed spend conflicts with a spent output", txID, err)
+			}
+
+			// In a block, blockHeight is the block's own height, so a spend forbidden there makes
+			// the tx, and with it the block, invalid. Outside a block the coinbase may yet mature
+			// and the freeze be lifted. Below a checkpoint the block is valid by definition, and a
+			// failure is ours to retry.
+			if forbiddenSpend != nil && validationOptions.CreateConflicting && !validationOptions.SkipScriptValidation && !validationOptions.OutpointOnlySpend {
+				err = errors.NewTxInvalidError("[Validate][%s] spends an output no block at height %d may spend: %v", txID, blockHeight, forbiddenSpend, err)
 			}
 		} else if errors.Is(err, errors.ErrTxNotFound) {
 			// PHASE ASSUMPTION: this branch (and the ErrUtxoError branch above) assumes the

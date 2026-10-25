@@ -112,7 +112,16 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   tx that double-spent a mempool tx and also spent an immature coinbase, or a frozen or
   mismatched output, was accepted where SV nodes reject it. Such a block now fails
   validation instead. Each input is classified by its own error, whatever its position in
-  the tx. (#2038)
+  the tx.
+
+  A block whose tx spends an immature coinbase or a frozen output, with or without a
+  double spend, is now marked invalid: the validator returns `TX_INVALID` for it on the
+  block path, at the block's own height. It used to fail as a processing error, so the
+  block was retried and never marked invalid, and the peer that sent it was not charged.
+  Outside a block the same spend is still a plain rejection, and below a checkpoint a
+  failure stays local. A frozen output makes the block invalid only for nodes holding
+  the same freeze; a node that has not applied the alert accepts it. A mismatched output
+  still fails without a verdict. (#2038)
 
 - **Peer subtrees holding conflicting txs are stored instead of rejected.** A subtree
   announced by a peer used to fail validation when it held a tx conflicting with one

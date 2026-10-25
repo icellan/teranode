@@ -1220,6 +1220,8 @@ func TestBlessMissing_ReadBackOnlyOnTheValidatorsConflictingVerdict(t *testing.T
 	txMeta, err := f.server.blessMissingTransaction(t.Context(), chainhash.Hash{}, chainhash.Hash{}, tx, 101, map[uint32]bool{},
 		validator.ProcessOptions(validator.WithCreateConflicting(true)))
 	require.Error(t, err, "the rejection stands")
+	require.True(t, errors.Is(err, errors.ErrTxInvalid), "an immature spend in a block is invalid, so the block is: %v", err)
+	require.True(t, errors.Is(errors.UnwrapGRPC(errors.WrapGRPC(rejection)), errors.ErrTxInvalid), "the verdict survives a remote validator: %v", rejection)
 	require.Nil(t, txMeta)
 }
 
