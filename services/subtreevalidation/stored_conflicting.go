@@ -29,30 +29,36 @@ func (u *Server) checkStoredConflictingAtHeight(ctx context.Context, txHashes []
 			tx = txs[i]
 		}
 
-		if tx == nil {
-			stored, err := u.utxoStore.Get(ctx, &txHashes[i], fields.Tx)
-			if err != nil {
-				return errors.NewProcessingError("[checkStoredConflictingAtHeight][%s] failed to read the stored conflicting tx", txHashes[i].String(), err)
-			}
-
-			if stored.Tx == nil {
-				return errors.NewProcessingError("[checkStoredConflictingAtHeight][%s] the stored conflicting tx has no body", txHashes[i].String())
-			}
-
-			tx = stored.Tx
-		}
-
-		parents, err := u.inputParents(ctx, tx)
-		if err != nil {
-			return err
-		}
-
-		if err = validator.CheckStoredTxAtHeight(tx, parents, blockHeight, u.settings, opts); err != nil {
+		if err := u.checkStoredTxAtHeight(ctx, txHashes[i], tx, blockHeight, opts); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// checkStoredTxAtHeight runs validator.CheckStoredTxAtHeight on one stored tx, reading it from the
+// store when tx is nil.
+func (u *Server) checkStoredTxAtHeight(ctx context.Context, txHash chainhash.Hash, tx *bt.Tx, blockHeight uint32, opts *validator.Options) error {
+	if tx == nil {
+		stored, err := u.utxoStore.Get(ctx, &txHash, fields.Tx)
+		if err != nil {
+			return errors.NewProcessingError("[checkStoredTxAtHeight][%s] failed to read the stored tx", txHash.String(), err)
+		}
+
+		if stored.Tx == nil {
+			return errors.NewProcessingError("[checkStoredTxAtHeight][%s] the stored tx has no body", txHash.String())
+		}
+
+		tx = stored.Tx
+	}
+
+	parents, err := u.inputParents(ctx, tx)
+	if err != nil {
+		return err
+	}
+
+	return validator.CheckStoredTxAtHeight(tx, parents, blockHeight, u.settings, opts)
 }
 
 // inputParents reads, for each input of tx, whether its parent is a coinbase and the lowest height

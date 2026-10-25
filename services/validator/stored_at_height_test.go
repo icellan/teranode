@@ -88,6 +88,24 @@ func TestCheckStoredTxAtHeight(t *testing.T) {
 		require.NoError(t, CheckStoredTxAtHeight(nonFinal, []InputParent{{IsCoinbase: true, Height: coinbaseHeight}}, height+1, tSettings, blockOptions(mtp)))
 	})
 
+	t.Run("after CSV a tx is final against the candidate parent's MTP", func(t *testing.T) {
+		height := max(uint32(tSettings.ChainCfgParams.CSVHeight), coinbaseHeight+maturity)
+		parents := []InputParent{{IsCoinbase: true, Height: coinbaseHeight}}
+
+		nonFinal := tx.Clone()
+		nonFinal.LockTime = mtp
+		nonFinal.Inputs[0].SequenceNumber = 0
+
+		err := CheckStoredTxAtHeight(nonFinal, parents, height, tSettings, blockOptions(mtp))
+		require.True(t, errors.Is(err, errors.ErrNonFinal), "%v", err)
+
+		require.NoError(t, CheckStoredTxAtHeight(nonFinal, parents, height, tSettings, blockOptions(mtp+1)))
+
+		// as the validator, never a fallback to the tip's time
+		err = CheckStoredTxAtHeight(nonFinal, parents, height, tSettings, blockOptions(0))
+		require.True(t, errors.Is(err, errors.ErrProcessing), "%v", err)
+	})
+
 	t.Run("one parent per input", func(t *testing.T) {
 		err := CheckStoredTxAtHeight(tx, nil, coinbaseHeight, tSettings, blockOptions(mtp))
 		require.True(t, errors.Is(err, errors.ErrProcessing), "%v", err)

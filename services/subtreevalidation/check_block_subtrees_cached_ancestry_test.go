@@ -204,9 +204,20 @@ func TestCheckBlockSubtrees_StoreConflictingFlagTriggersAncestryCheck(t *testing
 	mockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).
 		Return([]uint32{77}, nil)
 
+	mockUtxo := server.utxoStore.(*utxo.MockUtxostore)
+
+	// The check at the block's height reads the tx's body and its parent: one final
+	// input whose parent is no coinbase, so it passes.
+	stored := bt.NewTx()
+	stored.Inputs = []*bt.Input{{PreviousTxOutIndex: 0, SequenceNumber: bt.DefaultSequenceNumber}}
+	require.NoError(t, stored.Inputs[0].PreviousTxIDAdd(&chainhash.Hash{1}))
+	mockUtxo.On("Get", mock.Anything, mock.Anything, []fields.FieldName{fields.Tx}).
+		Return(&utxometa.Data{Tx: stored}, nil)
+	mockUtxo.On("Get", mock.Anything, mock.Anything, []fields.FieldName{fields.IsCoinbase, fields.BlockHeights}).
+		Return(&utxometa.Data{}, nil)
+
 	// An input-less transaction has no counter-spenders, so the conflicting walk
 	// terminates at once and the block is blessed.
-	mockUtxo := server.utxoStore.(*utxo.MockUtxostore)
 	mockUtxo.On("Get", mock.Anything, mock.Anything, mock.Anything).
 		Return(&utxometa.Data{Tx: bt.NewTx()}, nil)
 	// The walk always includes the transaction itself; with no block IDs it is

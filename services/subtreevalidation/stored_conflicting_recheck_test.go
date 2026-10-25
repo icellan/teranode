@@ -211,3 +211,52 @@ func TestPeerPathTakesStoredConflictingRecords(t *testing.T) {
 
 	require.Equal(t, calls, f.recorder.total(), "the stored record is taken without a validator call")
 }
+
+// TestCachedSubtreeChecksStoredConflictingTxsAtHeight pins the same for a block that references a
+// subtree this node already validated: it never reaches the lookups above, and took a stored
+// conflicting tx in it with only the ancestry check, so a node holding the subtree accepted a
+// block a node without it rejected.
+func TestCachedSubtreeChecksStoredConflictingTxsAtHeight(t *testing.T) {
+	check := func(t *testing.T, f *conflictingFixture, tx *bt.Tx) error {
+		server, subtreeStore := f.newServer(t)
+
+		subtree, err := subtreepkg.NewIncompleteTreeByLeafCount(2)
+		require.NoError(t, err)
+		require.NoError(t, subtree.AddNode(*tx.TxIDChainHash(), 0, 0))
+		require.NoError(t, subtree.AddNode(*f.other.TxIDChainHash(), 0, 0))
+
+		subtreeBytes, err := subtree.Serialize()
+		require.NoError(t, err)
+
+		root := *subtree.RootHash()
+		require.NoError(t, subtreeStore.Set(t.Context(), root[:], fileformat.FileTypeSubtree, subtreeBytes))
+
+		header := &model.BlockHeader{
+			Version:        1,
+			HashPrevBlock:  f.settings.ChainCfgParams.GenesisHash,
+			HashMerkleRoot: &chainhash.Hash{},
+			Timestamp:      uint32(time.Now().Unix()), //nolint:gosec
+			Bits:           model.NBit{},
+		}
+
+		block, err := model.NewBlock(header, &bt.Tx{Version: 1}, []*chainhash.Hash{&root}, 3, 1000, 101, 0)
+		require.NoError(t, err)
+
+		return server.checkCachedSubtreesAgainstCandidateChain(t.Context(), block, []chainhash.Hash{root})
+	}
+
+	t.Run("a record created at another height is checked at this one", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		tx := storedConflictingAtLaterHeight(t, f)
+
+		err := check(t, f, tx)
+		require.True(t, errors.Is(err, errors.ErrTxInvalid), "the coinbase is immature at the block's height: %v", err)
+	})
+
+	t.Run("a record valid at this height still passes", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		tx := storedConflictingAtThisHeight(t, f)
+
+		require.NoError(t, check(t, f, tx))
+	})
+}

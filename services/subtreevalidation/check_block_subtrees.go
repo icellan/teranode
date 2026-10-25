@@ -866,7 +866,35 @@ func (u *Server) checkCachedSubtreesAgainstCandidateChain(ctx context.Context, b
 		blockIds[blockID] = true
 	}
 
+	// the block's candidate times, as CheckBlockSubtrees derives them for the validator, for the
+	// finality half of checkStoredTxAtHeight below
+	var candidateBlockTime, candidateParentMedianTime uint32
+	if block.Height < uint32(u.settings.ChainCfgParams.CSVHeight) {
+		candidateBlockTime = block.Header.Timestamp
+	} else if candidateParentMedianTime, err = u.fetchCandidateParentMedianTime(ctx, block.Header.HashPrevBlock); err != nil {
+		return errors.NewProcessingError("[CheckBlockSubtrees][%s] candidate-parent MTP for cached-subtree check", block.Hash().String(), err)
+	}
+
+	atHeightOptions := validator.ProcessOptions(
+		validator.WithSkipPolicyChecks(true),
+		validator.WithCandidateBlockTime(candidateBlockTime),
+		validator.WithCandidateParentMedianTime(candidateParentMedianTime),
+	)
+
 	for _, txHash := range conflictingTxHashes {
+		// A conflicting record may have been created by another candidate block at another
+		// height; check it at this block's height, as the full-validation path does
+		// (checkStoredConflictingAtHeight). A record pruned since the probe, the tx or a parent,
+		// fails open, as below.
+		if err = u.checkStoredTxAtHeight(ctx, txHash, nil, block.Height, atHeightOptions); err != nil {
+			if !errors.Is(err, errors.ErrTxNotFound) {
+				return err
+			}
+
+			u.logger.Warnf("[CheckBlockSubtrees][%s][%s] cannot check cached-subtree tx at the block's height: it or a parent is no longer in the store, skipping",
+				block.Hash().String(), txHash.String())
+		}
+
 		// Same predicate the full-validation path applies via
 		// blessMissingTransaction, and now over the same facts: both paths ask it
 		// about every transaction the store currently flags Conflicting. This used
