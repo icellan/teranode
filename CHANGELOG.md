@@ -121,7 +121,13 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   Outside a block the same spend is still a plain rejection, and below a checkpoint a
   failure stays local. A frozen output makes the block invalid only for nodes holding
   the same freeze; a node that has not applied the alert accepts it. A mismatched output
-  still fails without a verdict. (#2038)
+  still fails without a verdict.
+
+  A block no longer takes a tx's stored conflicting record as its own verdict. Another
+  candidate block, at another height, may have created the record, and a tx valid there
+  can be invalid at this block's height. On every block path the validator now checks
+  such a tx again at the block's height; a peer subtree still takes the record as
+  before. Each conflicting tx in a block costs one more validation. (#2038)
 
 - **Peer subtrees holding conflicting txs are stored instead of rejected.** A subtree
   announced by a peer used to fail validation when it held a tx conflicting with one

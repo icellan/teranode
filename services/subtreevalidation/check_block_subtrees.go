@@ -1472,6 +1472,8 @@ func (u *Server) processTransactionsInLevels(ctx context.Context, allTransaction
 		}
 	}
 
+	missed += recheckStoredConflicting(txMetaSlice)
+
 	alreadyValidated := len(txHashes) - missed
 
 	if missed == 0 {

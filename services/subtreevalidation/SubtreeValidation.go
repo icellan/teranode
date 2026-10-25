@@ -1016,6 +1016,10 @@ func (u *Server) ValidateSubtreeInternal(ctx context.Context, v ValidateSubtree,
 			}
 		}
 
+		if v.FromBlock {
+			missed += recheckStoredConflicting(txMetaSlice)
+		}
+
 		if missed > 0 {
 			// 3. ...then attempt to load the txMeta from the network
 			start, stat5, ctx5 := tracing.NewStatFromDefaultContext(ctx, "5. processMissingTransactions")

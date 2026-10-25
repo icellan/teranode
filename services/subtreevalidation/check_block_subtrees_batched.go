@@ -140,6 +140,8 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 		}
 	}
 
+	missed += recheckStoredConflicting(txMetaSlice)
+
 	prometheusSubtreeValidationBatchStep.WithLabelValues("precheck").Observe(time.Since(start).Seconds())
 
 	if missed == 0 {

@@ -216,6 +216,25 @@ func (u *Server) processTxMetaUsingStore(ctx context.Context, txHashes []chainha
 	return u.processTxMetaUsingStoreAllowing(ctx, txHashes, txMetaSlice, blockIds, batched, failFast, skipCachePopulation, 0)
 }
 
+// recheckStoredConflicting clears the entries the lookups filled from a conflicting record and
+// returns how many it cleared, so a block sends those txs to the validator at its own height. The
+// block path creates a tx as conflicting at its block's height, and another candidate block at
+// another height may have created the record: a tx valid there can be invalid here, for instance
+// spending a coinbase that matures in between. Conflicting txs are rare, so checking them again
+// is cheap; the validator answers a valid one from its stored record.
+func recheckStoredConflicting(txMetaSlice []metaSliceItem) int {
+	cleared := 0
+
+	for i := range txMetaSlice {
+		if txMetaSlice[i].isSet && txMetaSlice[i].conflicting {
+			txMetaSlice[i] = metaSliceItem{}
+			cleared++
+		}
+	}
+
+	return cleared
+}
+
 // processTxMetaUsingStoreAllowing is processTxMetaUsingStore with the fail-fast miss
 // threshold raised by missAllowance, for misses already explained, such as txs the
 // validator rejected as conflicting, which are not in the store either.
