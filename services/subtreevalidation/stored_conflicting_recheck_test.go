@@ -61,7 +61,8 @@ func storedConflictingAtThisHeight(t *testing.T, f *conflictingFixture) *bt.Tx {
 }
 
 // TestBlockPathRechecksStoredConflictingTxs pins that a block never takes a stored conflicting
-// record as its own verdict. The block path creates a tx as conflicting at its block's height,
+// record as its own verdict, and checks it without the validator, which would spend inputs a
+// conflicting record does not hold. The block path creates a tx as conflicting at its block's height,
 // and another candidate block at another height can create the same tx; a tx valid there may be
 // invalid here, for instance spending a coinbase that matures in between. Every block entry
 // point accepted the stored record, from the UTXO store or the txmeta cache, without asking the
@@ -156,7 +157,14 @@ func TestBlockPathRechecksStoredConflictingTxs(t *testing.T) {
 		return f.server.processTransactionsBatched(t.Context(), checker, []*bt.Tx{tx.Clone(), f.other.Clone()}, chainhash.Hash{}, 101, 0, 0, map[uint32]bool{})
 	}
 
+	// the level path runs before CheckBlockSubtrees validates each subtree, and on its own for the
+	// batched path's fallbacks
+	viaLevels := func(t *testing.T, f *conflictingFixture, tx *bt.Tx) error {
+		return f.server.processTransactionsInLevels(t.Context(), []*bt.Tx{tx.Clone(), f.other.Clone()}, chainhash.Hash{}, chainhash.Hash{}, 101, 0, 0, map[uint32]bool{}, false)
+	}
+
 	entryPoints := map[string]entryPoint{
+		"processTransactionsInLevels":         viaLevels,
 		"checkSubtreeFromBlock http":          viaSubtreeFromBlock("http://peer.invalid", false),
 		"checkSubtreeFromBlock legacy":        viaSubtreeFromBlock("legacy", false),
 		"checkSubtreeFromBlock cached record": viaSubtreeFromBlock("http://peer.invalid", true),
@@ -171,6 +179,7 @@ func TestBlockPathRechecksStoredConflictingTxs(t *testing.T) {
 
 			err := check(t, f, tx)
 			require.True(t, errors.Is(err, errors.ErrTxInvalid), "the coinbase is immature at the block's height: %v", err)
+			require.False(t, f.recorder.validated(*tx.TxIDChainHash()), "the check writes nothing: the validator would spend inputs the record does not hold")
 		})
 
 		t.Run(name+": a record valid at this height still passes", func(t *testing.T) {
@@ -178,6 +187,7 @@ func TestBlockPathRechecksStoredConflictingTxs(t *testing.T) {
 			tx := storedConflictingAtThisHeight(t, f)
 
 			require.NoError(t, check(t, f, tx))
+			require.False(t, f.recorder.validated(*tx.TxIDChainHash()), "the check writes nothing")
 
 			stored := &meta.Data{}
 			require.NoError(t, f.store.GetMeta(t.Context(), tx.TxIDChainHash(), stored))

@@ -817,23 +817,6 @@ func spendConflicts(err error) bool {
 	return spendErr.Code() == errors.ERR_UTXO_SPENT || spendErr.Code() == errors.ERR_TX_CONFLICTING
 }
 
-// releaseSpends unspends the spends that succeeded.
-func (v *Validator) releaseSpends(ctx context.Context, spends []*utxo.Spend) error {
-	succeeded := make([]*utxo.Spend, 0, len(spends))
-
-	for _, spend := range spends {
-		if spend != nil && spend.Err == nil {
-			succeeded = append(succeeded, spend)
-		}
-	}
-
-	if len(succeeded) == 0 {
-		return nil
-	}
-
-	return v.utxoStore.Unspend(ctx, succeeded)
-}
-
 // spendsImmatureCoinbase reports whether a spend failed because its output is a coinbase output not
 // yet mature at the spending height. Like spendConflicts, it reads the spend's own top-level code.
 func spendsImmatureCoinbase(err error) bool {
@@ -1113,15 +1096,6 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			txMetaData = &meta.Data{}
 			if err = v.utxoStore.GetMeta(decoupledCtx, tx.TxIDChainHash(), txMetaData); err != nil {
 				return nil, errors.NewProcessingError("[Validate][%s] failed to get tx meta data from store", txID, err)
-			}
-
-			// A tx stored as conflicting holds no spends: ProcessConflicting unspends a loser's
-			// inputs. Once an input is free again, the spend above takes it, and kept, it would
-			// block every honest spender of the output while the tx stays conflicting.
-			if txMetaData.Conflicting {
-				if err = v.releaseSpends(decoupledCtx, spentUtxos); err != nil {
-					return nil, errors.NewProcessingError("[Validate][%s] failed to release the inputs of a tx stored as conflicting", txID, err)
-				}
 			}
 
 			// The transaction is already durably present; a resubmit is an

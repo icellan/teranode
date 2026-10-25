@@ -140,7 +140,15 @@ func (u *Server) processTransactionsBatched(ctx context.Context, checker validat
 		}
 	}
 
-	missed += recheckStoredConflicting(txMetaSlice)
+	storedConflictingOptions := validator.ProcessOptions(
+		validator.WithSkipPolicyChecks(true),
+		validator.WithCandidateBlockTime(candidateBlockTime),
+		validator.WithCandidateParentMedianTime(candidateParentMedianTime),
+	)
+
+	if err = u.checkStoredConflictingAtHeight(ctx, txHashes, txMetaSlice, allTransactions, blockHeight, storedConflictingOptions); err != nil {
+		return err
+	}
 
 	prometheusSubtreeValidationBatchStep.WithLabelValues("precheck").Observe(time.Since(start).Seconds())
 

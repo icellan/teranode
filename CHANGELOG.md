@@ -124,12 +124,12 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
   A block no longer takes a tx's stored conflicting record as its own verdict. Another
   candidate block, at another height, may have created the record, and a tx valid there
-  can be invalid at this block's height. On every block path the validator now checks
-  such a tx again at the block's height; a peer subtree still takes the record as
-  before. Each conflicting tx in a block costs one more validation, and on the
-  per-subtree path a fetch of its body from the peer. A tx stored as conflicting no
-  longer keeps an input it spends when validated again after the input became free; it
-  held it while staying conflicting, blocking every honest spender. (#2038)
+  can be invalid at this block's height. On every block path such a tx is now checked
+  again at the block's height for coinbase maturity (`TX_INVALID`) and finality, from the
+  store, without writing anything; a peer subtree still takes the record as before. Each
+  conflicting tx in a block costs a read of its body and its parents. Relative lock times
+  (BIP68, before Genesis) and the script rules of the Genesis boundary are not checked
+  again, and a stored record that is not conflicting is still taken as it was. (#2038)
 
 - **Peer subtrees holding conflicting txs are stored instead of rejected.** A subtree
   announced by a peer used to fail validation when it held a tx conflicting with one
