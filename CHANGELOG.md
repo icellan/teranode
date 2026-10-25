@@ -114,20 +114,22 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   validation instead. Each input is classified by its own error, whatever its position in
   the tx.
 
-  A block whose tx spends an immature coinbase or a frozen output, with or without a
-  double spend, is now marked invalid: the validator returns `TX_INVALID` for it on the
-  block path, at the block's own height. It used to fail as a processing error, so the
-  block was retried and never marked invalid, and the peer that sent it was not charged.
-  Outside a block the same spend is still a plain rejection, and below a checkpoint a
-  failure stays local. A frozen output makes the block invalid only for nodes holding
-  the same freeze; a node that has not applied the alert accepts it. A mismatched output
-  still fails without a verdict.
+  A block whose tx spends an immature coinbase, with or without a double spend, is now
+  marked invalid: the validator returns `TX_INVALID` for it on the block path, at the
+  block's own height. It used to fail as a processing error, so the block was retried and
+  never marked invalid, and the peer that sent it was not charged. Outside a block the
+  same spend is still a plain rejection, and below a checkpoint a failure stays local. A
+  frozen or mismatched output still fails without a verdict: freezes and reassignment
+  holds are this node's state, set at the height it applied the alert.
 
   A block no longer takes a tx's stored conflicting record as its own verdict. Another
   candidate block, at another height, may have created the record, and a tx valid there
   can be invalid at this block's height. On every block path the validator now checks
   such a tx again at the block's height; a peer subtree still takes the record as
-  before. Each conflicting tx in a block costs one more validation. (#2038)
+  before. Each conflicting tx in a block costs one more validation, and on the
+  per-subtree path a fetch of its body from the peer. A tx stored as conflicting no
+  longer keeps an input it spends when validated again after the input became free; it
+  held it while staying conflicting, blocking every honest spender. (#2038)
 
 - **Peer subtrees holding conflicting txs are stored instead of rejected.** A subtree
   announced by a peer used to fail validation when it held a tx conflicting with one

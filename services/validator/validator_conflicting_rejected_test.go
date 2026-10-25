@@ -329,13 +329,14 @@ func TestBlockPathCreatesConflictingOnlyWhenEveryFailedSpendConflicts(t *testing
 	}
 }
 
-// TestBlockPathSpendOfImmatureOrFrozenOutputIsInvalid pins the verdict for a block's tx that
-// spends an immature coinbase or a frozen output, alone or next to a double spend: the tx is
-// invalid at the block's height, so the block is. Without TX_INVALID in the error, subtree and
-// block validation saw a processing error and retried the block forever instead of marking it
-// invalid. The same spend outside a block is not invalid: the coinbase matures and a freeze can
-// be lifted, so a later block may include it.
-func TestBlockPathSpendOfImmatureOrFrozenOutputIsInvalid(t *testing.T) {
+// TestBlockPathSpendOfImmatureCoinbaseIsInvalid pins the verdict for a block's tx that spends an
+// immature coinbase, alone or next to a double spend: the tx is invalid at the block's height, so
+// the block is. Without TX_INVALID in the error, subtree and block validation saw a processing
+// error and retried the block forever instead of marking it invalid. The same spend outside a
+// block is not invalid: the coinbase matures, so a later block may include it. A frozen output is
+// never a verdict, in a block or not: freezes and reassignment holds are this node's state, and a
+// node that differs must not mark an honest block invalid or charge its peer.
+func TestBlockPathSpendOfImmatureCoinbaseIsInvalid(t *testing.T) {
 	type fixture struct {
 		v                  *Validator
 		parentTx, coinbase *bt.Tx
@@ -430,9 +431,20 @@ func TestBlockPathSpendOfImmatureOrFrozenOutputIsInvalid(t *testing.T) {
 			tx := spending(t, f, c.immature, c.frozen, c.doubleSpend)
 
 			txMeta, err := f.v.Validate(t.Context(), tx, 100, WithCreateConflicting(true), WithSkipPolicyChecks(true))
+			require.Error(t, err)
+			require.Nil(t, txMeta)
+
+			if c.frozen {
+				require.False(t, errors.Is(err, errors.ErrTxInvalid), "a frozen output is this node's state, not a verdict: %v", err)
+				return
+			}
+
 			require.True(t, errors.Is(err, errors.ErrTxInvalid), "%v", err)
 			require.False(t, errors.Is(err, errors.ErrTxPolicy), "a policy error is never charged as invalid: %v", err)
-			require.Nil(t, txMeta)
+
+			var top *errors.Error
+			require.True(t, errors.As(err, &top))
+			require.Equal(t, errors.ERR_TX_INVALID, top.Code(), "the verdict is on top, not under a processing error: %v", err)
 		})
 
 		t.Run(c.name+" below a checkpoint", func(t *testing.T) {
@@ -454,4 +466,61 @@ func TestBlockPathSpendOfImmatureOrFrozenOutputIsInvalid(t *testing.T) {
 			require.False(t, errors.Is(err, errors.ErrTxInvalid), "%v", err)
 		})
 	}
+}
+
+// TestResubmittedConflictingTxReleasesTheInputsItSpends pins that a tx stored as conflicting
+// holds no spends, as ProcessConflicting leaves a loser. Once its input is free again, for
+// instance after the tx it lost to was flipped, validating it again (a block re-checking the
+// stored record at its own height) spends the input before the create finds the record. The
+// record is returned as before, but the spend must not stay: it would block every honest
+// spender of the output while the tx stays conflicting.
+func TestResubmittedConflictingTxReleasesTheInputsItSpends(t *testing.T) {
+	ctx := t.Context()
+	logger := ulogger.NewErrorTestLogger(t)
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockAssembly.Disabled = true
+
+	utxoStoreURL, err := url.Parse("sqlitememory:///resubmitted_conflicting_releases")
+	require.NoError(t, err)
+
+	utxoStore, err := sql.New(ctx, logger, tSettings, utxoStoreURL)
+	require.NoError(t, err)
+	utxoStore.RawDB().SetMaxOpenConns(1)
+	require.NoError(t, utxoStore.SetBlockHeight(100))
+	require.NoError(t, utxoStore.SetMedianBlockTime(uint32(time.Now().Unix()))) //nolint:gosec
+
+	privateKey, publicKey := bec.PrivateKeyFromBytes([]byte("RESUBMITTED_CONFLICTING_KEY!!!!!"))
+
+	parentTx := transactions.Create(t,
+		transactions.WithCoinbaseData(1, "/resubmitted conflicting parent/"),
+		transactions.WithP2PKHOutputs(1, 100_000, publicKey),
+	)
+	_, err = utxoStore.Create(ctx, parentTx, 1, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: 1, BlockHeight: 1, SubtreeIdx: 0}))
+	require.NoError(t, err)
+
+	validator, err := New(ctx, logger, tSettings, utxoStore, nil, nil, nil, nil, nil)
+	require.NoError(t, err)
+
+	// stored as conflicting, its input free: the state of a loser after ProcessConflicting
+	// once the tx it lost to no longer holds the input
+	loser := transactions.Create(t,
+		transactions.WithPrivateKey(privateKey),
+		transactions.WithInput(parentTx, 0, privateKey),
+		transactions.WithP2PKHOutputs(1, 80_000, publicKey),
+	)
+	_, err = utxoStore.Create(ctx, loser, 100, utxostore.WithConflicting(true))
+	require.NoError(t, err)
+
+	txMeta, err := validator.Validate(ctx, loser, 101, WithCreateConflicting(true), WithSkipPolicyChecks(true))
+	require.NoError(t, err)
+	require.NotNil(t, txMeta)
+	require.True(t, txMeta.Conflicting, "the stored record is returned")
+
+	honest := transactions.Create(t,
+		transactions.WithPrivateKey(privateKey),
+		transactions.WithInput(parentTx, 0, privateKey),
+		transactions.WithP2PKHOutputs(1, 90_000, publicKey),
+	)
+	_, err = validator.Validate(ctx, honest, 101)
+	require.NoError(t, err, "the conflicting tx must not keep the input it spent")
 }
