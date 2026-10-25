@@ -24,6 +24,7 @@ import (
 	"sync"
 
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/util"
@@ -39,7 +40,8 @@ var _ Interface = &MockValidator{}
 // Validation behavior (in precedence order):
 //   - ValidateFunc, if set, is invoked directly.
 //   - Otherwise, if Errors is non-empty, the first queued error is returned and popped.
-//   - Otherwise, if UtxoStore is set, the transaction is created in that store.
+//   - Otherwise, if UtxoStore is set, the transaction is created in that store; one already
+//     there is answered from its stored record, as the validator answers it.
 //   - Otherwise, transaction metadata is derived directly from the transaction.
 //
 // The mock is safe for concurrent use of the error queue.
@@ -122,6 +124,14 @@ func (m *MockValidator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, bloc
 
 	if m.UtxoStore != nil {
 		md, _, err := m.UtxoStore.SpendAndCreate(context.Background(), tx, 0, utxo.WithCreateOnly())
+		if errors.Is(err, errors.ErrTxExists) {
+			// as the validator does, answer a tx already in the store from its record
+			md = &meta.Data{}
+			if err = m.UtxoStore.GetMeta(ctx, tx.TxIDChainHash(), md); err != nil {
+				return nil, err
+			}
+		}
+
 		return md, err
 	}
 
