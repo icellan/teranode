@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ordishs/gocore"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,7 +38,13 @@ func TestBlockAssemblyTxMapDirs_SinglePath(t *testing.T) {
 }
 
 // Unset must stay empty — that is what selects the in-memory SplitTxInpointsMap.
+// The shipped default is checked in the committed settings.conf, not through
+// NewSettings, so a developer's settings_local.conf that sets the key can neither
+// fail this test nor mask a committed value.
 func TestBlockAssemblyTxMapDirs_DefaultEmpty(t *testing.T) {
+	requireUnsetInCommittedConf(t, "blockassembly_txMapDirs")
+	ignoreLocalConf(t, "blockassembly_txMapDirs")
+
 	tSettings := NewSettings()
 
 	require.Empty(t, tSettings.BlockAssembly.TxMapDirs,
@@ -74,6 +81,11 @@ func TestBlockValidationSubtreeMmapDir_EnvIsRead(t *testing.T) {
 // Unset must stay empty: that is what selects heap-allocated Nodes, which is the
 // documented default and the behaviour every existing deployment has today.
 func TestSubtreeMmapDir_DefaultEmpty(t *testing.T) {
+	for _, key := range []string{"blockassembly_subtreeMmapDir", "blockvalidation_subtreeMmapDir"} {
+		requireUnsetInCommittedConf(t, key)
+		ignoreLocalConf(t, key)
+	}
+
 	tSettings := NewSettings()
 
 	require.Empty(t, tSettings.BlockAssembly.SubtreeMmapDir,
@@ -202,4 +214,28 @@ func collectKeyTags(typ reflect.Type, seen map[reflect.Type]bool) []string {
 	}
 
 	return keys
+}
+
+// requireUnsetInCommittedConf fails if the committed settings.conf gives key a
+// non-empty value in any context.
+func requireUnsetInCommittedConf(t *testing.T, key string) {
+	t.Helper()
+
+	for k, v := range readCommittedSettingsConf(t) {
+		if k == key || strings.HasPrefix(k, key+".") {
+			require.Empty(t, v, "settings.conf sets %s", k)
+		}
+	}
+}
+
+// ignoreLocalConf blanks key in the environment, which gocore reads before any
+// file, when a loaded conf sets it, so a settings_local.conf cannot reach
+// NewSettings. Without one, as in CI, NewSettings still falls back to the code
+// default.
+func ignoreLocalConf(t *testing.T, key string) {
+	t.Helper()
+
+	if _, found := gocore.Config().Get(key); found {
+		t.Setenv(key, "")
+	}
 }
