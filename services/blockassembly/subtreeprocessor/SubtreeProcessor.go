@@ -4310,6 +4310,25 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 			return errors.NewProcessingError("[reorgBlocks] timeout waiting for block being mined %s", moveForwardBlocks[len(moveForwardBlocks)-1].Hash().String())
 		}
 
+		// Drain the backlog before moving forward, as the reorg branch below
+		// does: the drained txs then sit in the subtrees, which each block's
+		// remainder pass filters against that block. Draining only on the last
+		// block filtered the backlog against the last block alone, and txs
+		// mined in an earlier block of the catch-up were mined again (issue
+		// 2050). Draining before the state capture below means a failed
+		// catch-up rolls back to the drained state instead of losing it.
+		if err = stp.dequeueDuringBlockMovement(nil, nil, nil, true); err != nil {
+			return errors.NewProcessingError("[reorgBlocks] error dequeueing transactions before catch-up", err)
+		}
+
+		// A catch-up of empty blocks never reaches a moveForwardBlock
+		// pre-commit check, so check the drain's own disk tx map writes here.
+		stp.flushDiskTxMapWriters()
+
+		if mapErr := stp.diskTxMapErr(); mapErr != nil {
+			return errors.NewStorageError("[reorgBlocks] disk tx map storage error after draining the queue before catch-up", mapErr)
+		}
+
 		// create empty map for processed conflicting hashes
 		processedConflictingHashesMap := make(map[chainhash.Hash]struct{})
 
@@ -5839,7 +5858,7 @@ func (stp *SubtreeProcessor) processRemainderTransactionsAndDequeue(ctx context.
 
 		stp.logger.Debugf("[moveForwardBlock][%s] processRemainderTxHashes with %d subtrees", params.Block.String(), len(params.ChainedSubtrees))
 
-		if err := stp.processRemainderTxHashes(ctx, remainderSubtrees, params.TransactionMap, params.LosingTxHashesMap, params.CurrentTxMap, params.SkipNotification); err != nil {
+		if err := stp.processRemainderTxHashes(ctx, remainderSubtrees, params.TransactionMap, params.LosingTxHashesMap, params.ConflictingHashes, params.CurrentTxMap, params.SkipNotification); err != nil {
 			return errors.NewProcessingError("[moveForwardBlock][%s] error getting remainder tx hashes", params.Block.String(), err)
 		}
 
@@ -6441,23 +6460,8 @@ func (stp *SubtreeProcessor) dequeueDuringBlockMovement(transactionMap *SortedHa
 					continue
 				}
 
-				if len(conflictingHashes) > 0 {
-					if _, ok := conflictingHashes[node.Hash]; ok {
-						continue
-					}
-					if txInpoints != nil {
-						matched := false
-						for _, parent := range txInpoints.ParentTxHashes {
-							if _, ok := conflictingHashes[parent]; ok {
-								matched = true
-								break
-							}
-						}
-						if matched {
-							conflictingHashes[node.Hash] = struct{}{}
-							continue
-						}
-					}
+				if len(conflictingHashes) > 0 && rejectConflicting(node.Hash, txInpoints, conflictingHashes) {
+					continue
 				}
 
 				if addErr := stp.addNode(node, txInpoints, skipNotification); addErr != nil {
@@ -6639,6 +6643,77 @@ func remainderWorkers(configured int) int {
 	return workers
 }
 
+// dropConflictingDescendants removes, in place, every remainder node that is
+// in conflictingHashes or spends a tx in it, adding each one dropped by parent
+// to the set. The inpoint lookups run in parallel, since on a disk tx map each
+// one is a read; the walk itself is sequential in subtree order, which puts
+// parents before children, so a dropped child takes its own descendants with it.
+func dropConflictingDescendants(ctx context.Context, remainderSubtrees [][]subtreepkg.Node,
+	conflictingHashes map[chainhash.Hash]struct{}, currentTxMap TxInpointsMap, workers int) error {
+	inpoints := make([][]*subtreepkg.TxInpoints, len(remainderSubtrees))
+
+	g, _ := errgroup.WithContext(ctx)
+	g.SetLimit(workers)
+
+	for idx, nodes := range remainderSubtrees {
+		inpoints[idx] = make([]*subtreepkg.TxInpoints, len(nodes))
+
+		g.Go(func() error {
+			for i, node := range nodes {
+				txInpoints, ok := currentTxMap.Get(node.Hash)
+				if !ok {
+					return errors.NewProcessingError("[processRemainderTxHashes] error getting node txInpoints from currentTxMap for %s", node.Hash.String())
+				}
+
+				inpoints[idx][i] = txInpoints
+			}
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	for idx, nodes := range remainderSubtrees {
+		kept := nodes[:0]
+
+		for i, node := range nodes {
+			if !rejectConflicting(node.Hash, inpoints[idx][i], conflictingHashes) {
+				kept = append(kept, node)
+			}
+		}
+
+		remainderSubtrees[idx] = kept
+	}
+
+	return nil
+}
+
+// rejectConflicting reports whether a tx must be kept out of the subtrees
+// because it is in conflictingHashes or spends a tx in it. On a parent match
+// it adds the tx itself to the set, so its own descendants are rejected too.
+// txInpoints may be nil, in which case only the tx's own hash is checked.
+func rejectConflicting(hash chainhash.Hash, txInpoints *subtreepkg.TxInpoints, conflictingHashes map[chainhash.Hash]struct{}) bool {
+	if _, ok := conflictingHashes[hash]; ok {
+		return true
+	}
+
+	if txInpoints == nil {
+		return false
+	}
+
+	for _, parent := range txInpoints.ParentTxHashes {
+		if _, ok := conflictingHashes[parent]; ok {
+			conflictingHashes[hash] = struct{}{}
+			return true
+		}
+	}
+
+	return false
+}
+
 // processRemainderTxHashes processes remaining transaction hashes after reorganization.
 //
 // Parameters:
@@ -6646,12 +6721,18 @@ func remainderWorkers(configured int) int {
 //   - chainedSubtrees: List of subtrees to process
 //   - transactionMap: Map of transactions that were in the block and need to be removed
 //   - losingTxHashesMap: Map of transactions that were conflicting and need to be removed
+//   - conflictingHashes: every tx the block's conflict cascade marked
+//     conflicting (see dequeueDuringBlockMovement). May be nil. A remainder
+//     tx in the set, or spending one, is removed, and on a parent match its
+//     own hash is added, so its descendants go too and the drain that follows
+//     rejects their queued children.
 //   - skipNotification: Whether to skip notification of new subtrees
 //
 // Returns:
 //   - error: Any error encountered during processing
 func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chainedSubtrees []*subtreepkg.Subtree,
-	transactionMap *SortedHashSet, losingTxHashesMap txmap.TxMap, currentTxMap TxInpointsMap, skipNotification bool) error {
+	transactionMap *SortedHashSet, losingTxHashesMap txmap.TxMap, conflictingHashes map[chainhash.Hash]struct{},
+	currentTxMap TxInpointsMap, skipNotification bool) error {
 	// clean out the transactions from the old current subtree that were in the block
 	// and add the remainderSubtreeNodes to the new current subtree, in order.
 	//
@@ -6752,6 +6833,12 @@ func (stp *SubtreeProcessor) processRemainderTxHashes(ctx context.Context, chain
 
 	if err := g.Wait(); err != nil {
 		return errors.NewProcessingError("error collecting remainder txs", err)
+	}
+
+	if len(conflictingHashes) > 0 {
+		if err := dropConflictingDescendants(ctx, remainderSubtrees, conflictingHashes, currentTxMap, workers); err != nil {
+			return err
+		}
 	}
 
 	// Calculate total nodes for threshold check

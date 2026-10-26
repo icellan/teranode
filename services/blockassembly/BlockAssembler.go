@@ -2474,9 +2474,10 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 
 // handleCatchUp executes a forward-only catch-up. Delegates to the subtree
 // processor's reorgBlocks fast path (the `len(moveBackBlocks)==0 && len(moveForwardBlocks)>0`
-// branch, see SubtreeProcessor.go:2794), which iterates moveForwardBlock per block with
-// skipNotification + skipDequeue on every block except the last and rolls back to
-// pre-catchup state on mid-loop failure. ctx is unused at this layer — Reorg controls
+// branch), which drains the queue into the subtrees first, so every block's remainder pass
+// filters the backlog, then iterates moveForwardBlock per block with skipNotification +
+// skipDequeue on every block except the last, and rolls back to the drained pre-catchup
+// state on mid-loop failure. ctx is unused at this layer — Reorg controls
 // its own internal lifecycle via reorgBlockChan.
 func (b *BlockAssembler) handleCatchUp(_ context.Context, moveForward []blockWithMeta) error {
 	if len(moveForward) == 0 {
