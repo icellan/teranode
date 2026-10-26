@@ -1,0 +1,641 @@
+package blockvalidation
+
+import (
+	"bufio"
+	"context"
+	"sync"
+
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
+	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/stores/utxo"
+)
+
+// Overtaken-tip repair (issue 2051).
+//
+// setTxMined clears unmined_since on a block's txs when the block is on the longest chain
+// at the time it runs. If a competing chain later overtakes that block before block
+// assembly has moved onto it, block assembly reaches the new tip by a pure catch-up and
+// never sees the block as a moveBack block, so nothing in block assembly restores
+// unmined_since. Those txs then sit in the mempool looking mined: the pruner treats them
+// (and their parents) as prunable, and loadUnminedTransactions cannot see them. At scale
+// block assembly lags by minutes, so this is the normal case in a fork storm, not an edge.
+//
+// Block assembly's reorg used to cover this by re-marking its whole mempool on every reorg,
+// a batch write per mempool tx. The repair here replaces that: it tracks the blocks
+// setTxMined wrote as on-chain and, when one has left the chain, re-marks its txs that are
+// not mined on the new chain.
+//
+// It runs on the setMined worker, between blocks, one slice of txs at a time. Running it
+// there, rather than concurrently, is what makes it correct: no setTxMined write can land
+// in the middle of a slice's read-decide-write, so for a tx the overtaken block shares with
+// another block both orders end right. If the slice runs first, the tx is stamped and the
+// other block's setTxMined clears it again; if that setTxMined ran first, the tx's block
+// ids show it is mined on the longest chain and the slice leaves it alone. The slice size
+// bounds how long a repair delays the next block's mined_set.
+//
+// Limitations. The repair is serialised with this process's setMined worker only: it
+// assumes one block validation instance writes setTxMined for the chain. Its state is in
+// memory. After a restart the tracker is rebuilt from the chain without knowing which
+// blocks were re-marked, so a re-marked block that comes back onto the chain afterwards
+// keeps those txs flagged unmined until block assembly's next unmined-transaction load
+// fixes them (fixUnminedSinceInconsistencies); and fork blocks deeper than
+// tipRepairSeedForkDepth at the restart are not repaired.
+
+const (
+	// tipRepairWindow is how deep below the best block a tracked block is kept. A reorg
+	// deeper than this is not repaired here.
+	tipRepairWindow = 1000
+
+	// tipRepairSeedForkDepth bounds the fork blocks the startup seed looks at, measured from
+	// the best height. The seed cannot tell a fork block that was once the tip from one
+	// that never was, and each one costs a read per tx, so it stays shallow.
+	tipRepairSeedForkDepth = 10
+
+	// tipRepairSeedMaxBlocks caps the recent blocks the startup seed reads to find them.
+	tipRepairSeedMaxBlocks = 1000
+
+	// tipRepairMaxAttempts is how many times a block may fail permanently (its block or
+	// subtrees are gone) before it is dropped. Transient failures do not count.
+	tipRepairMaxAttempts = 10
+
+	// defaultTipRepairSliceSize is used when BlockValidation.TipRepairSliceSize is unset.
+	defaultTipRepairSliceSize = 250_000
+)
+
+// tipRepairExpired reports whether a tracked block at height has left the window. Each slice
+// reads main-chain ids with GetBlockHeaderIDs(best, tipRepairWindow), which covers best down
+// to best-tipRepairWindow+1; a block below that would look off chain while it is not.
+func tipRepairExpired(height, bestHeight uint32) bool {
+	return height+tipRepairWindow <= bestHeight
+}
+
+// isPermanentRepairError reports whether a repair error means the block can never be
+// repaired: the block or its subtrees are gone.
+func isPermanentRepairError(err error) bool {
+	return errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrSubtreeNotFound) ||
+		errors.Is(err, errors.ErrBlobNotFound) || errors.Is(err, errors.ErrNotFound)
+}
+
+// minedOnChainBlock is a block setTxMined wrote with onLongestChain=true.
+type minedOnChainBlock struct {
+	id     uint32
+	height uint32
+	// gen changes whenever a new on-chain write of the block starts. A repair in progress
+	// for an older gen is abandoned: the new write cleared the txs again.
+	gen uint64
+	// written is set once the block's setTxMined write has completed. A repair only starts
+	// on a written block.
+	written bool
+	// stamped is set once any of the block's txs were re-marked not on the longest chain,
+	// so they need marking mined again if the block comes back onto the chain.
+	stamped bool
+	// done is set when every tx of the block has been through the repair while it was off
+	// the chain; it is cleared when the block is seen back on the chain.
+	done     bool
+	failures int // permanent failures so far
+}
+
+// minedOnChainTracker holds the blocks the overtaken-tip repair watches. A nil tracker
+// tracks nothing, for a BlockValidation not built by NewBlockValidation.
+type minedOnChainTracker struct {
+	mu      sync.Mutex
+	blocks  map[chainhash.Hash]minedOnChainBlock
+	nextGen uint64
+}
+
+func newMinedOnChainTracker() *minedOnChainTracker {
+	return &minedOnChainTracker{blocks: make(map[chainhash.Hash]minedOnChainBlock)}
+}
+
+// track watches a block. With written=false a new on-chain write is starting: it clears the
+// block's txs again, so the block gets a new gen and starts over. With written=true (the
+// restart seed) a block already watched keeps its state.
+func (t *minedOnChainTracker) track(hash chainhash.Hash, id, height uint32, written bool) {
+	if t == nil {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	b, ok := t.blocks[hash]
+	if ok && written {
+		return
+	}
+
+	t.nextGen++
+	t.blocks[hash] = minedOnChainBlock{id: id, height: height, gen: t.nextGen, written: written, failures: b.failures}
+}
+
+// markWritten records that the block's setTxMined write has completed and reports whether
+// the block is tracked, in which case the caller asks for a repair slice.
+func (t *minedOnChainTracker) markWritten(hash chainhash.Hash) bool {
+	if t == nil {
+		return false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	b, ok := t.blocks[hash]
+	if !ok {
+		return false
+	}
+
+	b.written = true
+	t.blocks[hash] = b
+
+	return true
+}
+
+// update applies fn to the block's entry if it is still at gen.
+func (t *minedOnChainTracker) update(hash chainhash.Hash, gen uint64, fn func(*minedOnChainBlock)) {
+	if t == nil {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if b, ok := t.blocks[hash]; ok && b.gen == gen {
+		fn(&b)
+		t.blocks[hash] = b
+	}
+}
+
+func (t *minedOnChainTracker) drop(hash chainhash.Hash) {
+	if t == nil {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	delete(t.blocks, hash)
+}
+
+func (t *minedOnChainTracker) empty() bool {
+	if t == nil {
+		return true
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return len(t.blocks) == 0
+}
+
+func (t *minedOnChainTracker) snapshot() map[chainhash.Hash]minedOnChainBlock {
+	if t == nil {
+		return nil
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	out := make(map[chainhash.Hash]minedOnChainBlock, len(t.blocks))
+	for hash, b := range t.blocks {
+		out[hash] = b
+	}
+
+	return out
+}
+
+// tipRepairJobKind is what a tipRepairJob writes.
+type tipRepairJobKind int
+
+const (
+	// unmarkJob re-marks the txs of a block that left the chain and are not mined on it.
+	unmarkJob tipRepairJobKind = iota
+	// remineJob marks the txs of a re-marked block mined again, now that it is back on the
+	// chain. Every one of them carries the block's id, so clearing unmined_since is right
+	// for all of them.
+	remineJob
+)
+
+// tipRepairJob is a repair in progress over one block, worked through one subtree, and
+// within a subtree one slice of txs, per step. Only the current subtree's tx hashes are
+// held.
+type tipRepairJob struct {
+	kind     tipRepairJobKind
+	hash     chainhash.Hash
+	id       uint32
+	gen      uint64
+	subtrees []*chainhash.Hash
+	// nextSubtree is the index of the subtree to load once current is used up.
+	nextSubtree int
+	current     []subtreepkg.Node
+	marked      int
+	total       int
+}
+
+// signalTipRepair asks the setMined worker for a repair slice. Never blocks; a pending
+// request covers any number of calls.
+func (u *BlockValidation) signalTipRepair() {
+	u.tipRepairPending.Store(true)
+
+	select {
+	case u.tipRepairSignal <- struct{}{}:
+	default:
+	}
+}
+
+// runTipRepairSlice is called by the setMined worker when a slice was requested. It runs one
+// slice and requests the next while there is more to do. A transient failure is retried on
+// the next request (a chain change, a write, or the periodic tick, which keeps asking while
+// tipRepairRetry is set).
+func (u *BlockValidation) runTipRepairSlice(ctx context.Context, blockchainClient blockchain.ClientI) {
+	more, err := u.tipRepairSlice(ctx, blockchainClient)
+	u.tipRepairRetry.Store(err != nil)
+
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+
+		u.logger.Errorf("[repairOvertakenTips] slice failed, will retry: %v", err)
+
+		return
+	}
+
+	if more {
+		u.signalTipRepair()
+	}
+}
+
+// seedMinedOnChainTrackerLocked rebuilds the in-memory tracker after a restart: the
+// main-chain blocks inside the window that are mined, and the mined fork blocks within
+// tipRepairSeedForkDepth of the best height, which may have been the tip before the restart.
+func (u *BlockValidation) seedMinedOnChainTrackerLocked(ctx context.Context, blockchainClient blockchain.ClientI) error {
+	bestHeader, bestMeta, err := blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil {
+		return errors.NewServiceError("[repairOvertakenTips] seed: failed to get best block header", err)
+	}
+
+	headers, metas, err := blockchainClient.GetBlockHeaders(ctx, bestHeader.Hash(), tipRepairWindow)
+	if err != nil {
+		return errors.NewServiceError("[repairOvertakenTips] seed: failed to get main chain headers", err)
+	}
+
+	u.trackMinedHeaders(headers, metas)
+
+	// Fork blocks near the tip: one query for the highest blocks, side chains included.
+	// GetChainTips would do too, but on SQLite it holds a row cursor open across nested
+	// queries and deadlocks against a concurrent write transaction.
+	recent, err := blockchainClient.GetLastNBlocks(ctx, tipRepairSeedMaxBlocks, true, 0)
+	if err != nil {
+		return errors.NewServiceError("[repairOvertakenTips] seed: failed to get recent blocks", err)
+	}
+
+	for _, info := range recent {
+		if info.Height+tipRepairSeedForkDepth < bestMeta.Height {
+			break // highest first
+		}
+
+		header, err := model.NewBlockHeaderFromBytes(info.BlockHeader)
+		if err != nil {
+			return errors.NewProcessingError("[repairOvertakenTips] seed: invalid block header at height %d", info.Height, err)
+		}
+
+		_, meta, err := blockchainClient.GetBlockHeader(ctx, header.Hash())
+		if err != nil {
+			return errors.NewServiceError("[repairOvertakenTips] seed: failed to get block header %s", header.Hash().String(), err)
+		}
+
+		u.trackMinedHeaders([]*model.BlockHeader{header}, []*model.BlockHeaderMeta{meta})
+	}
+
+	u.tipRepairSeeded = true
+
+	return nil
+}
+
+func (u *BlockValidation) trackMinedHeaders(headers []*model.BlockHeader, metas []*model.BlockHeaderMeta) {
+	for i, meta := range metas {
+		if i >= len(headers) || meta == nil || !meta.MinedSet || meta.Invalid {
+			continue
+		}
+
+		u.minedOnChain.track(*headers[i].Hash(), meta.ID, meta.Height, true)
+	}
+}
+
+// tipRepairSlice does one bounded step of the repair against the current best chain and
+// reports whether more steps are pending. A step is one of: load the next subtree of the
+// job in progress, or write the next slice of its txs; start a job, marking a re-marked
+// block that is back on the chain mined again before repairing a block that left it.
+// Housekeeping drops expired and invalid blocks.
+//
+// The repair is serialised with this process's setMined worker only. Several block
+// validation instances writing setTxMined for the same chain would each run their own
+// repair, unserialised against the others' writes.
+func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient blockchain.ClientI) (more bool, err error) {
+	u.tipRepairMu.Lock()
+	defer u.tipRepairMu.Unlock()
+
+	// Nothing to do until this process has written a block as on the longest chain. The
+	// restart seed waits for that too: after a restart the next block's setTxMined comes
+	// within one block interval, and a process that never marks blocks mined (or a test
+	// harness that never runs setTxMined) makes no blockchain calls here at all.
+	if !u.tipRepairSeeded && u.minedOnChain.empty() {
+		return false, nil
+	}
+
+	if !u.tipRepairSeeded {
+		if err = u.seedMinedOnChainTrackerLocked(ctx, blockchainClient); err != nil {
+			return false, err
+		}
+	}
+
+	onMainChain, bestHeight, err := u.mainChainIDsLocked(ctx, blockchainClient)
+	if err != nil {
+		return false, err
+	}
+
+	tracked := u.minedOnChain.snapshot()
+
+	for hash, b := range tracked {
+		switch {
+		case tipRepairExpired(b.height, bestHeight):
+			if b.written && !onMainChain[b.id] && !b.done {
+				u.logger.Warnf("[repairOvertakenTips][%s] block left the repair window before its repair finished; some of its txs may still look mined", hash.String())
+			}
+
+			u.minedOnChain.drop(hash)
+			delete(tracked, hash)
+
+		case onMainChain[b.id] && b.done && !b.stamped:
+			// Back on the chain and nothing was re-marked: nothing to undo, but if it
+			// leaves again it needs repairing again.
+			u.minedOnChain.update(hash, b.gen, func(e *minedOnChainBlock) { e.done = false })
+			b.done = false
+			tracked[hash] = b
+		}
+	}
+
+	if job := u.tipRepairJob; job != nil {
+		b, ok := tracked[job.hash]
+
+		switch {
+		case !ok || b.gen != job.gen:
+			u.tipRepairJob = nil // dropped, or rewritten by a new setTxMined
+			return true, nil
+		case job.kind == unmarkJob && onMainChain[b.id], job.kind == remineJob && !onMainChain[b.id]:
+			u.tipRepairJob = nil // the chain moved; the next step starts the right job
+			return true, nil
+		}
+
+		return true, u.jobStep(ctx, blockchainClient, job, onMainChain)
+	}
+
+	// A re-marked block back on the chain first: its txs look unmined while mined.
+	for hash, b := range tracked {
+		if b.stamped && onMainChain[b.id] {
+			return true, u.startJob(ctx, blockchainClient, remineJob, hash, b)
+		}
+	}
+
+	for hash, b := range tracked {
+		if !b.written || b.done || onMainChain[b.id] {
+			continue
+		}
+
+		_, meta, err := blockchainClient.GetBlockHeader(ctx, &hash)
+		if err != nil {
+			return true, u.repairFailed(hash, b.gen, errors.NewServiceError("[repairOvertakenTips][%s] failed to get block header", hash.String(), err))
+		}
+
+		if meta == nil {
+			return true, u.repairFailed(hash, b.gen, errors.NewServiceError("[repairOvertakenTips][%s] block header meta is nil", hash.String()))
+		}
+
+		if meta.Invalid {
+			// block validation's unsetMined owns invalid blocks
+			u.minedOnChain.drop(hash)
+			continue
+		}
+
+		return true, u.startJob(ctx, blockchainClient, unmarkJob, hash, b)
+	}
+
+	return false, nil
+}
+
+// mainChainIDsLocked returns the ids of the tipRepairWindow blocks ending at the best block,
+// and the best height. When the best block only extends the one seen last time, the cached
+// set is extended with the new block's id instead of fetched again, so a step costs two
+// small blockchain calls in steady state rather than a 1000-id fetch.
+func (u *BlockValidation) mainChainIDsLocked(ctx context.Context, blockchainClient blockchain.ClientI) (map[uint32]bool, uint32, error) {
+	bestHeader, bestMeta, err := blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil {
+		return nil, 0, errors.NewServiceError("[repairOvertakenTips] failed to get best block header", err)
+	}
+
+	bestHash := *bestHeader.Hash()
+
+	switch {
+	case u.tipRepairMainChain != nil && bestHash == u.tipRepairBestHash:
+		return u.tipRepairMainChain, bestMeta.Height, nil
+
+	case u.tipRepairMainChain != nil && bestHeader.HashPrevBlock.IsEqual(&u.tipRepairBestHash):
+		// GetBestBlockHeader's meta carries no block id over gRPC, so ask for it.
+		ids, err := blockchainClient.GetBlockHeaderIDs(ctx, &bestHash, 1)
+		if err != nil || len(ids) == 0 {
+			return nil, 0, errors.NewServiceError("[repairOvertakenTips] failed to get best block id", err)
+		}
+
+		// Ids that fell out of the window stay in the set; tipRepairExpired drops their
+		// blocks before the set is consulted for them.
+		u.tipRepairMainChain[ids[0]] = true
+		u.tipRepairBestHash = bestHash
+
+		return u.tipRepairMainChain, bestMeta.Height, nil
+	}
+
+	ids, err := blockchainClient.GetBlockHeaderIDs(ctx, &bestHash, tipRepairWindow)
+	if err != nil {
+		return nil, 0, errors.NewServiceError("[repairOvertakenTips] failed to get main chain block ids", err)
+	}
+
+	onMainChain := make(map[uint32]bool, len(ids))
+	for _, id := range ids {
+		onMainChain[id] = true
+	}
+
+	u.tipRepairMainChain = onMainChain
+	u.tipRepairBestHash = bestHash
+
+	return onMainChain, bestMeta.Height, nil
+}
+
+// startJob begins a job over the block: it reads the block's subtree list, not its txs.
+func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockchain.ClientI, kind tipRepairJobKind, hash chainhash.Hash, b minedOnChainBlock) error {
+	block, err := blockchainClient.GetBlock(ctx, &hash)
+	if err != nil {
+		return u.repairFailed(hash, b.gen, errors.NewServiceError("[repairOvertakenTips][%s] failed to get block", hash.String(), err))
+	}
+
+	if kind == remineJob {
+		u.minedOnChain.update(hash, b.gen, func(e *minedOnChainBlock) { e.done = false })
+	}
+
+	u.tipRepairJob = &tipRepairJob{kind: kind, hash: hash, id: b.id, gen: b.gen, subtrees: block.Subtrees}
+
+	return nil
+}
+
+// jobStep writes the next slice of the job's txs, first loading the next subtree if the
+// current one is used up, and finishes the job with its last slice. A subtree that is gone
+// or unreadable is skipped with an error log, so the rest of the block is still repaired.
+func (u *BlockValidation) jobStep(ctx context.Context, blockchainClient blockchain.ClientI, job *tipRepairJob, onMainChain map[uint32]bool) error {
+	for len(job.current) == 0 {
+		if job.nextSubtree >= len(job.subtrees) {
+			u.finishJob(job)
+			return nil
+		}
+
+		subtreeHash := job.subtrees[job.nextSubtree]
+
+		nodes, err := u.loadSubtreeNodes(ctx, subtreeHash)
+		if err != nil {
+			if !isPermanentRepairError(err) {
+				return errors.NewProcessingError("[repairOvertakenTips][%s] failed to load subtree %d", job.hash.String(), job.nextSubtree, err)
+			}
+
+			u.logger.Errorf("[repairOvertakenTips][%s] skipping subtree %s, its txs may still look mined: %v", job.hash.String(), subtreeHash.String(), err)
+		}
+
+		job.nextSubtree++
+		job.current = nodes
+	}
+
+	sliceSize := u.settings.BlockValidation.TipRepairSliceSize
+	if sliceSize <= 0 {
+		sliceSize = defaultTipRepairSliceSize
+	}
+
+	sliceNodes := job.current[:min(sliceSize, len(job.current))]
+
+	slice := make([]chainhash.Hash, 0, len(sliceNodes))
+	for _, node := range sliceNodes {
+		if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			slice = append(slice, node.Hash)
+		}
+	}
+
+	switch job.kind {
+	case unmarkJob:
+		notOnLongestChain, err := model.FilterTxsNotOnLongestChain(ctx, u.logger, u.settings, u.utxoStore, blockchainClient, onMainChain, job.id, slice, true)
+		if err != nil {
+			return errors.NewProcessingError("[repairOvertakenTips][%s] error filtering txs of overtaken block", job.hash.String(), err)
+		}
+
+		if len(notOnLongestChain) > 0 {
+			// Before writing, so a write that fails part way still counts as stamped.
+			u.minedOnChain.update(job.hash, job.gen, func(e *minedOnChainBlock) { e.stamped = true })
+
+			if err = u.utxoStore.MarkTransactionsOnLongestChain(ctx, notOnLongestChain, false, utxo.WithSkipMissing()); err != nil {
+				return errors.NewProcessingError("[repairOvertakenTips][%s] error marking txs of overtaken block as not on longest chain", job.hash.String(), err)
+			}
+		}
+
+		job.marked += len(notOnLongestChain)
+
+	case remineJob:
+		// Only the txs that were stamped need writing.
+		unmined, err := model.FilterTxsUnmined(ctx, u.logger, u.settings, u.utxoStore, slice)
+		if err != nil {
+			return errors.NewProcessingError("[repairOvertakenTips][%s] error reading txs of block back on the longest chain", job.hash.String(), err)
+		}
+
+		if len(unmined) > 0 {
+			if err = u.utxoStore.MarkTransactionsOnLongestChain(ctx, unmined, true, utxo.WithSkipMissing()); err != nil {
+				return errors.NewProcessingError("[repairOvertakenTips][%s] error marking txs of block back on the longest chain", job.hash.String(), err)
+			}
+		}
+
+		job.marked += len(unmined)
+	}
+
+	job.total += len(slice)
+	job.current = job.current[len(sliceNodes):]
+
+	if len(job.current) == 0 && job.nextSubtree >= len(job.subtrees) {
+		u.finishJob(job)
+	}
+
+	return nil
+}
+
+// finishJob records a completed job on its block.
+func (u *BlockValidation) finishJob(job *tipRepairJob) {
+	u.tipRepairJob = nil
+
+	switch job.kind {
+	case unmarkJob:
+		u.minedOnChain.update(job.hash, job.gen, func(e *minedOnChainBlock) {
+			e.done = true
+			e.failures = 0
+		})
+
+		u.logger.Warnf("[repairOvertakenTips][%s] block left the longest chain after its txs were marked mined, marked %d of %d txs as not on longest chain", job.hash.String(), job.marked, job.total)
+
+	case remineJob:
+		u.minedOnChain.update(job.hash, job.gen, func(e *minedOnChainBlock) {
+			e.stamped = false
+			e.failures = 0
+		})
+
+		u.logger.Infof("[repairOvertakenTips][%s] block is back on the longest chain, marked %d of %d txs mined again", job.hash.String(), job.marked, job.total)
+	}
+}
+
+// repairFailed records a failed step for a block and returns err. A permanent failure (the
+// block or its subtrees are gone) counts toward tipRepairMaxAttempts, after which the block
+// is dropped; a transient one is only retried.
+func (u *BlockValidation) repairFailed(hash chainhash.Hash, gen uint64, err error) error {
+	if !isPermanentRepairError(err) {
+		return err
+	}
+
+	failures := 0
+	u.minedOnChain.update(hash, gen, func(e *minedOnChainBlock) {
+		e.failures++
+		failures = e.failures
+	})
+
+	if failures >= tipRepairMaxAttempts {
+		u.logger.Errorf("[repairOvertakenTips][%s] giving up after %d failed attempts; its txs may still look mined: %v", hash.String(), tipRepairMaxAttempts, err)
+		u.minedOnChain.drop(hash)
+
+		if u.tipRepairJob != nil && u.tipRepairJob.hash == hash {
+			u.tipRepairJob = nil
+		}
+	}
+
+	return err
+}
+
+// loadSubtreeNodes returns the nodes of one subtree.
+func (u *BlockValidation) loadSubtreeNodes(ctx context.Context, subtreeHash *chainhash.Hash) ([]subtreepkg.Node, error) {
+	reader, err := u.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		_ = reader.Close()
+	}()
+
+	subtree, err := subtreepkg.NewSubtreeFromReader(bufio.NewReader(reader))
+	if err != nil {
+		// A corrupt subtree cannot be read on a retry either.
+		return nil, errors.NewSubtreeNotFoundError("failed to deserialize subtree %s", subtreeHash.String(), err)
+	}
+
+	return subtree.Nodes, nil
+}

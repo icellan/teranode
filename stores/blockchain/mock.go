@@ -13,8 +13,10 @@
 package blockchain
 
 import (
+	"cmp"
 	"context"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -327,8 +329,46 @@ func (m *MockStore) AssignBlockID(_ context.Context, blockHash *chainhash.Hash) 
 	return id, nil
 }
 
+// GetLastNBlocks returns up to n blocks, highest first. Without includeOrphans only the best
+// block's chain is returned; fromHeight, when non-zero, caps the height.
 func (m *MockStore) GetLastNBlocks(ctx context.Context, n int64, includeOrphans bool, fromHeight uint32) ([]*model.BlockInfo, error) {
-	panic(implementMe)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	mainChain := make(map[chainhash.Hash]bool)
+	if m.BestBlock != nil {
+		for block := m.BestBlock; block != nil; block = m.Blocks[*block.Header.HashPrevBlock] {
+			mainChain[*block.Hash()] = true
+		}
+	}
+
+	blocks := make([]*model.Block, 0, len(m.Blocks))
+	for hash, block := range m.Blocks {
+		if (!includeOrphans && !mainChain[hash]) || (fromHeight > 0 && block.Height > fromHeight) {
+			continue
+		}
+
+		blocks = append(blocks, block)
+	}
+
+	slices.SortFunc(blocks, func(a, b *model.Block) int { return cmp.Compare(b.Height, a.Height) })
+
+	infos := make([]*model.BlockInfo, 0, min(int64(len(blocks)), n))
+	for _, block := range blocks {
+		if int64(len(infos)) >= n {
+			break
+		}
+
+		infos = append(infos, &model.BlockInfo{
+			Height:           block.Height,
+			Orphaned:         !mainChain[*block.Hash()],
+			BlockHeader:      block.Header.Bytes(),
+			TransactionCount: block.TransactionCount,
+			Size:             block.SizeInBytes,
+		})
+	}
+
+	return infos, nil
 }
 
 func (m *MockStore) GetLastNInvalidBlocks(ctx context.Context, n int64) ([]*model.BlockInfo, error) {

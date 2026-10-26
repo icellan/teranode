@@ -1637,8 +1637,11 @@ func (stp *SubtreeProcessor) reset(blockHeader *model.BlockHeader, moveBackBlock
 	// (WHERE unmined_since IS NOT NULL) — will not find them, and they will be silently dropped
 	// from block assembly after the reset.
 	//
-	// This mirrors exactly what reorgBlocks() does at lines 2665-2710 before it finalises a reorg.
-	// The call is idempotent: for transactions that already have unmined_since set, it is a no-op.
+	// reorgBlocks() no longer sweeps the whole assembly (issue 2051); block validation repairs
+	// an overtaken tip's txs when the best chain changes, asynchronously. This sweep stays as
+	// the catch-all for a reset that lands before that repair, since reset is rare and is
+	// where a gap drops txs from block assembly. For transactions that already have
+	// unmined_since set, it is a no-op.
 	{
 		currentSubtree := stp.currentSubtree.Load()
 		subtreeNodeCount := len(currentSubtree.Nodes)
@@ -5126,10 +5129,12 @@ func (stp *SubtreeProcessor) reorgBlocks(ctx context.Context, moveBackBlocks []*
 	// writes a mempool tx with unmined_since set, and setTxMined only clears it for a block
 	// on the longest chain, so a pure mempool tx needs no repair. The one way such a tx can
 	// look mined without being in a moveBack block is a tip that was overtaken before block
-	// assembly ever moved onto it; setTxMined repairs that at the source
-	// (BlockValidation.unmarkIfOvertaken). Folding the whole mempool in here cost a batch
-	// write per mempool tx on every reorg — 380M records and ~8 minutes at scale, with
-	// block assembly intake stalled throughout.
+	// assembly ever moved onto it. Block validation repairs those when the best chain
+	// changes (services/blockvalidation/overtaken_tip_repair.go), asynchronously; reset()
+	// keeps its whole-assembly sweep as the catch-all for a reset that lands before that
+	// repair. Folding the whole mempool in here cost a batch write per mempool tx on every
+	// reorg — 380M records and ~8 minutes at scale, with block assembly intake stalled
+	// throughout.
 	//
 	// The set is restricted to txs still in block assembly, not the whole moveBack-minus-
 	// moveForward set: MarkTransactionsOnLongestChain treats a missing record as fatal, and
@@ -5332,10 +5337,13 @@ func (stp *SubtreeProcessor) markNotOnLongestChain(ctx context.Context, moveBack
 func (stp *SubtreeProcessor) checkMarkNotOnLongestChain(ctx context.Context, invalidBlock *model.Block, markNotOnLongestChain []chainhash.Hash) ([]chainhash.Hash, error) {
 	stp.logger.Infof("[reorgBlocks] block %s we moved back is invalid, checking whether to mark transactions as not on longest chain", invalidBlock.String())
 
-	// With defaults (MaxMinedRoutines=128) the limit is always >= 1.
-	checkMarkNotOnLongestChain, err := model.FilterTxsNotOnLongestChain(ctx, stp.logger, stp.utxoStore, stp.blockchainClient,
-		invalidBlock.Header.HashPrevBlock, invalidBlock.ID, markNotOnLongestChain,
-		max(stp.settings.UtxoStore.MaxMinedRoutines, stp.settings.UtxoStore.GetBatcherSize*2))
+	recentIDs, err := model.RecentChainBlockIDs(ctx, stp.blockchainClient, invalidBlock.Header.HashPrevBlock, 1000)
+	if err != nil {
+		return nil, errors.NewProcessingError("[reorgBlocks] error getting last block headers", err)
+	}
+
+	checkMarkNotOnLongestChain, err := model.FilterTxsNotOnLongestChain(ctx, stp.logger, stp.settings, stp.utxoStore, stp.blockchainClient,
+		recentIDs, invalidBlock.ID, markNotOnLongestChain, false)
 	if err != nil {
 		return nil, errors.NewProcessingError("[reorgBlocks] error filtering transactions not on longest chain", err)
 	}

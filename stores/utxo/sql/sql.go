@@ -5232,7 +5232,7 @@ func (s *Store) existingHashes(ctx context.Context, q string, args []interface{}
 	return found, rows.Err()
 }
 
-func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool, opts ...utxo.MarkLongestChainOption) error {
 	if len(txHashes) == 0 {
 		return nil
 	}
@@ -5380,10 +5380,15 @@ func (s *Store) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []c
 		attempted, totalUpdated, errorCount, missingCount, onLongestChain)
 
 	if missingCount > 0 {
-		if !onLongestChain {
+		switch skipMissing := utxo.NewMarkLongestChainOptions(opts...).SkipMissing; {
+		case !onLongestChain && !skipMissing:
 			s.logger.Fatalf("CRITICAL: %d MISSING transactions during MarkTransactionsOnLongestChain(false) - data integrity compromised, first: %v",
 				missingCount, firstMissing)
-		} else {
+		case skipMissing:
+			// Expected: the caller's records may have been pruned since it read them.
+			s.logger.Warnf("[MarkTransactionsOnLongestChain] skipped %d transactions no longer in the store, first: %v",
+				missingCount, firstMissing)
+		default:
 			s.logger.Errorf("[MarkTransactionsOnLongestChain] skipped %d transactions the store does not hold, first: %v",
 				missingCount, firstMissing)
 		}

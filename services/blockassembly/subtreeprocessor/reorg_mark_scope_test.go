@@ -17,7 +17,6 @@ import (
 	blob_memory "github.com/bsv-blockchain/teranode/stores/blob/memory"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
-	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
@@ -26,7 +25,7 @@ import (
 )
 
 // scopeMarkRecorder records the hashes of every MarkTransactionsOnLongestChain call, per
-// direction, and of every Get, and then applies the call to the real store underneath.
+// direction, and of every BatchDecorate read, and then applies the call to the real store underneath.
 type scopeMarkRecorder struct {
 	utxostore.Store
 
@@ -45,12 +44,14 @@ func newScopeMarkRecorder(store utxostore.Store) *scopeMarkRecorder {
 	}
 }
 
-func (s *scopeMarkRecorder) Get(ctx context.Context, hash *chainhash.Hash, fields ...fields.FieldName) (*meta.Data, error) {
+func (s *scopeMarkRecorder) BatchDecorate(ctx context.Context, unresolvedMetaDataSlice []*utxostore.UnresolvedMetaData, fields ...fields.FieldName) error {
 	s.mu.Lock()
-	s.gets[*hash] = struct{}{}
+	for _, item := range unresolvedMetaDataSlice {
+		s.gets[item.Hash] = struct{}{}
+	}
 	s.mu.Unlock()
 
-	return s.Store.Get(ctx, hash, fields...)
+	return s.Store.BatchDecorate(ctx, unresolvedMetaDataSlice, fields...)
 }
 
 func (s *scopeMarkRecorder) gotten(hash chainhash.Hash) bool {
@@ -62,7 +63,7 @@ func (s *scopeMarkRecorder) gotten(hash chainhash.Hash) bool {
 	return ok
 }
 
-func (s *scopeMarkRecorder) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool) error {
+func (s *scopeMarkRecorder) MarkTransactionsOnLongestChain(ctx context.Context, txHashes []chainhash.Hash, onLongestChain bool, opts ...utxostore.MarkLongestChainOption) error {
 	s.mu.Lock()
 	target := s.markFalse
 	if onLongestChain {
@@ -74,7 +75,7 @@ func (s *scopeMarkRecorder) MarkTransactionsOnLongestChain(ctx context.Context, 
 	}
 	s.mu.Unlock()
 
-	return s.Store.MarkTransactionsOnLongestChain(ctx, txHashes, onLongestChain)
+	return s.Store.MarkTransactionsOnLongestChain(ctx, txHashes, onLongestChain, opts...)
 }
 
 func (s *scopeMarkRecorder) markedFalse(hash chainhash.Hash) bool {

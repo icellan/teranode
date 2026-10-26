@@ -295,6 +295,23 @@ type BlockValidation struct {
 	// wait in checkParentProcessingComplete is unaffected by the backoff window.
 	setMinedRetryPending sync.Map
 
+	// minedOnChain tracks the blocks setTxMined wrote as on the longest chain, for the
+	// overtaken-tip repair (overtaken_tip_repair.go), which the setMined worker runs a slice
+	// at a time. tipRepairPending requests a slice; tipRepairSignal (capacity 1) wakes an
+	// idle worker for it. tipRepairMu guards tipRepairSeeded and tipRepairJob.
+	minedOnChain     *minedOnChainTracker
+	tipRepairPending atomic.Bool
+	tipRepairSignal  chan struct{}
+	tipRepairMu      sync.Mutex
+	tipRepairSeeded  bool
+	tipRepairJob     *tipRepairJob
+	// tipRepairMainChain caches the main-chain ids ending at tipRepairBestHash (guarded by
+	// tipRepairMu), so a best block that only extends the chain costs one call.
+	tipRepairMainChain map[uint32]bool
+	tipRepairBestHash  chainhash.Hash
+	// tipRepairRetry is set while the last slice failed, so the periodic tick retries it.
+	tipRepairRetry atomic.Bool
+
 	// revalidateBlockChan receives blocks that need revalidation
 	revalidateBlockChan chan revalidateBlockData
 
@@ -448,6 +465,8 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		setMinedChan:                  make(chan *chainhash.Hash, 1000),
 		setMinedOverflow:              make(map[chainhash.Hash]struct{}),
 		setMinedOverflowSignal:        make(chan struct{}, 1),
+		minedOnChain:                  newMinedOnChainTracker(),
+		tipRepairSignal:               make(chan struct{}, 1),
 		revalidateBlockChan:           make(chan revalidateBlockData, 2),
 		revalidateWorkerStopped:       make(chan struct{}),
 		stats:                         gocore.NewStat("blockvalidation"),
@@ -579,6 +598,12 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 								bv.enqueueSetMined(&cHash)
 							}
 
+							// Any best-chain change may have overtaken a block whose txs setTxMined
+							// marked mined; let the overtaken-tip repair look.
+							if notification.Type == model.NotificationType_Block {
+								bv.signalTipRepair()
+							}
+
 							// Listen for BlockMinedUnset notifications (sent by InvalidateBlock RPC)
 							// This triggers immediate processing instead of waiting for periodic job
 							if notification.Type == model.NotificationType_BlockMinedUnset {
@@ -636,6 +661,10 @@ func initialiseInvalidBlockKafkaProducer(ctx context.Context, logger ulogger.Log
 func (u *BlockValidation) start(ctx context.Context) error {
 	g, gCtx := errgroup.WithContext(ctx)
 
+	// Read once here, with the rest of start's startup reads; the setMined worker below
+	// runs the overtaken-tip repair with this client.
+	blockchainClient := u.blockchainClient
+
 	if u.blockchainClient != nil {
 		// check whether all old blocks have their subtrees_set set
 		u.processSubtreesNotSet(gCtx, g)
@@ -679,6 +708,10 @@ func (u *BlockValidation) start(ctx context.Context) error {
 			case <-ticker.C:
 				u.processSubtreesNotSet(ctx, g)
 				u.processBlockMinedNotSet(ctx)
+				// Retries a failed overtaken-tip repair while the chain is idle.
+				if u.tipRepairRetry.Load() {
+					u.signalTipRepair()
+				}
 			}
 		}
 	}()
@@ -696,10 +729,22 @@ func (u *BlockValidation) start(ctx context.Context) error {
 		defer u.logger.Infof("[BlockValidation:start] setMinedChan worker stopped")
 
 		for {
+			// One slice of the overtaken-tip repair between blocks, when one is pending.
+			// Running it here keeps it from overlapping a setTxMined write; the slice size
+			// bounds how long it delays the next block.
+			if u.tipRepairPending.Swap(false) {
+				u.runTipRepairSlice(ctx, blockchainClient)
+			}
+
 			// nextSetMinedHash drains setMinedChan first and falls back to the
-			// overflow set; it returns nil only when ctx is done.
+			// overflow set; it returns nil when ctx is done or a repair slice was
+			// requested while it waited.
 			blockHash := u.nextSetMinedHash(ctx)
 			if blockHash == nil {
+				if ctx.Err() == nil {
+					continue
+				}
+
 				u.logger.Warnf("[BlockValidation:start] exiting setMined goroutine: %s", ctx.Err())
 
 				return
@@ -1000,8 +1045,9 @@ func (u *BlockValidation) enqueueSetMined(blockHash *chainhash.Hash) {
 
 // nextSetMinedHash returns the next block hash for the setMined worker to process,
 // preferring setMinedChan and falling back to the overflow set. It blocks until a hash
-// is available and returns nil only when ctx is done. Only the setMined worker calls
-// this.
+// is available, and returns nil when ctx is done or when an overtaken-tip repair step was
+// requested while it waited, which the caller tells apart by ctx.Err(). Only the setMined
+// worker calls this.
 func (u *BlockValidation) nextSetMinedHash(ctx context.Context) *chainhash.Hash {
 	for {
 		select {
@@ -1021,6 +1067,8 @@ func (u *BlockValidation) nextSetMinedHash(ctx context.Context) *chainhash.Hash 
 			return blockHash
 		case <-u.setMinedOverflowSignal:
 			// re-check the overflow set
+		case <-u.tipRepairSignal:
+			return nil // the caller runs the requested repair slice
 		}
 	}
 }
@@ -1579,6 +1627,13 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		return errors.NewServiceError("[setTxMined][%s] failed to get block header ids", blockHash.String())
 	}
 
+	// Track before writing: if this write clears unmined_since and the block is later
+	// overtaken, the overtaken-tip repair must know about it, even if this attempt fails
+	// and a retry sees onLongestChain=false.
+	if onLongestChain && (len(unsetMined) == 0 || !unsetMined[0]) {
+		u.minedOnChain.track(*blockHash, blockHeaderMeta.ID, blockHeaderMeta.Height, false)
+	}
+
 	// add the transactions in this block to the block IDs in the utxo store
 	if err = model.UpdateTxMinedStatus(
 		ctx,
@@ -1594,11 +1649,16 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 	); err != nil {
 		// check whether we got already mined errors and mark the block as invalid
 		if errors.Is(err, errors.ErrBlockInvalid) {
+			// unsetMined owns an invalid block's txs, not the overtaken-tip repair
+			u.minedOnChain.drop(*blockHash)
+
 			// mark the block as invalid in the blockchain
 			// setTxMined no longer knows which peer supplied the block, so no
 			// provenance is attached; the p2p consumer falls back to its peer map.
 			return u.markBlockAsInvalid(ctx, block, "contains transactions already on our chain: "+err.Error(), "", "")
 		} else if errors.Is(err, errors.ErrBlockParentNotMined) {
+			// Another call for this block is in flight. Its tracking stays: that write
+			// marks it written when it completes.
 			u.logger.Warnf("[setTxMined][%s] skipping, already in progress of setMined for block", block.Hash().String())
 			return nil
 		}
@@ -1606,12 +1666,12 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		return errors.NewProcessingError("[setTxMined][%s] error updating tx mined status", block.Hash().String(), err)
 	}
 
-	// Must run before SetBlockMinedSet below: block assembly waits on mined_set before it
-	// acts on this block, so the repair is in place before anything can build on it.
-	if onLongestChain && (len(unsetMined) == 0 || !unsetMined[0]) {
-		if err = u.unmarkIfOvertaken(ctx, block, blockHeaderMeta.ID); err != nil {
-			return err
-		}
+	// The write is complete, whichever onLongestChain this attempt used: a block tracked by
+	// an earlier attempt (whose clears may have landed) becomes eligible for the repair now.
+	// Ask for a slice: a chain change that happened while the write was in flight would
+	// otherwise wait for the next one.
+	if u.minedOnChain.markWritten(*blockHash) {
+		u.signalTipRepair()
 	}
 
 	// Close mmap-backed subtrees and clear to free memory. Routed through
@@ -1629,66 +1689,6 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 	// update block mined_set to true
 	if err = u.blockchainClient.SetBlockMinedSet(ctx, blockHash); err != nil {
 		return errors.NewServiceError("[setTxMined][%s] failed to set block mined", block.Hash().String(), err)
-	}
-
-	return nil
-}
-
-// unmarkIfOvertaken repairs the txs of a block that left the longest chain while its
-// setTxMined was running.
-//
-// setTxMined decides onLongestChain once, before writing. If the block was the tip then,
-// the write cleared unmined_since on its txs. If a competing chain overtook it before block
-// assembly moved onto it, block assembly reaches the new tip by a pure catch-up, never sees
-// this block as a moveBack block, and nothing else restores unmined_since. Those txs would
-// then sit in the mempool looking mined: prunable, and invisible to loadUnminedTransactions.
-//
-// Only the txs not mined on the new longest chain are re-marked; a tx shared with the
-// winning chain is mined there and keeps its cleared unmined_since. This is the source-side
-// repair that lets block assembly's reorg mark only the txs a reorg actually moves
-// (issue 2051).
-func (u *BlockValidation) unmarkIfOvertaken(ctx context.Context, block *model.Block, blockID uint32) error {
-	stillOnLongestChain, err := u.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{blockID})
-	if err != nil {
-		return errors.NewServiceError("[setTxMined][%s] failed to re-check if block is on longest chain", block.Hash().String(), err)
-	}
-
-	if stillOnLongestChain {
-		return nil
-	}
-
-	bestBlockHeader, _, err := u.blockchainClient.GetBestBlockHeader(ctx)
-	if err != nil {
-		return errors.NewServiceError("[setTxMined][%s] failed to get best block header", block.Hash().String(), err)
-	}
-
-	txHashes := make([]chainhash.Hash, 0, block.TransactionCount)
-
-	for _, subtree := range block.SubtreeSlices {
-		if subtree == nil {
-			return errors.NewProcessingError("[setTxMined][%s] missing subtree while re-marking an overtaken block", block.Hash().String())
-		}
-
-		for _, node := range subtree.Nodes {
-			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-				txHashes = append(txHashes, node.Hash)
-			}
-		}
-	}
-
-	notOnLongestChain, err := model.FilterTxsNotOnLongestChain(ctx, u.logger, u.utxoStore, u.blockchainClient,
-		bestBlockHeader.Hash(), blockID, txHashes,
-		max(u.settings.UtxoStore.MaxMinedRoutines, u.settings.UtxoStore.GetBatcherSize*2))
-	if err != nil {
-		return errors.NewProcessingError("[setTxMined][%s] error filtering txs of overtaken block", block.Hash().String(), err)
-	}
-
-	u.logger.Warnf("[setTxMined][%s] block left the longest chain during setTxMined, marking %d of %d txs as not on longest chain", block.Hash().String(), len(notOnLongestChain), len(txHashes))
-
-	if len(notOnLongestChain) > 0 {
-		if err = u.utxoStore.MarkTransactionsOnLongestChain(ctx, notOnLongestChain, false); err != nil {
-			return errors.NewProcessingError("[setTxMined][%s] error marking txs of overtaken block as not on longest chain", block.Hash().String(), err)
-		}
 	}
 
 	return nil
