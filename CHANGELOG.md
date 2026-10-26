@@ -117,7 +117,10 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   A block whose tx spends an immature coinbase, with or without a double spend, is now
   marked invalid: the validator returns `TX_INVALID` for it on the block path, at the
   block's own height. It used to fail as a processing error, so the block was retried and
-  never marked invalid, and the peer that sent it was not charged. Outside a block the
+  never marked invalid, and the peer that sent it was not charged. This includes an
+  immature output another tx already spent: the SQL store reports that spend only as
+  spent, so the validator reads the parent of each double-spent output on the block path
+  and checks its maturity itself, a read per failed spend. Outside a block the
   same spend is still a plain rejection, and below a checkpoint a failure stays local. A
   frozen or mismatched output still fails without a verdict: freezes and reassignment
   holds are this node's state, set at the height it applied the alert.

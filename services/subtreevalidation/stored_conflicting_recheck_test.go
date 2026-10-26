@@ -193,6 +193,19 @@ func TestBlockPathRechecksStoredConflictingTxs(t *testing.T) {
 			require.NoError(t, f.store.GetMeta(t.Context(), tx.TxIDChainHash(), stored))
 			require.True(t, stored.Conflicting)
 		})
+
+		// The ancestry check fails on a pruned parent before the height check runs, except from
+		// the txmeta cache, where the height check fails the same way. A retry, not a verdict;
+		// a block referencing a subtree this node already validated fails open (see below).
+		t.Run(name+": a record whose parent was pruned fails without a verdict", func(t *testing.T) {
+			f := newConflictingFixture(t)
+			tx := storedConflictingAtThisHeight(t, f)
+			require.NoError(t, f.store.Delete(t.Context(), f.parent.TxIDChainHash()))
+
+			err := check(t, f, tx)
+			require.Error(t, err)
+			require.False(t, errors.Is(err, errors.ErrTxInvalid), "%v", err)
+		})
 	}
 }
 
@@ -256,6 +269,15 @@ func TestCachedSubtreeChecksStoredConflictingTxsAtHeight(t *testing.T) {
 	t.Run("a record valid at this height still passes", func(t *testing.T) {
 		f := newConflictingFixture(t)
 		tx := storedConflictingAtThisHeight(t, f)
+
+		require.NoError(t, check(t, f, tx))
+	})
+
+	// unlike the full path, which fails on the same block (TestBlockPathRechecksStoredConflictingTxs)
+	t.Run("a record whose parent was pruned fails open", func(t *testing.T) {
+		f := newConflictingFixture(t)
+		tx := storedConflictingAtThisHeight(t, f)
+		require.NoError(t, f.store.Delete(t.Context(), f.parent.TxIDChainHash()))
 
 		require.NoError(t, check(t, f, tx))
 	})

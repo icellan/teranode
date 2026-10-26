@@ -53,46 +53,10 @@ func (u *Server) checkStoredTxAtHeight(ctx context.Context, txHash chainhash.Has
 		tx = stored.Tx
 	}
 
-	parents, err := u.inputParents(ctx, tx)
+	parents, err := validator.InputParents(ctx, u.utxoStore, tx)
 	if err != nil {
 		return err
 	}
 
 	return validator.CheckStoredTxAtHeight(tx, parents, blockHeight, u.settings, opts)
-}
-
-// inputParents reads, for each input of tx, whether its parent is a coinbase and the lowest height
-// it was mined at.
-func (u *Server) inputParents(ctx context.Context, tx *bt.Tx) ([]validator.InputParent, error) {
-	read := make(map[chainhash.Hash]validator.InputParent, len(tx.Inputs))
-	parents := make([]validator.InputParent, len(tx.Inputs))
-
-	for i, input := range tx.Inputs {
-		hash := *input.PreviousTxIDChainHash()
-
-		parent, ok := read[hash]
-		if !ok {
-			data, err := u.utxoStore.Get(ctx, &hash, fields.IsCoinbase, fields.BlockHeights)
-			if err != nil {
-				return nil, errors.NewProcessingError("[inputParents][%s] failed to read parent %s", tx.TxIDChainHash().String(), hash.String(), err)
-			}
-
-			parent.IsCoinbase = data.IsCoinbase
-
-			if len(data.BlockHeights) > 0 {
-				parent.Height = data.BlockHeights[0]
-				for _, h := range data.BlockHeights[1:] {
-					parent.Height = min(parent.Height, h)
-				}
-			} else if parent.IsCoinbase {
-				return nil, errors.NewProcessingError("[inputParents][%s] coinbase parent %s has no block height", tx.TxIDChainHash().String(), hash.String())
-			}
-
-			read[hash] = parent
-		}
-
-		parents[i] = parent
-	}
-
-	return parents, nil
 }

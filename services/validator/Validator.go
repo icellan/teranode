@@ -1155,6 +1155,44 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 				}
 			}
 
+			// a block's verdict, as below: not below a checkpoint, where the block is valid by definition
+			blockVerdict := validationOptions.CreateConflicting && !validationOptions.SkipScriptValidation && !validationOptions.OutpointOnlySpend
+
+			// A store may answer a spent output UTXO_SPENT without checking its maturity: the SQL
+			// store checks maturity only on an unspent output. Another candidate may have spent it
+			// at a height where it was mature, so a double spend is checked for maturity here,
+			// whatever else failed.
+			if blockVerdict && immatureSpend == nil {
+				read := make(map[chainhash.Hash]struct{})
+
+				for _, spend := range spentUtxos {
+					if spend.Err == nil || spend.TxID == nil || !spendConflicts(spend.Err) {
+						continue
+					}
+
+					if _, ok := read[*spend.TxID]; ok {
+						continue
+					}
+
+					read[*spend.TxID] = struct{}{}
+
+					parent, readErr := readInputParent(decoupledCtx, v.utxoStore, spend.TxID)
+					if readErr != nil {
+						err = errors.NewProcessingError("[Validate][%s] failed to read parent %s of a spent output", txID, spend.TxID.String(), readErr)
+						span.RecordError(err)
+
+						return nil, err
+					}
+
+					if immatureErr := immatureCoinbase(parent, blockHeight, v.settings); immatureErr != nil {
+						immatureSpend = errors.NewTxCoinbaseImmatureError("[Validate][%s] %s:%d", txID, spend.TxID.String(), spend.Vout, immatureErr)
+						everyFailedSpendConflicts = false
+
+						break
+					}
+				}
+			}
+
 			// A block's tx is created as conflicting only when it is a double spend and nothing
 			// else: any other failed spend (an immature coinbase, a frozen or mismatched output)
 			// makes it invalid, and creating it as conflicting would drop that failure.
@@ -1238,7 +1276,7 @@ func (v *Validator) validateInternal(ctx context.Context, tx *bt.Tx, blockHeight
 			// mature. Below a checkpoint the block is valid by definition, and a failure is ours
 			// to retry. A frozen output is not a verdict: freezes and reassignment holds are this
 			// node's state, set at the height it applied the alert, and another node may differ.
-			if immatureSpend != nil && validationOptions.CreateConflicting && !validationOptions.SkipScriptValidation && !validationOptions.OutpointOnlySpend {
+			if immatureSpend != nil && blockVerdict {
 				err = errors.NewTxInvalidError("[Validate][%s] spends a coinbase output not yet mature at height %d: %v", txID, blockHeight, immatureSpend, err)
 				span.RecordError(err)
 

@@ -1,10 +1,14 @@
 package validator
 
 import (
+	"context"
+
 	"github.com/bsv-blockchain/go-bt/v2"
+	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/util"
 )
 
@@ -28,13 +32,9 @@ func CheckStoredTxAtHeight(tx *bt.Tx, parents []InputParent, blockHeight uint32,
 		return errors.NewProcessingError("[CheckStoredTxAtHeight][%s] %d parents for %d inputs", txID, len(parents), len(tx.Inputs))
 	}
 
-	// the stores make a coinbase output spendable from its height plus the maturity
-	maturity := uint32(tSettings.ChainCfgParams.CoinbaseMaturity)
-
 	for i, parent := range parents {
-		if parent.IsCoinbase && blockHeight < parent.Height+maturity {
-			return errors.NewTxInvalidError("[CheckStoredTxAtHeight][%s] spends a coinbase output not yet mature at height %d", txID, blockHeight,
-				errors.NewTxCoinbaseImmatureError("input %d spends a coinbase output mined at %d, spendable from %d", i, parent.Height, parent.Height+maturity))
+		if err := immatureCoinbase(parent, blockHeight, tSettings); err != nil {
+			return errors.NewTxInvalidError("[CheckStoredTxAtHeight][%s] input %d spends a coinbase output not yet mature at height %d", txID, i, blockHeight, err)
 		}
 	}
 
@@ -51,4 +51,65 @@ func CheckStoredTxAtHeight(tx *bt.Tx, parents []InputParent, blockHeight uint32,
 	}
 
 	return nil
+}
+
+// immatureCoinbase returns TX_COINBASE_IMMATURE when parent is a coinbase whose outputs are not yet
+// spendable at blockHeight. The stores make a coinbase output spendable from its height plus the
+// maturity.
+func immatureCoinbase(parent InputParent, blockHeight uint32, tSettings *settings.Settings) error {
+	maturity := uint32(tSettings.ChainCfgParams.CoinbaseMaturity)
+
+	if parent.IsCoinbase && blockHeight < parent.Height+maturity {
+		return errors.NewTxCoinbaseImmatureError("spends a coinbase output mined at %d, spendable from %d", parent.Height, parent.Height+maturity)
+	}
+
+	return nil
+}
+
+// InputParents reads, for each input of tx, whether its parent is a coinbase and the lowest height
+// it was mined at.
+func InputParents(ctx context.Context, utxoStore utxo.Store, tx *bt.Tx) ([]InputParent, error) {
+	read := make(map[chainhash.Hash]InputParent, len(tx.Inputs))
+	parents := make([]InputParent, len(tx.Inputs))
+
+	for i, input := range tx.Inputs {
+		hash := *input.PreviousTxIDChainHash()
+
+		parent, ok := read[hash]
+		if !ok {
+			var err error
+			if parent, err = readInputParent(ctx, utxoStore, &hash); err != nil {
+				return nil, errors.NewProcessingError("[InputParents][%s] failed to read parent %s", tx.TxIDChainHash().String(), hash.String(), err)
+			}
+
+			read[hash] = parent
+		}
+
+		parents[i] = parent
+	}
+
+	return parents, nil
+}
+
+// readInputParent reads whether the tx hash is a coinbase and the lowest height it was mined at.
+func readInputParent(ctx context.Context, utxoStore utxo.Store, hash *chainhash.Hash) (InputParent, error) {
+	var parent InputParent
+
+	data, err := utxoStore.Get(ctx, hash, fields.IsCoinbase, fields.BlockHeights)
+	if err != nil {
+		return parent, err
+	}
+
+	parent.IsCoinbase = data.IsCoinbase
+
+	if len(data.BlockHeights) > 0 {
+		parent.Height = data.BlockHeights[0]
+		for _, h := range data.BlockHeights[1:] {
+			parent.Height = min(parent.Height, h)
+		}
+	} else if parent.IsCoinbase {
+		return parent, errors.NewProcessingError("coinbase %s has no block height", hash.String())
+	}
+
+	return parent, nil
 }
