@@ -51,6 +51,8 @@ import (
 func TestFetchBlocksConcurrently_CurrentImplementation(t *testing.T) {
 	t.Run("Single Block Fetch", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		// Create test blocks
@@ -112,6 +114,8 @@ func TestFetchBlocksConcurrently_CurrentImplementation(t *testing.T) {
 
 	t.Run("Multiple_Blocks_Fetch_-_Ordering_Test", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		numBlocks := 5
@@ -192,6 +196,8 @@ func TestFetchBlocksConcurrently_CurrentImplementation(t *testing.T) {
 
 	t.Run("HTTP Error Handling", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		numBlocks := 3
@@ -243,6 +249,8 @@ func TestFetchBlocksConcurrently_CurrentImplementation(t *testing.T) {
 
 	t.Run("Context Cancellation", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		blocks := testhelpers.CreateTestBlockChain(t, 2)
@@ -302,6 +310,8 @@ func TestFetchBlocksConcurrently_CurrentImplementation(t *testing.T) {
 
 	t.Run("Empty_Block_Response", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		numBlocks := 2
@@ -353,6 +363,8 @@ func TestFetchBlocksConcurrently_CurrentImplementation(t *testing.T) {
 
 	t.Run("Concurrent_Block_Fetching_Behavior", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		numBlocks := 10
@@ -444,6 +456,8 @@ func TestFetchBlocksConcurrently_CurrentImplementation(t *testing.T) {
 
 	t.Run("No Headers", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		blocks := testhelpers.CreateTestBlockChain(t, 1)
@@ -489,6 +503,8 @@ func TestFetchBlocksConcurrently_CurrentImplementation(t *testing.T) {
 
 	t.Run("Nil Headers", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		blocks := testhelpers.CreateTestBlockChain(t, 1)
@@ -519,6 +535,8 @@ func TestFetchBlocksConcurrently_CurrentImplementation(t *testing.T) {
 
 	t.Run("Fetch Blocks Batch", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		// Create test block
@@ -547,6 +565,8 @@ func TestFetchBlocksConcurrently_CurrentImplementation(t *testing.T) {
 
 	t.Run("Fetch Single Block", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		// Create test block
@@ -578,6 +598,8 @@ func TestFetchBlocksConcurrently_CurrentImplementation(t *testing.T) {
 func TestFetchBlocksConcurrently_PerformanceCharacteristics(t *testing.T) {
 	t.Run("Memory_Usage_Pattern", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		numBlocks := 100
@@ -1395,6 +1417,8 @@ func TestFetchAndStoreSubtreeData_StallWithoutRejectionStaysAttributable(t *test
 func TestFetchBlocksConcurrently_OptimizedBehavior(t *testing.T) {
 	t.Run("Ordered_Delivery_With_Batching", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		// Create test blockchain with 10 blocks
@@ -1469,6 +1493,8 @@ func TestFetchBlocksConcurrently_OptimizedBehavior(t *testing.T) {
 
 	t.Run("Efficient_Batching_Strategy", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		// Create test blockchain with 20 blocks
@@ -1553,6 +1579,8 @@ func TestFetchBlocksConcurrently_OptimizedBehavior(t *testing.T) {
 
 	t.Run("Large_Batch_Fetching", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		// Create test blockchain with 100 blocks
@@ -1626,6 +1654,8 @@ func TestFetchBlocksConcurrently_OptimizedBehavior(t *testing.T) {
 
 	t.Run("Multiple_Large_Batches_250_Blocks", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		// Create test blockchain with 250 blocks
@@ -1710,6 +1740,8 @@ func TestFetchBlocksConcurrently_OptimizedBehavior(t *testing.T) {
 
 	t.Run("Worker_Pool_Parallel_Processing", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		// Create test blockchain with 50 blocks
@@ -1796,6 +1828,8 @@ func TestFetchBlocksConcurrently_OptimizedBehavior(t *testing.T) {
 
 	t.Run("Error_Handling_In_Worker_Pipeline", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		// Create test blockchain
@@ -1850,6 +1884,8 @@ func TestFetchBlocksConcurrently_OptimizedBehavior(t *testing.T) {
 func TestFetchBlocksConcurrently_WorkerPoolArchitecture(t *testing.T) {
 	t.Run("Large_Batch_Processing_100_Blocks", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		// Create test blockchain with 100 blocks
@@ -2280,6 +2316,8 @@ func TestSubtreeFunctions(t *testing.T) {
 func TestFetchBlocksConcurrentlyOptimized(t *testing.T) {
 	t.Run("BackwardCompatibilityAlias", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		// Create test blocks
@@ -3501,6 +3539,8 @@ func TestFetchBlocksConcurrently_ErrorHandling(t *testing.T) {
 // TestOrderedDelivery_StrictOrdering tests that blocks are delivered in correct order despite worker completion order
 func TestOrderedDelivery_StrictOrdering(t *testing.T) {
 	suite := NewCatchupTestSuite(t)
+	// The blocks are not stored, so catchup fetches them all.
+	suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 	defer suite.Cleanup()
 
 	// Create test blocks
@@ -4206,6 +4246,8 @@ func TestBlockWorker_Optimistic_SkipsFetchSubtreeData(t *testing.T) {
 func TestFetchBlocksConcurrently_BlockHeightIsSet(t *testing.T) {
 	t.Run("Block_Height_Should_Be_Set_During_Catchup", func(t *testing.T) {
 		suite := NewCatchupTestSuite(t)
+		// The blocks are not stored, so catchup fetches them all.
+		suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
 		defer suite.Cleanup()
 
 		// Create test blocks at specific heights

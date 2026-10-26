@@ -1335,6 +1335,24 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	)
 	defer deferFn()
 
+	// Blocks at the front of the header list may have been stored since the header phase, by the
+	// normal path while this catchup was starting. Fetching them again is pure waste (a large
+	// block's subtree data runs to hundreds of GB), and moving to CATCHINGBLOCKS for nothing makes
+	// the subtree validator drop live peer subtrees.
+	stored, err := u.storedHeaderPrefix(ctx, catchupCtx.blockHeaders)
+	if err != nil {
+		return errors.NewProcessingError("[catchup:fetchAndValidateBlocks][%s] failed to check for stored blocks", catchupCtx.blockUpTo.Hash().String(), err)
+	}
+
+	if stored > 0 {
+		u.logger.Infof("[catchup:fetchAndValidateBlocks][%s] %d of %d blocks were stored since the header phase, not fetching them", catchupCtx.blockUpTo.Hash().String(), stored, len(catchupCtx.blockHeaders))
+		catchupCtx.blockHeaders = catchupCtx.blockHeaders[stored:]
+
+		if len(catchupCtx.blockHeaders) == 0 {
+			return nil
+		}
+	}
+
 	// Set up channels and counters
 	var size atomic.Int64
 	size.Store(int64(len(catchupCtx.blockHeaders)))
@@ -1389,7 +1407,7 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	})
 
 	// Wait for both operations to complete
-	err := errorGroup.Wait()
+	err = errorGroup.Wait()
 
 	// Release any wait barrier still blocked on a job no worker will ever receive
 	// (bitcoin-sv/teranode#4692). A job is only ever Done()'d by a worker that actually receives it,
@@ -1483,6 +1501,34 @@ func (u *Server) extractHeadersAfterAncestor(headers []*model.BlockHeader, ances
 	}
 
 	return nil
+}
+
+// storedHeaderPrefix returns how many headers at the front of headers are stored as valid. It
+// stops at the first block that is not stored or is stored invalid, so a block stored invalid is
+// still validated and returns its invalid verdict. Stored blocks always form a prefix of a
+// connected header list, because a block is only stored after its parent.
+func (u *Server) storedHeaderPrefix(ctx context.Context, headers []*model.BlockHeader) (int, error) {
+	for i, header := range headers {
+		exists, err := u.blockValidation.GetBlockExists(ctx, header.Hash())
+		if err != nil {
+			return 0, err
+		}
+
+		if !exists {
+			return i, nil
+		}
+
+		_, meta, err := u.blockchainClient.GetBlockHeader(ctx, header.Hash())
+		if err != nil {
+			return 0, err
+		}
+
+		if meta == nil || meta.Invalid {
+			return i, nil
+		}
+	}
+
+	return len(headers), nil
 }
 
 // filterExistingBlocks removes blocks that already exist in our database.
@@ -1729,10 +1775,17 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan blockForValidat
 			// Get cached headers for validation
 			cachedHeaders, _ := u.headerChainCache.GetValidationHeaders(block.Hash())
 
-			// Try quick validation if applicable
-			tryNormalValidation, err := u.tryQuickValidation(gCtx, block, catchupCtx, peerID, baseURL, writeJobsChan, item.freshlyWritten)
-			if err != nil {
-				return err
+			// A block stored since the header phase has no prewarmed subtree data, so it goes
+			// straight to normal validation, which finds it stored (or stored invalid) and stops.
+			tryNormalValidation := true
+			if !item.alreadyStored {
+				var err error
+
+				// Try quick validation if applicable
+				tryNormalValidation, err = u.tryQuickValidation(gCtx, block, catchupCtx, peerID, baseURL, writeJobsChan, item.freshlyWritten)
+				if err != nil {
+					return err
+				}
 			}
 
 			if tryNormalValidation {

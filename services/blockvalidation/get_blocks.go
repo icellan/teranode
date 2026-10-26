@@ -55,6 +55,9 @@ type resultItem struct {
 	// verdict (bitcoin-sv/teranode#4692), so a doctored body naming an already-persisted hash never
 	// triggers deletion of that hash's promoted blobs.
 	freshlyWritten map[chainhash.Hash]map[fileformat.FileType]struct{}
+	// alreadyStored marks a block that was stored after the header phase, by another path. Its
+	// subtree data was not fetched.
+	alreadyStored bool
 }
 
 // blockForValidation wraps a block with metadata about which peers contributed data
@@ -62,6 +65,7 @@ type blockForValidation struct {
 	block             *model.Block
 	contributingPeers map[string]struct{}
 	freshlyWritten    map[chainhash.Hash]map[fileformat.FileType]struct{}
+	alreadyStored     bool
 }
 
 // fetchBlocksConcurrently fetches blocks from a peer using a high-performance worker pool architecture.
@@ -251,6 +255,32 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 			// and the Record call below; the snapshot lets the state machine
 			// drop any observation whose underlying work was performed in a
 			// different mode.
+			// A block stored since the header phase, by the normal path while catchup was starting,
+			// needs no prewarm: validation finds it stored and stops there. Checked here, just before
+			// the fetch, because that fetch can be the whole block's subtree data.
+			alreadyStored, existsErr := u.blockStoredSinceHeaders(ctx, work.block)
+			if existsErr != nil {
+				select {
+				case resultQueue <- resultItem{block: work.block, index: work.index, err: existsErr}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+
+				continue
+			}
+
+			if alreadyStored {
+				u.logger.Infof("[catchup:blockWorker-%d][%s] block %s was stored since the header phase, not fetching its subtree data", workerID, blockUpTo.Hash().String(), work.block.Hash().String())
+
+				select {
+				case resultQueue <- resultItem{block: work.block, index: work.index, alreadyStored: true}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+
+				continue
+			}
+
 			modeAtSample := u.adaptiveFetch.Mode()
 			optimistic := modeAtSample == adaptivefetch.ModeOptimistic
 
@@ -332,6 +362,21 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 	}
 }
 
+// blockStoredSinceHeaders reports whether block is now stored. A store error is returned, never
+// guessed. Server-literal test fixtures without block validation report false.
+func (u *Server) blockStoredSinceHeaders(ctx context.Context, block *model.Block) (bool, error) {
+	if u.blockValidation == nil {
+		return false, nil
+	}
+
+	exists, err := u.blockValidation.GetBlockExists(ctx, block.Hash())
+	if err != nil {
+		return false, errors.NewProcessingError("[catchup] failed to check whether block %s is stored", block.Hash().String(), err)
+	}
+
+	return exists, nil
+}
+
 // orderedDelivery ensures blocks are delivered to validateBlocksChan in strict order
 func (u *Server) orderedDelivery(gCtx context.Context, resultQueue <-chan resultItem, validateBlocksChan chan<- blockForValidation, totalBlocks int, blockUpTo *model.Block, size *atomic.Int64) error {
 	ctx, _, deferFn := tracing.Tracer("blockvalidation").Start(gCtx, "orderedDelivery",
@@ -370,7 +415,7 @@ func (u *Server) orderedDelivery(gCtx context.Context, resultQueue <-chan result
 					u.logger.Debugf("[catchup:orderedDelivery][%s] delivering block %s at index %d (received %d/%d)", blockUpTo.Hash().String(), orderedResult.block.Hash().String(), nextIndex, receivedCount, totalBlocks)
 
 					select {
-					case validateBlocksChan <- blockForValidation{block: orderedResult.block, contributingPeers: orderedResult.contributingPeers, freshlyWritten: orderedResult.freshlyWritten}:
+					case validateBlocksChan <- blockForValidation{block: orderedResult.block, contributingPeers: orderedResult.contributingPeers, freshlyWritten: orderedResult.freshlyWritten, alreadyStored: orderedResult.alreadyStored}:
 						delete(results, nextIndex)
 						nextIndex++
 						// Note: size counter is decremented by validateBlocksOnChannel after processing
