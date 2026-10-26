@@ -24,7 +24,8 @@ import (
 
 // subtreeMessageHandler returns a Kafka message handler for subtree validation.
 //
-// The handler skips processing when blockchain FSM is in CATCHINGBLOCKS state and classifies
+// While the blockchain FSM is not RUNNING the handler does not validate peer subtrees; it keeps
+// them (see skippedSubtrees) and validates them once the node is RUNNING again. It classifies
 // errors to prevent infinite retry loops on unrecoverable failures.
 //
 // rather than blocking in this handler. This prevents session timeouts and improves resource usage.
@@ -59,10 +60,14 @@ func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.Kafk
 		}
 
 		// Peer subtrees are only validated when caught up. IDLE can follow an
-		// operator STOP mid-catchup, with a UTXO set far behind the tip.
+		// operator STOP mid-catchup, with a UTXO set far behind the tip. They are
+		// kept and validated once the node is RUNNING again.
 		if *state != blockchain.FSMStateRUNNING {
+			u.recordSkippedSubtreeMessage(msg.Value)
 			return nil
 		}
+
+		u.replaySkippedSubtrees(gCtx)
 
 		// In BlocksOnly mode, skip processing peer-announced subtrees (only process subtrees from blocks)
 		if u.settings.SubtreeValidation.BlocksOnly {
@@ -142,6 +147,7 @@ func (u *Server) subtreesHandler(ctx context.Context, hash *chainhash.Hash, base
 	}
 
 	if *state != blockchain.FSMStateRUNNING {
+		u.recordSkippedSubtree(hash, baseURL, peerID)
 		return nil
 	}
 

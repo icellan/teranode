@@ -711,6 +711,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			GRPCListenAddress:                         getString("subtreevalidation_grpcListenAddress", ":8089", alternativeContext...),
 			ProcessTxMetaUsingCacheConcurrency:        getInt("subtreevalidation_processTxMetaUsingCache_Concurrency", 32, alternativeContext...),
 			PeerSubtreeConcurrency:                    getInt("subtreevalidation_peerSubtreeConcurrency", 32, alternativeContext...),
+			SkippedSubtreeBackfillMax:                 getInt("subtreevalidation_skippedSubtreeBackfillMax", 4096, alternativeContext...),
 			ProcessTxMetaUsingCacheMissingTxThreshold: getInt("subtreevalidation_processTxMetaUsingCache_MissingTxThreshold", 1, alternativeContext...),
 			SubtreeDAHConcurrency:                     getInt("subtreevalidation_subtreeDAHConcurrency", 8, alternativeContext...),
 			TxMetaCacheEnabled:                        getBool("subtreevalidation_txMetaCacheEnabled", true, alternativeContext...),
