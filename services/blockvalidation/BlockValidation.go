@@ -1606,6 +1606,14 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		return errors.NewProcessingError("[setTxMined][%s] error updating tx mined status", block.Hash().String(), err)
 	}
 
+	// Must run before SetBlockMinedSet below: block assembly waits on mined_set before it
+	// acts on this block, so the repair is in place before anything can build on it.
+	if onLongestChain && (len(unsetMined) == 0 || !unsetMined[0]) {
+		if err = u.unmarkIfOvertaken(ctx, block, blockHeaderMeta.ID); err != nil {
+			return err
+		}
+	}
+
 	// Close mmap-backed subtrees and clear to free memory. Routed through
 	// ReleaseSubtreeNodes so the entries are nil-ed under the block's subtree
 	// mutex: this block may still be reachable via lastValidatedBlocks, whose
@@ -1621,6 +1629,66 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 	// update block mined_set to true
 	if err = u.blockchainClient.SetBlockMinedSet(ctx, blockHash); err != nil {
 		return errors.NewServiceError("[setTxMined][%s] failed to set block mined", block.Hash().String(), err)
+	}
+
+	return nil
+}
+
+// unmarkIfOvertaken repairs the txs of a block that left the longest chain while its
+// setTxMined was running.
+//
+// setTxMined decides onLongestChain once, before writing. If the block was the tip then,
+// the write cleared unmined_since on its txs. If a competing chain overtook it before block
+// assembly moved onto it, block assembly reaches the new tip by a pure catch-up, never sees
+// this block as a moveBack block, and nothing else restores unmined_since. Those txs would
+// then sit in the mempool looking mined: prunable, and invisible to loadUnminedTransactions.
+//
+// Only the txs not mined on the new longest chain are re-marked; a tx shared with the
+// winning chain is mined there and keeps its cleared unmined_since. This is the source-side
+// repair that lets block assembly's reorg mark only the txs a reorg actually moves
+// (issue 2051).
+func (u *BlockValidation) unmarkIfOvertaken(ctx context.Context, block *model.Block, blockID uint32) error {
+	stillOnLongestChain, err := u.blockchainClient.CheckBlockIsInCurrentChain(ctx, []uint32{blockID})
+	if err != nil {
+		return errors.NewServiceError("[setTxMined][%s] failed to re-check if block is on longest chain", block.Hash().String(), err)
+	}
+
+	if stillOnLongestChain {
+		return nil
+	}
+
+	bestBlockHeader, _, err := u.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil {
+		return errors.NewServiceError("[setTxMined][%s] failed to get best block header", block.Hash().String(), err)
+	}
+
+	txHashes := make([]chainhash.Hash, 0, block.TransactionCount)
+
+	for _, subtree := range block.SubtreeSlices {
+		if subtree == nil {
+			return errors.NewProcessingError("[setTxMined][%s] missing subtree while re-marking an overtaken block", block.Hash().String())
+		}
+
+		for _, node := range subtree.Nodes {
+			if !node.Hash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+				txHashes = append(txHashes, node.Hash)
+			}
+		}
+	}
+
+	notOnLongestChain, err := model.FilterTxsNotOnLongestChain(ctx, u.logger, u.utxoStore, u.blockchainClient,
+		bestBlockHeader.Hash(), blockID, txHashes,
+		max(u.settings.UtxoStore.MaxMinedRoutines, u.settings.UtxoStore.GetBatcherSize*2))
+	if err != nil {
+		return errors.NewProcessingError("[setTxMined][%s] error filtering txs of overtaken block", block.Hash().String(), err)
+	}
+
+	u.logger.Warnf("[setTxMined][%s] block left the longest chain during setTxMined, marking %d of %d txs as not on longest chain", block.Hash().String(), len(notOnLongestChain), len(txHashes))
+
+	if len(notOnLongestChain) > 0 {
+		if err = u.utxoStore.MarkTransactionsOnLongestChain(ctx, notOnLongestChain, false); err != nil {
+			return errors.NewProcessingError("[setTxMined][%s] error marking txs of overtaken block as not on longest chain", block.Hash().String(), err)
+		}
 	}
 
 	return nil
