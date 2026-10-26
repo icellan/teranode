@@ -97,7 +97,7 @@ func TestFetchAndValidateBlocks_ExistsCheckErrorHalts(t *testing.T) {
 	defer cleanup()
 
 	blocks := testhelpers.CreateTestBlockChain(t, 3)
-	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, errors.NewStorageError("db down"))
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, errors.NewServiceError("blockchain service unavailable"))
 
 	catchupCtx := &CatchupContext{
 		blockUpTo:    blocks[2],
@@ -106,7 +106,7 @@ func TestFetchAndValidateBlocks_ExistsCheckErrorHalts(t *testing.T) {
 
 	err := server.fetchAndValidateBlocks(context.Background(), catchupCtx)
 	require.Error(t, err)
-	require.True(t, errors.Is(err, errors.ErrStorageError))
+	require.True(t, errors.Is(err, errors.ErrStorageError), "a local lookup failure is a storage fault, never the peer's")
 	mockBlockchainClient.AssertNotCalled(t, "CatchUpBlocks", mock.Anything)
 }
 
@@ -151,7 +151,7 @@ func TestBlockWorker_ExistsCheckError_FailsBlock(t *testing.T) {
 
 	blocks := testhelpers.CreateTestBlockChain(t, 2)
 	block := blocks[1]
-	mockBlockchainClient.On("GetBlockExists", mock.Anything, block.Header.Hash()).Return(false, errors.NewStorageError("db down"))
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, block.Header.Hash()).Return(false, errors.NewServiceError("blockchain service unavailable"))
 
 	var fetchCalls atomic.Int32
 	server.fetchSubtreeDataForBlockFn = func(context.Context, *model.Block, string, string) (map[string]struct{}, map[chainhash.Hash]map[fileformat.FileType]struct{}, error) {
@@ -172,7 +172,7 @@ func TestBlockWorker_ExistsCheckError_FailsBlock(t *testing.T) {
 
 	result := <-resultQueue
 	require.Error(t, result.err)
-	require.True(t, errors.Is(result.err, errors.ErrStorageError))
+	require.True(t, errors.Is(result.err, errors.ErrStorageError), "a local lookup failure is a storage fault, never the peer's")
 }
 
 // TestOrderedDelivery_CarriesAlreadyStored: the stored mark reaches validation, which skips quick

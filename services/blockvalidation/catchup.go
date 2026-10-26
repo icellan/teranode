@@ -1345,7 +1345,7 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	// the subtree validator drop live peer subtrees.
 	stored, lastStoredHeight, err := u.storedHeaderPrefix(ctx, catchupCtx.blockHeaders)
 	if err != nil {
-		return errors.NewProcessingError("[catchup:fetchAndValidateBlocks][%s] failed to check for stored blocks", catchupCtx.blockUpTo.Hash().String(), err)
+		return errors.NewStorageError("[catchup:fetchAndValidateBlocks][%s] failed to check for stored blocks", catchupCtx.blockUpTo.Hash().String(), err)
 	}
 
 	if stored > 0 {

@@ -372,7 +372,7 @@ func (u *Server) blockStoredSinceHeaders(ctx context.Context, block *model.Block
 
 	exists, err := u.blockValidation.GetBlockExists(ctx, block.Hash())
 	if err != nil {
-		return false, errors.NewProcessingError("[catchup] failed to check whether block %s is stored", block.Hash().String(), err)
+		return false, errors.NewStorageError("[catchup] failed to check whether block %s is stored", block.Hash().String(), err)
 	}
 
 	return exists, nil
