@@ -71,6 +71,10 @@ const (
 	// deadline cut off is still running server side and cannot be cancelled.
 	blockDeadlineRetryDelay = time.Minute
 
+	// validationDoneBestHeaderTimeout bounds the best-header read that decides whether children
+	// of a just-validated block extend the tip.
+	validationDoneBestHeaderTimeout = 5 * time.Second
+
 	// blockRetryAttemptsTTL bounds how long a block's requeue count is kept. It must outlive
 	// MaxRetries attempts that each run into CheckBlockSubtreesTimeout (30 min by default).
 	blockRetryAttemptsTTL = 24 * time.Hour
@@ -2582,7 +2586,38 @@ func (u *Server) wireValidationInFlight() {
 	}
 
 	u.forkManager.SetValidatingCheck(u.blockValidation.IsValidating)
-	u.blockValidation.SetValidationDoneHook(u.blockPriorityQueue.Broadcast)
+
+	// The hook runs on its own goroutine after Init, so it keeps the client it was wired with
+	// instead of reading the field.
+	blockchainClient := u.blockchainClient
+
+	u.blockValidation.SetValidationDoneHooks(func(hash *chainhash.Hash, err error) {
+		u.promoteChildrenOfNewTip(blockchainClient, hash, err)
+	}, u.blockPriorityQueue.Broadcast)
+}
+
+// promoteChildrenOfNewTip runs when any validation of a block ends, while its children are still
+// held. A child queued while this block was validated outside the queue was classified without it
+// and got a fork class; if the block is now the best block, the child extends the tip, so it gets
+// the tip class. The queue is woken after this returns.
+func (u *Server) promoteChildrenOfNewTip(blockchainClient blockchain.ClientI, hash *chainhash.Hash, err error) {
+	if err != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), validationDoneBestHeaderTimeout)
+	defer cancel()
+
+	bestHeader, _, headerErr := blockchainClient.GetBestBlockHeader(ctx)
+	if headerErr != nil {
+		// Only the child's class is at stake: it keeps its fork class and still starts.
+		u.logger.Warnf("[onValidationDone][%s] failed to read the best block header, children keep their class: %v", hash.String(), headerErr)
+		return
+	}
+
+	if bestHeader.Hash().IsEqual(hash) {
+		u.blockPriorityQueue.PromoteChildren(hash, PriorityChainExtending)
+	}
 }
 
 // inFlightPriority returns the class of a queued or processing block, so a child queued

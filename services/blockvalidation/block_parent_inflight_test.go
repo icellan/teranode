@@ -9,6 +9,7 @@ import (
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/teranode/services/validator"
@@ -129,6 +130,15 @@ func TestRequeueBlock_StaysQueuedDuringBackoff(t *testing.T) {
 func newParentInFlightServer(t *testing.T) (*Server, []*chainhash.Hash) {
 	t.Helper()
 
+	server, blocks := newParentInFlightServerWithBlocks(t)
+
+	return server, []*chainhash.Hash{blocks[2].Hash(), blocks[3].Hash()}
+}
+
+// newParentInFlightServerWithBlocks is newParentInFlightServer returning the whole test chain.
+func newParentInFlightServerWithBlocks(t *testing.T) (*Server, []*model.Block) {
+	t.Helper()
+
 	ctx := context.Background()
 	logger := ulogger.TestLogger{}
 	tSettings := test.CreateBaseTestSettings(t)
@@ -163,7 +173,7 @@ func newParentInFlightServer(t *testing.T) (*Server, []*chainhash.Hash) {
 		catchupAlternatives: ttlcache.New[chainhash.Hash, []processBlockCatchup](),
 	}
 
-	return server, []*chainhash.Hash{blocks[2].Hash(), blocks[3].Hash()}
+	return server, blocks
 }
 
 // TestAddBlockToPriorityQueue_ParentProcessing_QueuesChild pins issue 4944 item 4: a child
@@ -482,8 +492,8 @@ func TestAddBlockToPriorityQueue_ParentValidatingOutsideQueue_QueuesChild(t *tes
 }
 
 // TestRunOncePerBlock_WakesQueueAfterRelease: a child held behind a parent validated outside the
-// queue is only released by a queue wake-up. The hook must run after the block has left
-// blocksCurrentlyValidating, or the woken worker still sees the parent in flight and parks again.
+// queue is only released by a queue wake-up. The hook must run once the block no longer counts as
+// validating, or the woken worker still sees the parent in flight and parks again.
 func TestRunOncePerBlock_WakesQueueAfterRelease(t *testing.T) {
 	server, hashes := newParentInFlightServer(t)
 	bv := server.blockValidation
@@ -491,7 +501,7 @@ func TestRunOncePerBlock_WakesQueueAfterRelease(t *testing.T) {
 
 	type hookCall struct{ stillValidating bool }
 	calls := make(chan hookCall, 1)
-	bv.SetValidationDoneHook(func() { calls <- hookCall{stillValidating: bv.IsValidating(parent)} })
+	bv.SetValidationDoneHooks(nil, func() { calls <- hookCall{stillValidating: bv.IsValidating(parent)} })
 
 	require.NoError(t, bv.runOncePerBlock(parent, nil, func(*ValidateBlockOptions) error {
 		require.True(t, bv.IsValidating(parent))
@@ -500,7 +510,7 @@ func TestRunOncePerBlock_WakesQueueAfterRelease(t *testing.T) {
 
 	select {
 	case call := <-calls:
-		require.False(t, call.stillValidating, "the hook must run after the block left blocksCurrentlyValidating")
+		require.False(t, call.stillValidating, "the hook must run once the block no longer counts as validating")
 	case <-time.After(2 * time.Second):
 		t.Fatal("the validation-done hook never ran")
 	}
@@ -555,4 +565,145 @@ func TestWireValidationInFlight_ReleasesHeldChild(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("the child was never released after its parent finished validating")
 	}
+}
+
+// TestValidationDone_PromotesChildOfNewTip pins that a child held behind a parent validated
+// outside the queue takes the tip class once that parent is stored as the best block. It was
+// classified while the parent was unknown, so it got a fork class, and only a worker-validated
+// parent promotes its children; without this the next tip block cannot use the reserved slot.
+func TestValidationDone_PromotesChildOfNewTip(t *testing.T) {
+	initPrometheusMetrics()
+	server, blocks := newParentInFlightServerWithBlocks(t)
+	parent, child := blocks[2], blocks[3].Hash()
+
+	server.blockPriorityQueue.Add(processBlockFound{hash: child, parentHash: parent.Hash()}, PriorityDeepFork, 3)
+	require.NoError(t, server.blockchainClient.AddBlock(context.Background(), parent, "test-peer"))
+
+	server.promoteChildrenOfNewTip(server.blockchainClient, parent.Hash(), nil)
+
+	priority, ok := server.blockPriorityQueue.PriorityOf(child)
+	require.True(t, ok)
+	require.Equal(t, PriorityChainExtending, priority)
+}
+
+// TestValidationDone_FailedParentDoesNotPromote pins that a parent whose validation failed
+// passes no class to its children.
+func TestValidationDone_FailedParentDoesNotPromote(t *testing.T) {
+	initPrometheusMetrics()
+	server, blocks := newParentInFlightServerWithBlocks(t)
+	parent, child := blocks[2], blocks[3].Hash()
+
+	server.blockPriorityQueue.Add(processBlockFound{hash: child, parentHash: parent.Hash()}, PriorityDeepFork, 3)
+
+	server.promoteChildrenOfNewTip(server.blockchainClient, parent.Hash(), errors.NewBlockInvalidError("invalid"))
+
+	priority, ok := server.blockPriorityQueue.PriorityOf(child)
+	require.True(t, ok)
+	require.Equal(t, PriorityDeepFork, priority)
+}
+
+// TestRunOncePerBlock_NotValidatingOnceDone pins that a block stops counting as validating as soon
+// as its result is published, not after the grace window. The window only serves duplicate
+// arrivals; holding children through it delayed every worker-validated parent's child by it.
+func TestRunOncePerBlock_NotValidatingOnceDone(t *testing.T) {
+	server, hashes := newParentInFlightServer(t)
+	bv := server.blockValidation
+	parent := hashes[0]
+
+	type wake struct {
+		at         time.Time
+		validating bool
+	}
+
+	wakes := make(chan wake, 1)
+	bv.SetValidationDoneHooks(nil, func() { wakes <- wake{at: time.Now(), validating: bv.IsValidating(parent)} })
+
+	start := time.Now()
+	require.NoError(t, bv.runOncePerBlock(parent, nil, func(*ValidateBlockOptions) error { return nil }))
+
+	select {
+	case w := <-wakes:
+		require.False(t, w.validating, "a finished validation must not hold children")
+		require.Less(t, w.at.Sub(start), validationResultGrace, "the queue must be woken when the result is published, not after the grace window")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the validation-done hook never ran")
+	}
+}
+
+// TestRunOncePerBlock_HoldsChildrenUntilSettled pins that a finished parent keeps counting as
+// validating until the settle hook has given its children their class. Otherwise an unrelated
+// wake-up in between starts a child with the fork class it got while the parent was unknown.
+func TestRunOncePerBlock_HoldsChildrenUntilSettled(t *testing.T) {
+	server, hashes := newParentInFlightServer(t)
+	bv := server.blockValidation
+	parent := hashes[0]
+
+	settling := make(chan struct{})
+	release := make(chan struct{})
+	woken := make(chan struct{})
+
+	bv.SetValidationDoneHooks(func(*chainhash.Hash, error) {
+		close(settling)
+		<-release
+	}, func() { close(woken) })
+
+	require.NoError(t, bv.runOncePerBlock(parent, nil, func(*ValidateBlockOptions) error { return nil }))
+
+	<-settling
+	require.True(t, bv.IsValidating(parent), "the parent must hold its children while they are being classified")
+
+	select {
+	case <-woken:
+		t.Fatal("the queue was woken before the children were classified")
+	default:
+	}
+
+	close(release)
+
+	select {
+	case <-woken:
+		require.False(t, bv.IsValidating(parent))
+	case <-time.After(2 * time.Second):
+		t.Fatal("the queue was never woken")
+	}
+}
+
+// TestRunOncePerBlock_SettlePanicReleasesChildren pins that a panic in the settle hook neither
+// takes the process down nor leaves children held: the parent stops counting as validating and
+// the queue is still woken.
+func TestRunOncePerBlock_SettlePanicReleasesChildren(t *testing.T) {
+	server, hashes := newParentInFlightServer(t)
+	bv := server.blockValidation
+	parent := hashes[0]
+
+	woken := make(chan struct{})
+	bv.SetValidationDoneHooks(func(*chainhash.Hash, error) { panic("settle failed") }, func() { close(woken) })
+
+	require.NoError(t, bv.runOncePerBlock(parent, nil, func(*ValidateBlockOptions) error { return nil }))
+
+	select {
+	case <-woken:
+		require.False(t, bv.IsValidating(parent))
+	case <-time.After(2 * time.Second):
+		t.Fatal("the queue was never woken after the settle hook panicked")
+	}
+}
+
+// TestRunOncePerBlock_SlowSettleOutlastsGrace pins that a settle hook slower than the grace
+// window still holds the children: the entry must not be dropped before the hook is done.
+func TestRunOncePerBlock_SlowSettleOutlastsGrace(t *testing.T) {
+	server, hashes := newParentInFlightServer(t)
+	bv := server.blockValidation
+	parent := hashes[0]
+
+	release := make(chan struct{})
+	bv.SetValidationDoneHooks(func(*chainhash.Hash, error) { <-release }, nil)
+
+	require.NoError(t, bv.runOncePerBlock(parent, nil, func(*ValidateBlockOptions) error { return nil }))
+
+	time.Sleep(3 * validationResultGrace)
+	require.True(t, bv.IsValidating(parent), "the parent must hold its children until the settle hook is done")
+
+	close(release)
+	require.Eventually(t, func() bool { return !bv.IsValidating(parent) }, 2*time.Second, time.Millisecond)
 }

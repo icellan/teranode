@@ -490,15 +490,16 @@ func (pq *BlockPriorityQueue) UnmarkFetching(hash *chainhash.Hash) {
 	pq.cond.Signal()
 }
 
-// PromoteChildren gives every queued child of parent the parent's class. A child queued while
-// its parent was still being fetched was classified without it, and is held by isWaiting until
-// the parent finishes, which is when the caller promotes it.
+// PromoteChildren raises every queued child of parent to priority, if that is a higher class than
+// it has. A child queued while its parent was still being fetched or validated outside the queue
+// was classified without it, and is held by isWaiting until the parent finishes, which is when the
+// callers promote it. Two callers can promote the same child, so a class is never lowered.
 func (pq *BlockPriorityQueue) PromoteChildren(parent *chainhash.Hash, priority BlockPriority) {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 
 	for _, item := range pq.items {
-		if item.blockFound.parentHash != nil && item.blockFound.parentHash.IsEqual(parent) && item.priority != priority {
+		if item.blockFound.parentHash != nil && item.blockFound.parentHash.IsEqual(parent) && priority < item.priority {
 			item.priority = priority
 			pq.needsSort = true
 		}

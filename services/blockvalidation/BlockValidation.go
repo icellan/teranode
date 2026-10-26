@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -96,6 +97,18 @@ type validationResult struct {
 	done chan struct{} // Closed when validation completes
 	err  error         // The validation result
 	mu   sync.RWMutex  // Protects err
+
+	// settled is closed after done, once the settle hook has run. Until then the block still
+	// counts as validating, so children held behind it are not started before they have their
+	// class. Nil in literals built by tests, which then fall back to done.
+	settled chan struct{}
+}
+
+// validationDoneHooks run after a block's validation result is published: settle with the block
+// and its validation error, then wake once the block no longer counts as validating.
+type validationDoneHooks struct {
+	settle func(*chainhash.Hash, error)
+	wake   func()
 }
 
 const (
@@ -255,10 +268,10 @@ type BlockValidation struct {
 	// blocksCurrentlyValidating tracks blocks being validated to prevent concurrent validation
 	blocksCurrentlyValidating *txmap.SyncedMap[chainhash.Hash, *validationResult]
 
-	// validationDoneHook, when set, runs after a block has left blocksCurrentlyValidating. It wakes
-	// the priority queue, whose children held behind a block validated outside the queue are
-	// otherwise released only by an unrelated queue event.
-	validationDoneHook atomic.Pointer[func()]
+	// validationDoneHooks, when set, run once a block's validation result is published. They
+	// classify the children held behind a block validated outside the queue and wake the priority
+	// queue, which otherwise releases those children only on an unrelated queue event.
+	validationDoneHooks atomic.Pointer[validationDoneHooks]
 
 	// setMinedChan receives block hashes that need to be marked as mined
 	setMinedChan chan *chainhash.Hash
@@ -1662,15 +1675,34 @@ func (u *BlockValidation) isParentMined(ctx context.Context, blockHeader *model.
 	return parentBlockMined, nil
 }
 
-// IsValidating reports whether the block is being validated, on any path, or its result is
-// still inside the validationResultGrace window.
+// IsValidating reports whether the block is being validated, on any path, or its settle hook has
+// not finished yet. A settled validation whose entry is still kept for the validationResultGrace
+// window does not count: its outcome is already in the store, and the window serves only
+// duplicate arrivals.
 func (u *BlockValidation) IsValidating(blockHash *chainhash.Hash) bool {
-	return u.blocksCurrentlyValidating.Exists(*blockHash)
+	result, ok := u.blocksCurrentlyValidating.Get(*blockHash)
+	if !ok {
+		return false
+	}
+
+	finished := result.settled
+	if finished == nil {
+		finished = result.done
+	}
+
+	select {
+	case <-finished:
+		return false
+	default:
+		return true
+	}
 }
 
-// SetValidationDoneHook sets the function run each time a block leaves blocksCurrentlyValidating.
-func (u *BlockValidation) SetValidationDoneHook(hook func()) {
-	u.validationDoneHook.Store(&hook)
+// SetValidationDoneHooks sets the hooks run, on their own goroutine, each time a block's
+// validation result is published: settle with the block and the validation error, then wake once
+// the block no longer counts as validating. Either may be nil.
+func (u *BlockValidation) SetValidationDoneHooks(settle func(*chainhash.Hash, error), wake func()) {
+	u.validationDoneHooks.Store(&validationDoneHooks{settle: settle, wake: wake})
 }
 
 // runOncePerBlock ensures validation runs only once per block.
@@ -1694,7 +1726,8 @@ const prepareBlockAssemblyTimeout = 2 * time.Second
 
 func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *ValidateBlockOptions, validate func(opts *ValidateBlockOptions) error) (err error) {
 	result := &validationResult{
-		done: make(chan struct{}),
+		done:    make(chan struct{}),
+		settled: make(chan struct{}),
 	}
 
 	existingResult, wasFirst := u.blocksCurrentlyValidating.SetIfNotExists(*blockHash, result)
@@ -1724,14 +1757,32 @@ func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *Valid
 		result.mu.Unlock()
 		close(result.done)
 
-		go func() {
-			time.Sleep(validationResultGrace)
-			u.blocksCurrentlyValidating.Delete(*blockHash)
+		// The entry is dropped only after settle, however long it takes: without the entry the
+		// block no longer counts as validating, and its children would be released before they
+		// have their class. A panic in settle is logged, not fatal (BV-STARTUP-007), and still
+		// releases the children.
+		go func(err error) {
+			hooks := u.validationDoneHooks.Load()
 
-			if hook := u.validationDoneHook.Load(); hook != nil {
-				(*hook)()
+			defer func() {
+				if r := recover(); r != nil {
+					u.logger.Errorf("[ValidateBlock][%s] PANIC in the validation-done settle hook: %v stack=%q", blockHash.String(), r, debug.Stack())
+				}
+
+				close(result.settled)
+
+				if hooks != nil && hooks.wake != nil {
+					hooks.wake()
+				}
+
+				time.Sleep(validationResultGrace)
+				u.blocksCurrentlyValidating.Delete(*blockHash)
+			}()
+
+			if hooks != nil && hooks.settle != nil {
+				hooks.settle(blockHash, err)
 			}
-		}()
+		}(err)
 
 		if r != nil {
 			panic(r)

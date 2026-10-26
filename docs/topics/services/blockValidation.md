@@ -769,7 +769,7 @@ The `WaitForBlock()` method:
 5. Returns block to worker for validation
 6. Blocks waiting if no blocks available (with timeout)
 
-When a block is announced and its parent is not stored yet but is being fetched, queued or validated, it is queued behind the parent instead of going to catchup. A parent validated outside the queue (by catchup, a gRPC `ProcessBlock` call or legacy sync) holds no worker slot, so the check also asks block validation whether the parent is still validating, and the queue is woken when that validation ends. It takes the parent's class when the parent is queued or validating. A parent still being fetched has no class yet, so the child is classified on its own and takes the parent's class when the parent finishes.
+When a block is announced and its parent is not stored yet but is being fetched, queued or validated, it is queued behind the parent instead of going to catchup. A parent validated outside the queue (by catchup, a gRPC `ProcessBlock` call or legacy sync) holds no worker slot, so the check also asks block validation whether the parent is still validating, and the queue is woken when that validation ends. If the parent is then the best block, its queued children take the chain-extending class. Below the checkpoint, the quick-validation paths of legacy sync and catchup skip this check. It takes the parent's class when the parent is queued or validating. A parent still being fetched has no class yet, so the child is classified on its own and takes the parent's class when the parent finishes.
 
 ##### Retry Mechanism
 
