@@ -579,7 +579,7 @@ func TestValidationDone_PromotesChildOfNewTip(t *testing.T) {
 	server.blockPriorityQueue.Add(processBlockFound{hash: child, parentHash: parent.Hash()}, PriorityDeepFork, 3)
 	require.NoError(t, server.blockchainClient.AddBlock(context.Background(), parent, "test-peer"))
 
-	server.promoteChildrenOfNewTip(server.blockchainClient, parent.Hash(), nil)
+	server.settleValidatedBlock(server.blockchainClient, parent.Hash(), nil)
 
 	priority, ok := server.blockPriorityQueue.PriorityOf(child)
 	require.True(t, ok)
@@ -595,7 +595,7 @@ func TestValidationDone_FailedParentDoesNotPromote(t *testing.T) {
 
 	server.blockPriorityQueue.Add(processBlockFound{hash: child, parentHash: parent.Hash()}, PriorityDeepFork, 3)
 
-	server.promoteChildrenOfNewTip(server.blockchainClient, parent.Hash(), errors.NewBlockInvalidError("invalid"))
+	server.settleValidatedBlock(server.blockchainClient, parent.Hash(), errors.NewBlockInvalidError("invalid"))
 
 	priority, ok := server.blockPriorityQueue.PriorityOf(child)
 	require.True(t, ok)
@@ -706,4 +706,120 @@ func TestRunOncePerBlock_SlowSettleOutlastsGrace(t *testing.T) {
 
 	close(release)
 	require.Eventually(t, func() bool { return !bv.IsValidating(parent) }, 2*time.Second, time.Millisecond)
+}
+
+// fetchMarked reports whether hash holds a fetching mark, ignoring whether it is queued.
+func fetchMarked(pq *BlockPriorityQueue, hash *chainhash.Hash) bool {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	_, ok := pq.fetching[*hash]
+
+	return ok
+}
+
+// TestClaimFetchMark_DuplicateOfInFlightBlockReleased pins that a fetch of a block that is already
+// queued, holding a slot or validated outside the queue gives up its mark straight away. Once that
+// block is stored, its children must not wait on the duplicate's fetch.
+func TestClaimFetchMark_DuplicateOfInFlightBlockReleased(t *testing.T) {
+	initPrometheusMetrics()
+
+	tests := []struct {
+		name  string
+		setup func(server *Server, hash *chainhash.Hash)
+	}{
+		{"queued", func(server *Server, hash *chainhash.Hash) {
+			server.blockPriorityQueue.Add(processBlockFound{hash: hash}, PriorityChainExtending, 2)
+		}},
+		{"processing", func(server *Server, hash *chainhash.Hash) {
+			require.True(t, server.forkManager.StartProcessingBlock(hash, PriorityChainExtending))
+		}},
+		{"validating outside the queue", func(server *Server, hash *chainhash.Hash) {
+			server.wireValidationInFlight()
+			server.blockValidation.blocksCurrentlyValidating.Set(*hash, &validationResult{done: make(chan struct{}), settled: make(chan struct{})})
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, hashes := newParentInFlightServer(t)
+			parent := hashes[0]
+
+			tt.setup(server, parent)
+
+			release := server.claimFetchMark(parent)
+			defer release()
+
+			require.False(t, fetchMarked(server.blockPriorityQueue, parent), "a duplicate fetch must not hold a mark")
+		})
+	}
+}
+
+// TestClaimFetchMark_AfterFirstFetcherQueued pins oskarszoon's interleaving: the first fetcher
+// queues the block and drops its mark, then a duplicate claims. Taking the mark before checking
+// means the duplicate always sees the block queued (or further along) and lets go.
+func TestClaimFetchMark_AfterFirstFetcherQueued(t *testing.T) {
+	initPrometheusMetrics()
+	server, hashes := newParentInFlightServer(t)
+	parent := hashes[0]
+
+	first := server.claimFetchMark(parent)
+	require.True(t, fetchMarked(server.blockPriorityQueue, parent))
+
+	server.blockPriorityQueue.Add(processBlockFound{hash: parent}, PriorityChainExtending, 2)
+	first()
+
+	duplicate := server.claimFetchMark(parent)
+	defer duplicate()
+
+	require.False(t, fetchMarked(server.blockPriorityQueue, parent))
+}
+
+// TestClaimFetchMark_FreeBlockHeldUntilReleased pins the normal case and that releasing twice is
+// harmless.
+func TestClaimFetchMark_FreeBlockHeldUntilReleased(t *testing.T) {
+	initPrometheusMetrics()
+	server, hashes := newParentInFlightServer(t)
+	parent := hashes[0]
+
+	release := server.claimFetchMark(parent)
+	require.True(t, fetchMarked(server.blockPriorityQueue, parent))
+
+	release()
+	release()
+	require.False(t, fetchMarked(server.blockPriorityQueue, parent))
+}
+
+// TestSettleValidatedBlock_ClearsFetchingMark pins that a successful validation on any path drops
+// the block's fetching mark, so a duplicate still fetching it no longer holds its children.
+func TestSettleValidatedBlock_ClearsFetchingMark(t *testing.T) {
+	initPrometheusMetrics()
+	server, blocks := newParentInFlightServerWithBlocks(t)
+	parent, child := blocks[2], blocks[3].Hash()
+
+	require.True(t, server.blockPriorityQueue.MarkFetching(parent.Hash()))
+	server.blockPriorityQueue.Add(processBlockFound{hash: child, parentHash: parent.Hash()}, PriorityChainExtending, 3)
+	require.NoError(t, server.blockchainClient.AddBlock(context.Background(), parent, "test-peer"))
+
+	server.settleValidatedBlock(server.blockchainClient, parent.Hash(), nil)
+
+	require.False(t, fetchMarked(server.blockPriorityQueue, parent.Hash()))
+
+	taken, status := server.blockPriorityQueue.Get(context.Background(), server.forkManager)
+	require.Equal(t, GetOK, status, "the child must no longer wait on the duplicate fetch")
+	require.Equal(t, child, taken.hash)
+}
+
+// TestSettleValidatedBlock_FailedValidationKeepsFetchingMark pins that a failed validation leaves
+// another fetch's mark alone: that fetch may bring a good copy.
+func TestSettleValidatedBlock_FailedValidationKeepsFetchingMark(t *testing.T) {
+	initPrometheusMetrics()
+	server, hashes := newParentInFlightServer(t)
+	parent := hashes[0]
+
+	require.True(t, server.blockPriorityQueue.MarkFetching(parent))
+
+	server.settleValidatedBlock(server.blockchainClient, parent, errors.NewBlockInvalidError("invalid"))
+
+	require.True(t, fetchMarked(server.blockPriorityQueue, parent))
 }

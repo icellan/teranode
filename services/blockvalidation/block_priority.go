@@ -490,6 +490,15 @@ func (pq *BlockPriorityQueue) UnmarkFetching(hash *chainhash.Hash) {
 	pq.cond.Signal()
 }
 
+// ClearFetching drops a block's fetching mark, whoever holds it. It is called once the block is
+// stored, when nothing is left for its children to wait on.
+func (pq *BlockPriorityQueue) ClearFetching(hash *chainhash.Hash) {
+	pq.mu.Lock()
+	defer pq.mu.Unlock()
+
+	delete(pq.fetching, *hash)
+}
+
 // PromoteChildren raises every queued child of parent to priority, if that is a higher class than
 // it has. A child queued while its parent was still being fetched or validated outside the queue
 // was classified without it, and is held by isWaiting until the parent finishes, which is when the

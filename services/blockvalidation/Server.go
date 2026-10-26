@@ -1186,6 +1186,11 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 		}
 	}
 
+	// The fetching mark is claimed before the exists check, which must come after its in-flight
+	// check (see claimFetchMark). It is dropped once the block is queued or this call returns.
+	releaseFetchMark := u.claimFetchMark(blockFound.hash)
+	defer releaseFetchMark()
+
 	// Check if block already exists to avoid redundant processing
 	exists, err := u.blockValidation.GetBlockExists(ctx, blockFound.hash)
 	if err != nil {
@@ -1235,14 +1240,6 @@ func (u *Server) processBlockFoundChannel(ctx context.Context, blockFound proces
 		}
 
 		return nil
-	}
-
-	// Count the block as in flight while it is fetched, so a child announced meanwhile waits
-	// for it instead of going to catchup. The mark is cleared after the block is queued. A
-	// duplicate of a block already in flight is not marked: once that block is stored, its
-	// children must not wait on the duplicate's fetch.
-	if !u.isBlockInFlight(blockFound.hash) && u.blockPriorityQueue.MarkFetching(blockFound.hash) {
-		defer u.blockPriorityQueue.UnmarkFetching(blockFound.hash)
 	}
 
 	// Check queue depth and determine if we might need catchup mode
@@ -2592,8 +2589,47 @@ func (u *Server) wireValidationInFlight() {
 	blockchainClient := u.blockchainClient
 
 	u.blockValidation.SetValidationDoneHooks(func(hash *chainhash.Hash, err error) {
-		u.promoteChildrenOfNewTip(blockchainClient, hash, err)
+		u.settleValidatedBlock(blockchainClient, hash, err)
 	}, u.blockPriorityQueue.Broadcast)
+}
+
+// claimFetchMark marks an announced block as being fetched, so a child announced meanwhile waits
+// for it instead of going to catchup, and returns the function that drops the mark. It may be
+// called more than once. Only the first fetcher gets a mark. The mark is taken before checking
+// whether the block is already queued, holding a slot or validated elsewhere, and dropped at once
+// if it is: a fetcher queues its block before dropping its own mark, so a later mark's check always
+// sees that block, and once it is stored its children must not wait on this duplicate's fetch.
+// The caller checks the store after this, so a block that finished in between is caught there.
+func (u *Server) claimFetchMark(hash *chainhash.Hash) func() {
+	if !u.blockPriorityQueue.MarkFetching(hash) {
+		return func() {}
+	}
+
+	var once sync.Once
+
+	release := func() {
+		once.Do(func() { u.blockPriorityQueue.UnmarkFetching(hash) })
+	}
+
+	if u.forkManager.IsBlockInFlight(hash, u.blockPriorityQueue.Contains) {
+		release()
+	}
+
+	return release
+}
+
+// settleValidatedBlock runs when a validation of a block through runOncePerBlock ends, while its
+// children are still held; the quick-validation paths below the checkpoint do not run it. A block
+// that validated is stored, so a fetch of it still running no longer holds its children: its mark
+// is dropped. Then, if the block is the best block, its children take the tip class. A later
+// UnmarkFetching by that fetch is harmless: any mark taken since is checked against the store and
+// dropped by claimFetchMark's caller.
+func (u *Server) settleValidatedBlock(blockchainClient blockchain.ClientI, hash *chainhash.Hash, err error) {
+	if err == nil {
+		u.blockPriorityQueue.ClearFetching(hash)
+	}
+
+	u.promoteChildrenOfNewTip(blockchainClient, hash, err)
 }
 
 // promoteChildrenOfNewTip runs when any validation of a block ends, while its children are still
