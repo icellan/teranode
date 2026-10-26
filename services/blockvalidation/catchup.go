@@ -108,6 +108,10 @@ type CatchupContext struct {
 
 	// Checkpoints to use for this catchup (isolated copy, not shared with settings)
 	checkpoints []chaincfg.Checkpoint
+
+	// firstBlockHeight is the height of blockHeaders[0] once stored blocks were trimmed from the
+	// front of the list; 0 means commonAncestorMeta.Height+1. Read it with catchupFirstBlockHeight.
+	firstBlockHeight uint32
 }
 
 // markSubtreesCommitted records every subtree hash the block just committed in this run depends
@@ -1339,7 +1343,7 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	// normal path while this catchup was starting. Fetching them again is pure waste (a large
 	// block's subtree data runs to hundreds of GB), and moving to CATCHINGBLOCKS for nothing makes
 	// the subtree validator drop live peer subtrees.
-	stored, err := u.storedHeaderPrefix(ctx, catchupCtx.blockHeaders)
+	stored, lastStoredHeight, err := u.storedHeaderPrefix(ctx, catchupCtx.blockHeaders)
 	if err != nil {
 		return errors.NewProcessingError("[catchup:fetchAndValidateBlocks][%s] failed to check for stored blocks", catchupCtx.blockUpTo.Hash().String(), err)
 	}
@@ -1347,6 +1351,9 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	if stored > 0 {
 		u.logger.Infof("[catchup:fetchAndValidateBlocks][%s] %d of %d blocks were stored since the header phase, not fetching them", catchupCtx.blockUpTo.Hash().String(), stored, len(catchupCtx.blockHeaders))
 		catchupCtx.blockHeaders = catchupCtx.blockHeaders[stored:]
+		// Blocks are numbered by their position in blockHeaders, so the numbering moves with the
+		// trim. commonAncestorMeta stays as found: status and progress report it.
+		catchupCtx.firstBlockHeight = lastStoredHeight + 1
 
 		if len(catchupCtx.blockHeaders) == 0 {
 			return nil
@@ -1503,32 +1510,45 @@ func (u *Server) extractHeadersAfterAncestor(headers []*model.BlockHeader, ances
 	return nil
 }
 
-// storedHeaderPrefix returns how many headers at the front of headers are stored as valid. It
-// stops at the first block that is not stored or is stored invalid, so a block stored invalid is
-// still validated and returns its invalid verdict. Stored blocks always form a prefix of a
-// connected header list, because a block is only stored after its parent.
-func (u *Server) storedHeaderPrefix(ctx context.Context, headers []*model.BlockHeader) (int, error) {
+// storedHeaderPrefix returns how many headers at the front of headers are stored as valid, and the
+// height of the last of them. It stops at the first block that is not stored or is stored invalid,
+// so a block stored invalid is still validated and returns its invalid verdict. Stored blocks
+// always form a prefix of a connected header list, because a block is only stored after its parent.
+func (u *Server) storedHeaderPrefix(ctx context.Context, headers []*model.BlockHeader) (int, uint32, error) {
+	var lastStoredHeight uint32
+
 	for i, header := range headers {
 		exists, err := u.blockValidation.GetBlockExists(ctx, header.Hash())
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 
 		if !exists {
-			return i, nil
+			return i, lastStoredHeight, nil
 		}
 
 		_, meta, err := u.blockchainClient.GetBlockHeader(ctx, header.Hash())
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 
 		if meta == nil || meta.Invalid {
-			return i, nil
+			return i, lastStoredHeight, nil
 		}
+
+		lastStoredHeight = meta.Height
 	}
 
-	return len(headers), nil
+	return len(headers), lastStoredHeight, nil
+}
+
+// catchupFirstBlockHeight returns the height of catchupCtx.blockHeaders[0].
+func catchupFirstBlockHeight(catchupCtx *CatchupContext) uint32 {
+	if catchupCtx.firstBlockHeight != 0 {
+		return catchupCtx.firstBlockHeight
+	}
+
+	return catchupCtx.commonAncestorMeta.Height + 1
 }
 
 // filterExistingBlocks removes blocks that already exist in our database.

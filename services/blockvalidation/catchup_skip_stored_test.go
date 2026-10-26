@@ -1,7 +1,9 @@
 package blockvalidation
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +13,8 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
+	"github.com/bsv-blockchain/teranode/util"
+	"github.com/jarcoal/httpmock"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -189,4 +193,115 @@ func TestOrderedDelivery_CarriesAlreadyStored(t *testing.T) {
 
 	item := <-validateBlocksChan
 	require.True(t, item.alreadyStored)
+}
+
+// TestFetchAndValidateBlocks_TrimmedPrefixKeepsHeights: blocks are numbered from the common
+// ancestor by their position in the header list, so trimming the stored front must move the
+// starting height with it. Without that, in the incident case the child gets its parent's height,
+// fails the BIP34 coinbase-height check and is stored invalid.
+func TestFetchAndValidateBlocks_TrimmedPrefixKeepsHeights(t *testing.T) {
+	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	blocks := testhelpers.CreateTestBlockChain(t, 4)
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, blocks[1].Header.Hash()).Return(true, nil)
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, blocks[1].Header.Hash()).Return(blocks[1].Header, &model.BlockHeaderMeta{Height: 101}, nil)
+	mockBlockchainClient.ExpectedCalls = filterMockCalls(mockBlockchainClient.ExpectedCalls, "CatchUpBlocks")
+	mockBlockchainClient.On("CatchUpBlocks", mock.Anything).Return(errors.NewStateError("stop here"))
+
+	catchupCtx := &CatchupContext{
+		blockUpTo:          blocks[3],
+		blockHeaders:       []*model.BlockHeader{blocks[1].Header, blocks[2].Header, blocks[3].Header},
+		commonAncestorMeta: &model.BlockHeaderMeta{Height: 100},
+	}
+
+	require.Error(t, server.fetchAndValidateBlocks(context.Background(), catchupCtx))
+	require.Equal(t, uint32(102), catchupFirstBlockHeight(catchupCtx), "the first remaining block sits one above the last stored one")
+	require.Equal(t, uint32(100), catchupCtx.commonAncestorMeta.Height, "the common ancestor itself is reported unchanged")
+}
+
+// TestCatchupFirstBlockHeight_DefaultsToCommonAncestor: an untrimmed list starts one above the
+// common ancestor, as before.
+func TestCatchupFirstBlockHeight_DefaultsToCommonAncestor(t *testing.T) {
+	catchupCtx := &CatchupContext{commonAncestorMeta: &model.BlockHeaderMeta{Height: 99}}
+	require.Equal(t, uint32(100), catchupFirstBlockHeight(catchupCtx))
+}
+
+// TestValidateBlocksOnChannel_AlreadyStoredSkipsQuickValidation: a block the worker found stored
+// goes to normal validation even when quick validation is on, and normal validation stops at the
+// stored block.
+func TestValidateBlocksOnChannel_AlreadyStoredSkipsQuickValidation(t *testing.T) {
+	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	blocks := testhelpers.CreateTestBlockChain(t, 2)
+	block := blocks[1]
+	block.Height = 1
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, block.Header.Hash()).Return(true, nil)
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, block.Header.Hash()).Return(block.Header, &model.BlockHeaderMeta{Height: 1}, nil)
+
+	catchupCtx := &CatchupContext{
+		blockUpTo:               block,
+		useQuickValidation:      true,
+		highestCheckpointHeight: 1000,
+	}
+
+	validateBlocksChan := make(chan blockForValidation, 1)
+	validateBlocksChan <- blockForValidation{block: block, alreadyStored: true}
+	close(validateBlocksChan)
+
+	var size atomic.Int64
+	size.Store(1)
+
+	quickWrites := make(chan *SubtreeWriteJob, 1)
+	require.NoError(t, server.validateBlocksOnChannel(validateBlocksChan, context.Background(), catchupCtx, &size, quickWrites))
+	require.Zero(t, size.Load())
+	require.Empty(t, quickWrites, "a stored block must not go through quick validation")
+}
+
+// TestFetchBlocksConcurrently_NumbersFromFirstBlockHeight: once the stored front was trimmed,
+// delivered blocks are numbered from firstBlockHeight, not from the common ancestor.
+func TestFetchBlocksConcurrently_NumbersFromFirstBlockHeight(t *testing.T) {
+	suite := NewCatchupTestSuite(t)
+	suite.MockBlockchain.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil).Maybe()
+	defer suite.Cleanup()
+
+	blocks := testhelpers.CreateTestBlockChain(t, 4)
+
+	httpmock.ActivateNonDefault(util.HTTPClient())
+	defer httpmock.DeactivateAndReset()
+
+	// blocks[1] was stored and trimmed: the list starts at blocks[2].
+	batch := bytes.Buffer{}
+	for i := 3; i >= 2; i-- {
+		blockBytes, err := blocks[i].Bytes()
+		require.NoError(t, err)
+		batch.Write(blockBytes)
+	}
+
+	httpmock.RegisterResponder("GET", fmt.Sprintf("http://test-peer/blocks/%s?n=%d", blocks[3].Header.Hash().String(), 2), httpmock.NewBytesResponder(200, batch.Bytes()))
+
+	var size atomic.Int64
+	size.Store(2)
+	validateBlocksChan := make(chan blockForValidation, 2)
+
+	catchupCtx := &CatchupContext{
+		blockUpTo:          blocks[3],
+		baseURL:            "http://test-peer",
+		blockHeaders:       []*model.BlockHeader{blocks[2].Header, blocks[3].Header},
+		commonAncestorMeta: &model.BlockHeaderMeta{Height: 99},
+		firstBlockHeight:   101,
+	}
+
+	require.NoError(t, suite.Server.fetchBlocksConcurrently(suite.Ctx, catchupCtx, validateBlocksChan, &size))
+
+	for i, want := range []uint32{101, 102} {
+		select {
+		case item := <-validateBlocksChan:
+			require.Equal(t, want, item.block.Height, "block %d", i)
+		case <-time.After(time.Second):
+			t.Fatalf("timeout waiting for block %d", i)
+		}
+	}
 }

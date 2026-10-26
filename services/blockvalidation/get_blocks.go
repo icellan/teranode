@@ -142,8 +142,9 @@ func (u *Server) fetchBlocksConcurrently(ctx context.Context, catchupCtx *Catchu
 			return errors.NewProcessingError("[catchup:fetchBlocksConcurrently][%s] commonAncestorMeta must not be nil", blockUpTo.Hash().String())
 		}
 
-		// Calculate starting height from common ancestor
-		startingHeight := catchupCtx.commonAncestorMeta.Height + 1
+		// Calculate starting height from common ancestor, moved past any stored blocks trimmed
+		// from the front of the list
+		startingHeight := catchupFirstBlockHeight(catchupCtx)
 
 		return u.batchFetchAndDistribute(gCtx, blockHeaders, workQueue, peerID, baseURL, blockUpTo, largeBatchSize, startingHeight)
 	})
@@ -236,25 +237,6 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 				return nil
 			}
 
-			// Fetch subtree data for this block — adaptive-fetch state may skip it
-			// entirely when the node is receiving txs via a distributor.
-			//
-			// What the skip actually costs: this fetch is only a prewarm. It
-			// pulls subtreeData ahead of time so the later block-validation step
-			// finds everything already in the store. Skipping it does NOT skip
-			// validation — when the block is validated, subtree validation still
-			// runs and recovers any genuinely-missing txs from peers on demand
-			// (see services/subtreevalidation getSubtreeMissingTxs). So an
-			// optimistic skip that turns out to be wrong costs extra bandwidth
-			// later (the txs get fetched then instead of now); it does not risk
-			// accepting an unvalidated block or losing data.
-			//
-			// Capture the live mode (not just the boolean) so we can later
-			// record the observation against the snapshot. Workers run
-			// concurrently and the mode can transition between this point
-			// and the Record call below; the snapshot lets the state machine
-			// drop any observation whose underlying work was performed in a
-			// different mode.
 			// A block stored since the header phase, by the normal path while catchup was starting,
 			// needs no prewarm: validation finds it stored and stops there. Checked here, just before
 			// the fetch, because that fetch can be the whole block's subtree data.
@@ -281,6 +263,25 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 				continue
 			}
 
+			// Fetch subtree data for this block — adaptive-fetch state may skip it
+			// entirely when the node is receiving txs via a distributor.
+			//
+			// What the skip actually costs: this fetch is only a prewarm. It
+			// pulls subtreeData ahead of time so the later block-validation step
+			// finds everything already in the store. Skipping it does NOT skip
+			// validation — when the block is validated, subtree validation still
+			// runs and recovers any genuinely-missing txs from peers on demand
+			// (see services/subtreevalidation getSubtreeMissingTxs). So an
+			// optimistic skip that turns out to be wrong costs extra bandwidth
+			// later (the txs get fetched then instead of now); it does not risk
+			// accepting an unvalidated block or losing data.
+			//
+			// Capture the live mode (not just the boolean) so we can later
+			// record the observation against the snapshot. Workers run
+			// concurrently and the mode can transition between this point
+			// and the Record call below; the snapshot lets the state machine
+			// drop any observation whose underlying work was performed in a
+			// different mode.
 			modeAtSample := u.adaptiveFetch.Mode()
 			optimistic := modeAtSample == adaptivefetch.ModeOptimistic
 
