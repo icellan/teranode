@@ -665,6 +665,9 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 		}
 	}
 
+	// The daemon's own BlockValidation service (always started above) sets the
+	// mined status of blocks; a second setMined worker on the same stores races
+	// it and can leave an invalidated block's transactions marked mined.
 	blockValidation := blockvalidation.NewBlockValidation(
 		d.Ctx,
 		logger,
@@ -676,6 +679,7 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 		validatorClient,
 		subtreeValidationClient,
 		p2pClient,
+		blockvalidation.NoSetMined{},
 	)
 
 	assert.NotNil(t, blockchainClient)
