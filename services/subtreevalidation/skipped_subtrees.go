@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -15,11 +16,17 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// skippedSubtree is a peer subtree announced while the node was not RUNNING.
+// skippedSubtreeMaxAge is how old a kept subtree may be and still be replayed. A catchup can be
+// followed by an operator STOP that lasts days; by then the peers may have pruned the subtree, and
+// a replay that cannot fetch it reports the peer.
+const skippedSubtreeMaxAge = 30 * time.Minute
+
+// skippedSubtree is a peer subtree announced while the node was catching up.
 type skippedSubtree struct {
-	hash    chainhash.Hash
-	baseURL *url.URL
-	peerID  string
+	hash       chainhash.Hash
+	baseURL    *url.URL
+	peerID     string
+	recordedAt time.Time
 }
 
 // skippedSubtrees keeps the peer subtrees announced while the node was catching up, so they are
@@ -34,6 +41,9 @@ type skippedSubtrees struct {
 
 	// replaying is set while a replay runs, so only one runs at a time.
 	replaying atomic.Bool
+
+	// watching is set while a goroutine waits for RUNNING to start the replay.
+	watching atomic.Bool
 }
 
 // record keeps entry, evicting the oldest entry when max are already kept. A subtree already kept
@@ -61,20 +71,24 @@ func (s *skippedSubtrees) record(entry skippedSubtree, max int) (added, evicted 
 		evicted = true
 	}
 
+	entry.recordedAt = time.Now()
 	s.entries[entry.hash] = entry
 	s.order = append(s.order, entry.hash)
 
 	return true, evicted
 }
 
-// take removes and returns every kept subtree, oldest first.
+// take removes every kept subtree and returns those younger than skippedSubtreeMaxAge, oldest
+// first.
 func (s *skippedSubtrees) take() []skippedSubtree {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	taken := make([]skippedSubtree, 0, len(s.order))
 	for _, hash := range s.order {
-		taken = append(taken, s.entries[hash])
+		if entry := s.entries[hash]; time.Since(entry.recordedAt) <= skippedSubtreeMaxAge {
+			taken = append(taken, entry)
+		}
 	}
 
 	s.entries = nil
@@ -93,7 +107,7 @@ func (s *skippedSubtrees) len() int {
 // recordSkippedSubtreeMessage keeps a peer subtree announced while the node is catching up. A
 // malformed message is ignored without the malformed-message metric, which stays a RUNNING-only
 // signal. A blocks-only node never validates peer subtrees, so it keeps none.
-func (u *Server) recordSkippedSubtreeMessage(state blockchain.FSMStateType, value []byte) {
+func (u *Server) recordSkippedSubtreeMessage(ctx context.Context, state blockchain.FSMStateType, value []byte) {
 	if u.settings.SubtreeValidation.BlocksOnly {
 		return
 	}
@@ -113,13 +127,14 @@ func (u *Server) recordSkippedSubtreeMessage(state blockchain.FSMStateType, valu
 		return
 	}
 
-	u.recordSkippedSubtree(state, hash, baseURL, kafkaMsg.PeerId)
+	u.recordSkippedSubtree(ctx, state, hash, baseURL, kafkaMsg.PeerId)
 }
 
 // recordSkippedSubtree keeps a peer subtree that was not validated because the node is catching
 // up. Only CATCHINGBLOCKS: IDLE (an operator STOP) can last days, by which time the peers may have
-// pruned the subtree, and a replay that cannot fetch it reports the peer.
-func (u *Server) recordSkippedSubtree(state blockchain.FSMStateType, hash *chainhash.Hash, baseURL *url.URL, peerID string) {
+// pruned the subtree, and a replay that cannot fetch it reports the peer. The first kept subtree
+// starts a watcher that replays once the node is RUNNING.
+func (u *Server) recordSkippedSubtree(ctx context.Context, state blockchain.FSMStateType, hash *chainhash.Hash, baseURL *url.URL, peerID string) {
 	if state != blockchain.FSMStateCATCHINGBLOCKS {
 		return
 	}
@@ -127,6 +142,7 @@ func (u *Server) recordSkippedSubtree(state blockchain.FSMStateType, hash *chain
 	added, evicted := u.skippedSubtrees.record(skippedSubtree{hash: *hash, baseURL: baseURL, peerID: peerID}, u.settings.SubtreeValidation.SkippedSubtreeBackfillMax)
 	if added {
 		prometheusSkippedSubtrees.WithLabelValues("recorded").Inc()
+		u.watchForRunning(ctx)
 	}
 
 	if evicted {
@@ -134,8 +150,29 @@ func (u *Server) recordSkippedSubtree(state blockchain.FSMStateType, hash *chain
 	}
 }
 
+// watchForRunning starts, unless one is already waiting, a goroutine that replays the kept
+// subtrees as soon as the node is RUNNING. Catchup sends RUN only after its last block, and the
+// blockchain client does not pass FSM notifications to subscribers, so without it the replay would
+// wait for the next peer subtree message or block; on a quiet network that is the next block,
+// validated with the kept subtrees still unvalidated.
+func (u *Server) watchForRunning(ctx context.Context) {
+	if !u.skippedSubtrees.watching.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer u.skippedSubtrees.watching.Store(false)
+
+		if err := u.blockchainClient.WaitForFSMtoTransitionToGivenState(ctx, blockchain.FSMStateRUNNING); err != nil {
+			return
+		}
+
+		u.replaySkippedSubtrees(ctx)
+	}()
+}
+
 // replayLimit is how many kept subtrees are validated at once: half the peer-subtree admission
-// slots, so live peer subtrees keep the other half.
+// slots (at least one), so live peer subtrees keep the rest.
 func replayLimit(peerSubtreeConcurrency int) int {
 	if peerSubtreeConcurrency <= 0 {
 		peerSubtreeConcurrency = runtime.NumCPU()
@@ -177,21 +214,24 @@ func (u *Server) replaySkippedSubtrees(ctx context.Context) {
 
 		u.logger.Infof("[replaySkippedSubtrees] validating %d peer subtrees announced while the node was catching up", len(entries))
 
-		g, gCtx := errgroup.WithContext(ctx)
+		// A plain group on ctx, not errgroup.WithContext: a subtree kept again during the replay
+		// starts a watcher with this ctx, which must outlive the replay.
+		var g errgroup.Group
+
 		g.SetLimit(replayLimit(u.settings.SubtreeValidation.PeerSubtreeConcurrency))
 
 		for _, entry := range entries {
-			if gCtx.Err() != nil {
+			if ctx.Err() != nil {
 				break
 			}
 
 			g.Go(func() error {
-				err := u.replaySubtree(gCtx, &entry.hash, entry.baseURL, entry.peerID)
+				err := u.replaySubtree(ctx, &entry.hash, entry.baseURL, entry.peerID)
 
 				switch {
 				case err == nil, errors.Is(err, errors.ErrSubtreeExists):
 					prometheusSkippedSubtrees.WithLabelValues("replayed").Inc()
-				case gCtx.Err() != nil || errors.Is(err, errors.ErrContextCanceled):
+				case ctx.Err() != nil:
 					// shutting down
 				default:
 					// Like a live peer subtree, a failed one is not retried: block validation

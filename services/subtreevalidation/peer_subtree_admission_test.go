@@ -217,6 +217,8 @@ func TestSubtreesHandler_SkipsWhenNoLongerRunningAfterTheWait(t *testing.T) {
 	catchingBlocks := blockchain.FSMStateCATCHINGBLOCKS
 	blockchainClient := &blockchain.Mock{}
 	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&catchingBlocks, nil)
+	// The dropped subtree is kept for the backfill, which waits for RUNNING; let it give up.
+	blockchainClient.On("WaitForFSMtoTransitionToGivenState", mock.Anything, blockchain.FSMStateRUNNING).Return(errors.NewContextCanceledError("test")).Maybe()
 	server.blockchainClient = blockchainClient
 
 	hash := chainhash.HashH([]byte("peer subtree"))

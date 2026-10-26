@@ -457,6 +457,8 @@ func testSubtreeMessageHandlerSkipsInState(t *testing.T, state blockchain.FSMSta
 	validateSubtreeCalled := atomic.Bool{}
 	blockchainClient := &blockchain.Mock{}
 	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&state, nil)
+	// A subtree skipped while catching up starts a watcher for RUNNING; let it give up.
+	blockchainClient.On("WaitForFSMtoTransitionToGivenState", mock.Anything, blockchain.FSMStateRUNNING).Return(errors.NewContextCanceledError("test")).Maybe()
 
 	server := &testServer{
 		Server: Server{

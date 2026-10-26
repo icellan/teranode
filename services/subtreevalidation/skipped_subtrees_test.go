@@ -49,6 +49,8 @@ func newSkippedSubtreeServer(t *testing.T, state *fsmState, max int) (*Server, c
 
 	blockchainClient := &blockchain.Mock{}
 	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&state.state, nil)
+	// The RUNNING watcher gives up at once unless a test wires a real wait.
+	blockchainClient.On("WaitForFSMtoTransitionToGivenState", mock.Anything, blockchain.FSMStateRUNNING).Return(errors.NewContextCanceledError("no watcher in this test")).Maybe()
 
 	replayed := make(chan replayedSubtree, 16)
 	server := &Server{
@@ -303,4 +305,65 @@ func TestSubtreesHandler_LeftRunningWhileQueued_RecordsSubtree(t *testing.T) {
 
 	require.NoError(t, server.subtreesHandler(context.Background(), hash, baseURL, "p1"))
 	require.Equal(t, 1, server.skippedSubtrees.len())
+}
+
+// TestSkippedSubtrees_TakeDropsStaleEntries: a catchup can be followed by an operator STOP that
+// lasts days. By then the peers may have pruned the subtrees, and a replay that cannot fetch one
+// reports the peer, so entries older than skippedSubtreeMaxAge are not replayed.
+func TestSkippedSubtrees_TakeDropsStaleEntries(t *testing.T) {
+	var set skippedSubtrees
+
+	stale, err := chainhash.NewHashFromStr(skippedHashA)
+	require.NoError(t, err)
+	fresh, err := chainhash.NewHashFromStr(skippedHashB)
+	require.NoError(t, err)
+
+	set.record(skippedSubtree{hash: *stale}, 16)
+	set.record(skippedSubtree{hash: *fresh}, 16)
+
+	entry := set.entries[*stale]
+	entry.recordedAt = time.Now().Add(-skippedSubtreeMaxAge - time.Minute)
+	set.entries[*stale] = entry
+
+	require.Equal(t, []string{skippedHashB}, skippedHashes(set.take()))
+}
+
+// TestSkippedSubtrees_ReplayStartsWhenNodeReachesRunning: the first kept subtree starts a watcher
+// that replays once the node is RUNNING, with no peer subtree message or block needed. Catchup
+// sends RUN only after its last block, and a quiet network may announce nothing before the next
+// block, which would then be validated with the kept subtrees still unvalidated.
+func TestSkippedSubtrees_ReplayStartsWhenNodeReachesRunning(t *testing.T) {
+	fsm := &fsmState{state: blockchain.FSMStateCATCHINGBLOCKS}
+	server, replayed := newSkippedSubtreeServer(t, fsm, 16)
+
+	running := make(chan struct{})
+	blockchainClient := server.blockchainClient.(*blockchain.Mock)
+	blockchainClient.ExpectedCalls = nil
+	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&fsm.state, nil)
+	blockchainClient.On("WaitForFSMtoTransitionToGivenState", mock.Anything, blockchain.FSMStateRUNNING).
+		Run(func(mock.Arguments) { <-running }).Return(nil).Once()
+
+	handler := server.subtreeMessageHandler(context.Background())
+	require.NoError(t, handler(subtreeMessage(t, skippedHashA, "p1")))
+	require.NoError(t, handler(subtreeMessage(t, skippedHashB, "p1")), "one watcher for the whole catchup")
+
+	select {
+	case <-replayed:
+		t.Fatal("replayed while still catching up")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(running)
+
+	got := 0
+	for got < 2 {
+		select {
+		case <-replayed:
+			got++
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of 2 kept subtrees were replayed after RUNNING", got)
+		}
+	}
+
+	require.Eventually(t, func() bool { return !server.skippedSubtrees.watching.Load() }, time.Second, 10*time.Millisecond)
 }

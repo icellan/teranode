@@ -65,7 +65,7 @@ func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.Kafk
 		// announced while catching up are kept and validated once the node is
 		// RUNNING again.
 		if *state != blockchain.FSMStateRUNNING {
-			u.recordSkippedSubtreeMessage(*state, msg.Value)
+			u.recordSkippedSubtreeMessage(gCtx, *state, msg.Value)
 			return nil
 		}
 
@@ -149,7 +149,7 @@ func (u *Server) subtreesHandler(ctx context.Context, hash *chainhash.Hash, base
 	}
 
 	if *state != blockchain.FSMStateRUNNING {
-		u.recordSkippedSubtree(*state, hash, baseURL, peerID)
+		u.recordSkippedSubtree(ctx, *state, hash, baseURL, peerID)
 		return nil
 	}
 
