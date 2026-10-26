@@ -848,6 +848,8 @@ func (u *Server) Init(ctx context.Context) (err error) {
 		u.blockValidation = NewBlockValidation(ctx, u.logger, u.settings, u.blockchainClient, u.subtreeStore, u.txStore, u.utxoStore, u.validatorClient, subtreeValidationClient, u.p2pClient, u.blockAssemblyClient)
 	}
 
+	u.wireValidationInFlight()
+
 	// Record that the ttlcache eviction loops start here, BEFORE the go
 	// statements: ttlcache.Stop is an unbuffered send whose only receiver
 	// lives inside Start, so Stop must skip every cache whose loop never ran
@@ -2568,6 +2570,19 @@ func (u *Server) requeueBlock(blockFound processBlockFound, delay time.Duration)
 // would move the FSM to CATCHINGBLOCKS and stop mining while the parent is still validating.
 func (u *Server) isBlockInFlight(hash *chainhash.Hash) bool {
 	return u.forkManager.IsBlockInFlight(hash, u.blockPriorityQueue.IsPending)
+}
+
+// wireValidationInFlight makes a block validated outside the queue count as in flight, so its
+// child waits behind it instead of going to catchup, and wakes the queue when such a validation
+// ends, so that child is released.
+func (u *Server) wireValidationInFlight() {
+	// nil-guarded: some Server-literal test fixtures call Init without a queue or fork manager.
+	if u.forkManager == nil || u.blockPriorityQueue == nil {
+		return
+	}
+
+	u.forkManager.SetValidatingCheck(u.blockValidation.IsValidating)
+	u.blockValidation.SetValidationDoneHook(u.blockPriorityQueue.Broadcast)
 }
 
 // inFlightPriority returns the class of a queued or processing block, so a child queued

@@ -151,6 +151,9 @@ type ForkManager struct {
 	mainChainHeight     uint32
 	resolutionCallbacks []ForkResolutionCallback
 	processingCount     atomic.Int32 // Atomic counter for fast-path checking
+	// validating reports a block being validated outside the queue (catchup, gRPC, legacy sync),
+	// which never takes a worker slot. Nil until SetValidatingCheck.
+	validating func(*chainhash.Hash) bool
 }
 
 func NewForkManager(logger ulogger.Logger, tSettings *settings.Settings) *ForkManager {
@@ -426,11 +429,25 @@ func (fm *ForkManager) FinishProcessingBlock(blockHash *chainhash.Hash) {
 // A block claims its slot before it leaves the queue and is back on the queue before its slot is
 // released, so with slots held still one of the two reads always sees it. pending takes the
 // queue's lock, which is the same fm.mu → pq.mu order FinishProcessingBlock's Signal uses.
+//
+// A block validated outside the queue (catchup, gRPC, legacy sync) holds no slot, so the
+// validating check set by SetValidatingCheck reports it too. Otherwise a child arriving while
+// such a parent is being stored looks at a parent that is neither in flight nor stored, and goes
+// to catchup to fetch a block this node is about to hold.
 func (fm *ForkManager) IsBlockInFlight(blockHash *chainhash.Hash, pending func(chainhash.Hash) bool) bool {
 	fm.mu.RLock()
 	defer fm.mu.RUnlock()
 
-	return fm.processingBlocks[*blockHash] || pending(*blockHash)
+	return fm.processingBlocks[*blockHash] || pending(*blockHash) || (fm.validating != nil && fm.validating(blockHash))
+}
+
+// SetValidatingCheck sets the check IsBlockInFlight uses for blocks validated outside the queue.
+// The check must not call back into the fork manager.
+func (fm *ForkManager) SetValidatingCheck(validating func(*chainhash.Hash) bool) {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+
+	fm.validating = validating
 }
 
 // IsProcessingBlock reports whether a worker is currently validating the block.

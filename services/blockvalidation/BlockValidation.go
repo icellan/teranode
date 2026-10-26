@@ -255,6 +255,11 @@ type BlockValidation struct {
 	// blocksCurrentlyValidating tracks blocks being validated to prevent concurrent validation
 	blocksCurrentlyValidating *txmap.SyncedMap[chainhash.Hash, *validationResult]
 
+	// validationDoneHook, when set, runs after a block has left blocksCurrentlyValidating. It wakes
+	// the priority queue, whose children held behind a block validated outside the queue are
+	// otherwise released only by an unrelated queue event.
+	validationDoneHook atomic.Pointer[func()]
+
 	// setMinedChan receives block hashes that need to be marked as mined
 	setMinedChan chan *chainhash.Hash
 
@@ -1657,6 +1662,17 @@ func (u *BlockValidation) isParentMined(ctx context.Context, blockHeader *model.
 	return parentBlockMined, nil
 }
 
+// IsValidating reports whether the block is being validated, on any path, or its result is
+// still inside the validationResultGrace window.
+func (u *BlockValidation) IsValidating(blockHash *chainhash.Hash) bool {
+	return u.blocksCurrentlyValidating.Exists(*blockHash)
+}
+
+// SetValidationDoneHook sets the function run each time a block leaves blocksCurrentlyValidating.
+func (u *BlockValidation) SetValidationDoneHook(hook func()) {
+	u.validationDoneHook.Store(&hook)
+}
+
 // runOncePerBlock ensures validation runs only once per block.
 // If another goroutine is already validating, it waits and returns that result.
 // validationResultGrace is how long a finished validation's result stays published for
@@ -1711,6 +1727,10 @@ func (u *BlockValidation) runOncePerBlock(blockHash *chainhash.Hash, opts *Valid
 		go func() {
 			time.Sleep(validationResultGrace)
 			u.blocksCurrentlyValidating.Delete(*blockHash)
+
+			if hook := u.validationDoneHook.Load(); hook != nil {
+				(*hook)()
+			}
 		}()
 
 		if r != nil {

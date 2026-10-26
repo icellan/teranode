@@ -447,3 +447,112 @@ func TestIsWaiting_ParentVisibleAcrossRequeueHandoff(t *testing.T) {
 
 	require.Zero(t, missed, "the child saw its parent as neither queued nor processing")
 }
+
+// TestForkManager_IsBlockInFlight_CountsBlockValidatingOutsideQueue pins the scale-3 incident of
+// 2026-10-26: a parent validated by catchup, gRPC or legacy sync never takes a worker slot, so
+// the queue and slot state alone report it as gone and its child goes to catchup.
+func TestForkManager_IsBlockInFlight_CountsBlockValidatingOutsideQueue(t *testing.T) {
+	tSettings := test.CreateBaseTestSettings(t)
+	fm := NewForkManager(ulogger.TestLogger{}, tSettings)
+	parent := &chainhash.Hash{1}
+	notPending := func(chainhash.Hash) bool { return false }
+
+	require.False(t, fm.IsBlockInFlight(parent, notPending))
+
+	fm.SetValidatingCheck(func(hash *chainhash.Hash) bool { return *hash == *parent })
+
+	require.True(t, fm.IsBlockInFlight(parent, notPending), "a block being validated outside the queue is in flight")
+	require.False(t, fm.IsBlockInFlight(&chainhash.Hash{2}, notPending))
+}
+
+// TestAddBlockToPriorityQueue_ParentValidatingOutsideQueue_QueuesChild: a child whose parent is
+// being validated by another path is queued behind it, not sent to catchup.
+func TestAddBlockToPriorityQueue_ParentValidatingOutsideQueue_QueuesChild(t *testing.T) {
+	initPrometheusMetrics()
+	server, hashes := newParentInFlightServer(t)
+	parent, child := hashes[0], hashes[1]
+
+	server.wireValidationInFlight()
+	server.blockValidation.blocksCurrentlyValidating.Set(*parent, &validationResult{done: make(chan struct{})})
+
+	server.addBlockToPriorityQueue(context.Background(), processBlockFound{hash: child, baseURL: "http://peer", peerID: "p1"})
+
+	require.Empty(t, server.catchupCh, "a parent still validating is not a gap to catch up")
+	require.True(t, server.blockPriorityQueue.Contains(*child), "the child must be queued behind its parent")
+}
+
+// TestRunOncePerBlock_WakesQueueAfterRelease: a child held behind a parent validated outside the
+// queue is only released by a queue wake-up. The hook must run after the block has left
+// blocksCurrentlyValidating, or the woken worker still sees the parent in flight and parks again.
+func TestRunOncePerBlock_WakesQueueAfterRelease(t *testing.T) {
+	server, hashes := newParentInFlightServer(t)
+	bv := server.blockValidation
+	parent := hashes[0]
+
+	type hookCall struct{ stillValidating bool }
+	calls := make(chan hookCall, 1)
+	bv.SetValidationDoneHook(func() { calls <- hookCall{stillValidating: bv.IsValidating(parent)} })
+
+	require.NoError(t, bv.runOncePerBlock(parent, nil, func(*ValidateBlockOptions) error {
+		require.True(t, bv.IsValidating(parent))
+		return nil
+	}))
+
+	select {
+	case call := <-calls:
+		require.False(t, call.stillValidating, "the hook must run after the block left blocksCurrentlyValidating")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the validation-done hook never ran")
+	}
+}
+
+// TestWireValidationInFlight_ReleasesHeldChild: end to end through the queue. The child waits
+// while its parent validates outside the queue and is handed out once the validation is done,
+// without any other queue event.
+func TestWireValidationInFlight_ReleasesHeldChild(t *testing.T) {
+	initPrometheusMetrics()
+	server, hashes := newParentInFlightServer(t)
+	parent, child := hashes[0], hashes[1]
+	server.wireValidationInFlight()
+
+	release := make(chan struct{})
+	validated := make(chan error, 1)
+
+	go func() {
+		validated <- server.blockValidation.runOncePerBlock(parent, nil, func(*ValidateBlockOptions) error {
+			<-release
+			return nil
+		})
+	}()
+
+	require.Eventually(t, func() bool { return server.blockValidation.IsValidating(parent) }, 2*time.Second, time.Millisecond)
+
+	server.blockPriorityQueue.Add(processBlockFound{hash: child, parentHash: parent}, PriorityChainExtending, 11)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	taken := make(chan processBlockFound, 1)
+	go func() {
+		block, status := server.blockPriorityQueue.WaitForBlock(ctx, server.forkManager)
+		if status == GetOK {
+			taken <- block
+		}
+	}()
+
+	select {
+	case <-taken:
+		t.Fatal("the child was handed out while its parent was still validating")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	require.NoError(t, <-validated)
+
+	select {
+	case block := <-taken:
+		require.Equal(t, *child, *block.hash)
+	case <-ctx.Done():
+		t.Fatal("the child was never released after its parent finished validating")
+	}
+}
