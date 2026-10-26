@@ -876,40 +876,45 @@ func (u *Server) checkCachedSubtreesAgainstCandidateChain(ctx context.Context, b
 		blockIds[blockID] = true
 	}
 
-	for _, txHash := range conflictingTxHashes {
-		// Same predicate the full-validation path applies via
-		// blessMissingTransaction, and now over the same facts: both paths ask it
-		// about every transaction the store currently flags Conflicting. This used
-		// to be asked only of the transactions a subtree's trailer named, which
-		// missed any transaction that became conflicting after its subtree was
-		// blessed and whose loser was never mined — the residual tracked as issue
-		// #1742, closed by sourcing the flag from the store above.
-		//
-		// Wrapped as a processing error
-		// rather than forced to tx-invalid: the underlying call returns
-		// ErrTxInvalid only for a genuine ancestry conflict, and errors.Is finds
-		// it through the chain. A walk-budget or store failure stays retryable
-		// instead of permanently marking the block invalid.
-		if err = u.checkCounterConflictingOnCurrentChain(ctx, txHash, blockIds); err != nil {
-			// txHash was read from the store moments ago, so ErrTxNotFound here
-			// means a counter-conflicting record is gone, or txHash itself was
-			// pruned between the probe and this walk.
-			//
-			// A record we cannot find is not evidence of an ancestor double
-			// spend. Rejecting on it would make one node refuse a block its
-			// peers accept purely because it pruned earlier — a node-local
-			// consensus split caused by housekeeping. Fail open, matching the
-			// same decision in filterAncestryConfirmedLosers, and leave the
-			// store-level guard to catch a real conflict at promotion time.
-			if errors.Is(err, errors.ErrTxNotFound) {
-				u.logger.Warnf("[CheckBlockSubtrees][%s][%s] cannot check cached-subtree conflict: a counter-conflicting record is no longer in the store, skipping",
-					block.Hash().String(), txHash.String())
+	// Same predicate the full-validation path applies via
+	// blessMissingTransaction, and now over the same facts: both paths ask it
+	// about every transaction the store currently flags Conflicting. This used
+	// to be asked only of the transactions a subtree's trailer named, which
+	// missed any transaction that became conflicting after its subtree was
+	// blessed and whose loser was never mined — the residual tracked as issue
+	// #1742, closed by sourcing the flag from the store above.
+	//
+	// Asked once for all of them, not once per transaction: the transactions
+	// share cones, and the per-transaction loop re-walked them N^2/2 times
+	// (issue 2037). Sourcing the set from the store rather than the trailer
+	// raises that N, so the batch is what keeps this path affordable.
+	//
+	// Wrapped as a processing error
+	// rather than forced to tx-invalid: the underlying call returns
+	// ErrTxInvalid only for a genuine ancestry conflict, and errors.Is finds
+	// it through the chain. A walk-budget or store failure stays retryable
+	// instead of permanently marking the block invalid.
+	notFound, err := u.checkCounterConflictingOnCurrentChainBatch(ctx, conflictingTxHashes, blockIds, skipMissingRecords)
+	if err != nil {
+		return errors.NewProcessingError("[CheckBlockSubtrees][%s] cached subtree conflicts with the candidate chain", block.Hash().String(), err)
+	}
 
-				continue
-			}
-
-			return errors.NewProcessingError("[CheckBlockSubtrees][%s][%s] cached subtree conflicts with the candidate chain", block.Hash().String(), txHash.String(), err)
-		}
+	// Each of these hashes was read from the store moments ago, so a record
+	// missing now means a counter-conflicting record is gone, or the
+	// transaction itself was pruned between the probe and this walk. The
+	// pre-existing caller of this predicate never saw either, because it had
+	// just validated the transaction and so knew the record existed; probing
+	// cached subtrees removes that precondition.
+	//
+	// A record we cannot find is not evidence of an ancestor double
+	// spend. Rejecting on it would make one node refuse a block its
+	// peers accept purely because it pruned earlier — a node-local
+	// consensus split caused by housekeeping. Fail open, matching the
+	// same decision in filterAncestryConfirmedLosers, and leave the
+	// store-level guard to catch a real conflict at promotion time.
+	for _, txHash := range notFound {
+		u.logger.Warnf("[CheckBlockSubtrees][%s][%s] cannot check cached-subtree conflict: a counter-conflicting record is no longer in the store, skipping",
+			block.Hash().String(), txHash.String())
 	}
 
 	return nil
@@ -1311,8 +1316,11 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 		}
 	}()
 
-	// Use TeeReader to split network stream to storage and parser simultaneously
-	teeReader := io.TeeReader(body, pw)
+	// Use TeeReader to split network stream to storage and parser simultaneously.
+	// storeSide records whether a write into the store failed, which tells a parse
+	// error caused by the store from one caused by the peer's bytes.
+	storeSide := &pipeWriteRecorder{w: pw}
+	teeReader := io.TeeReader(body, storeSide)
 
 	// Use pooled bufio.Reader for parsing
 	bufferedReader := bufioReaderPool.Get().(*bufio.Reader)
@@ -1335,6 +1343,17 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 
 	// Wait for storage operation to complete
 	storeErr := <-storeDone
+
+	// The parser failed on the peer's bytes while every write into the store had
+	// succeeded, so the store's error, if any, is only the abort above echoed
+	// back. Reporting it would make the peer's fault look like a local storage
+	// fault, which catch-up neither charges to the peer nor retries elsewhere.
+	// If the store failed on its own in the same instant, before any write saw
+	// it, that failure is not reported here; nothing was stored, and the next
+	// attempt meets it again.
+	if parseErr != nil && !storeSide.failed {
+		return errors.NewProcessingError("[processSubtreeDataStream] failed to parse transactions", parseErr)
+	}
 
 	// Check for errors from both operations
 	if storeErr != nil {
@@ -1368,6 +1387,22 @@ func (u *Server) processSubtreeDataStream(ctx context.Context, subtree *subtreep
 		txCount, subtree.RootHash().String())
 
 	return nil
+}
+
+// pipeWriteRecorder forwards writes and records whether any failed. It is written
+// only from the parsing goroutine, through the TeeReader.
+type pipeWriteRecorder struct {
+	w      io.Writer
+	failed bool
+}
+
+func (p *pipeWriteRecorder) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	if err != nil {
+		p.failed = true
+	}
+
+	return n, err
 }
 
 // readTransactionsFromSubtreeDataStream reads transactions directly from subtreeData stream.
