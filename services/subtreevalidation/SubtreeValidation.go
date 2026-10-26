@@ -572,6 +572,15 @@ func (u *Server) blessMissing(ctx context.Context, blockHash chainhash.Hash, sub
 		err = nil
 	}
 
+	// The validator returns a broken spend rule under a ProcessingError. With SkipPolicyChecks,
+	// which only the block paths set, coinbase maturity is checked at the block's height and
+	// finality against the block's parent (selectFinalityComparisonTime), so it is a verdict on
+	// the block. Without it, maturity is checked at tip+1 and finality against the tip's median
+	// time, and a peer one block ahead is not at fault.
+	if err != nil && validationOptions.SkipPolicyChecks && errors.IsBlockSpendRuleViolation(err) {
+		return nil, false, errors.NewTxInvalidError("[blessMissingTransaction][%s/%s][%s] transaction breaks a consensus spend rule", blockHash.String(), subtreeHash.String(), tx.TxID(), err)
+	}
+
 	// Only the validator's created-as-conflicting verdict gets past here: a rejection also
 	// carries the stores' per-input TX_CONFLICTING, deeper in the chain.
 	if err != nil && !validatorCreatedConflicting(err) {

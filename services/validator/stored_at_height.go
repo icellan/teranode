@@ -23,8 +23,8 @@ type InputParent struct {
 // on the height of the block it is in: no input spends a coinbase output not yet mature, and the
 // tx is final. Another candidate block, at another height, may have created the record. It reads
 // and writes nothing, so it never takes a spend: parents gives each input's parent, in input order.
-// An immature spend is TX_INVALID, as the validator answers it on the block path; a tx that is not
-// final fails as the validator fails it, without a verdict.
+// Both are TX_INVALID: opts, with SkipPolicyChecks, carries the block's own candidate times, so either is a verdict on
+// the block, as blessMissingTransaction gives it for a tx it validates (errors.IsBlockSpendRuleViolation).
 func CheckStoredTxAtHeight(tx *bt.Tx, parents []InputParent, blockHeight uint32, tSettings *settings.Settings, opts *Options) error {
 	txID := tx.TxIDChainHash().String()
 
@@ -46,7 +46,8 @@ func CheckStoredTxAtHeight(tx *bt.Tx, parents []InputParent, blockHeight uint32,
 
 	if !skipFinality {
 		if err = util.IsTransactionFinal(tx, blockHeight, comparisonTime); err != nil {
-			return errors.NewUtxoNonFinalError("[CheckStoredTxAtHeight][%s] transaction is not final", txID, err)
+			return errors.NewTxInvalidError("[CheckStoredTxAtHeight][%s] transaction is not final at height %d", txID, blockHeight,
+				errors.NewUtxoNonFinalError("transaction is not final", err))
 		}
 	}
 

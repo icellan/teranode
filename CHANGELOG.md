@@ -128,9 +128,10 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   A block no longer takes a tx's stored conflicting record as its own verdict. Another
   candidate block, at another height, may have created the record, and a tx valid there
   can be invalid at this block's height. On every block path such a tx is now checked
-  again at the block's height for coinbase maturity (`TX_INVALID`) and finality, from the
-  store, without writing anything; a peer subtree still takes the record as before. Each
-  conflicting tx in a block costs a read of its body and its parents, including in a
+  again at the block's height for coinbase maturity and finality, from the store, without
+  writing anything. Either failure is `TX_INVALID`, as for a tx the block validates
+  (#2022); a peer subtree still takes the record as before. Each conflicting tx in a
+  block costs a read of its body and its parents, including in a
   subtree this node validated before the block arrived. Relative lock times (BIP68,
   before Genesis), the script rules of the Genesis boundary and frozen outputs are not
   checked again, and a stored record that is not conflicting is still taken as it was.
@@ -283,6 +284,29 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   connected. Teranode never sends `sendcmpct`, so a well-behaved peer should not
   send these. The bump also bounds how much the wire decoder allocates up front
   for a declared element count. (#1996)
+
+- **A local processing error is no longer charged to a peer.** During catchup and
+  announced-block fetches, a `ProcessingError` with no peer or consensus code in its
+  chain no longer records a reputation failure or a malicious report, and no longer
+  signals a sync-peer rotation. Catchup treats it like other local faults: it clears the
+  block's markers and cached alternative announcers, does not try alternative peers, and
+  counts the attempt toward `blockvalidation_catchup_max_attempts_per_block`. Before, local faults such as a failed conflict-resolution
+  read lowered the serving peer's reputation and could drop it as a sync source. The
+  catchup error type for these is now `local_processing_fault`. Faults that a peer causes
+  are now coded `NETWORK_INVALID_RESPONSE` or `NETWORK_ERROR`, and they are still charged:
+  bytes that do not match the requested hash, headers with no common ancestor, a
+  checkpoint mismatch, and a failed fetch. The catchup dashboard shows these as
+  `network_error`. A checkpoint mismatch was shown as `checkpoint_verification_failed`
+  before. Because these codes count as network errors, more failures now take the
+  existing network-error retry paths. On the announced-block path, a block served for the
+  wrong hash, or a block whose subtrees the peer served with bad bytes, now tries the
+  alternative sources, and the block worker re-queues it. A block whose transaction
+  spends an immature coinbase or is non-final is now rejected as an invalid
+  transaction, not as a processing error. Catchup reports the serving peer malicious
+  for it, the direct block path strikes the peer for a corrupt body, and the legacy
+  route rejects the block as invalid. A block that spends a UTXO this node has frozen,
+  or that hits a UTXO hash mismatch in this node's store, stays a local fault.
+  (#2022)
 
 - **This release removes four Aerospike pruner metrics.** External monitoring systems must
   remove queries for `utxo_pruner_parents_skipped_pruned_total`,

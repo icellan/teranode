@@ -2857,7 +2857,7 @@ func TestValidateSubtreeLeafCount(t *testing.T) {
 	t.Run("OverCap", func(t *testing.T) {
 		err := validateSubtreeLeafCount(subtreeHash, 5, 4)
 		require.Error(t, err)
-		require.True(t, errors.Is(err, errors.ErrProcessing))
+		require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse))
 		require.Contains(t, err.Error(), subtreeHash.String())
 		require.Contains(t, err.Error(), "exceeds policy max")
 	})
@@ -2867,7 +2867,7 @@ func TestValidateSubtreeLeafCount(t *testing.T) {
 		// (bitcoin-sv/teranode#4692) rather than left to the downstream constructor's incidental error.
 		err := validateSubtreeLeafCount(subtreeHash, 0, 4)
 		require.Error(t, err)
-		require.True(t, errors.Is(err, errors.ErrProcessing))
+		require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse))
 		require.Contains(t, err.Error(), subtreeHash.String())
 		require.Contains(t, err.Error(), "subtree has zero nodes")
 	})
@@ -2875,6 +2875,6 @@ func TestValidateSubtreeLeafCount(t *testing.T) {
 	t.Run("LargeOverflow", func(t *testing.T) {
 		err := validateSubtreeLeafCount(subtreeHash, 1<<30, 1<<20)
 		require.Error(t, err)
-		require.True(t, errors.Is(err, errors.ErrProcessing))
+		require.True(t, errors.Is(err, errors.ErrNetworkInvalidResponse))
 	})
 }

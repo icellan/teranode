@@ -150,31 +150,48 @@ func incompleteTreeFromNodes(leafCount int, node func(i int) chainhash.Hash) (*s
 		return nil, errors.NewProcessingError("failed to create subtree structure", err)
 	}
 
-	for i := 0; i < leafCount; i++ {
-		nodeHash := node(i)
-
-		if nodeHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
-			if err = tree.AddCoinbaseNode(); err != nil {
-				return nil, errors.NewProcessingError("failed to add coinbase node to subtree", err)
-			}
-		} else if err = tree.AddNode(nodeHash, 0, 0); err != nil {
-			return nil, errors.NewProcessingError("failed to add node to subtree", err)
-		}
+	if err = addNodes(tree, leafCount, node); err != nil {
+		return nil, errors.NewProcessingError("failed to add nodes to subtree", err)
 	}
 
 	return tree, nil
 }
 
+// addNodes adds leafCount node hashes to tree, node(i) returning the i-th. Whose fault a rejected
+// list is depends on where it came from, so the caller's code on top decides it: a peer code
+// outranks the processing error under it when a peer is charged.
+func addNodes(tree *subtreepkg.Subtree, leafCount int, node func(i int) chainhash.Hash) error {
+	for i := 0; i < leafCount; i++ {
+		nodeHash := node(i)
+
+		if nodeHash.Equal(subtreepkg.CoinbasePlaceholderHashValue) {
+			if err := tree.AddCoinbaseNode(); err != nil {
+				return errors.NewProcessingError("failed to add coinbase node to subtree", err)
+			}
+		} else if err := tree.AddNode(nodeHash, 0, 0); err != nil {
+			return errors.NewProcessingError("failed to add node to subtree", err)
+		}
+	}
+
+	return nil
+}
+
 // subtreeToCheckFromNodes builds the FileTypeSubtreeToCheck form of a subtree from its
 // leafCount node hashes, node(i) returning the i-th, and checks it against the subtree's root.
+// The node hashes are a peer's, so a list the tree rejects (the coinbase placeholder anywhere
+// but first) or one that does not hash to the root is the peer's fault.
 func subtreeToCheckFromNodes(subtreeHash chainhash.Hash, leafCount int, node func(i int) chainhash.Hash) (*subtreepkg.Subtree, []byte, error) {
-	subtreeToCheck, err := incompleteTreeFromNodes(leafCount, node)
+	subtreeToCheck, err := subtreepkg.NewIncompleteTreeByLeafCount(leafCount)
 	if err != nil {
-		return nil, nil, errors.NewProcessingError("[subtreeToCheckFromNodes][%s] failed to build subtree", subtreeHash.String(), err)
+		return nil, nil, errors.NewProcessingError("[subtreeToCheckFromNodes][%s] failed to create subtree structure", subtreeHash.String(), err)
+	}
+
+	if err = addNodes(subtreeToCheck, leafCount, node); err != nil {
+		return nil, nil, errors.NewNetworkInvalidResponseError("[subtreeToCheckFromNodes][%s] failed to build subtree", subtreeHash.String(), err)
 	}
 
 	if !subtreeHash.Equal(*subtreeToCheck.RootHash()) {
-		return nil, nil, errors.NewProcessingError("[subtreeToCheckFromNodes][%s] subtree root hash mismatch: %s", subtreeHash.String(), subtreeToCheck.RootHash().String())
+		return nil, nil, errors.NewNetworkInvalidResponseError("[subtreeToCheckFromNodes][%s] subtree root hash mismatch: %s", subtreeHash.String(), subtreeToCheck.RootHash().String())
 	}
 
 	subtreeBytes, err := subtreeToCheck.Serialize()

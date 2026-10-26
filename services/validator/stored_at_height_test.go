@@ -75,7 +75,7 @@ func TestCheckStoredTxAtHeight(t *testing.T) {
 		require.NoError(t, CheckStoredTxAtHeight(tx, []InputParent{{Height: coinbaseHeight}}, coinbaseHeight, tSettings, blockOptions(mtp)))
 	})
 
-	t.Run("a tx not final at the block's height fails as the validator fails it", func(t *testing.T) {
+	t.Run("a tx not final at the block's height is invalid", func(t *testing.T) {
 		height := coinbaseHeight + maturity
 
 		nonFinal := tx.Clone()
@@ -84,6 +84,7 @@ func TestCheckStoredTxAtHeight(t *testing.T) {
 
 		err := CheckStoredTxAtHeight(nonFinal, []InputParent{{IsCoinbase: true, Height: coinbaseHeight}}, height, tSettings, blockOptions(mtp))
 		require.True(t, errors.Is(err, errors.ErrNonFinal), "%v", err)
+		requireTopLevelTxInvalid(t, err)
 
 		require.NoError(t, CheckStoredTxAtHeight(nonFinal, []InputParent{{IsCoinbase: true, Height: coinbaseHeight}}, height+1, tSettings, blockOptions(mtp)))
 	})
@@ -98,16 +99,27 @@ func TestCheckStoredTxAtHeight(t *testing.T) {
 
 		err := CheckStoredTxAtHeight(nonFinal, parents, height, tSettings, blockOptions(mtp))
 		require.True(t, errors.Is(err, errors.ErrNonFinal), "%v", err)
+		requireTopLevelTxInvalid(t, err)
 
 		require.NoError(t, CheckStoredTxAtHeight(nonFinal, parents, height, tSettings, blockOptions(mtp+1)))
 
-		// as the validator, never a fallback to the tip's time
+		// as the validator, never a fallback to the tip's time, and no verdict without the time
 		err = CheckStoredTxAtHeight(nonFinal, parents, height, tSettings, blockOptions(0))
 		require.True(t, errors.Is(err, errors.ErrProcessing), "%v", err)
+		require.False(t, errors.Is(err, errors.ErrTxInvalid), "%v", err)
 	})
 
 	t.Run("one parent per input", func(t *testing.T) {
 		err := CheckStoredTxAtHeight(tx, nil, coinbaseHeight, tSettings, blockOptions(mtp))
 		require.True(t, errors.Is(err, errors.ErrProcessing), "%v", err)
 	})
+}
+
+// requireTopLevelTxInvalid asserts the verdict is err's own code, not one wrapped deeper.
+func requireTopLevelTxInvalid(t *testing.T, err error) {
+	t.Helper()
+
+	var top *errors.Error
+	require.True(t, errors.As(err, &top), "%v", err)
+	require.Equal(t, errors.ERR_TX_INVALID, top.Code(), "%v", err)
 }
