@@ -167,7 +167,7 @@ type Server struct {
 	// once; see subtreesHandler.
 	peerSubtreeAdmission admissionGate
 
-	// skippedSubtrees keeps peer subtrees announced while the node was not RUNNING, for
+	// skippedSubtrees keeps peer subtrees announced while the node was catching up, for
 	// validation once it is RUNNING again.
 	skippedSubtrees skippedSubtrees
 
@@ -432,6 +432,9 @@ func (u *Server) blockchainSubscriptionListener(ctx context.Context) {
 							}
 							ctxLogger.Errorf("[SubtreeValidation:blockchainSubscriptionListener] failed to update best block: %s", err)
 						}
+
+						// A block can arrive before any peer subtree message after a catchup.
+						u.replaySkippedSubtreesIfRunning(ctx)
 					}
 				}
 			}

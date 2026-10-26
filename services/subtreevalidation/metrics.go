@@ -146,8 +146,9 @@ var (
 	// a metric a spike in the rate would be invisible.
 	prometheusSubtreeAlreadyExistsSkipped prometheus.Counter
 
-	// prometheusSkippedSubtrees counts peer subtrees announced while the node was not RUNNING, by
-	// outcome: recorded (kept for the backfill), dropped_over_cap, replayed.
+	// prometheusSkippedSubtrees counts peer subtrees announced while the node was catching up, by
+	// outcome: recorded (newly kept), evicted (oldest dropped when full), replayed (validated or
+	// already present), replay_failed.
 	prometheusSkippedSubtrees *prometheus.CounterVec
 
 	// prometheusPeerSubtreeAdmissionWait tracks how long a peer subtree waited for a
@@ -382,7 +383,7 @@ func _initPrometheusMetrics() {
 			Namespace: "teranode",
 			Subsystem: "subtreevalidation",
 			Name:      "skipped_peer_subtrees_total",
-			Help:      "Peer subtrees announced while the node was not RUNNING, by outcome (recorded, dropped_over_cap, replayed)",
+			Help:      "Peer subtrees announced while the node was catching up, by outcome (recorded, evicted, replayed, replay_failed)",
 		},
 		[]string{"outcome"},
 	)
