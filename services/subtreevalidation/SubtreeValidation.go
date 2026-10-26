@@ -251,8 +251,8 @@ func (u *Server) DelTxMetaCache(ctx context.Context, hash *chainhash.Hash) error
 	return nil
 }
 
-// txMetaDemotionOps is implemented by txmetacache.TxMetaCache.
-type txMetaDemotionOps interface {
+// demotedDeleter is implemented by txmetacache.TxMetaCache.
+type demotedDeleter interface {
 	DeleteDemoted(hashes []chainhash.Hash)
 }
 
@@ -260,7 +260,7 @@ type txMetaDemotionOps interface {
 // txmetacache.TxMetaCache, keeps later writes from caching them again (see
 // TxMetaCache.DeleteDemoted). Other caching stores get a plain delete.
 func (u *Server) DelTxMetaCacheDemoted(ctx context.Context, hashes []chainhash.Hash) error {
-	if cache, ok := u.utxoStore.(txMetaDemotionOps); ok {
+	if cache, ok := u.utxoStore.(demotedDeleter); ok {
 		cache.DeleteDemoted(hashes)
 
 		return nil
