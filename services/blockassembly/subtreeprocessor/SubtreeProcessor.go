@@ -6648,40 +6648,51 @@ func remainderWorkers(configured int) int {
 // to the set. The inpoint lookups run in parallel, since on a disk tx map each
 // one is a read; the walk itself is sequential in subtree order, which puts
 // parents before children, so a dropped child takes its own descendants with it.
+// Both run a window at a time, so the looked-up inpoints held at once stay
+// bounded however large the remainder is.
 func dropConflictingDescendants(ctx context.Context, remainderSubtrees [][]subtreepkg.Node,
 	conflictingHashes map[chainhash.Hash]struct{}, currentTxMap TxInpointsMap, workers int) error {
-	inpoints := make([][]*subtreepkg.TxInpoints, len(remainderSubtrees))
+	const lookupChunk = 16 << 10
 
-	g, _ := errgroup.WithContext(ctx)
-	g.SetLimit(workers)
-
-	for idx, nodes := range remainderSubtrees {
-		inpoints[idx] = make([]*subtreepkg.TxInpoints, len(nodes))
-
-		g.Go(func() error {
-			for i, node := range nodes {
-				txInpoints, ok := currentTxMap.Get(node.Hash)
-				if !ok {
-					return errors.NewProcessingError("[processRemainderTxHashes] error getting node txInpoints from currentTxMap for %s", node.Hash.String())
-				}
-
-				inpoints[idx][i] = txInpoints
-			}
-
-			return nil
-		})
-	}
-
-	if err := g.Wait(); err != nil {
-		return err
-	}
+	window := workers * lookupChunk
+	inpoints := make([]*subtreepkg.TxInpoints, window)
 
 	for idx, nodes := range remainderSubtrees {
+		// kept never overtakes the node being read, and each window is
+		// looked up before the walk writes into it.
 		kept := nodes[:0]
 
-		for i, node := range nodes {
-			if !rejectConflicting(node.Hash, inpoints[idx][i], conflictingHashes) {
-				kept = append(kept, node)
+		for start := 0; start < len(nodes); start += window {
+			part := nodes[start:min(start+window, len(nodes))]
+
+			g, _ := errgroup.WithContext(ctx)
+			g.SetLimit(workers)
+
+			for c := 0; c < len(part); c += lookupChunk {
+				end := min(c+lookupChunk, len(part))
+
+				g.Go(func() error {
+					for i := c; i < end; i++ {
+						txInpoints, ok := currentTxMap.Get(part[i].Hash)
+						if !ok {
+							return errors.NewProcessingError("[processRemainderTxHashes] error getting node txInpoints from currentTxMap for %s", part[i].Hash.String())
+						}
+
+						inpoints[i] = txInpoints
+					}
+
+					return nil
+				})
+			}
+
+			if err := g.Wait(); err != nil {
+				return err
+			}
+
+			for i, node := range part {
+				if !rejectConflicting(node.Hash, inpoints[i], conflictingHashes) {
+					kept = append(kept, node)
+				}
 			}
 		}
 
