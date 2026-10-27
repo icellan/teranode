@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"sync"
+	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	subtreepkg "github.com/bsv-blockchain/go-subtree"
@@ -67,6 +68,10 @@ const (
 
 	// defaultTipRepairSliceSize is used when BlockValidation.TipRepairSliceSize is unset.
 	defaultTipRepairSliceSize = 250_000
+
+	// tipRepairSubtreeReadAttempts and tipRepairSubtreeReadBackoff match Block.GetSubtrees.
+	tipRepairSubtreeReadAttempts = 3
+	tipRepairSubtreeReadBackoff  = 100 * time.Millisecond
 )
 
 // tipRepairExpired reports whether a tracked block at height has left the window. Each slice
@@ -100,6 +105,9 @@ type minedOnChainBlock struct {
 	// the chain; it is cleared when the block is seen back on the chain.
 	done     bool
 	failures int // permanent failures so far
+	// deferred is set when the block's job kept failing and was set aside, so other
+	// blocks are repaired first.
+	deferred bool
 }
 
 // minedOnChainTracker holds the blocks the overtaken-tip repair watches. A nil tracker
@@ -226,8 +234,7 @@ const (
 	// unmarkJob re-marks the txs of a block that left the chain and are not mined on it.
 	unmarkJob tipRepairJobKind = iota
 	// remineJob marks the txs of a re-marked block mined again, now that it is back on the
-	// chain. Every one of them carries the block's id, so clearing unmined_since is right
-	// for all of them.
+	// chain, for those that still carry the block's id.
 	remineJob
 )
 
@@ -245,6 +252,8 @@ type tipRepairJob struct {
 	current     []subtreepkg.Node
 	marked      int
 	total       int
+	// failures counts the consecutive failed steps.
+	failures int
 }
 
 // signalTipRepair asks the setMined worker for a repair slice. Never blocks; a pending
@@ -414,28 +423,55 @@ func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient b
 			return true, nil
 		}
 
-		return true, u.jobStep(ctx, blockchainClient, job, onMainChain)
+		if err = u.jobStep(ctx, blockchainClient, job, onMainChain); err == nil {
+			job.failures = 0
+			return true, nil
+		}
+
+		// A job that keeps failing is set aside, so it does not hold up the other blocks;
+		// it starts over once they have had their turn.
+		if job.failures++; job.failures >= tipRepairMaxAttempts {
+			u.logger.Warnf("[repairOvertakenTips][%s] setting the repair aside after %d failed steps, other blocks go first", job.hash.String(), job.failures)
+			u.minedOnChain.update(job.hash, job.gen, func(e *minedOnChainBlock) { e.deferred = true })
+			u.tipRepairJob = nil
+		}
+
+		return true, err
 	}
 
+	// Blocks set aside after failing come last.
+	for _, deferred := range []bool{false, true} {
+		if more, started, err := u.startNextJob(ctx, blockchainClient, tracked, onMainChain, deferred); started {
+			return more, err
+		}
+	}
+
+	return false, nil
+}
+
+// startNextJob starts a job on the next block that needs one, among the blocks whose deferred
+// flag matches, and reports whether it found one.
+func (u *BlockValidation) startNextJob(ctx context.Context, blockchainClient blockchain.ClientI, tracked map[chainhash.Hash]minedOnChainBlock,
+	onMainChain map[uint32]bool, deferred bool) (more, started bool, err error) {
 	// A re-marked block back on the chain first: its txs look unmined while mined.
 	for hash, b := range tracked {
-		if b.stamped && onMainChain[b.id] {
-			return true, u.startJob(ctx, blockchainClient, remineJob, hash, b)
+		if b.deferred == deferred && b.stamped && onMainChain[b.id] {
+			return true, true, u.startJob(ctx, blockchainClient, remineJob, hash, b)
 		}
 	}
 
 	for hash, b := range tracked {
-		if !b.written || b.done || onMainChain[b.id] {
+		if b.deferred != deferred || !b.written || b.done || onMainChain[b.id] {
 			continue
 		}
 
 		_, meta, err := blockchainClient.GetBlockHeader(ctx, &hash)
 		if err != nil {
-			return true, u.repairFailed(hash, b.gen, errors.NewServiceError("[repairOvertakenTips][%s] failed to get block header", hash.String(), err))
+			return true, true, u.repairFailed(hash, b.gen, errors.NewServiceError("[repairOvertakenTips][%s] failed to get block header", hash.String(), err))
 		}
 
 		if meta == nil {
-			return true, u.repairFailed(hash, b.gen, errors.NewServiceError("[repairOvertakenTips][%s] block header meta is nil", hash.String()))
+			return true, true, u.repairFailed(hash, b.gen, errors.NewServiceError("[repairOvertakenTips][%s] block header meta is nil", hash.String()))
 		}
 
 		if meta.Invalid {
@@ -444,10 +480,10 @@ func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient b
 			continue
 		}
 
-		return true, u.startJob(ctx, blockchainClient, unmarkJob, hash, b)
+		return true, true, u.startJob(ctx, blockchainClient, unmarkJob, hash, b)
 	}
 
-	return false, nil
+	return false, false, nil
 }
 
 // mainChainIDsLocked returns the ids of the tipRepairWindow blocks ending at the best block,
@@ -504,9 +540,13 @@ func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockch
 		return u.repairFailed(hash, b.gen, errors.NewServiceError("[repairOvertakenTips][%s] failed to get block", hash.String(), err))
 	}
 
-	if kind == remineJob {
-		u.minedOnChain.update(hash, b.gen, func(e *minedOnChainBlock) { e.done = false })
-	}
+	u.minedOnChain.update(hash, b.gen, func(e *minedOnChainBlock) {
+		e.deferred = false
+
+		if kind == remineJob {
+			e.done = false
+		}
+	})
 
 	u.tipRepairJob = &tipRepairJob{kind: kind, hash: hash, id: b.id, gen: b.gen, subtrees: block.Subtrees}
 
@@ -571,8 +611,9 @@ func (u *BlockValidation) jobStep(ctx context.Context, blockchainClient blockcha
 		job.marked += len(notOnLongestChain)
 
 	case remineJob:
-		// Only the txs that were stamped need writing.
-		unmined, err := model.FilterTxsUnmined(ctx, u.logger, u.settings, u.utxoStore, slice)
+		// Only the txs that were stamped need writing, and only those still in this block: a
+		// tx pruned and created again while the block was off the chain is in no block.
+		unmined, err := model.FilterTxsUnmined(ctx, u.logger, u.settings, u.utxoStore, job.id, slice)
 		if err != nil {
 			return errors.NewProcessingError("[repairOvertakenTips][%s] error reading txs of block back on the longest chain", job.hash.String(), err)
 		}
@@ -645,9 +686,41 @@ func (u *BlockValidation) repairFailed(hash chainhash.Hash, gen uint64, err erro
 	return err
 }
 
-// loadSubtreeNodes returns the nodes of one subtree.
+// loadSubtreeNodes returns the nodes of one subtree, read like setTxMined reads it
+// (Block.GetSubtrees): from the .subtree file, or the .subtreeToCheck file when that is
+// missing. A read that fails, for example truncated while another service moves the file, is
+// tried again; one that still cannot be deserialized is a corrupt subtree.
 func (u *BlockValidation) loadSubtreeNodes(ctx context.Context, subtreeHash *chainhash.Hash) ([]subtreepkg.Node, error) {
+	var err error
+
+	for attempt := 0; attempt < tipRepairSubtreeReadAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(tipRepairSubtreeReadBackoff):
+			}
+		}
+
+		var nodes []subtreepkg.Node
+		if nodes, err = u.readSubtreeNodes(ctx, subtreeHash); err == nil {
+			return nodes, nil
+		}
+
+		if errors.Is(err, errors.ErrNotFound) {
+			return nil, err
+		}
+	}
+
+	return nil, errors.NewSubtreeNotFoundError("failed to read subtree %s", subtreeHash.String(), err)
+}
+
+func (u *BlockValidation) readSubtreeNodes(ctx context.Context, subtreeHash *chainhash.Hash) ([]subtreepkg.Node, error) {
 	reader, err := u.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+	if errors.Is(err, errors.ErrNotFound) {
+		reader, err = u.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -658,8 +731,7 @@ func (u *BlockValidation) loadSubtreeNodes(ctx context.Context, subtreeHash *cha
 
 	subtree, err := subtreepkg.NewSubtreeFromReader(bufio.NewReader(reader))
 	if err != nil {
-		// A corrupt subtree cannot be read on a retry either.
-		return nil, errors.NewSubtreeNotFoundError("failed to deserialize subtree %s", subtreeHash.String(), err)
+		return nil, errors.NewProcessingError("failed to deserialize subtree %s", subtreeHash.String(), err)
 	}
 
 	return subtree.Nodes, nil

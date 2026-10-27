@@ -14,13 +14,15 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/settings"
 	blob_memory "github.com/bsv-blockchain/teranode/stores/blob/memory"
+	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
+	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
@@ -136,6 +138,68 @@ func storeScopeTestSubtree(t *testing.T, ctx context.Context, blobStore *blob_me
 	return key
 }
 
+// newScopeTestChain returns a blockchain client over an in-memory SQLite chain store that
+// holds only genesis.
+func newScopeTestChain(t *testing.T, tSettings *settings.Settings) blockchain.ClientI {
+	t.Helper()
+
+	chainStore, err := blockchain_store.NewStore(ulogger.TestLogger{}, &url.URL{Scheme: "sqlitememory"}, tSettings)
+	require.NoError(t, err)
+
+	client, err := blockchain.NewLocalClient(ulogger.TestLogger{}, tSettings, chainStore, nil, nil)
+	require.NoError(t, err)
+
+	return client
+}
+
+// addScopeTestBlock mines a block on parent, adds it to the chain with its mined_set written,
+// and returns it with the id the chain store gave it.
+func addScopeTestBlock(t *testing.T, ctx context.Context, client blockchain.ClientI, parent *chainhash.Hash, height uint32,
+	coinbase *bt.Tx, subtrees ...*chainhash.Hash) *model.Block {
+	t.Helper()
+
+	nBits, err := model.NewNBitFromString("207fffff")
+	require.NoError(t, err)
+
+	header := &model.BlockHeader{
+		Version:        1,
+		HashPrevBlock:  parent,
+		HashMerkleRoot: coinbase.TxIDChainHash(),           // distinct per block
+		Timestamp:      uint32(time.Now().Unix()) + height, //nolint:gosec
+		Bits:           *nBits,
+	}
+
+	for ok, _, _ := header.HasMetTargetDifficulty(); !ok; ok, _, _ = header.HasMetTargetDifficulty() {
+		header.Nonce++
+	}
+
+	block, err := model.NewBlock(header, coinbase, subtrees, uint64(1+2*len(subtrees)), 0, height, 0) //nolint:gosec
+	require.NoError(t, err)
+	require.NoError(t, client.AddBlock(ctx, block, "test", blockchainoptions.WithSubtreesSet(true)))
+	// Block validation has finished with it: a reorg waits for blocks whose mined_set is unset.
+	require.NoError(t, client.SetBlockMinedSet(ctx, block.Hash()))
+
+	_, meta, err := client.GetBlockHeader(ctx, block.Hash())
+	require.NoError(t, err)
+
+	block.ID = meta.ID
+
+	return block
+}
+
+// mineScopeTestTxs writes hashes as mined on the longest chain in block.
+func mineScopeTestTxs(t *testing.T, ctx context.Context, store utxostore.Store, block *model.Block, hashes ...chainhash.Hash) {
+	t.Helper()
+
+	ptrs := make([]*chainhash.Hash, len(hashes))
+	for i := range hashes {
+		ptrs[i] = &hashes[i]
+	}
+
+	_, err := store.SetMinedMulti(ctx, ptrs, utxostore.MinedBlockInfo{BlockID: block.ID, BlockHeight: block.Height, OnLongestChain: true})
+	require.NoError(t, err)
+}
+
 // TestReorgBlocks_MarkFalseScope pins issue 2051: a reorg marks not-on-longest-chain only
 // the txs whose chain state it changes (moved back and not moved forward), never the whole
 // block assembly mempool.
@@ -156,11 +220,10 @@ func TestReorgBlocks_MarkFalseScope(t *testing.T) {
 
 	store := newScopeMarkRecorder(sqlStore)
 	blobStore := blob_memory.New()
+	chain := newScopeTestChain(t, tSettings)
 
-	const blockAID = uint32(10)
-
-	a1 := createScopeTestTx(t, ctx, store, 0, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: blockAID, BlockHeight: 2, OnLongestChain: true}))
-	shared := createScopeTestTx(t, ctx, store, 1, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: blockAID, BlockHeight: 2, OnLongestChain: true}))
+	a1 := createScopeTestTx(t, ctx, store, 0)
+	shared := createScopeTestTx(t, ctx, store, 1)
 	b1 := createScopeTestTx(t, ctx, store, 2)
 	m1 := createScopeTestTx(t, ctx, store, 3)
 	m2 := createScopeTestTx(t, ctx, store, 4)
@@ -178,41 +241,12 @@ func TestReorgBlocks_MarkFalseScope(t *testing.T) {
 	_, err = sqlStore.Create(ctx, coinbaseTx3, 2)
 	require.NoError(t, err)
 
-	blockA := &model.Block{
-		ID:         blockAID,
-		Height:     2,
-		CoinbaseTx: coinbaseTx2,
-		Subtrees:   []*chainhash.Hash{storeScopeTestSubtree(t, ctx, blobStore, a1, shared)},
-		Header: &model.BlockHeader{
-			Version:        1,
-			HashPrevBlock:  prevBlockHeader.Hash(),
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      3000000001,
-			Bits:           model.NBit{},
-			Nonce:          501,
-		},
-	}
-
-	blockB := &model.Block{
-		ID:         blockAID + 1,
-		Height:     2,
-		CoinbaseTx: coinbaseTx3,
-		Subtrees:   []*chainhash.Hash{storeScopeTestSubtree(t, ctx, blobStore, shared, b1)},
-		Header: &model.BlockHeader{
-			Version:        1,
-			HashPrevBlock:  prevBlockHeader.Hash(),
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      3000000002,
-			Bits:           model.NBit{},
-			Nonce:          502,
-		},
-	}
-
-	mockBlockchainClient := &blockchain.Mock{}
-	mockBlockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
-	mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
-	mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(prevBlockHeader, &model.BlockHeaderMeta{}, nil)
-	mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
+	// A and B compete on genesis. A was the tip and mined a1 and shared; B also mines shared,
+	// and b1, which as a side-chain tx is still unmined.
+	genesis := tSettings.ChainCfgParams.GenesisHash
+	blockA := addScopeTestBlock(t, ctx, chain, genesis, 1, coinbaseTx2, storeScopeTestSubtree(t, ctx, blobStore, a1, shared))
+	blockB := addScopeTestBlock(t, ctx, chain, genesis, 1, coinbaseTx3, storeScopeTestSubtree(t, ctx, blobStore, shared, b1))
+	mineScopeTestTxs(t, ctx, store, blockA, a1, shared)
 
 	newSubtreeChan := make(chan NewSubtreeRequest, 10)
 	go func() {
@@ -224,7 +258,7 @@ func TestReorgBlocks_MarkFalseScope(t *testing.T) {
 	}()
 	t.Cleanup(func() { close(newSubtreeChan) })
 
-	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, blobStore, mockBlockchainClient, store, newSubtreeChan)
+	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, blobStore, chain, store, newSubtreeChan)
 	require.NoError(t, err)
 	stp.Start(ctx)
 
@@ -294,48 +328,27 @@ func TestReorgBlocks_InvalidMoveBackChecksOnlyItsOwnTxs(t *testing.T) {
 
 	store := newScopeMarkRecorder(sqlStore)
 	blobStore := blob_memory.New()
+	chain := newScopeTestChain(t, tSettings)
 
-	const (
-		invalidBlockID = uint32(20)
-		validBlockID   = uint32(5)
-	)
-
-	a1 := createScopeTestTx(t, ctx, store, 0, utxostore.WithMinedBlockInfo(utxostore.MinedBlockInfo{BlockID: invalidBlockID, BlockHeight: 2, OnLongestChain: true}))
-	dup := createScopeTestTx(t, ctx, store, 1, utxostore.WithMinedBlockInfo(
-		utxostore.MinedBlockInfo{BlockID: validBlockID, BlockHeight: 1, OnLongestChain: true},
-		utxostore.MinedBlockInfo{BlockID: invalidBlockID, BlockHeight: 2, OnLongestChain: true},
-	))
+	a1 := createScopeTestTx(t, ctx, store, 0)
+	dup := createScopeTestTx(t, ctx, store, 1)
 	m1 := createScopeTestTx(t, ctx, store, 2)
 
 	_, err = sqlStore.Create(ctx, coinbaseTx2, 2)
 	require.NoError(t, err)
 
-	blockA := &model.Block{
-		ID:         invalidBlockID,
-		Height:     2,
-		CoinbaseTx: coinbaseTx2,
-		Subtrees:   []*chainhash.Hash{storeScopeTestSubtree(t, ctx, blobStore, a1, dup)},
-		Header: &model.BlockHeader{
-			Version:        1,
-			HashPrevBlock:  prevBlockHeader.Hash(),
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      3000000011,
-			Bits:           model.NBit{},
-			Nonce:          511,
-		},
-	}
+	// genesis -> V -> A. V mined dup; A mined a1 and dup again, and is then invalidated, so
+	// V is the tip.
+	blockV := addScopeTestBlock(t, ctx, chain, tSettings.ChainCfgParams.GenesisHash, 1, coinbaseTx3)
+	blockA := addScopeTestBlock(t, ctx, chain, blockV.Hash(), 2, coinbaseTx2, storeScopeTestSubtree(t, ctx, blobStore, a1, dup))
+	mineScopeTestTxs(t, ctx, store, blockV, dup)
+	mineScopeTestTxs(t, ctx, store, blockA, a1, dup)
 
-	mockBlockchainClient := &blockchain.Mock{}
-	mockBlockchainClient.On("GetBlocksMinedNotSet", mock.Anything).Return([]*model.Block{}, nil)
-	mockBlockchainClient.On("SetBlockProcessedAt", mock.Anything, mock.AnythingOfType("*chainhash.Hash"), mock.AnythingOfType("[]bool")).Return(nil)
-	mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(prevBlockHeader, &model.BlockHeaderMeta{Invalid: true}, nil)
-	mockBlockchainClient.On("GetBlockHeaders", mock.Anything, mock.Anything, mock.Anything).
-		Return([]*model.BlockHeader{}, []*model.BlockHeaderMeta{{ID: validBlockID}}, nil)
-	// Only reached for a tx in neither the invalid block alone nor a recent block, i.e. a
-	// mempool tx that should never have been checked.
-	mockBlockchainClient.On("CheckBlockIsInCurrentChain", mock.Anything, mock.Anything).Return(false, nil)
-	mockBlockchainClient.On("GetBlock", mock.Anything, mock.Anything).Return(&model.Block{Header: prevBlockHeader, Height: 1}, nil)
-	mockBlockchainClient.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
+	_, err = chain.InvalidateBlock(ctx, blockA.Hash())
+	require.NoError(t, err)
+	// Invalidating clears A's mined_set for block validation's unset-mined pass, and the
+	// reorg waits for that pass to finish.
+	require.NoError(t, chain.SetBlockMinedSet(ctx, blockA.Hash()))
 
 	newSubtreeChan := make(chan NewSubtreeRequest, 10)
 	go func() {
@@ -347,7 +360,7 @@ func TestReorgBlocks_InvalidMoveBackChecksOnlyItsOwnTxs(t *testing.T) {
 	}()
 	t.Cleanup(func() { close(newSubtreeChan) })
 
-	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, blobStore, mockBlockchainClient, store, newSubtreeChan)
+	stp, err := NewSubtreeProcessor(ctx, ulogger.TestLogger{}, tSettings, blobStore, chain, store, newSubtreeChan)
 	require.NoError(t, err)
 	stp.Start(ctx)
 

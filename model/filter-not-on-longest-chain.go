@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
@@ -141,11 +142,11 @@ func FilterTxsNotOnLongestChain(ctx context.Context, logger ulogger.Logger, tSet
 	return notOnLongestChain, nil
 }
 
-// FilterTxsUnmined returns the subset of hashes whose unmined_since is set: the txs a
-// MarkTransactionsOnLongestChain(true) would change. Hashes missing from the UTXO store
-// are skipped.
-func FilterTxsUnmined(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, utxoStore txMetaBatchReader, hashes []chainhash.Hash) ([]chainhash.Hash, error) {
-	items, err := batchReadTxMeta(ctx, logger, tSettings, utxoStore, hashes, fields.UnminedSince)
+// FilterTxsUnmined returns the subset of hashes whose unmined_since is set and that are
+// mined in blockID: the txs of that block a MarkTransactionsOnLongestChain(true) would
+// change. Hashes missing from the UTXO store are skipped.
+func FilterTxsUnmined(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, utxoStore txMetaBatchReader, blockID uint32, hashes []chainhash.Hash) ([]chainhash.Hash, error) {
+	items, err := batchReadTxMeta(ctx, logger, tSettings, utxoStore, hashes, fields.UnminedSince, fields.BlockIDs)
 	if err != nil {
 		return nil, errors.NewProcessingError("[FilterTxsUnmined] error getting transactions from utxo store", err)
 	}
@@ -161,7 +162,7 @@ func FilterTxsUnmined(ctx context.Context, logger ulogger.Logger, tSettings *set
 			return nil, errors.NewProcessingError("[FilterTxsUnmined] error getting transaction %s from utxo store", item.Hash.String(), item.Err)
 		}
 
-		if item.Data != nil && item.Data.UnminedSince != 0 {
+		if item.Data != nil && item.Data.UnminedSince != 0 && slices.Contains(item.Data.BlockIDs, blockID) {
 			unmined = append(unmined, item.Hash)
 		}
 	}

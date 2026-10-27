@@ -2,6 +2,7 @@ package blockvalidation
 
 import (
 	"context"
+	"io"
 	"net/url"
 	"slices"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
+	blobopts "github.com/bsv-blockchain/teranode/stores/blob/options"
 	blockchain_store "github.com/bsv-blockchain/teranode/stores/blockchain"
 	blockchainoptions "github.com/bsv-blockchain/teranode/stores/blockchain/options"
 	utxostore "github.com/bsv-blockchain/teranode/stores/utxo"
@@ -106,6 +108,7 @@ type overtakeFixture struct {
 	nBits                   *model.NBit
 	blockB                  *model.Block
 	blockBID                uint32
+	bOnlyTx                 *bt.Tx
 	bOnly                   *chainhash.Hash
 	shared                  *chainhash.Hash
 }
@@ -173,6 +176,7 @@ func newOvertakeFixture(t *testing.T) *overtakeFixture {
 		nBits:                   nBits,
 		blockB:                  blockB,
 		blockBID:                metaB.ID,
+		bOnlyTx:                 bOnlyTx,
 		bOnly:                   bOnlyTx.TxIDChainHash(),
 		shared:                  sharedTx.TxIDChainHash(),
 	}
@@ -985,4 +989,138 @@ func TestRepairOvertakenTips_InvalidBlockDropped(t *testing.T) {
 
 	_, tracked := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
 	require.False(t, tracked, "the invalid block is dropped")
+}
+
+// TestRepairOvertakenTips_SubtreeToCheckOnly: setTxMined reads a subtree from its
+// .subtreeToCheck file when the .subtree file is not there, so the repair must too, or a
+// block marked mined that way is never repaired.
+func TestRepairOvertakenTips_SubtreeToCheckOnly(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	subtreeHash := f.blockB.Subtrees[0]
+	subtreeBytes, err := f.subtreeStore.Get(f.ctx, subtreeHash[:], fileformat.FileTypeSubtree)
+	require.NoError(t, err)
+	require.NoError(t, f.subtreeStore.Set(f.ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck, subtreeBytes))
+	require.NoError(t, f.subtreeStore.Del(f.ctx, subtreeHash[:], fileformat.FileTypeSubtree))
+
+	_, err = drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "the subtree is read from its .subtreeToCheck file")
+}
+
+// truncatingSubtreeStore returns a truncated reader for the next truncate reads: a subtree
+// read while another service moves the file.
+type truncatingSubtreeStore struct {
+	blob.Store
+	truncate atomic.Int32
+}
+
+func (s *truncatingSubtreeStore) GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...blobopts.FileOption) (io.ReadCloser, error) {
+	reader, err := s.Store.GetIoReader(ctx, key, fileType, opts...)
+	if err != nil || s.truncate.Load() <= 0 {
+		return reader, err
+	}
+
+	s.truncate.Add(-1)
+
+	return struct {
+		io.Reader
+		io.Closer
+	}{io.LimitReader(reader, 10), reader}, nil
+}
+
+// TestRepairOvertakenTips_TruncatedSubtreeReadRetried: a truncated subtree read must be
+// retried, not taken for a subtree that is gone, which would skip its txs for good.
+func TestRepairOvertakenTips_TruncatedSubtreeReadRetried(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	store := &truncatingSubtreeStore{Store: f.subtreeStore}
+	store.truncate.Store(1)
+	bv.subtreeStore = store
+
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "the subtree is read again and repaired")
+}
+
+// TestRepairOvertakenTips_StuckJobYields: a job that keeps failing must not hold up the
+// repair of other blocks.
+func TestRepairOvertakenTips_StuckJobYields(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	// A second overtaken block, written mined while it was on the chain. It has no txs, so
+	// its repair finishes in one step.
+	time.Sleep(10 * time.Millisecond)
+
+	fork := coinbaseOnlyBlock(t, f.tSettings.ChainCfgParams.GenesisHash, f.nBits, 1, 0xf1)
+	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, fork, "test", blockchainoptions.WithSubtreesSet(true)))
+
+	_, forkMeta, err := f.blockchainClient.GetBlockHeader(f.ctx, fork.Hash())
+	require.NoError(t, err)
+	require.False(t, f.onChain(t, forkMeta.ID))
+
+	f.store.failMarkFalse.Store(1 << 30)
+
+	// B's job starts first and gets stuck.
+	_, err = bv.tipRepairSlice(f.ctx, bv.blockchainClient)
+	require.NoError(t, err)
+	require.NotNil(t, bv.tipRepairJob)
+	require.Equal(t, *f.blockB.Hash(), bv.tipRepairJob.hash)
+
+	bv.minedOnChain.track(*fork.Hash(), forkMeta.ID, forkMeta.Height)
+	require.True(t, bv.minedOnChain.markWritten(*fork.Hash()))
+
+	for i := 0; i < 3*tipRepairMaxAttempts; i++ {
+		_, _ = bv.tipRepairSlice(f.ctx, bv.blockchainClient)
+	}
+
+	require.True(t, bv.minedOnChain.snapshot()[*fork.Hash()].done, "the other block is repaired while B's job keeps failing")
+	require.False(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "B is not done")
+
+	f.store.failMarkFalse.Store(0)
+
+	_, err = drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "B is repaired once the failure clears")
+}
+
+// TestRepairOvertakenTips_RemineSkipsTxNotInBlock: a tx of a re-marked block that was pruned
+// and created again unmined while the block was off the chain no longer carries the block's
+// id. Marking it mined when the block comes back would leave it looking mined in no block.
+func TestRepairOvertakenTips_RemineSkipsTxNotInBlock(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].stamped, "precondition: B's txs were re-marked")
+
+	require.NoError(t, f.store.Store.Delete(f.ctx, f.bOnly))
+	_, _, err = f.store.Store.SpendAndCreate(f.ctx, f.bOnlyTx, 1, utxostore.WithCreateOnly())
+	require.NoError(t, err)
+
+	f.extendB(t)
+
+	_, err = drainTipRepair(t, bv)
+	require.NoError(t, err)
+
+	m, err := f.store.Store.Get(f.ctx, f.bOnly, fields.UnminedSince, fields.BlockIDs)
+	require.NoError(t, err)
+	require.Empty(t, m.BlockIDs, "precondition: the re-created tx is in no block")
+	require.NotZero(t, m.UnminedSince, "a tx in no block must stay unmined")
 }
