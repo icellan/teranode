@@ -679,12 +679,8 @@ func TestShouldHandleReorg(t *testing.T) {
 	err = waitForBestBlockHash(ctx, ba.blockchainClient, chainBHeader1.Hash(), 10*time.Second)
 	require.NoError(t, err, "Timeout waiting for reorganization to Chain B")
 
-	// Additional wait to ensure block assembly has processed the reorg
-	time.Sleep(500 * time.Millisecond)
-
 	// Verify transactions are still present after reorg
-	mc2, st2, err := ba.blockAssembler.GetMiningCandidate(context.Background())
-	require.NoError(t, err)
+	mc2, st2 := waitForMiningCandidate(t, ba.blockAssembler, chainBHeader1.Hash(), 10*time.Second)
 	require.NotNil(t, mc2)
 	require.NotEmpty(t, st2)
 
