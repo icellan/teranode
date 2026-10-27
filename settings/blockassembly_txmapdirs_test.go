@@ -228,6 +228,30 @@ func requireUnsetInCommittedConf(t *testing.T, key string) {
 	}
 }
 
+// readSettingsFile must read values the way gocore does, or
+// requireUnsetInCommittedConf passes a committed value that NewSettings sees as
+// set. gocore v1.1.0 strips a pair of quotes only from a value longer than two
+// characters, so `key = ""` reaches NewSettings as the literal "", and it cuts a
+// value at the first #, not only at " #".
+func TestReadSettingsFile_MatchesGocoreValueParsing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.conf")
+	require.NoError(t, os.WriteFile(path, []byte(
+		"quotedEmpty = \"\"\n"+
+			"quotedPath = \"/data/x\"\n"+
+			"singleQuote = \"\n"+
+			"hashInValue = /data/x#y\n"+
+			"spacedComment = /data/z # note\n",
+	), 0o600))
+
+	conf := readSettingsFile(t, path)
+
+	require.Equal(t, `""`, conf["quotedEmpty"])
+	require.Equal(t, "/data/x", conf["quotedPath"])
+	require.Equal(t, `"`, conf["singleQuote"])
+	require.Equal(t, "/data/x", conf["hashInValue"])
+	require.Equal(t, "/data/z", conf["spacedComment"])
+}
+
 // ignoreLocalConf blanks key in the environment, which gocore reads before any
 // file, when a loaded conf sets it, so a settings_local.conf cannot reach
 // NewSettings. Without one, as in CI, NewSettings still falls back to the code
