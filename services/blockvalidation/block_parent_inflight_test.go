@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"sync"
 	"testing"
 	"time"
 
@@ -757,30 +756,36 @@ func TestClaimFetchMark_DuplicateOfInFlightBlockReleased(t *testing.T) {
 }
 
 // TestClaimFetchMark_FirstFetcherQueuesDuringDuplicateCheck pins oskarszoon's interleaving: a
-// duplicate sees the block not yet in flight, then the first fetcher queues it and drops its mark.
+// duplicate sees the block not in flight, then the first fetcher marks, queues and releases it.
 // Checking before marking let the duplicate take a mark after that and keep it, so once the block
-// was stored its children waited on the duplicate's fetch. The first fetcher's queue-and-release
-// runs inside the duplicate's in-flight check, the window that order left open.
+// was stored its children waited on the duplicate's fetch. No mark exists at the start, so the
+// duplicate's in-flight check reaches the validating check, where the first fetcher runs. With the
+// mark taken first, the duplicate holds it by then and the first fetcher queues without one.
 func TestClaimFetchMark_FirstFetcherQueuesDuringDuplicateCheck(t *testing.T) {
 	initPrometheusMetrics()
 	server, hashes := newParentInFlightServer(t)
 	parent := hashes[0]
+	pq := server.blockPriorityQueue
 
-	first := server.claimFetchMark(parent)
-	require.True(t, fetchMarked(server.blockPriorityQueue, parent))
-
-	var queueOnce sync.Once
-
-	firstQueuesAndReleases := func() {
-		queueOnce.Do(func() {
-			server.blockPriorityQueue.Add(processBlockFound{hash: parent}, PriorityChainExtending, 2)
-			first()
-		})
-	}
+	var (
+		firstFetcherRan       bool
+		duplicateMarkedFirst  bool
+		firstFetcherHeldAMark bool
+	)
 
 	server.forkManager.SetValidatingCheck(func(hash *chainhash.Hash) bool {
-		if hash.IsEqual(parent) {
-			firstQueuesAndReleases()
+		if !hash.IsEqual(parent) || firstFetcherRan {
+			return false
+		}
+
+		firstFetcherRan = true
+		duplicateMarkedFirst = fetchMarked(pq, parent)
+
+		firstFetcherHeldAMark = pq.MarkFetching(parent)
+		pq.Add(processBlockFound{hash: parent}, PriorityChainExtending, 2)
+
+		if firstFetcherHeldAMark {
+			pq.UnmarkFetching(parent)
 		}
 
 		return false
@@ -789,10 +794,12 @@ func TestClaimFetchMark_FirstFetcherQueuesDuringDuplicateCheck(t *testing.T) {
 	duplicate := server.claimFetchMark(parent)
 	defer duplicate()
 
-	// The duplicate may not have looked at the block at all; the first fetcher finishes either way.
-	firstQueuesAndReleases()
+	require.True(t, firstFetcherRan, "the first fetcher must run inside the duplicate's in-flight check")
 
-	require.False(t, fetchMarked(server.blockPriorityQueue, parent), "a duplicate must not keep a mark taken after the first fetcher queued the block")
+	// The duplicate holds a mark either way; it must be one taken before the first fetcher queued.
+	require.True(t, fetchMarked(pq, parent))
+	require.True(t, duplicateMarkedFirst, "the duplicate kept a mark taken after the first fetcher queued the block and let go of its own")
+	require.False(t, firstFetcherHeldAMark)
 }
 
 // TestClaimFetchMark_FreeBlockHeldUntilReleased pins the normal case and that releasing twice is

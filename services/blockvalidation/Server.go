@@ -2602,7 +2602,9 @@ func (u *Server) wireValidationInFlight() {
 // The caller checks the store after this, so a block that finished in between is caught there.
 func (u *Server) claimFetchMark(hash *chainhash.Hash) func() {
 	if !u.blockPriorityQueue.MarkFetching(hash) {
-		return func() {}
+		return func() {
+			// Another fetch holds the mark and drops it itself.
+		}
 	}
 
 	var once sync.Once
