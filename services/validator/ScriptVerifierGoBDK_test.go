@@ -266,6 +266,16 @@ func TestScriptVerifierGoBDKReRunsPolicyScriptErrorsInConsensusMode(t *testing.T
 		require.Zero(t, fake.rerunCalls)
 	})
 
+	t.Run("post-Genesis stack size: TxPolicy without a re-run", func(t *testing.T) {
+		// The re-run has the same stack memory cap, so it could only report policy again.
+		genesis := chaincfg.TestNetParams.GenesisActivationHeight
+		verifier, fake := newVerifier(bdkscript.NewScriptError(bdkscript.SCRIPT_ERR_STACK_SIZE), nil)
+
+		err := verifier.ValidateTransaction(aTx, genesis+100, false, []uint32{genesis + 1})
+		require.ErrorIs(t, err, errors.ErrTxPolicy)
+		require.Zero(t, fake.rerunCalls)
+	})
+
 	t.Run("engine fault in the re-run: Processing", func(t *testing.T) {
 		verifier, _ := newVerifier(policyScriptErr, bdkscript.NewScriptError(bdkscript.SCRIPT_ERR_CGO_EXCEPTION))
 

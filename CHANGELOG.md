@@ -123,7 +123,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   stack memory is capped at `maxstackmemoryusagepolicy` rather than the unlimited
   consensus default, and reaching the cap is `TX_POLICY`. The exception, with or
   without a re-run, is `STACK_SIZE` on a tx with a pre-Genesis input: it can be the
-  1000-element consensus limit, so it is `TX_INVALID`. RPC and propagation clients that act on the error code see the new codes.
+  1000-element consensus limit, so it is `TX_INVALID`. RPC and propagation clients that act on the error code see the new codes (#2068).
 
 - **A block's tx is created as conflicting only when it is a double spend and nothing
   else.** Block validation used to create a tx as conflicting as soon as one of its inputs

@@ -384,9 +384,15 @@ func (v *scriptVerifierGoBDK) classifyPolicyScriptError(tx *bt.Tx, eTxBytes []by
 		return errors.NewInvalidArgumentError("failed conversion for block height", errConv)
 	}
 
-	// Decided without a re-run, so that holding every slot cannot turn it into policy.
+	// STACK_SIZE is decided without a re-run. Pre-Genesis, so that holding every
+	// slot cannot turn it into policy. Otherwise it is the stack memory cap, which
+	// consensusRerun shares, so a re-run could only report policy again.
 	if v.isPreGenesisStackSize(errVerify, utxoHeights) {
 		return errors.NewTxInvalidError(errMsgInvalidTx, bdkCause(errors.ERR_TX_INVALID, errVerify))
+	}
+
+	if isStackSize(errVerify) {
+		return v.mapBDKValidationError(errVerify, false)
 	}
 
 	select {
@@ -435,8 +441,7 @@ func (v *scriptVerifierGoBDK) classifyPolicyScriptError(tx *bt.Tx, eTxBytes []by
 // towards not publishing. A pre-Genesis script cannot reach the default 100 MB
 // policy memory limit on its own.
 func (v *scriptVerifierGoBDK) isPreGenesisStackSize(err error, utxoHeights []int32) bool {
-	var scriptErr bdkscript.ScriptError
-	if !errors.As(err, &scriptErr) || scriptErr.Code() != bdkscript.SCRIPT_ERR_STACK_SIZE {
+	if !isStackSize(err) {
 		return false
 	}
 
@@ -447,6 +452,11 @@ func (v *scriptVerifierGoBDK) isPreGenesisStackSize(err error, utxoHeights []int
 	}
 
 	return false
+}
+
+func isStackSize(err error) bool {
+	var scriptErr bdkscript.ScriptError
+	return errors.As(err, &scriptErr) && scriptErr.Code() == bdkscript.SCRIPT_ERR_STACK_SIZE
 }
 
 // bdkCause turns the engine's own description of the failure into a typed link
