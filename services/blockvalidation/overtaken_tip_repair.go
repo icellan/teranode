@@ -42,8 +42,11 @@ import (
 // memory. After a restart the tracker is rebuilt from the chain without knowing which
 // blocks were re-marked, so a re-marked block that comes back onto the chain afterwards
 // keeps those txs flagged unmined until block assembly's next unmined-transaction load
-// fixes them (fixUnminedSinceInconsistencies); and fork blocks deeper than
-// tipRepairSeedForkDepth at the restart are not repaired.
+// fixes them (fixUnminedSinceInconsistencies). That is the safe direction. The unsafe one
+// remains for fork blocks deeper than tipRepairSeedForkDepth when the seed runs: the seed
+// does not see them, so if one was overtaken with its repair unfinished, or with a
+// setTxMined that cleared some of its txs and then failed, those txs keep looking mined
+// while off the chain, and nothing else re-marks them.
 
 const (
 	// tipRepairWindow is how deep below the best block a tracked block is kept. A reorg
@@ -111,10 +114,9 @@ func newMinedOnChainTracker() *minedOnChainTracker {
 	return &minedOnChainTracker{blocks: make(map[chainhash.Hash]minedOnChainBlock)}
 }
 
-// track watches a block. With written=false a new on-chain write is starting: it clears the
-// block's txs again, so the block gets a new gen and starts over. With written=true (the
-// restart seed) a block already watched keeps its state.
-func (t *minedOnChainTracker) track(hash chainhash.Hash, id, height uint32, written bool) {
+// track watches a block whose on-chain write is starting: the write clears the block's txs
+// again, so the block gets a new gen and starts over.
+func (t *minedOnChainTracker) track(hash chainhash.Hash, id, height uint32) {
 	if t == nil {
 		return
 	}
@@ -122,13 +124,25 @@ func (t *minedOnChainTracker) track(hash chainhash.Hash, id, height uint32, writ
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	b, ok := t.blocks[hash]
-	if ok && written {
+	t.nextGen++
+	t.blocks[hash] = minedOnChainBlock{id: id, height: height, gen: t.nextGen, failures: t.blocks[hash].failures}
+}
+
+// seed watches a block found by the restart seed. A block already watched keeps its state.
+func (t *minedOnChainTracker) seed(hash chainhash.Hash, id, height uint32, written bool) {
+	if t == nil {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if _, ok := t.blocks[hash]; ok {
 		return
 	}
 
 	t.nextGen++
-	t.blocks[hash] = minedOnChainBlock{id: id, height: height, gen: t.nextGen, written: written, failures: b.failures}
+	t.blocks[hash] = minedOnChainBlock{id: id, height: height, gen: t.nextGen, written: written}
 }
 
 // markWritten records that the block's setTxMined write has completed and reports whether
@@ -306,7 +320,15 @@ func (u *BlockValidation) seedMinedOnChainTrackerLocked(ctx context.Context, blo
 			return errors.NewServiceError("[repairOvertakenTips] seed: failed to get block header %s", header.Hash().String(), err)
 		}
 
-		u.trackMinedHeaders([]*model.BlockHeader{header}, []*model.BlockHeaderMeta{meta})
+		if meta == nil || meta.Invalid {
+			continue
+		}
+
+		// A block whose mined_set is not written may still have had txs cleared by a
+		// setTxMined that failed part way before the restart. Its retry, with
+		// onLongestChain=false once it is off the chain, leaves unmined_since alone, so it
+		// is watched unwritten and becomes repairable when that retry completes.
+		u.minedOnChain.seed(*header.Hash(), meta.ID, meta.Height, meta.MinedSet)
 	}
 
 	u.tipRepairSeeded = true
@@ -320,7 +342,7 @@ func (u *BlockValidation) trackMinedHeaders(headers []*model.BlockHeader, metas 
 			continue
 		}
 
-		u.minedOnChain.track(*headers[i].Hash(), meta.ID, meta.Height, true)
+		u.minedOnChain.seed(*headers[i].Hash(), meta.ID, meta.Height, true)
 	}
 }
 
@@ -332,7 +354,10 @@ func (u *BlockValidation) trackMinedHeaders(headers []*model.BlockHeader, metas 
 //
 // The repair is serialised with this process's setMined worker only. Several block
 // validation instances writing setTxMined for the same chain would each run their own
-// repair, unserialised against the others' writes.
+// repair, unserialised against the others' writes. That race errs on the safe side: a
+// mark(false) landing after another instance's setTxMined leaves the tx's block ids alone,
+// so the tx is over-retained (flagged unmined while mined on the chain) until
+// fixUnminedSinceInconsistencies clears it, never pruned while off the chain.
 func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient blockchain.ClientI) (more bool, err error) {
 	u.tipRepairMu.Lock()
 	defer u.tipRepairMu.Unlock()

@@ -30,15 +30,18 @@ import (
 )
 
 // overtakeTestStore wraps the UTXO store so a test can act at precise points:
-// afterSetMined runs once, right after the first SetMinedMulti for blockID, and
-// failMarkFalse makes the next N MarkTransactionsOnLongestChain(false) calls fail.
+// afterSetMined runs once, right after the first SetMinedMulti for blockID,
+// failMarkFalse makes the next N MarkTransactionsOnLongestChain(false) calls fail, and
+// failAfterSetMined makes SetMinedMulti fail after its write landed: a setTxMined that
+// cleared unmined_since and then failed, leaving the block's mined_set unwritten.
 type overtakeTestStore struct {
 	utxostore.Store
 
-	blockID       uint32
-	once          sync.Once
-	afterSetMined func()
-	failMarkFalse atomic.Int32
+	blockID           uint32
+	once              sync.Once
+	afterSetMined     func()
+	failMarkFalse     atomic.Int32
+	failAfterSetMined atomic.Bool
 
 	markedTrueMu sync.Mutex
 	markedTrue   []chainhash.Hash // every hash passed to MarkTransactionsOnLongestChain(true)
@@ -46,6 +49,10 @@ type overtakeTestStore struct {
 
 func (s *overtakeTestStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxostore.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
 	res, err := s.Store.SetMinedMulti(ctx, hashes, minedBlockInfo)
+	if err == nil && s.failAfterSetMined.Load() {
+		return nil, errors.NewStorageError("injected failure after the write")
+	}
+
 	if err == nil && s.afterSetMined != nil && minedBlockInfo.BlockID == s.blockID {
 		s.once.Do(s.afterSetMined)
 	}
@@ -628,6 +635,39 @@ func TestRepairOvertakenTips_SeedAfterRestart(t *testing.T) {
 	require.Zero(t, f.unminedSince(t, f.shared), "a tx also mined on the winning chain must stay mined")
 }
 
+// TestRepairOvertakenTips_PartialWriteSeededBeforeRetry: B's setTxMined clears its txs and
+// then fails, so B's mined_set stays unwritten. The node restarts, the competing chain
+// overtakes B, and the restarted process seeds the tracker before B's retry. The retry runs
+// with onLongestChain=false, which leaves unmined_since alone, so the cleared txs would keep
+// looking mined unless the seed tracks B although its mined_set is not written.
+func TestRepairOvertakenTips_PartialWriteSeededBeforeRetry(t *testing.T) {
+	f := newOvertakeFixture(t)
+
+	f.store.failAfterSetMined.Store(true)
+	require.Error(t, f.newBlockValidation(t).setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	f.store.failAfterSetMined.Store(false)
+
+	_, metaB, err := f.blockchainClient.GetBlockHeader(f.ctx, f.blockB.Hash())
+	require.NoError(t, err)
+	require.False(t, metaB.MinedSet, "precondition: B's mined_set is not written")
+	require.Zero(t, f.unminedSince(t, f.bOnly), "precondition: the failed write cleared B's txs")
+
+	blockC2 := f.overtakeB(t)
+
+	restarted := f.newBlockValidation(t)
+
+	require.NoError(t, restarted.setTxMinedStatus(f.ctx, blockC2.Hash()))
+	_, err = drainTipRepair(t, restarted)
+	require.NoError(t, err)
+
+	require.NoError(t, restarted.setTxMinedStatus(f.ctx, f.blockB.Hash()), "B's retry, now off the longest chain")
+	_, err = drainTipRepair(t, restarted)
+	require.NoError(t, err)
+
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "a tx cleared by the failed write must be unmined again")
+	require.Zero(t, f.unminedSince(t, f.shared), "a tx also mined on the winning chain must stay mined")
+}
+
 // TestRepairOvertakenTips_SkipsPrunedTxs: a tx of the overtaken block that is no longer in
 // the store (pruned) must not stop the repair of the others.
 func TestRepairOvertakenTips_SkipsPrunedTxs(t *testing.T) {
@@ -742,7 +782,7 @@ func TestMinedOnChainTracker_NewWriteStartsOver(t *testing.T) {
 	tracker := newMinedOnChainTracker()
 	hash := chainhash.HashH([]byte("b"))
 
-	tracker.track(hash, 1, 1, false)
+	tracker.track(hash, 1, 1)
 	require.True(t, tracker.markWritten(hash))
 
 	gen := tracker.snapshot()[hash].gen
@@ -752,7 +792,7 @@ func TestMinedOnChainTracker_NewWriteStartsOver(t *testing.T) {
 	})
 
 	// setTxMined writes the block as on the longest chain again (its mined_set was cleared).
-	tracker.track(hash, 1, 1, false)
+	tracker.track(hash, 1, 1)
 
 	b := tracker.snapshot()[hash]
 	require.NotEqual(t, gen, b.gen, "a new write is a new generation; a repair in progress for the old one is abandoned")
@@ -762,4 +802,187 @@ func TestMinedOnChainTracker_NewWriteStartsOver(t *testing.T) {
 
 	tracker.update(hash, gen, func(e *minedOnChainBlock) { e.done = true })
 	require.False(t, tracker.snapshot()[hash].done, "an update for the old generation is ignored")
+}
+
+func TestMinedOnChainTracker_Nil(t *testing.T) {
+	var tracker *minedOnChainTracker
+	hash := chainhash.HashH([]byte("b"))
+
+	tracker.track(hash, 1, 1)
+	tracker.seed(hash, 1, 1, true)
+	require.False(t, tracker.markWritten(hash))
+	tracker.update(hash, 1, func(e *minedOnChainBlock) { e.done = true })
+	tracker.drop(hash)
+	require.True(t, tracker.empty())
+	require.Nil(t, tracker.snapshot())
+}
+
+// TestRepairOvertakenTips_DefaultSliceSize: an unset slice size falls back to the default.
+func TestRepairOvertakenTips_DefaultSliceSize(t *testing.T) {
+	f := newOvertakeFixture(t)
+	f.tSettings.BlockValidation.TipRepairSliceSize = 0
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.NotZero(t, f.unminedSince(t, f.bOnly))
+}
+
+// TestRunTipRepairSlice_RetriesAfterError: a failed slice leaves the retry flag set, so the
+// periodic tick asks again; the next good slice clears it.
+func TestRunTipRepairSlice_RetriesAfterError(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	client := &failingGetBlockClient{ClientI: f.blockchainClient}
+	client.fail.Store(true)
+
+	bv.runTipRepairSlice(f.ctx, client)
+	require.True(t, bv.tipRepairRetry.Load())
+
+	client.fail.Store(false)
+
+	for i := 0; i < 10 && bv.tipRepairPending.Swap(false); i++ {
+		bv.runTipRepairSlice(f.ctx, client)
+	}
+
+	bv.runTipRepairSlice(f.ctx, client)
+	require.False(t, bv.tipRepairRetry.Load())
+	require.NotZero(t, f.unminedSince(t, f.bOnly))
+}
+
+// seedFailClient fails the one blockchain call named by failOn.
+type seedFailClient struct {
+	blockchain.ClientI
+	failOn string
+}
+
+func (c *seedFailClient) err(name string) error {
+	if c.failOn == name {
+		return errors.NewServiceError("injected %s failure", name)
+	}
+
+	return nil
+}
+
+func (c *seedFailClient) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	if err := c.err("GetBestBlockHeader"); err != nil {
+		return nil, nil, err
+	}
+
+	return c.ClientI.GetBestBlockHeader(ctx)
+}
+
+func (c *seedFailClient) GetBlockHeaders(ctx context.Context, hash *chainhash.Hash, n uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	if err := c.err("GetBlockHeaders"); err != nil {
+		return nil, nil, err
+	}
+
+	return c.ClientI.GetBlockHeaders(ctx, hash, n)
+}
+
+func (c *seedFailClient) GetLastNBlocks(ctx context.Context, n int64, includeOrphans bool, fromHeight uint32) ([]*model.BlockInfo, error) {
+	if err := c.err("GetLastNBlocks"); err != nil {
+		return nil, err
+	}
+
+	return c.ClientI.GetLastNBlocks(ctx, n, includeOrphans, fromHeight)
+}
+
+func (c *seedFailClient) GetBlockHeader(ctx context.Context, hash *chainhash.Hash) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	if err := c.err("GetBlockHeader"); err != nil {
+		return nil, nil, err
+	}
+
+	return c.ClientI.GetBlockHeader(ctx, hash)
+}
+
+func (c *seedFailClient) GetBlockHeaderIDs(ctx context.Context, hash *chainhash.Hash, n uint64) ([]uint32, error) {
+	if err := c.err("GetBlockHeaderIDs"); err != nil {
+		return nil, err
+	}
+
+	return c.ClientI.GetBlockHeaderIDs(ctx, hash, n)
+}
+
+// TestRepairOvertakenTips_SeedFailures: a blockchain call failing during the restart seed or
+// the main-chain read fails the slice and leaves the seed to run again.
+func TestRepairOvertakenTips_SeedFailures(t *testing.T) {
+	for _, failOn := range []string{"GetBestBlockHeader", "GetBlockHeaders", "GetLastNBlocks", "GetBlockHeader", "GetBlockHeaderIDs"} {
+		t.Run(failOn, func(t *testing.T) {
+			f := newOvertakeFixture(t)
+			bv := f.newBlockValidation(t)
+
+			require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+			_ = f.overtakeB(t)
+
+			// The seed must run in this slice.
+			bv.tipRepairSeeded = false
+
+			_, err := bv.tipRepairSlice(f.ctx, &seedFailClient{ClientI: f.blockchainClient, failOn: failOn})
+			require.Error(t, err)
+
+			_, err = drainTipRepair(t, bv)
+			require.NoError(t, err)
+			require.NotZero(t, f.unminedSince(t, f.bOnly), "the next slice repairs the block")
+		})
+	}
+}
+
+// farBestClient reports the best block as much higher than it is, so tracked blocks look
+// older than the repair window.
+type farBestClient struct {
+	blockchain.ClientI
+}
+
+func (c *farBestClient) GetBestBlockHeader(ctx context.Context) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
+	header, meta, err := c.ClientI.GetBestBlockHeader(ctx)
+	if meta != nil {
+		far := *meta
+		far.Height += 2 * tipRepairWindow
+		meta = &far
+	}
+
+	return header, meta, err
+}
+
+// TestRepairOvertakenTips_ExpiredBlockDropped: a block that left the window before its repair
+// is dropped, not repaired.
+func TestRepairOvertakenTips_ExpiredBlockDropped(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	bv.blockchainClient = &farBestClient{ClientI: f.blockchainClient}
+
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.True(t, bv.minedOnChain.empty(), "the expired block is dropped")
+	require.Zero(t, f.unminedSince(t, f.bOnly), "and not repaired")
+}
+
+// TestRepairOvertakenTips_InvalidBlockDropped: an invalidated block belongs to unsetMined,
+// so the repair drops it.
+func TestRepairOvertakenTips_InvalidBlockDropped(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+
+	_, err := f.blockchainClient.InvalidateBlock(f.ctx, f.blockB.Hash())
+	require.NoError(t, err)
+
+	_, err = drainTipRepair(t, bv)
+	require.NoError(t, err)
+
+	_, tracked := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
+	require.False(t, tracked, "the invalid block is dropped")
 }

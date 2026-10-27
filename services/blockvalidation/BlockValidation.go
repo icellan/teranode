@@ -1631,7 +1631,7 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 	// overtaken, the overtaken-tip repair must know about it, even if this attempt fails
 	// and a retry sees onLongestChain=false.
 	if onLongestChain && (len(unsetMined) == 0 || !unsetMined[0]) {
-		u.minedOnChain.track(*blockHash, blockHeaderMeta.ID, blockHeaderMeta.Height, false)
+		u.minedOnChain.track(*blockHash, blockHeaderMeta.ID, blockHeaderMeta.Height)
 	}
 
 	// add the transactions in this block to the block IDs in the utxo store

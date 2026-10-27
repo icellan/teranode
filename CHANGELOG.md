@@ -106,6 +106,17 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **A reorg no longer re-marks block assembly's whole mempool.** Block assembly marks
+  only the transactions it moved back and that are not mined on the new chain. Block
+  validation now repairs a block it marked mined that a competing chain later overtakes,
+  on its setMined worker, in slices of `blockvalidation_tipRepairSliceSize` transactions
+  (new setting, default 250000). Each slice can delay the next block's mined status by
+  one slice. The repair assumes a single block validation instance writes mined status
+  for the chain, and its state is in memory: fork blocks more than 10 below the tip at a
+  restart are not repaired. A deployment that runs more than one block validation
+  replica loses no data, but transactions can stay flagged unmined until block
+  assembly's next unmined load. No action needed for a single-instance deployment. (#2065)
+
 - **A block's tx is created as conflicting only when it is a double spend and nothing
   else.** Block validation used to create a tx as conflicting as soon as one of its inputs
   was already spent by another tx, dropping every other failed input. A block holding a
