@@ -1345,7 +1345,7 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	// the subtree validator drop live peer subtrees.
 	stored, lastStoredHeight, err := u.storedHeaderPrefix(ctx, catchupCtx.blockHeaders)
 	if err != nil {
-		return errors.NewStorageError("[catchup:fetchAndValidateBlocks][%s] failed to check for stored blocks", catchupCtx.blockUpTo.Hash().String(), err)
+		return storedLookupError(err, "[catchup:fetchAndValidateBlocks][%s] failed to check for stored blocks", catchupCtx.blockUpTo.Hash().String())
 	}
 
 	if stored > 0 {
@@ -1522,17 +1522,13 @@ func (u *Server) storedHeaderPrefix(ctx context.Context, headers []*model.BlockH
 	var lastStoredHeight uint32
 
 	for i, header := range headers {
-		exists, err := u.blockValidation.GetBlockExists(ctx, header.Hash())
-		if err != nil {
-			return 0, 0, err
-		}
-
-		if !exists {
-			return i, lastStoredHeight, nil
-		}
-
+		// One RPC for existence, validity and height: not-found means not stored.
 		_, meta, err := u.blockchainClient.GetBlockHeader(ctx, header.Hash())
 		if err != nil {
+			if errors.Is(err, errors.ErrBlockNotFound) {
+				return i, lastStoredHeight, nil
+			}
+
 			return 0, 0, err
 		}
 
@@ -1544,6 +1540,22 @@ func (u *Server) storedHeaderPrefix(ctx context.Context, headers []*model.BlockH
 	}
 
 	return len(headers), lastStoredHeight, nil
+}
+
+// storedLookupError wraps a failed stored-block lookup. The failure is always local, never the
+// peer's: shutdown and an unreachable blockchain service keep their own labels in
+// releaseCatchupLock, and anything else, a deadline included, is a storage fault.
+func storedLookupError(err error, message string, params ...interface{}) error {
+	params = append(params, err)
+
+	switch {
+	case errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled:
+		return errors.NewContextCanceledError(message, params...)
+	case errors.Is(err, errors.ErrServiceUnavailable) || status.Code(err) == codes.Unavailable:
+		return errors.NewServiceUnavailableError(message, params...)
+	default:
+		return errors.NewStorageError(message, params...)
+	}
 }
 
 // catchupFirstBlockHeight returns the height of catchupCtx.blockHeaders[0].
@@ -1799,10 +1811,22 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan blockForValidat
 			// Get cached headers for validation
 			cachedHeaders, _ := u.headerChainCache.GetValidationHeaders(block.Hash())
 
-			// A block stored since the header phase has no prewarmed subtree data, so it goes
-			// straight to normal validation, which finds it stored (or stored invalid) and stops.
+			// A block stored since the header phase goes straight to normal validation, which finds
+			// it stored (or stored invalid) and stops; quick validation's commit would collide with
+			// it. The worker's mark only saves the prewarm: a block can also be stored after that
+			// check, so validation checks again here.
+			alreadyStored := item.alreadyStored
+			if !alreadyStored {
+				var err error
+
+				alreadyStored, err = u.blockStoredSinceHeaders(gCtx, block)
+				if err != nil {
+					return err
+				}
+			}
+
 			tryNormalValidation := true
-			if !item.alreadyStored {
+			if !alreadyStored {
 				var err error
 
 				// Try quick validation if applicable

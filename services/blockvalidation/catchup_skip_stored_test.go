@@ -19,6 +19,9 @@ import (
 	"github.com/jarcoal/httpmock"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/semaphore"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -34,7 +37,6 @@ func TestFetchAndValidateBlocks_AllHeadersStored_SkipsCatchingBlocks(t *testing.
 	defer cleanup()
 
 	blocks := testhelpers.CreateTestBlockChain(t, 3)
-	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 	mockBlockchainClient.On("Run", mock.Anything, mock.Anything).Return(nil)
 	mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(blocks[1].Header, &model.BlockHeaderMeta{Height: 1}, nil)
 
@@ -56,9 +58,8 @@ func TestFetchAndValidateBlocks_DropsStoredPrefixOnly(t *testing.T) {
 	defer cleanup()
 
 	blocks := testhelpers.CreateTestBlockChain(t, 4)
-	mockBlockchainClient.On("GetBlockExists", mock.Anything, blocks[1].Header.Hash()).Return(true, nil)
-	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 	mockBlockchainClient.On("GetBlockHeader", mock.Anything, blocks[1].Header.Hash()).Return(blocks[1].Header, &model.BlockHeaderMeta{Height: 1}, nil)
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(nil, nil, errors.NewBlockNotFoundError("not stored"))
 
 	// Stop at the FSM transition: the test only needs to see what catchup would fetch.
 	mockBlockchainClient.ExpectedCalls = filterMockCalls(mockBlockchainClient.ExpectedCalls, "CatchUpBlocks")
@@ -80,7 +81,6 @@ func TestFetchAndValidateBlocks_StoredInvalidBlockIsKept(t *testing.T) {
 	defer cleanup()
 
 	blocks := testhelpers.CreateTestBlockChain(t, 3)
-	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
 	mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(blocks[1].Header, &model.BlockHeaderMeta{Height: 1, Invalid: true}, nil)
 	mockBlockchainClient.ExpectedCalls = filterMockCalls(mockBlockchainClient.ExpectedCalls, "CatchUpBlocks")
 	mockBlockchainClient.On("CatchUpBlocks", mock.Anything).Return(errors.NewStateError("stop here"))
@@ -102,7 +102,7 @@ func TestFetchAndValidateBlocks_ExistsCheckErrorHalts(t *testing.T) {
 	defer cleanup()
 
 	blocks := testhelpers.CreateTestBlockChain(t, 3)
-	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, errors.NewServiceError("blockchain service unavailable"))
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(nil, nil, errors.NewServiceError("blockchain service unavailable"))
 
 	catchupCtx := &CatchupContext{
 		blockUpTo:    blocks[2],
@@ -146,6 +146,54 @@ func TestBlockWorker_BlockStoredSinceHeaders_SkipsSubtreeFetch(t *testing.T) {
 	result := <-resultQueue
 	require.NoError(t, result.err)
 	require.True(t, result.alreadyStored)
+}
+
+// TestBlockWorker_StoredWhileParkedOnBudget_SkipsSubtreeFetch: a worker parked on the prefetch
+// budget (behind another block's prewarm) checks for the stored block only once it holds the
+// reservation. A block the normal path stored during the wait is not prewarmed, and the reservation
+// is handed back.
+func TestBlockWorker_StoredWhileParkedOnBudget_SkipsSubtreeFetch(t *testing.T) {
+	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	const budget = int64(64 << 20)
+	server.catchupPrefetchBudget = semaphore.NewWeighted(budget)
+	server.catchupPrefetchBudgetBytes = budget
+	require.True(t, server.catchupPrefetchBudget.TryAcquire(budget), "another block's prewarm holds the whole budget")
+
+	blocks := testhelpers.CreateTestBlockChain(t, 2)
+	block := blocks[1]
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, block.Header.Hash()).Return(false, nil)
+
+	var fetchCalls atomic.Int32
+	server.fetchSubtreeDataForBlockFn = func(context.Context, *model.Block, string, string) (map[string]struct{}, map[chainhash.Hash]map[fileformat.FileType]struct{}, error) {
+		fetchCalls.Add(1)
+		return nil, nil, nil
+	}
+
+	workQueue := make(chan workItem, 1)
+	resultQueue := make(chan resultItem, 1)
+	workQueue <- workItem{block: block, index: 0}
+	close(workQueue)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	workerErr := make(chan error, 1)
+	go func() { workerErr <- server.blockWorker(ctx, 0, workQueue, resultQueue, "peer", "http://peer/", block) }()
+
+	// Let the worker reach the budget wait, then store the block and free the budget.
+	time.Sleep(100 * time.Millisecond)
+	server.blockValidation.blockExistsCache.Set(*block.Header.Hash(), true)
+	server.releaseCatchupPrefetch(budget)
+
+	require.NoError(t, <-workerErr)
+	require.Zero(t, fetchCalls.Load(), "a block stored while the worker was parked must not be prewarmed")
+
+	result := <-resultQueue
+	require.NoError(t, result.err)
+	require.True(t, result.alreadyStored)
+	require.True(t, server.catchupPrefetchBudget.TryAcquire(budget), "the reservation must be released when the block is found stored")
 }
 
 // TestBlockWorker_ExistsCheckError_FailsBlock: a store error on the exists check fails the block
@@ -209,9 +257,8 @@ func TestFetchAndValidateBlocks_TrimmedPrefixKeepsHeights(t *testing.T) {
 	defer cleanup()
 
 	blocks := testhelpers.CreateTestBlockChain(t, 4)
-	mockBlockchainClient.On("GetBlockExists", mock.Anything, blocks[1].Header.Hash()).Return(true, nil)
-	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
 	mockBlockchainClient.On("GetBlockHeader", mock.Anything, blocks[1].Header.Hash()).Return(blocks[1].Header, &model.BlockHeaderMeta{Height: 101}, nil)
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(nil, nil, errors.NewBlockNotFoundError("not stored"))
 	mockBlockchainClient.ExpectedCalls = filterMockCalls(mockBlockchainClient.ExpectedCalls, "CatchUpBlocks")
 	mockBlockchainClient.On("CatchUpBlocks", mock.Anything).Return(errors.NewStateError("stop here"))
 
@@ -263,6 +310,68 @@ func TestValidateBlocksOnChannel_AlreadyStoredSkipsQuickValidation(t *testing.T)
 	require.NoError(t, server.validateBlocksOnChannel(validateBlocksChan, context.Background(), catchupCtx, &size, quickWrites))
 	require.Zero(t, size.Load())
 	require.Empty(t, quickWrites, "a stored block must not go through quick validation")
+}
+
+// TestValidateBlocksOnChannel_StoredAfterWorkerCheckSkipsQuickValidation: a block stored after the
+// worker checked it (while the worker was parked on the prefetch budget, or during its prewarm)
+// arrives unmarked. Validation checks again, so it still never reaches quick validation, whose
+// commit would collide with the stored block.
+func TestValidateBlocksOnChannel_StoredAfterWorkerCheckSkipsQuickValidation(t *testing.T) {
+	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	blocks := testhelpers.CreateTestBlockChain(t, 2)
+	block := blocks[1]
+	block.Height = 1
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, block.Header.Hash()).Return(true, nil)
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, block.Header.Hash()).Return(block.Header, &model.BlockHeaderMeta{Height: 1}, nil)
+
+	catchupCtx := &CatchupContext{
+		blockUpTo:               block,
+		useQuickValidation:      true,
+		highestCheckpointHeight: 1000,
+	}
+
+	validateBlocksChan := make(chan blockForValidation, 1)
+	validateBlocksChan <- blockForValidation{block: block}
+	close(validateBlocksChan)
+
+	var size atomic.Int64
+	size.Store(1)
+
+	quickWrites := make(chan *SubtreeWriteJob, 1)
+	require.NoError(t, server.validateBlocksOnChannel(validateBlocksChan, context.Background(), catchupCtx, &size, quickWrites))
+	require.Zero(t, size.Load())
+	require.Empty(t, quickWrites, "a block stored after the worker check must not go through quick validation")
+}
+
+// TestValidateBlocksOnChannel_ExistsCheckErrorHalts: a store error on validation's own exists check
+// halts the catchup as a storage fault instead of guessing.
+func TestValidateBlocksOnChannel_ExistsCheckErrorHalts(t *testing.T) {
+	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
+	defer cleanup()
+
+	blocks := testhelpers.CreateTestBlockChain(t, 2)
+	block := blocks[1]
+	block.Height = 1
+	mockBlockchainClient.On("GetBlockExists", mock.Anything, block.Header.Hash()).Return(false, errors.NewServiceError("blockchain service unavailable"))
+
+	catchupCtx := &CatchupContext{
+		blockUpTo:               block,
+		useQuickValidation:      true,
+		highestCheckpointHeight: 1000,
+	}
+
+	validateBlocksChan := make(chan blockForValidation, 1)
+	validateBlocksChan <- blockForValidation{block: block}
+	close(validateBlocksChan)
+
+	var size atomic.Int64
+	size.Store(1)
+
+	err := server.validateBlocksOnChannel(validateBlocksChan, context.Background(), catchupCtx, &size, make(chan *SubtreeWriteJob, 1))
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrStorageError), "a local lookup failure is a storage fault, never the peer's")
 }
 
 // TestFetchBlocksConcurrently_NumbersFromFirstBlockHeight: once the stored front was trimmed,
@@ -352,4 +461,57 @@ func TestFetchAndValidateBlocks_AllHeadersStored_PreservesOperatorIdle(t *testin
 	require.NoError(t, server.fetchAndValidateBlocks(context.Background(), catchupCtx))
 	requirePromotionState(t, client, store, blockchain.FSMStateIDLE)
 	require.Equal(t, 1, client.runCalls)
+}
+
+// TestStoredHeaderPrefix_RealStore: on a sqlitememory store, the prefix stops at the first block
+// that is stored invalid or not stored at all, and reports the height of the last stored one.
+func TestStoredHeaderPrefix_RealStore(t *testing.T) {
+	server, _, store, _ := newPromotionAuthority(t)
+
+	chain := testhelpers.CreateTestBlocksWithPrev(t, 3, server.settings.ChainCfgParams.GenesisHash)
+	for _, block := range chain[:2] {
+		_, _, err := store.StoreBlock(context.Background(), block, "test")
+		require.NoError(t, err)
+	}
+
+	_, err := store.InvalidateBlock(context.Background(), chain[1].Header.Hash())
+	require.NoError(t, err)
+
+	headers := []*model.BlockHeader{chain[0].Header, chain[1].Header, chain[2].Header}
+
+	stored, lastStoredHeight, err := server.storedHeaderPrefix(context.Background(), headers)
+	require.NoError(t, err)
+	require.Equal(t, 1, stored, "a block stored invalid ends the prefix")
+	require.Equal(t, uint32(1), lastStoredHeight)
+
+	stored, _, err = server.storedHeaderPrefix(context.Background(), headers[2:])
+	require.NoError(t, err)
+	require.Zero(t, stored, "a block that is not stored ends the prefix")
+}
+
+// TestStoredLookupError_KeepsLocalLabels: a failed stored-block lookup is always local, but
+// shutdown and an unreachable blockchain service keep their own local labels instead of being
+// reported as a storage fault. Deadlines have no label of their own, so they stay storage faults.
+func TestStoredLookupError_KeepsLocalLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want error
+		not  error
+	}{
+		{"cancelled", context.Canceled, errors.ErrContextCanceled, errors.ErrStorageError},
+		{"grpc cancelled", status.Error(codes.Canceled, "shutdown"), errors.ErrContextCanceled, errors.ErrStorageError},
+		{"unavailable", errors.NewServiceUnavailableError("blockchain down"), errors.ErrServiceUnavailable, errors.ErrStorageError},
+		{"grpc unavailable", status.Error(codes.Unavailable, "blockchain down"), errors.ErrServiceUnavailable, errors.ErrStorageError},
+		{"deadline", context.DeadlineExceeded, errors.ErrStorageError, nil},
+		{"other", errors.NewServiceError("boom"), errors.ErrStorageError, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := storedLookupError(tc.err, "lookup of %s failed", "block")
+			require.True(t, errors.Is(err, tc.want), "got %v", err)
+			if tc.not != nil {
+				require.False(t, errors.Is(err, tc.not), "got %v", err)
+			}
+		})
+	}
 }

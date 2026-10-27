@@ -4956,7 +4956,7 @@ func TestFetchAndValidateBlocks_FSMRejectsWhenNotRunning(t *testing.T) {
 	// from an invalid source state (so CATCHUPBLOCKS event is invalid)
 	mockBlockchainClient.ExpectedCalls = filterMockCalls(mockBlockchainClient.ExpectedCalls, "CatchUpBlocks")
 	mockBlockchainClient.On("CatchUpBlocks", mock.Anything).Return(errors.NewStateError("event CATCHUPBLOCKS inappropriate in current state IDLE"))
-	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+	mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(nil, nil, errors.NewBlockNotFoundError("not stored"))
 
 	blocks := testhelpers.CreateTestBlockChain(t, 3)
 	catchupCtx := &CatchupContext{

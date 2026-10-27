@@ -25,6 +25,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/adaptivefetch"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/teranode/services/p2p"
 	"github.com/bsv-blockchain/teranode/settings"
@@ -34,6 +35,7 @@ import (
 	"github.com/bsv-blockchain/teranode/test/utils/transactions"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/jarcoal/httpmock"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -3248,9 +3250,10 @@ func TestBlockWorker(t *testing.T) {
 	mockSubtreeStore := memory.New()
 	settings := test.CreateBaseTestSettings(t)
 	server := &Server{
-		logger:       logger,
-		subtreeStore: mockSubtreeStore,
-		settings:     settings,
+		logger:          logger,
+		subtreeStore:    mockSubtreeStore,
+		settings:        settings,
+		blockValidation: notStoredBlockValidation(t),
 	}
 
 	baseURL := "http://test-peer:8080"
@@ -4177,9 +4180,10 @@ func TestBlockWorker_Pessimistic_CallsFetchSubtreeData(t *testing.T) {
 
 	var fetchCalls atomic.Int32
 	server := &Server{
-		logger:        ulogger.TestLogger{},
-		stats:         gocore.NewStat("test-pess"),
-		adaptiveFetch: afState,
+		logger:          ulogger.TestLogger{},
+		stats:           gocore.NewStat("test-pess"),
+		adaptiveFetch:   afState,
+		blockValidation: notStoredBlockValidation(t),
 	}
 	server.fetchSubtreeDataForBlockFn = func(ctx context.Context, b *model.Block, peerID, baseURL string) (map[string]struct{}, map[chainhash.Hash]map[fileformat.FileType]struct{}, error) {
 		fetchCalls.Add(1)
@@ -5086,6 +5090,20 @@ func newBudgetedPrefetchServer(t *testing.T, budget int64) *Server {
 // newBudgetedPrefetchWorkerServer extends newBudgetedPrefetchServer with the two fields
 // blockWorker itself needs: a stat for the tracing span and an adaptive-fetch state to
 // sample the mode from.
+// notStoredBlockValidation is block validation for worker fixtures: every block reads as not yet
+// stored, so the worker goes on to prewarm it.
+func notStoredBlockValidation(t *testing.T) *BlockValidation {
+	t.Helper()
+
+	client := &blockchain.Mock{}
+	client.On("GetBlockExists", mock.Anything, mock.Anything).Return(false, nil)
+
+	cache := expiringmap.New[chainhash.Hash, bool](time.Minute)
+	t.Cleanup(cache.Stop)
+
+	return &BlockValidation{blockchainClient: client, blockExistsCache: cache}
+}
+
 func newBudgetedPrefetchWorkerServer(t *testing.T, budget int64, mode adaptivefetch.Mode) *Server {
 	t.Helper()
 
@@ -5105,6 +5123,7 @@ func newBudgetedPrefetchWorkerServer(t *testing.T, budget int64, mode adaptivefe
 	server := newBudgetedPrefetchServer(t, budget)
 	server.stats = gocore.NewStat("test-prefetch-budget")
 	server.adaptiveFetch = af
+	server.blockValidation = notStoredBlockValidation(t)
 
 	return server
 }

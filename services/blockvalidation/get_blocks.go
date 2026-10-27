@@ -237,32 +237,6 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 				return nil
 			}
 
-			// A block stored since the header phase, by the normal path while catchup was starting,
-			// needs no prewarm: validation finds it stored and stops there. Checked here, just before
-			// the fetch, because that fetch can be the whole block's subtree data.
-			alreadyStored, existsErr := u.blockStoredSinceHeaders(ctx, work.block)
-			if existsErr != nil {
-				select {
-				case resultQueue <- resultItem{block: work.block, index: work.index, err: existsErr}:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-
-				continue
-			}
-
-			if alreadyStored {
-				u.logger.Infof("[catchup:blockWorker-%d][%s] block %s was stored since the header phase, not fetching its subtree data", workerID, blockUpTo.Hash().String(), work.block.Hash().String())
-
-				select {
-				case resultQueue <- resultItem{block: work.block, index: work.index, alreadyStored: true}:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-
-				continue
-			}
-
 			// Fetch subtree data for this block — adaptive-fetch state may skip it
 			// entirely when the node is receiving txs via a distributor.
 			//
@@ -287,6 +261,7 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 
 			var contributingPeers map[string]struct{}
 			var freshlyWritten map[chainhash.Hash]map[fileformat.FileType]struct{}
+			var alreadyStored bool
 			var err error
 			if optimistic {
 				contributingPeers, freshlyWritten, err = nil, nil, nil
@@ -306,15 +281,34 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 
 				weight, err = u.acquireCatchupPrefetch(ctx, work.block)
 				if err == nil {
-					fetchFn := u.fetchSubtreeDataForBlockFn
-					if fetchFn == nil {
-						fetchFn = u.fetchSubtreeDataForBlock
-					}
+					// A block stored since the header phase, by the normal path, needs no prewarm:
+					// validation finds it stored and stops there. Checked after the reservation, just
+					// before the fetch, because the wait for the budget can be another block's whole
+					// prewarm, and this fetch can be the whole block's subtree data.
+					alreadyStored, err = u.blockStoredSinceHeaders(ctx, work.block)
+					if err == nil && !alreadyStored {
+						fetchFn := u.fetchSubtreeDataForBlockFn
+						if fetchFn == nil {
+							fetchFn = u.fetchSubtreeDataForBlock
+						}
 
-					contributingPeers, freshlyWritten, err = fetchFn(ctx, work.block, peerID, baseURL)
+						contributingPeers, freshlyWritten, err = fetchFn(ctx, work.block, peerID, baseURL)
+					}
 
 					u.releaseCatchupPrefetch(weight)
 				}
+			}
+
+			if err == nil && alreadyStored {
+				u.logger.Infof("[catchup:blockWorker-%d][%s] block %s was stored since the header phase, not fetching its subtree data", workerID, blockUpTo.Hash().String(), work.block.Hash().String())
+
+				select {
+				case resultQueue <- resultItem{block: work.block, index: work.index, alreadyStored: true}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+
+				continue
 			}
 
 			if err != nil {
@@ -364,15 +358,11 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 }
 
 // blockStoredSinceHeaders reports whether block is now stored. A store error is returned, never
-// guessed. Server-literal test fixtures without block validation report false.
+// guessed.
 func (u *Server) blockStoredSinceHeaders(ctx context.Context, block *model.Block) (bool, error) {
-	if u.blockValidation == nil {
-		return false, nil
-	}
-
 	exists, err := u.blockValidation.GetBlockExists(ctx, block.Hash())
 	if err != nil {
-		return false, errors.NewStorageError("[catchup] failed to check whether block %s is stored", block.Hash().String(), err)
+		return false, storedLookupError(err, "[catchup] failed to check whether block %s is stored", block.Hash().String())
 	}
 
 	return exists, nil
