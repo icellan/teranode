@@ -35,6 +35,10 @@ func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.Kafk
 	g.SetLimit(int(math.Max(4, float64(runtime.NumCPU()))))
 
 	return func(msg *kafka.KafkaMessage) error {
+		// Taken before any wait, including for a slot in g: a subtree kept for replay is aged
+		// from its receipt.
+		receivedAt := time.Now()
+
 		if msg == nil {
 			u.logger.Errorf("[subtreeMessageHandler] received nil message")
 			prometheusSubtreeKafkaMalformed.WithLabelValues("nil_message").Inc()
@@ -100,7 +104,7 @@ func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.Kafk
 		// Run the subtree handler in a goroutine managed by errgroup.
 		// We validate subtrees on best effort basis - no retries needed.
 		g.Go(func() error {
-			err := u.subtreesHandler(gCtx, hash, baseURL, kafkaMsg.PeerId)
+			err := u.subtreesHandler(gCtx, receivedAt, hash, baseURL, kafkaMsg.PeerId)
 			if err == nil {
 				return nil
 			}
@@ -124,10 +128,9 @@ func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.Kafk
 	}
 }
 
-func (u *Server) subtreesHandler(ctx context.Context, hash *chainhash.Hash, baseURL *url.URL, peerID string, validationOptions ...validator.Option) error {
-	// Taken before the wait: a subtree kept for replay is aged from its announcement.
-	announcedAt := time.Now()
-
+// subtreesHandler validates a peer subtree received at receivedAt. A subtree kept for replay
+// because the node is catching up is aged from receivedAt.
+func (u *Server) subtreesHandler(ctx context.Context, receivedAt time.Time, hash *chainhash.Hash, baseURL *url.URL, peerID string, validationOptions ...validator.Option) error {
 	// Wait for a validation slot before taking the subtree's quorum lock:
 	// block validation (CheckBlockSubtrees) waits on that lock, so a subtree
 	// queued here while holding it would make a block wait for the queue. A
@@ -148,7 +151,7 @@ func (u *Server) subtreesHandler(ctx context.Context, hash *chainhash.Hash, base
 	}
 
 	if *state != blockchain.FSMStateRUNNING {
-		if u.recordSkippedSubtree(ctx, *state, skippedSubtree{hash: *hash, baseURL: baseURL, peerID: peerID, recordedAt: announcedAt}) {
+		if u.recordSkippedSubtree(ctx, *state, skippedSubtree{hash: *hash, baseURL: baseURL, peerID: peerID, recordedAt: receivedAt}) {
 			prometheusSkippedSubtrees.WithLabelValues("recorded").Inc()
 		}
 

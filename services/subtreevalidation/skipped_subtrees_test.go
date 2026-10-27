@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -350,7 +351,7 @@ func TestSubtreesHandler_LeftRunningWhileQueued_RecordsSubtree(t *testing.T) {
 	baseURL, err := url.Parse("http://peer-p1:8000")
 	require.NoError(t, err)
 
-	require.NoError(t, server.subtreesHandler(context.Background(), hash, baseURL, "p1"))
+	require.NoError(t, server.subtreesHandler(context.Background(), time.Now(), hash, baseURL, "p1"))
 	require.Equal(t, 1, server.skippedSubtrees.len())
 }
 
@@ -697,7 +698,9 @@ func TestSubtreesHandler_AnnouncementTimeIsBeforeAdmissionWait(t *testing.T) {
 	arrived := time.Now()
 
 	done := make(chan error, 1)
-	go func() { done <- server.subtreesHandler(context.Background(), &entry.hash, entry.baseURL, entry.peerID) }()
+	go func() {
+		done <- server.subtreesHandler(context.Background(), arrived, &entry.hash, entry.baseURL, entry.peerID)
+	}()
 
 	time.Sleep(300 * time.Millisecond)
 	releaseSlot()
@@ -724,4 +727,44 @@ func TestReplaySkippedSubtrees_IdleIsCountedAsDropped(t *testing.T) {
 	require.Empty(t, replayed)
 	require.Zero(t, server.skippedSubtrees.len())
 	require.Equal(t, dropped+1, testutil.ToFloat64(prometheusSkippedSubtrees.WithLabelValues("dropped")))
+}
+
+// TestSubtreeMessageHandler_AnnouncementTimeIsBeforeHandlerGroupWait: a subtree received while
+// RUNNING can wait for a slot in the handler's goroutine group before subtreesHandler starts. If
+// the node is catching up by then, it is kept aged from its receipt, not from the end of that wait.
+func TestSubtreeMessageHandler_AnnouncementTimeIsBeforeHandlerGroupWait(t *testing.T) {
+	fsm := &fsmState{state: blockchain.FSMStateRUNNING}
+	server, _ := newSkippedSubtreeServer(t, fsm, 1024)
+	server.settings.SubtreeValidation.PeerSubtreeConcurrency = 1
+
+	// Hold the only admission slot, so every subtreesHandler blocks and fills the handler group.
+	releaseSlot, err := server.peerSubtreeAdmission.acquire(context.Background(), 1)
+	require.NoError(t, err)
+
+	handler := server.subtreeMessageHandler(context.Background())
+
+	groupLimit := max(4, runtime.NumCPU())
+	for i := 0; i < groupLimit; i++ {
+		require.NoError(t, handler(subtreeMessage(t, chainhash.HashH([]byte{byte(i), 1}).String(), "p1")))
+	}
+
+	waiting := chainhash.HashH([]byte("waits for the handler group"))
+	received := time.Now()
+
+	done := make(chan error, 1)
+	go func() { done <- handler(subtreeMessage(t, waiting.String(), "p2")) }()
+
+	time.Sleep(300 * time.Millisecond)
+	fsm.set(blockchain.FSMStateCATCHINGBLOCKS)
+	releaseSlot()
+	require.NoError(t, <-done)
+
+	require.Eventually(t, func() bool { return server.skippedSubtrees.len() == groupLimit+1 }, 5*time.Second, time.Millisecond)
+
+	server.skippedSubtrees.mu.Lock()
+	entry, ok := server.skippedSubtrees.entries[waiting]
+	server.skippedSubtrees.mu.Unlock()
+
+	require.True(t, ok)
+	require.WithinDuration(t, received, entry.recordedAt, 100*time.Millisecond, "aged from receipt, not from the end of the handler group wait")
 }
