@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -613,4 +614,114 @@ func TestSkippedSubtrees_KeptAgainKeepsAnnouncementOrder(t *testing.T) {
 
 		require.Equal(t, []string{skippedHashA, skippedHashB, skippedHashC, skippedHashD}, skippedHashes(set.take()))
 	})
+}
+
+// TestReplaySkippedSubtrees_WatcherHandoffInNarrowWindow: the second watcher finds the replay
+// running and gives up, but the replay ends before that watcher has returned. The replay's new
+// watcher must still start, so the watcher clears its flag before it calls the replay, not after.
+func TestReplaySkippedSubtrees_WatcherHandoffInNarrowWindow(t *testing.T) {
+	fsm := &fsmState{state: blockchain.FSMStateCATCHINGBLOCKS}
+	server, replayed := newSkippedSubtreeServer(t, fsm, 16)
+	server.blockchainClient.(*fsmClient).waitForRunning = true
+
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	server.replaySubtreeFn = func(_ context.Context, hash *chainhash.Hash, baseURL *url.URL, peerID string) error {
+		if hash.String() == skippedHashA {
+			close(blocked)
+			<-release
+		}
+		replayed <- replayedSubtree{hash: *hash, baseURL: baseURL.String(), peerID: peerID}
+		return nil
+	}
+
+	// Hold the second watcher right after its replay call, which finds the first replay running.
+	var watchers atomic.Int32
+	secondHeld := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	server.watcherReplayCalledFn = func() {
+		if watchers.Add(1) == 2 {
+			close(secondHeld)
+			<-releaseSecond
+		}
+	}
+	defer close(releaseSecond)
+
+	handler := server.subtreeMessageHandler(context.Background())
+	require.NoError(t, handler(subtreeMessage(t, skippedHashA, "p1")))
+
+	fsm.set(blockchain.FSMStateRUNNING)
+	select {
+	case <-blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the replay of the first catchup did not start")
+	}
+
+	// A second catchup while that replay runs.
+	fsm.set(blockchain.FSMStateCATCHINGBLOCKS)
+	require.NoError(t, handler(subtreeMessage(t, skippedHashB, "p2")))
+	fsm.set(blockchain.FSMStateRUNNING)
+
+	select {
+	case <-secondHeld:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the second watcher did not reach the replay")
+	}
+
+	// The first replay ends while the second watcher has not returned.
+	close(release)
+
+	got := map[string]bool{}
+	for len(got) < 2 {
+		select {
+		case r := <-replayed:
+			got[r.hash.String()] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("replayed %v; the replay's new watcher lost its flag to the second watcher", got)
+		}
+	}
+}
+
+// TestSubtreesHandler_AnnouncementTimeIsBeforeAdmissionWait: a live subtree kept because the node
+// started catching up while it waited for an admission slot is aged from its arrival, not from
+// the end of the wait.
+func TestSubtreesHandler_AnnouncementTimeIsBeforeAdmissionWait(t *testing.T) {
+	fsm := &fsmState{state: blockchain.FSMStateCATCHINGBLOCKS}
+	server, _ := newSkippedSubtreeServer(t, fsm, 16)
+	server.settings.SubtreeValidation.PeerSubtreeConcurrency = 1
+
+	releaseSlot, err := server.peerSubtreeAdmission.acquire(context.Background(), 1)
+	require.NoError(t, err)
+
+	entry := skippedEntry(t, skippedHashA, time.Time{})
+	arrived := time.Now()
+
+	done := make(chan error, 1)
+	go func() { done <- server.subtreesHandler(context.Background(), &entry.hash, entry.baseURL, entry.peerID) }()
+
+	time.Sleep(300 * time.Millisecond)
+	releaseSlot()
+	require.NoError(t, <-done)
+
+	kept := server.skippedSubtrees.take()
+	require.Len(t, kept, 1)
+	require.WithinDuration(t, arrived, kept[0].recordedAt, 100*time.Millisecond, "aged from arrival, not from the end of the admission wait")
+}
+
+// TestReplaySkippedSubtrees_IdleIsCountedAsDropped: a replayed subtree that finds the node IDLE
+// (an operator STOP, or the blockchain client's cached IDLE after a broken notification stream)
+// is not kept, and is counted so the outcomes still add up.
+func TestReplaySkippedSubtrees_IdleIsCountedAsDropped(t *testing.T) {
+	fsm := &fsmState{state: blockchain.FSMStateIDLE}
+	server, replayed := newSkippedSubtreeServer(t, fsm, 16)
+
+	server.skippedSubtrees.record(skippedEntry(t, skippedHashA, time.Now()), 16)
+
+	dropped := testutil.ToFloat64(prometheusSkippedSubtrees.WithLabelValues("dropped"))
+	server.replaySkippedSubtrees(context.Background())
+
+	require.Eventually(t, func() bool { return !server.skippedSubtrees.replaying.Load() }, 2*time.Second, time.Millisecond)
+	require.Empty(t, replayed)
+	require.Zero(t, server.skippedSubtrees.len())
+	require.Equal(t, dropped+1, testutil.ToFloat64(prometheusSkippedSubtrees.WithLabelValues("dropped")))
 }

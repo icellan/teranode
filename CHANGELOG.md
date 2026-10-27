@@ -735,7 +735,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   announced while IDLE, or more than 30 minutes before their replay, are still
   dropped. New metric:
   `teranode_subtreevalidation_skipped_peer_subtrees_total{outcome}` (recorded,
-  evicted, expired, requeued, replayed, replay_failed). Set the key to `0` for the previous
+  evicted, expired, requeued, dropped, replayed, replay_failed). Set the key to `0` for the previous
   behaviour. (#2055)
 
 - **Mining candidates no longer build on the old tip during a reorg.** While block

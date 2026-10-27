@@ -195,6 +195,10 @@ func (u *Server) watchForRunning(ctx context.Context) {
 		}
 
 		u.replaySkippedSubtrees(ctx)
+
+		if u.watcherReplayCalledFn != nil {
+			u.watcherReplayCalledFn()
+		}
 	}()
 }
 
@@ -286,7 +290,8 @@ func (u *Server) replaySkippedSubtrees(ctx context.Context) {
 
 // replaySubtree validates one kept subtree once it has an admission slot, and returns the metric
 // outcome: replayed (validated, or already stored), expired, requeued (kept again because the node
-// is catching up again), or none (the subtree was dropped, or another validation holds its lock).
+// is catching up again), dropped (the node is IDLE), or none (evicted for a newer announcement, or
+// another validation holds its lock).
 func (u *Server) replaySubtree(ctx context.Context, entry skippedSubtree) (string, error) {
 	releaseAdmission, err := u.admitPeerSubtree(ctx)
 	if err != nil {
@@ -306,6 +311,12 @@ func (u *Server) replaySubtree(ctx context.Context, entry skippedSubtree) (strin
 	}
 
 	if *state != blockchain.FSMStateRUNNING {
+		// IDLE (an operator STOP, or the blockchain client's cached IDLE after its notification
+		// stream broke) keeps nothing; block validation validates the subtree if a block needs it.
+		if *state != blockchain.FSMStateCATCHINGBLOCKS {
+			return "dropped", nil
+		}
+
 		if u.recordSkippedSubtree(ctx, *state, entry) {
 			return "requeued", nil
 		}

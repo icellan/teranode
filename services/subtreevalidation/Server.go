@@ -174,6 +174,10 @@ type Server struct {
 	// replaySubtreeFn replaces the validation of a replayed subtree, after its admission, age and
 	// RUNNING checks; nil in production.
 	replaySubtreeFn func(ctx context.Context, hash *chainhash.Hash, baseURL *url.URL, peerID string) error
+
+	// watcherReplayCalledFn is called by a RUNNING watcher after its replay call returns; nil in
+	// production.
+	watcherReplayCalledFn func()
 }
 
 // New creates a new Server instance with the provided dependencies.

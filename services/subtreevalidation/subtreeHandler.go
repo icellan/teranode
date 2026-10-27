@@ -125,6 +125,9 @@ func (u *Server) subtreeMessageHandler(ctx context.Context) func(msg *kafka.Kafk
 }
 
 func (u *Server) subtreesHandler(ctx context.Context, hash *chainhash.Hash, baseURL *url.URL, peerID string, validationOptions ...validator.Option) error {
+	// Taken before the wait: a subtree kept for replay is aged from its announcement.
+	announcedAt := time.Now()
+
 	// Wait for a validation slot before taking the subtree's quorum lock:
 	// block validation (CheckBlockSubtrees) waits on that lock, so a subtree
 	// queued here while holding it would make a block wait for the queue. A
@@ -145,7 +148,7 @@ func (u *Server) subtreesHandler(ctx context.Context, hash *chainhash.Hash, base
 	}
 
 	if *state != blockchain.FSMStateRUNNING {
-		if u.recordSkippedSubtree(ctx, *state, skippedSubtree{hash: *hash, baseURL: baseURL, peerID: peerID, recordedAt: time.Now()}) {
+		if u.recordSkippedSubtree(ctx, *state, skippedSubtree{hash: *hash, baseURL: baseURL, peerID: peerID, recordedAt: announcedAt}) {
 			prometheusSkippedSubtrees.WithLabelValues("recorded").Inc()
 		}
 
