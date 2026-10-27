@@ -268,7 +268,10 @@ type Validator struct {
 	rejectedTxKafkaProducerClient kafka.KafkaAsyncProducerI
 
 	// policyRejectedTxKafkaProducerClient publishes consensus-valid transactions that were
-	// rejected by local policy (ErrTxPolicy). This is a separate topic from
+	// rejected by local policy (ErrTxPolicy). One exception: a policy script failure whose
+	// consensus re-run hit maxnonstdtxvalidationduration is published unconfirmed (see
+	// classifyPolicyScriptError), so consumers must still validate what they take from
+	// it, as subtree validation does. This is a separate topic from
 	// rejectedTxKafkaProducerClient for two reasons:
 	//   1. Different message schema: this topic carries the full raw tx bytes
 	//      (KafkaTxPolicyRejectedTopicMessage.RawTx) so that consumers can reconstruct

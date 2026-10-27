@@ -718,11 +718,9 @@ func TestMaxScriptNumLengthPolicy(t *testing.T) {
 		txValidator := NewTxValidator(ulogger.TestLogger{}, tSettings)
 		err := txValidator.ValidateTransaction(testTx, testBlockHeight, testUtxoHeights, &Options{SkipPolicyChecks: false})
 		assert.Error(t, err)
-		// SCRIPT_ERR_SCRIPTNUM_OVERFLOW is also the consensus error for an int64 overflow
-		// since bitcoin-sv 1.2.3, so a number over the policy length limit is reported as
-		// TxInvalid rather than TxPolicy (see bdkPolicyRelatedScriptError).
-		assert.ErrorIs(t, err, errors.ErrTxInvalid)
-		assert.False(t, errors.Is(err, errors.ErrTxPolicy))
+		// The number is within consensus limits, so the consensus re-run passes and
+		// the rejection is policy only.
+		assert.ErrorIs(t, err, errors.ErrTxPolicy)
 	})
 
 	t.Run("high MaxScriptNumLengthPolicy must pass", func(t *testing.T) {

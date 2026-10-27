@@ -6,9 +6,11 @@ This file implements the GoBDK transaction validation adapter.
 package validator
 
 import (
+	"context"
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	gobdk "github.com/bitcoin-sv/bdk/module/gobdk"
 	bdkscript "github.com/bitcoin-sv/bdk/module/gobdk/script"
@@ -158,6 +160,22 @@ func getBDKChainNameFromParams(l ulogger.Logger, pa *chaincfg.Params) string {
 func newScriptVerifierGoBDK(l ulogger.Logger, po *settings.PolicySettings, pa *chaincfg.Params) bdkValidator {
 	l.Infof("Use GoBDK transaction validator, version : %v", gobdk.BDK_VERSION_STRING())
 
+	return &scriptVerifierGoBDK{
+		logger: l,
+		policy: po,
+		params: pa,
+		se:     newBDKTxValidator(l, po, pa, int64(po.MaxStackMemoryUsageConsensus)),
+		// The consensus re-run of a policy script failure is held to the policy stack
+		// limit: the consensus limit is unlimited by default, and the re-run is for a
+		// transaction that is already rejected and pays nothing. See
+		// classifyPolicyScriptError.
+		consensusRerun: newBDKTxValidator(l, po, pa, int64(po.MaxStackMemoryUsagePolicy)),
+	}
+}
+
+// newBDKTxValidator creates a BDK transaction validator configured from po, with
+// maxStackMemoryConsensus as its consensus-mode stack memory limit.
+func newBDKTxValidator(l ulogger.Logger, po *settings.PolicySettings, pa *chaincfg.Params, maxStackMemoryConsensus int64) *bdkscript.TxValidator {
 	network := getBDKChainNameFromParams(l, pa)
 	se := bdkscript.NewTxValidator(network)
 
@@ -199,7 +217,7 @@ func newScriptVerifierGoBDK(l ulogger.Logger, po *settings.PolicySettings, pa *c
 		panic(err)
 	}
 
-	if err := se.SetMaxStackMemoryUsage(int64(po.MaxStackMemoryUsageConsensus), int64(po.MaxStackMemoryUsagePolicy)); err != nil {
+	if err := se.SetMaxStackMemoryUsage(maxStackMemoryConsensus, int64(po.MaxStackMemoryUsagePolicy)); err != nil {
 		panic(err)
 	}
 
@@ -245,12 +263,7 @@ func newScriptVerifierGoBDK(l ulogger.Logger, po *settings.PolicySettings, pa *c
 
 	se.SetAcceptNonStdConsolidationInput(po.AcceptNonStdConsolidationInput)
 
-	return &scriptVerifierGoBDK{
-		logger: l,
-		policy: po,
-		params: pa,
-		se:     se,
-	}
+	return se
 }
 
 type bdkValidator interface {
@@ -259,6 +272,7 @@ type bdkValidator interface {
 
 type bdkNativeTxValidator interface {
 	ValidateTransaction(extendedTX []byte, utxoHeights []int32, blockHeight int32, consensus bool) error
+	VerifyScriptContext(ctx context.Context, extendedTX []byte, utxoHeights []int32, blockHeight int32, consensus bool) error
 }
 
 // scriptVerifierGoBDK adapts Teranode validation data to GoBDK.
@@ -267,6 +281,8 @@ type scriptVerifierGoBDK struct {
 	policy *settings.PolicySettings
 	params *chaincfg.Params
 	se     bdkNativeTxValidator
+	// consensusRerun runs the consensus re-run of a policy script failure.
+	consensusRerun bdkNativeTxValidator
 }
 
 func bdkBlockHeight(blockHeight uint32, consensus bool) (int32, error) {
@@ -317,10 +333,65 @@ func (v *scriptVerifierGoBDK) ValidateTransaction(tx *bt.Tx, blockHeight uint32,
 
 		v.logger.Warnf("%s txID=%s blockHeight=%d utxoHeights=%s error=%v", errMsgInvalidTx, tx.TxID(), blockHeight, utxoInfoStr, errVerify)
 
+		var scriptErr bdkscript.ScriptError
+		if !consensus && errors.As(errVerify, &scriptErr) && bdkPolicyRelatedScriptError(scriptErr.Code()) {
+			return v.classifyPolicyScriptError(tx, eTxBytes, intUtxoHeights, blockHeight, errVerify)
+		}
+
 		return v.mapBDKValidationError(errVerify, consensus)
 	}
 
 	return nil
+}
+
+// classifyPolicyScriptError decides whether a policy-class script error from
+// policy mode is policy only or also a consensus failure, by running the scripts
+// again in consensus mode. An error code alone cannot tell: SCRIPTNUM_OVERFLOW is
+// both a number over maxscriptnumlengthpolicy and an int64 overflow, and OP_COUNT
+// and the other size limits are consensus failures on a pre-Genesis UTXO. sv-node
+// does the same in CheckInputScripts.
+//
+// Only the scripts run again: the transaction-level checks already passed, and a
+// consensus ValidateTransaction would reject an unconfirmed parent as
+// unconfirmed-input-in-block. utxoHeights is the policy-mode slice, so
+// unconfirmed parents stay at the candidate height.
+//
+// The re-run uses consensus limits, far above policy's, for a transaction that
+// is already rejected and pays nothing, so maxnonstdtxvalidationduration bounds
+// its time and consensusRerun holds its stack memory to the policy limit.
+// Reaching that limit is STACK_SIZE, which mapBDKValidationError reports as
+// policy in consensus mode too. A re-run that does not finish in time is reported as policy, which is what
+// sv-node does: subtree validation validates every transaction it takes from the
+// policy-rejected cache in consensus mode anyway.
+func (v *scriptVerifierGoBDK) classifyPolicyScriptError(tx *bt.Tx, eTxBytes []byte, utxoHeights []int32, blockHeight uint32, errVerify error) error {
+	intBlockHeight, errConv := bdkBlockHeight(blockHeight, true)
+	if errConv != nil {
+		return errors.NewInvalidArgumentError("failed conversion for block height", errConv)
+	}
+
+	ctx := context.Background()
+
+	if d := v.policy.MaxNonStdTxValidationDuration; d > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(d)*time.Millisecond)
+
+		defer cancel()
+	}
+
+	errConsensus := v.consensusRerun.VerifyScriptContext(ctx, eTxBytes, utxoHeights, intBlockHeight, true)
+
+	switch {
+	case errConsensus == nil:
+		return v.mapBDKValidationError(errVerify, false)
+	case errors.Is(errConsensus, bdkscript.ErrCancelled):
+		v.logger.Warnf("%s txID=%s consensus re-run did not finish within maxnonstdtxvalidationduration=%dms, reporting policy error=%v", errMsgInvalidTx, tx.TxID(), v.policy.MaxNonStdTxValidationDuration, errVerify)
+
+		return v.mapBDKValidationError(errVerify, false)
+	default:
+		v.logger.Warnf("%s txID=%s consensus re-run of policy error=%v failed: %v", errMsgInvalidTx, tx.TxID(), errVerify, errConsensus)
+
+		return v.mapBDKValidationError(errConsensus, true)
+	}
 }
 
 // bdkCause turns the engine's own description of the failure into a typed link
@@ -444,14 +515,12 @@ func (v *scriptVerifierGoBDK) mapBDKValidationError(errVerify error, consensus b
 	return errors.NewTxInvalidError(errMsgInvalidTx, bdkCause(errors.ERR_TX_INVALID, errVerify))
 }
 
-// bdkPolicyRelatedScriptError lists the script errors that policy mode reports as
-// TxPolicy. SCRIPT_ERR_SCRIPTNUM_OVERFLOW is not one of them: since bitcoin-sv
-// 1.2.3 it is also the consensus error for a script number that overflows int64,
-// and a policy label would publish such a transaction to KAFKA_TX_POLICY_REJECTED,
-// which carries consensus-valid transactions only. A big number that is only over
-// the policy length limit is reported as TxInvalid as a result.
+// bdkPolicyRelatedScriptError lists the script errors a policy limit can cause.
+// Each can also be a consensus failure, so policy mode reports one as TxPolicy
+// only after the consensus re-run in classifyPolicyScriptError passes.
 func bdkPolicyRelatedScriptError(errCode bdkscript.ScriptErrorCode) bool {
 	return errCode == bdkscript.SCRIPT_ERR_OP_COUNT ||
+		errCode == bdkscript.SCRIPT_ERR_SCRIPTNUM_OVERFLOW ||
 		errCode == bdkscript.SCRIPT_ERR_SCRIPTNUM_MINENCODE ||
 		errCode == bdkscript.SCRIPT_ERR_SCRIPT_SIZE ||
 		errCode == bdkscript.SCRIPT_ERR_PUBKEY_COUNT ||

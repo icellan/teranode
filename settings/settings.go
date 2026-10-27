@@ -126,7 +126,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			DataCarrier:         getBool("datacarrier", false, alternativeContext...),
 			PermitBareMultisig:  getBool("permitbaremultisig", true, alternativeContext...),
 			// MaxStdTxValidationDuration:    getInt("maxstdtxvalidationduration", 3, alternativeContext...),       // 3ms
-			// MaxNonStdTxValidationDuration: getInt("maxnonstdtxvalidationduration", 1000, alternativeContext...), // 1000ms
+			MaxNonStdTxValidationDuration: getInt("maxnonstdtxvalidationduration", 1000, alternativeContext...), // 1000ms
 			// MaxTxChainValidationBudget:    getInt("maxtxchainvalidationbudget", 50, alternativeContext...),      // 50ms
 			// ValidationClockCPU:              getBool("validationclockcpu", false, alternativeContext...),
 			MinConsolidationFactor:          getInt("minconsolidationfactor", 20, alternativeContext...),

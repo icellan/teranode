@@ -106,6 +106,18 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
+- **A policy-mode script error is classified by a consensus re-run.** When policy
+  validation fails on `SCRIPTNUM_OVERFLOW`, `OP_COUNT`, `SCRIPT_SIZE`, `PUBKEY_COUNT`,
+  `SCRIPTNUM_MINENCODE` or `STACK_SIZE`, the validator runs the scripts again under
+  consensus limits. The tx is `TX_POLICY` if that run passes and `TX_INVALID` if it
+  fails. A script number over `maxscriptnumlengthpolicy` but within int64 is `TX_POLICY`
+  again, and is published to `KAFKA_TX_POLICY_REJECTED`. A pre-Genesis UTXO over a
+  consensus limit is `TX_INVALID` instead of `TX_POLICY`. `maxnonstdtxvalidationduration`
+  is now read, with a default of 1000 ms, and bounds the re-run only. A re-run that does
+  not finish in time is reported as `TX_POLICY`, as sv-node does. Set it to 0 to remove
+  the bound. The re-run's stack memory is capped at `maxstackmemoryusagepolicy`, not the
+  unlimited consensus default, and a re-run that reaches the cap is also `TX_POLICY`. RPC and propagation clients that act on the error code see the new codes.
+
 - **A block's tx is created as conflicting only when it is a double spend and nothing
   else.** Block validation used to create a tx as conflicting as soon as one of its inputs
   was already spent by another tx, dropping every other failed input. A block holding a
