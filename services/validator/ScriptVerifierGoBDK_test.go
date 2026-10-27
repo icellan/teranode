@@ -255,6 +255,17 @@ func TestScriptVerifierGoBDKReRunsPolicyScriptErrorsInConsensusMode(t *testing.T
 		require.False(t, errors.Is(err, errors.ErrTxPolicy), "%v", err)
 	})
 
+	t.Run("pre-Genesis stack size with no free slot: TxInvalid", func(t *testing.T) {
+		genesis := chaincfg.TestNetParams.GenesisActivationHeight
+		verifier, fake := newVerifier(bdkscript.NewScriptError(bdkscript.SCRIPT_ERR_STACK_SIZE), nil)
+		verifier.rerunSlots <- struct{}{}
+
+		err := verifier.ValidateTransaction(aTx, genesis+100, false, []uint32{genesis - 1})
+		require.ErrorIs(t, err, errors.ErrTxInvalid)
+		require.False(t, errors.Is(err, errors.ErrTxPolicy), "%v", err)
+		require.Zero(t, fake.rerunCalls)
+	})
+
 	t.Run("engine fault in the re-run: Processing", func(t *testing.T) {
 		verifier, _ := newVerifier(policyScriptErr, bdkscript.NewScriptError(bdkscript.SCRIPT_ERR_CGO_EXCEPTION))
 

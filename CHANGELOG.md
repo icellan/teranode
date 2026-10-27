@@ -118,10 +118,12 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   the bound. The timeout is checked only between opcodes, so a new setting,
   `validator_consensusRerunSlots` (default 1), caps how many re-runs run at once. When
   no slot is free the tx is reported as `TX_POLICY` without a re-run. Set it to 0 to
-  turn re-runs off. The re-run's stack memory is capped at `maxstackmemoryusagepolicy`
-  rather than the unlimited consensus default. Reaching the cap is `TX_POLICY`, unless
-  an input is pre-Genesis, where `STACK_SIZE` can be a consensus failure and is
-  reported as `TX_INVALID`. RPC and propagation clients that act on the error code see the new codes.
+  turn re-runs off. While re-runs are unavailable, through a full slot or a timeout,
+  every policy script failure is `TX_POLICY`, including an int64 overflow. The re-run's
+  stack memory is capped at `maxstackmemoryusagepolicy` rather than the unlimited
+  consensus default, and reaching the cap is `TX_POLICY`. The exception, with or
+  without a re-run, is `STACK_SIZE` on a tx with a pre-Genesis input: it can be the
+  1000-element consensus limit, so it is `TX_INVALID`. RPC and propagation clients that act on the error code see the new codes.
 
 - **A block's tx is created as conflicting only when it is a double spend and nothing
   else.** Block validation used to create a tx as conflicting as soon as one of its inputs

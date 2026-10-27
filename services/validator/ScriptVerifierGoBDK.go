@@ -384,6 +384,11 @@ func (v *scriptVerifierGoBDK) classifyPolicyScriptError(tx *bt.Tx, eTxBytes []by
 		return errors.NewInvalidArgumentError("failed conversion for block height", errConv)
 	}
 
+	// Decided without a re-run, so that holding every slot cannot turn it into policy.
+	if v.isPreGenesisStackSize(errVerify, utxoHeights) {
+		return errors.NewTxInvalidError(errMsgInvalidTx, bdkCause(errors.ERR_TX_INVALID, errVerify))
+	}
+
 	select {
 	case v.rerunSlots <- struct{}{}:
 		defer func() { <-v.rerunSlots }()
@@ -415,22 +420,26 @@ func (v *scriptVerifierGoBDK) classifyPolicyScriptError(tx *bt.Tx, eTxBytes []by
 
 	v.logger.Debugf("%s txID=%s consensus re-run of policy error=%v failed: %v", errMsgInvalidTx, tx.TxID(), errVerify, errConsensus)
 
-	// STACK_SIZE is both the stack memory cap, which is policy, and the pre-Genesis
-	// 1000-element limit, which is consensus. BDK does not say which input failed,
-	// so any pre-Genesis input makes it consensus: wrongly so only for a
-	// transaction that mixes one with a memory-cap failure, which errs towards not
-	// publishing.
-	var scriptErr bdkscript.ScriptError
-	if errors.As(errConsensus, &scriptErr) && scriptErr.Code() == bdkscript.SCRIPT_ERR_STACK_SIZE && v.hasPreGenesisInput(utxoHeights) {
+	if v.isPreGenesisStackSize(errConsensus, utxoHeights) {
 		return errors.NewTxInvalidError(errMsgInvalidTx, bdkCause(errors.ERR_TX_INVALID, errConsensus))
 	}
 
 	return v.mapBDKValidationError(errConsensus, true)
 }
 
-// hasPreGenesisInput reports whether any input spends a UTXO created before
-// Genesis activation.
-func (v *scriptVerifierGoBDK) hasPreGenesisInput(utxoHeights []int32) bool {
+// isPreGenesisStackSize reports whether err is STACK_SIZE on a transaction with a
+// pre-Genesis input. STACK_SIZE is both the stack memory limit, which is policy,
+// and the pre-Genesis 1000-element limit, which is consensus. BDK does not say
+// which input failed, so any pre-Genesis input makes it consensus: wrongly so
+// only for a transaction that mixes one with a memory-limit failure, which errs
+// towards not publishing. A pre-Genesis script cannot reach the default 100 MB
+// policy memory limit on its own.
+func (v *scriptVerifierGoBDK) isPreGenesisStackSize(err error, utxoHeights []int32) bool {
+	var scriptErr bdkscript.ScriptError
+	if !errors.As(err, &scriptErr) || scriptErr.Code() != bdkscript.SCRIPT_ERR_STACK_SIZE {
+		return false
+	}
+
 	for _, h := range utxoHeights {
 		if h >= 0 && uint32(h) < v.params.GenesisActivationHeight {
 			return true
