@@ -17,6 +17,7 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	"github.com/bsv-blockchain/teranode/stores/txmetacache"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
+	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/stores/utxo/meta"
 	"github.com/bsv-blockchain/teranode/stores/utxo/nullstore"
 	"github.com/bsv-blockchain/teranode/stores/utxo/sql"
@@ -433,6 +434,7 @@ func XTestValidator_ValidateInternal_SpendUtxosError_WithConflicting(t *testing.
 		},
 	}
 
+	spentParentIsNotACoinbase(mockStore)
 	// Mock the Get calls that happen during transaction extension
 	// The store knows the real parent: the validator re-extends from the
 	// parent's own outputs rather than trusting the supplied ones
@@ -490,6 +492,7 @@ func TestValidator_ValidateInternal_CreateConflicting_TxAlreadyExists(t *testing
 	// checks against a genuinely signed child.
 	mockStore.On("ParentOutputsForValidation", mock.Anything, mock.Anything).Return(parentOutputsOf(coinbaseTx, utxo.ParentOutputNotMined), nil)
 	mockStore.On("GetBlockState").Return(utxo.BlockState{Height: 100, MedianTime: 1000000000})
+	spentParentIsNotACoinbase(mockStore)
 	// The main spend-and-create fails with a spend-phase utxo error (Once so the
 	// conflicting-fallback create below matches the second expectation).
 	mockStore.On("SpendAndCreate", mock.Anything, tx, mock.Anything, mock.Anything).Return(nil, spends, errors.NewUtxoError("utxo error", errors.ErrUtxoError)).Once()
@@ -554,6 +557,7 @@ func TestValidator_ValidateInternal_CreateConflicting_TxAlreadyExistsEvictsTxMet
 	// checks against a genuinely signed child.
 	mockStore.On("ParentOutputsForValidation", mock.Anything, mock.Anything).Return(parentOutputsOf(coinbaseTx, utxo.ParentOutputNotMined), nil)
 	mockStore.On("GetBlockState").Return(utxo.BlockState{Height: 100, MedianTime: 1000000000})
+	spentParentIsNotACoinbase(mockStore)
 	// The main spend-and-create fails with a spend-phase utxo error (Once so the
 	// conflicting-fallback create below matches the second expectation).
 	mockStore.On("SpendAndCreate", mock.Anything, tx, mock.Anything, mock.Anything).Return(nil, spends, errors.NewUtxoError("utxo error", errors.ErrUtxoError)).Once()
@@ -624,6 +628,7 @@ func TestValidator_ValidateInternal_CreateConflicting_PartialMarkEvictsTxMeta(t 
 	// checks against a genuinely signed child.
 	mockStore.On("ParentOutputsForValidation", mock.Anything, mock.Anything).Return(parentOutputsOf(coinbaseTx, utxo.ParentOutputNotMined), nil)
 	mockStore.On("GetBlockState").Return(utxo.BlockState{Height: 100, MedianTime: 1000000000})
+	spentParentIsNotACoinbase(mockStore)
 	// The main spend-and-create fails with a spend-phase utxo error (Once so the
 	// conflicting-fallback create below matches the second expectation).
 	mockStore.On("SpendAndCreate", mock.Anything, tx, mock.Anything, mock.Anything).Return(nil, spends, errors.NewUtxoError("utxo error", errors.ErrUtxoError)).Once()
@@ -850,6 +855,7 @@ func TestValidator_ValidateInternal_UTXOError_ConflictingTxCreation(t *testing.T
 	// Mock parent tx extension
 	mockStore.On("ParentOutputsForValidation", mock.Anything, mock.Anything).Return(parentOutputsOf(coinbaseTx, utxo.ParentOutputNotMined), nil)
 	mockStore.On("GetBlockState").Return(utxo.BlockState{Height: 100, MedianTime: 1000000000})
+	spentParentIsNotACoinbase(mockStore)
 
 	// Mock the spend phase to return UTXO error with conflicting spend (Once so
 	// the conflicting-fallback create below matches the second expectation)
@@ -1365,4 +1371,11 @@ func TestSplitTxMetaBatch(t *testing.T) {
 			}
 		})
 	}
+}
+
+// spentParentIsNotACoinbase answers the validator's read, on the block path, of the parent of an
+// output another tx already spent: a mined tx that is not a coinbase, so the failed spend is a
+// double spend and nothing else.
+func spentParentIsNotACoinbase(mockStore *utxo.MockUtxostore) {
+	mockStore.On("Get", mock.Anything, mock.Anything, []fields.FieldName{fields.IsCoinbase, fields.BlockHeights}).Return(&meta.Data{BlockHeights: []uint32{1}}, nil)
 }

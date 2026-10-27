@@ -1475,6 +1475,10 @@ func (b *BlockAssembler) Start(ctx context.Context) (err error) {
 		return errors.NewStorageError("[BlockAssembler] failed to load un-mined transactions: %v", err)
 	}
 
+	// the unmined txs were added outside the processing loop, so the loop has not yet
+	// checked the resulting subtrees against blockmaxsize
+	b.subtreeProcessor.RequestBlockMaxSizeCheck()
+
 	// AddTx is already enqueueing on the gRPC side. If loadUnminedTransactions
 	// flagged any tx as conflicting (and cascaded its descendants), drain the
 	// input queue with that set as a drop filter before the event-loop
@@ -2523,9 +2527,10 @@ func (b *BlockAssembler) handleReorg(ctx context.Context, header *model.BlockHea
 
 // handleCatchUp executes a forward-only catch-up. Delegates to the subtree
 // processor's reorgBlocks fast path (the `len(moveBackBlocks)==0 && len(moveForwardBlocks)>0`
-// branch, see SubtreeProcessor.go:2794), which iterates moveForwardBlock per block with
-// skipNotification + skipDequeue on every block except the last and rolls back to
-// pre-catchup state on mid-loop failure. ctx is unused at this layer — Reorg controls
+// branch), which drains the queue into the subtrees first, so every block's remainder pass
+// filters the backlog, then iterates moveForwardBlock per block with skipNotification +
+// skipDequeue on every block except the last, and rolls back to the drained pre-catchup
+// state on mid-loop failure. ctx is unused at this layer — Reorg controls
 // its own internal lifecycle via reorgBlockChan.
 func (b *BlockAssembler) handleCatchUp(_ context.Context, moveForward []blockWithMeta) error {
 	if len(moveForward) == 0 {
