@@ -787,7 +787,7 @@ func (v *Validator) ValidateWithOptions(ctx context.Context, tx *bt.Tx, blockHei
 			}
 		}
 
-		// Publish consensus-valid but policy-rejected transactions so subtree validation
+		// Publish policy-rejected transactions so subtree validation
 		// pods can cache the raw tx bytes and avoid HTTP roundtrips to other miners.
 		if errors.Is(err, errors.ErrTxPolicy) {
 			v.publishPolicyRejectedTx(ctx, ctxLogger, tx, err)

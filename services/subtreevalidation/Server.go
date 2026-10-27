@@ -111,7 +111,8 @@ type Server struct {
 	txmetaConsumerClient kafka.KafkaConsumerGroupI
 
 	// policyRejectedTxConsumerClient consumes policy-rejected transaction messages.
-	// These are consensus-valid transactions that our validator rejected on policy grounds.
+	// These are transactions our validator rejected on policy grounds, usually but not
+	// always consensus-valid, so they are validated in full when used.
 	// Raw tx bytes are cached locally so subtree validation can avoid HTTP fetches.
 	policyRejectedTxConsumerClient kafka.KafkaConsumerGroupI
 
