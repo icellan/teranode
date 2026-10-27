@@ -425,10 +425,9 @@ func TestFetchBlocksConcurrently_NumbersFromFirstBlockHeight(t *testing.T) {
 func allStoredPromotionSetup(t *testing.T) (*Server, *promotionAuthorityClient, *promotionFaultStore, *CatchupContext) {
 	t.Helper()
 	server, client, store, catchupCtx := newPromotionAuthority(t)
-	server.blockValidation = &BlockValidation{
-		blockchainClient: client,
-		blockExistsCache: expiringmap.New[chainhash.Hash, bool](time.Minute),
-	}
+	cache := expiringmap.New[chainhash.Hash, bool](time.Minute)
+	t.Cleanup(cache.Stop)
+	server.blockValidation = &BlockValidation{blockchainClient: client, blockExistsCache: cache}
 
 	block := testhelpers.CreateTestBlocksWithPrev(t, 1, server.settings.ChainCfgParams.GenesisHash)[0]
 	_, _, err := store.StoreBlock(context.Background(), block, "test")

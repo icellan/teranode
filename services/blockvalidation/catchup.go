@@ -1247,8 +1247,8 @@ func (u *Server) verifyCheckpointsAgainstHeaders(catchupCtx *CatchupContext) (in
 	// reached by the loop below) provides no cryptographic guarantee for this session.
 	var highestVerifiedCheckpointHeight uint32
 
-	firstBlockHeight := catchupCtx.commonAncestorMeta.Height + 1
-	lastBlockHeight := catchupCtx.commonAncestorMeta.Height + uint32(len(catchupCtx.blockHeaders))
+	firstBlockHeight := catchupFirstBlockHeight(catchupCtx)
+	lastBlockHeight := firstBlockHeight + uint32(len(catchupCtx.blockHeaders)) - 1
 
 	u.logger.Debugf("[catchup][%s] Verifying checkpoints in height range %d-%d (common ancestor at %d)", catchupCtx.blockUpTo.Hash().String(), firstBlockHeight, lastBlockHeight, catchupCtx.commonAncestorMeta.Height)
 
@@ -1567,36 +1567,6 @@ func catchupFirstBlockHeight(catchupCtx *CatchupContext) uint32 {
 	return catchupCtx.commonAncestorMeta.Height + 1
 }
 
-// filterExistingBlocks removes blocks that already exist in our database.
-// Checks each header against the blockchain to avoid redundant processing.
-//
-// Parameters:
-//   - ctx: Context for cancellation
-//   - headers: Headers to check
-//   - blockUpTo: Target block for logging
-//
-// Returns:
-//   - []*model.BlockHeader: Headers that don't exist in our database
-//   - error: If database check fails
-func (u *Server) filterExistingBlocks(ctx context.Context, headers []*model.BlockHeader, blockUpTo *model.Block) ([]*model.BlockHeader, error) {
-	var newHeaders []*model.BlockHeader
-
-	for _, header := range headers {
-		exists, err := u.blockValidation.GetBlockExists(ctx, header.Hash())
-		if err != nil {
-			u.logger.Warnf("[catchup][%s] failed to check if block %s exists: %v", blockUpTo.Hash().String(), header.Hash().String(), err)
-			// Include it to be safe
-			newHeaders = append(newHeaders, header)
-		} else if !exists {
-			newHeaders = append(newHeaders, header)
-		} else {
-			u.logger.Debugf("[catchup][%s] skipping block %s - already exists", blockUpTo.Hash().String(), header.Hash().String())
-		}
-	}
-
-	return newHeaders, nil
-}
-
 // reportValidatedHeaderProgress records locally verified header work for the
 // peer that served the header chain. The report is advisory and best-effort.
 //
@@ -1642,6 +1612,8 @@ func (u *Server) computeValidatedHeaderProgress(catchupCtx *CatchupContext) (uin
 		return 0, nil, nil, false
 	}
 
+	// Work and height accumulate from the common ancestor, so this must run on the untrimmed
+	// header list, before fetchAndValidateBlocks drops the stored front.
 	height := catchupCtx.commonAncestorMeta.Height
 	var lastHash *chainhash.Hash
 
