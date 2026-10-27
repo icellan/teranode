@@ -362,7 +362,7 @@ func (u *Server) blockWorker(ctx context.Context, workerID int, workQueue <-chan
 func (u *Server) blockStoredSinceHeaders(ctx context.Context, block *model.Block) (bool, error) {
 	exists, err := u.blockValidation.GetBlockExists(ctx, block.Hash())
 	if err != nil {
-		return false, storedLookupError(err, "[catchup] failed to check whether block %s is stored", block.Hash().String())
+		return false, storedLookupError(ctx, err, "[catchup] failed to check whether block %s is stored", block.Hash().String())
 	}
 
 	return exists, nil

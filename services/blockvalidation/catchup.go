@@ -1345,7 +1345,7 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 	// the subtree validator drop live peer subtrees.
 	stored, lastStoredHeight, err := u.storedHeaderPrefix(ctx, catchupCtx.blockHeaders)
 	if err != nil {
-		return storedLookupError(err, "[catchup:fetchAndValidateBlocks][%s] failed to check for stored blocks", catchupCtx.blockUpTo.Hash().String())
+		return storedLookupError(ctx, err, "[catchup:fetchAndValidateBlocks][%s] failed to check for stored blocks", catchupCtx.blockUpTo.Hash().String())
 	}
 
 	if stored > 0 {
@@ -1544,14 +1544,15 @@ func (u *Server) storedHeaderPrefix(ctx context.Context, headers []*model.BlockH
 
 // storedLookupError wraps a failed stored-block lookup. The failure is always local, never the
 // peer's: shutdown and an unreachable blockchain service keep their own labels in
-// releaseCatchupLock, and anything else, a deadline included, is a storage fault.
-func storedLookupError(err error, message string, params ...interface{}) error {
+// releaseCatchupLock, and anything else, a deadline included, is a storage fault. Shutdown is read
+// from ctx because the gRPC client's UnwrapGRPC drops a transport Canceled status.
+func storedLookupError(ctx context.Context, err error, message string, params ...interface{}) error {
 	params = append(params, err)
 
 	switch {
-	case errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled:
+	case ctx.Err() != nil || errors.Is(err, context.Canceled):
 		return errors.NewContextCanceledError(message, params...)
-	case errors.Is(err, errors.ErrServiceUnavailable) || status.Code(err) == codes.Unavailable:
+	case errors.Is(err, errors.ErrServiceUnavailable):
 		return errors.NewServiceUnavailableError(message, params...)
 	default:
 		return errors.NewStorageError(message, params...)
@@ -1786,7 +1787,8 @@ func (u *Server) validateBlocksOnChannel(validateBlocksChan chan blockForValidat
 			// A block stored since the header phase goes straight to normal validation, which finds
 			// it stored (or stored invalid) and stops; quick validation's commit would collide with
 			// it. The worker's mark only saves the prewarm: a block can also be stored after that
-			// check, so validation checks again here.
+			// check, so validation checks again here. This narrows the window to quick validation's
+			// own run; it does not close it.
 			alreadyStored := item.alreadyStored
 			if !alreadyStored {
 				var err error

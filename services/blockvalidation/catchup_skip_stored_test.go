@@ -492,21 +492,26 @@ func TestStoredHeaderPrefix_RealStore(t *testing.T) {
 // shutdown and an unreachable blockchain service keep their own local labels instead of being
 // reported as a storage fault. Deadlines have no label of their own, so they stay storage faults.
 func TestStoredLookupError_KeepsLocalLabels(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
 	for _, tc := range []struct {
 		name string
+		ctx  context.Context
 		err  error
 		want error
 		not  error
 	}{
-		{"cancelled", context.Canceled, errors.ErrContextCanceled, errors.ErrStorageError},
-		{"grpc cancelled", status.Error(codes.Canceled, "shutdown"), errors.ErrContextCanceled, errors.ErrStorageError},
-		{"unavailable", errors.NewServiceUnavailableError("blockchain down"), errors.ErrServiceUnavailable, errors.ErrStorageError},
-		{"grpc unavailable", status.Error(codes.Unavailable, "blockchain down"), errors.ErrServiceUnavailable, errors.ErrStorageError},
-		{"deadline", context.DeadlineExceeded, errors.ErrStorageError, nil},
-		{"other", errors.NewServiceError("boom"), errors.ErrStorageError, nil},
+		{"cancelled", context.Background(), context.Canceled, errors.ErrContextCanceled, errors.ErrStorageError},
+		// The gRPC client hands back UnwrapGRPC's ERR_ERROR, which has lost the Canceled status, so
+		// shutdown is recognised by the caller's own context.
+		{"grpc cancelled", cancelled, errors.UnwrapGRPC(status.Error(codes.Canceled, "context canceled")), errors.ErrContextCanceled, errors.ErrStorageError},
+		{"unavailable", context.Background(), errors.NewServiceUnavailableError("blockchain down"), errors.ErrServiceUnavailable, errors.ErrStorageError},
+		{"deadline", context.Background(), context.DeadlineExceeded, errors.ErrStorageError, nil},
+		{"other", context.Background(), errors.NewServiceError("boom"), errors.ErrStorageError, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := storedLookupError(tc.err, "lookup of %s failed", "block")
+			err := storedLookupError(tc.ctx, tc.err, "lookup of %s failed", "block")
 			require.True(t, errors.Is(err, tc.want), "got %v", err)
 			if tc.not != nil {
 				require.False(t, errors.Is(err, tc.not), "got %v", err)
