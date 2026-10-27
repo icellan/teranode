@@ -12,11 +12,14 @@ import (
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/services/blockvalidation/testhelpers"
 	"github.com/bsv-blockchain/teranode/util"
+	"github.com/bsv-blockchain/teranode/util/expiringmap"
 	"github.com/jarcoal/httpmock"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 // The scale-3 incident of 2026-10-26: a child went to catchup while its parent was being stored.
@@ -25,13 +28,14 @@ import (
 // ValidateBlock reported "tried to validate existing valid block".
 
 // TestFetchAndValidateBlocks_AllHeadersStored_SkipsCatchingBlocks: when every block catchup was
-// about to fetch is already stored as valid, it returns without touching the FSM.
+// about to fetch is already stored as valid, it returns without moving the FSM to CATCHINGBLOCKS.
 func TestFetchAndValidateBlocks_AllHeadersStored_SkipsCatchingBlocks(t *testing.T) {
 	server, mockBlockchainClient, _, cleanup := setupTestCatchupServer(t)
 	defer cleanup()
 
 	blocks := testhelpers.CreateTestBlockChain(t, 3)
 	mockBlockchainClient.On("GetBlockExists", mock.Anything, mock.Anything).Return(true, nil)
+	mockBlockchainClient.On("Run", mock.Anything, mock.Anything).Return(nil)
 	mockBlockchainClient.On("GetBlockHeader", mock.Anything, mock.Anything).Return(blocks[1].Header, &model.BlockHeaderMeta{Height: 1}, nil)
 
 	catchupCtx := &CatchupContext{
@@ -41,6 +45,7 @@ func TestFetchAndValidateBlocks_AllHeadersStored_SkipsCatchingBlocks(t *testing.
 
 	require.NoError(t, server.fetchAndValidateBlocks(context.Background(), catchupCtx))
 	mockBlockchainClient.AssertNotCalled(t, "CatchUpBlocks", mock.Anything)
+	mockBlockchainClient.AssertCalled(t, "Run", mock.Anything, mock.Anything)
 	require.Empty(t, catchupCtx.blockHeaders)
 }
 
@@ -304,4 +309,47 @@ func TestFetchBlocksConcurrently_NumbersFromFirstBlockHeight(t *testing.T) {
 			t.Fatalf("timeout waiting for block %d", i)
 		}
 	}
+}
+
+// allStoredPromotionSetup stores the only block catchup was about to fetch, on a real FSM authority
+// that starts in CATCHINGBLOCKS.
+func allStoredPromotionSetup(t *testing.T) (*Server, *promotionAuthorityClient, *promotionFaultStore, *CatchupContext) {
+	t.Helper()
+	server, client, store, catchupCtx := newPromotionAuthority(t)
+	server.blockValidation = &BlockValidation{
+		blockchainClient: client,
+		blockExistsCache: expiringmap.New[chainhash.Hash, bool](time.Minute),
+	}
+
+	block := testhelpers.CreateTestBlocksWithPrev(t, 1, server.settings.ChainCfgParams.GenesisHash)[0]
+	_, _, err := store.StoreBlock(context.Background(), block, "test")
+	require.NoError(t, err)
+
+	catchupCtx.blockUpTo = block
+	catchupCtx.blockHeaders = []*model.BlockHeader{block.Header}
+
+	return server, client, store, catchupCtx
+}
+
+// TestFetchAndValidateBlocks_AllHeadersStored_PromotesFromCatchingBlocks: a node left in
+// CATCHINGBLOCKS must still be promoted to RUNNING when there is nothing left to fetch.
+func TestFetchAndValidateBlocks_AllHeadersStored_PromotesFromCatchingBlocks(t *testing.T) {
+	server, client, store, catchupCtx := allStoredPromotionSetup(t)
+
+	require.NoError(t, server.fetchAndValidateBlocks(context.Background(), catchupCtx))
+	require.Empty(t, catchupCtx.blockHeaders)
+	requirePromotionState(t, client, store, blockchain.FSMStateRUNNING)
+	require.Equal(t, 1, client.runCalls)
+}
+
+// TestFetchAndValidateBlocks_AllHeadersStored_PreservesOperatorIdle: the promotion request on the
+// all-stored path must not undo an operator STOP.
+func TestFetchAndValidateBlocks_AllHeadersStored_PreservesOperatorIdle(t *testing.T) {
+	server, client, store, catchupCtx := allStoredPromotionSetup(t)
+	_, err := client.authority.Idle(context.Background(), &emptypb.Empty{})
+	require.NoError(t, err)
+
+	require.NoError(t, server.fetchAndValidateBlocks(context.Background(), catchupCtx))
+	requirePromotionState(t, client, store, blockchain.FSMStateIDLE)
+	require.Equal(t, 1, client.runCalls)
 }

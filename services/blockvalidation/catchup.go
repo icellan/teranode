@@ -1356,6 +1356,10 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 		catchupCtx.firstBlockHeight = lastStoredHeight + 1
 
 		if len(catchupCtx.blockHeaders) == 0 {
+			// Nothing to fetch, so no CATCHINGBLOCKS, but the node may already be in it: a
+			// successful catchup still asks the authority for RUN (no-op when RUNNING, refused
+			// from operator IDLE).
+			u.restoreFSMState(ctx, catchupCtx)
 			return nil
 		}
 	}
