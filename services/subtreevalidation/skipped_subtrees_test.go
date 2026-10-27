@@ -3,13 +3,18 @@ package subtreevalidation
 import (
 	"context"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/stores/blob/memory"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/kafka"
 	kafkamessage "github.com/bsv-blockchain/teranode/util/kafka/kafka_message"
@@ -25,13 +30,54 @@ import (
 // meant 300M txmeta reads from the UTXO store. Subtrees skipped while not RUNNING are now kept and
 // validated once the node is RUNNING again.
 
-// fsmState is the state the mocked blockchain client reports. Tests change it only while no
-// handler goroutine reads it.
+// fsmState is the state the test blockchain client reports. Replays read it from their own
+// goroutines while tests change it, so it is locked.
 type fsmState struct {
+	mu    sync.Mutex
 	state blockchain.FSMStateType
 }
 
-func (f *fsmState) set(state blockchain.FSMStateType) { f.state = state }
+func (f *fsmState) set(state blockchain.FSMStateType) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.state = state
+}
+
+func (f *fsmState) get() blockchain.FSMStateType {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.state
+}
+
+// fsmClient reports the state in fsmState. With waitForRunning, WaitForFSMtoTransitionToGivenState
+// behaves like the real client: it returns once the state is RUNNING. Otherwise the mock answers,
+// and the RUNNING watcher gives up at once.
+type fsmClient struct {
+	*blockchain.Mock
+	state          *fsmState
+	waitForRunning bool
+}
+
+func (c *fsmClient) GetFSMCurrentState(context.Context) (*blockchain.FSMStateType, error) {
+	state := c.state.get()
+	return &state, nil
+}
+
+func (c *fsmClient) WaitForFSMtoTransitionToGivenState(ctx context.Context, target blockchain.FSMStateType) error {
+	if !c.waitForRunning {
+		return c.Mock.WaitForFSMtoTransitionToGivenState(ctx, target)
+	}
+
+	for c.state.get() != target {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	return nil
+}
 
 type replayedSubtree struct {
 	hash    chainhash.Hash
@@ -47,10 +93,10 @@ func newSkippedSubtreeServer(t *testing.T, state *fsmState, max int) (*Server, c
 	tSettings.SubtreeValidation.BlocksOnly = false
 	tSettings.SubtreeValidation.SkippedSubtreeBackfillMax = max
 
-	blockchainClient := &blockchain.Mock{}
-	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&state.state, nil)
+	blockchainMock := &blockchain.Mock{}
 	// The RUNNING watcher gives up at once unless a test wires a real wait.
-	blockchainClient.On("WaitForFSMtoTransitionToGivenState", mock.Anything, blockchain.FSMStateRUNNING).Return(errors.NewContextCanceledError("no watcher in this test")).Maybe()
+	blockchainMock.On("WaitForFSMtoTransitionToGivenState", mock.Anything, blockchain.FSMStateRUNNING).Return(errors.NewContextCanceledError("no watcher in this test")).Maybe()
+	blockchainClient := &fsmClient{Mock: blockchainMock, state: state}
 
 	replayed := make(chan replayedSubtree, 16)
 	server := &Server{
@@ -337,9 +383,8 @@ func TestSkippedSubtrees_ReplayStartsWhenNodeReachesRunning(t *testing.T) {
 	server, replayed := newSkippedSubtreeServer(t, fsm, 16)
 
 	running := make(chan struct{})
-	blockchainClient := server.blockchainClient.(*blockchain.Mock)
+	blockchainClient := server.blockchainClient.(*fsmClient).Mock
 	blockchainClient.ExpectedCalls = nil
-	blockchainClient.On("GetFSMCurrentState", mock.Anything).Return(&fsm.state, nil)
 	blockchainClient.On("WaitForFSMtoTransitionToGivenState", mock.Anything, blockchain.FSMStateRUNNING).
 		Run(func(mock.Arguments) { <-running }).Return(nil).Once()
 
@@ -353,6 +398,7 @@ func TestSkippedSubtrees_ReplayStartsWhenNodeReachesRunning(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
+	fsm.set(blockchain.FSMStateRUNNING)
 	close(running)
 
 	got := 0
@@ -366,4 +412,205 @@ func TestSkippedSubtrees_ReplayStartsWhenNodeReachesRunning(t *testing.T) {
 	}
 
 	require.Eventually(t, func() bool { return !server.skippedSubtrees.watching.Load() }, time.Second, 10*time.Millisecond)
+}
+
+const skippedHashD = "0000000000000000000000000000000000000000000000000000000000000003"
+
+func skippedEntry(t *testing.T, hash string, recordedAt time.Time) skippedSubtree {
+	t.Helper()
+
+	h, err := chainhash.NewHashFromStr(hash)
+	require.NoError(t, err)
+
+	baseURL, err := url.Parse("http://peer-p1:8000")
+	require.NoError(t, err)
+
+	return skippedSubtree{hash: *h, baseURL: baseURL, peerID: "p1", recordedAt: recordedAt}
+}
+
+// TestReplaySkippedSubtrees_KeptDuringReplayAreReplayedAfter: a catchup that starts and ends
+// while a replay runs keeps subtrees and starts a watcher, which finds the replay running and
+// gives up. The running replay must pick them up when it finishes, or they wait for the next
+// peer subtree or block.
+func TestReplaySkippedSubtrees_KeptDuringReplayAreReplayedAfter(t *testing.T) {
+	fsm := &fsmState{state: blockchain.FSMStateCATCHINGBLOCKS}
+	server, replayed := newSkippedSubtreeServer(t, fsm, 16)
+	server.blockchainClient.(*fsmClient).waitForRunning = true
+
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	server.replaySubtreeFn = func(_ context.Context, hash *chainhash.Hash, baseURL *url.URL, peerID string) error {
+		if hash.String() == skippedHashA {
+			close(blocked)
+			<-release
+		}
+		replayed <- replayedSubtree{hash: *hash, baseURL: baseURL.String(), peerID: peerID}
+		return nil
+	}
+
+	handler := server.subtreeMessageHandler(context.Background())
+	require.NoError(t, handler(subtreeMessage(t, skippedHashA, "p1")))
+
+	fsm.set(blockchain.FSMStateRUNNING)
+	select {
+	case <-blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the replay of the first catchup did not start")
+	}
+
+	// A second catchup while that replay runs.
+	fsm.set(blockchain.FSMStateCATCHINGBLOCKS)
+	require.NoError(t, handler(subtreeMessage(t, skippedHashB, "p2")))
+	fsm.set(blockchain.FSMStateRUNNING)
+	require.Eventually(t, func() bool { return !server.skippedSubtrees.watching.Load() }, 2*time.Second, time.Millisecond, "the second watcher found the replay running")
+
+	close(release)
+
+	got := map[string]bool{}
+	for len(got) < 2 {
+		select {
+		case r := <-replayed:
+			got[r.hash.String()] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("replayed %v; the subtree kept during the replay was left queued", got)
+		}
+	}
+
+	require.Eventually(t, func() bool { return server.skippedSubtrees.len() == 0 }, time.Second, time.Millisecond)
+}
+
+// TestReplaySkippedSubtrees_ExpiresWhileWaitingForAdmission: an entry can wait for an admission
+// slot past skippedSubtreeMaxAge. It must not be fetched then: the peer may have pruned it, and a
+// fetch that fails reports the peer.
+func TestReplaySkippedSubtrees_ExpiresWhileWaitingForAdmission(t *testing.T) {
+	fsm := &fsmState{state: blockchain.FSMStateRUNNING}
+	server, replayed := newSkippedSubtreeServer(t, fsm, 16)
+	server.settings.SubtreeValidation.PeerSubtreeConcurrency = 1
+
+	// Take the only admission slot, as a live peer subtree would.
+	releaseSlot, err := server.peerSubtreeAdmission.acquire(context.Background(), 1)
+	require.NoError(t, err)
+
+	server.skippedSubtrees.record(skippedEntry(t, skippedHashA, time.Now().Add(-skippedSubtreeMaxAge+300*time.Millisecond)), 16)
+
+	expired := testutil.ToFloat64(prometheusSkippedSubtrees.WithLabelValues("expired"))
+	server.replaySkippedSubtrees(context.Background())
+
+	time.Sleep(600 * time.Millisecond)
+	releaseSlot()
+
+	require.Eventually(t, func() bool { return !server.skippedSubtrees.replaying.Load() }, 2*time.Second, time.Millisecond)
+	require.Empty(t, replayed, "an entry past skippedSubtreeMaxAge is not fetched")
+	require.Equal(t, expired+1, testutil.ToFloat64(prometheusSkippedSubtrees.WithLabelValues("expired")))
+}
+
+// TestReplaySkippedSubtrees_KeptAgainIsNotReplayed: a subtree that meets another catchup during
+// its replay is kept again with its original announcement time, so the age limit still counts
+// from the announcement, and it is not counted as replayed.
+func TestReplaySkippedSubtrees_KeptAgainIsNotReplayed(t *testing.T) {
+	fsm := &fsmState{state: blockchain.FSMStateCATCHINGBLOCKS}
+	server, replayed := newSkippedSubtreeServer(t, fsm, 16)
+
+	announced := time.Now().Add(-10 * time.Minute)
+	entry := skippedEntry(t, skippedHashA, announced)
+	server.skippedSubtrees.record(entry, 16)
+
+	replayedCount := testutil.ToFloat64(prometheusSkippedSubtrees.WithLabelValues("replayed"))
+	requeued := testutil.ToFloat64(prometheusSkippedSubtrees.WithLabelValues("requeued"))
+
+	server.replaySkippedSubtrees(context.Background())
+
+	require.Eventually(t, func() bool { return !server.skippedSubtrees.replaying.Load() }, 2*time.Second, time.Millisecond)
+	require.Empty(t, replayed, "nothing is validated while catching up")
+	require.Equal(t, replayedCount, testutil.ToFloat64(prometheusSkippedSubtrees.WithLabelValues("replayed")))
+	require.Equal(t, requeued+1, testutil.ToFloat64(prometheusSkippedSubtrees.WithLabelValues("requeued")))
+
+	kept := server.skippedSubtrees.take()
+	require.Len(t, kept, 1)
+	require.True(t, kept[0].recordedAt.Equal(announced), "kept again with the original announcement time")
+}
+
+// TestReplaySkippedSubtrees_HeldLockIsNotReplayed: a quorum lock held elsewhere with no subtree
+// stored yet means another validation is running, which may still fail. Only a stored subtree
+// counts as replayed.
+func TestReplaySkippedSubtrees_HeldLockIsNotReplayed(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		stored   bool
+		replayed float64
+	}{
+		{name: "lock held, nothing stored", stored: false, replayed: 0},
+		{name: "subtree stored", stored: true, replayed: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fsm := &fsmState{state: blockchain.FSMStateRUNNING}
+			server, _ := newSkippedSubtreeServer(t, fsm, 16)
+			server.replaySubtreeFn = nil
+
+			quorumPath := t.TempDir()
+			subtreeStore := memory.New()
+			server.subtreeStore = subtreeStore
+
+			var err error
+			server.quorum, err = NewQuorum(ulogger.TestLogger{}, subtreeStore, quorumPath)
+			require.NoError(t, err)
+
+			blockIDsMap := make(map[uint32]bool)
+			server.currentBlockIDsMap.Store(&blockIDsMap)
+			server.bestBlockHeaderMeta.Store(&model.BlockHeaderMeta{Height: 100})
+
+			entry := skippedEntry(t, skippedHashA, time.Now())
+			if tc.stored {
+				require.NoError(t, subtreeStore.Set(context.Background(), entry.hash.CloneBytes(), fileformat.FileTypeSubtree, []byte("existing")))
+			} else {
+				require.NoError(t, os.WriteFile(filepath.Join(quorumPath, entry.hash.String()+".lock"), nil, 0o600))
+			}
+
+			server.skippedSubtrees.record(entry, 16)
+
+			replayedCount := testutil.ToFloat64(prometheusSkippedSubtrees.WithLabelValues("replayed"))
+			failed := testutil.ToFloat64(prometheusSkippedSubtrees.WithLabelValues("replay_failed"))
+
+			server.replaySkippedSubtrees(context.Background())
+
+			require.Eventually(t, func() bool { return !server.skippedSubtrees.replaying.Load() }, 2*time.Second, time.Millisecond)
+			require.Equal(t, replayedCount+tc.replayed, testutil.ToFloat64(prometheusSkippedSubtrees.WithLabelValues("replayed")))
+			require.Equal(t, failed, testutil.ToFloat64(prometheusSkippedSubtrees.WithLabelValues("replay_failed")))
+		})
+	}
+}
+
+// TestSkippedSubtrees_KeptAgainKeepsAnnouncementOrder: entries kept again after a replay met
+// another catchup go back by announcement time, not to the back. With the queue full, they are
+// the oldest and go first, so newer announcements stay.
+func TestSkippedSubtrees_KeptAgainKeepsAnnouncementOrder(t *testing.T) {
+	now := time.Now()
+
+	t.Run("full queue drops the older entries kept again", func(t *testing.T) {
+		var set skippedSubtrees
+
+		set.record(skippedEntry(t, skippedHashC, now.Add(-time.Second)), 2)
+		set.record(skippedEntry(t, skippedHashD, now), 2)
+
+		added, evicted := set.record(skippedEntry(t, skippedHashA, now.Add(-2*time.Minute)), 2)
+		require.False(t, added)
+		require.True(t, evicted)
+
+		added, evicted = set.record(skippedEntry(t, skippedHashB, now.Add(-time.Minute)), 2)
+		require.False(t, added)
+		require.True(t, evicted)
+
+		require.Equal(t, []string{skippedHashC, skippedHashD}, skippedHashes(set.take()))
+	})
+
+	t.Run("room left inserts by announcement time", func(t *testing.T) {
+		var set skippedSubtrees
+
+		set.record(skippedEntry(t, skippedHashC, now.Add(-time.Second)), 4)
+		set.record(skippedEntry(t, skippedHashD, now), 4)
+		set.record(skippedEntry(t, skippedHashB, now.Add(-time.Minute)), 4)
+		set.record(skippedEntry(t, skippedHashA, now.Add(-2*time.Minute)), 4)
+
+		require.Equal(t, []string{skippedHashA, skippedHashB, skippedHashC, skippedHashD}, skippedHashes(set.take()))
+	})
 }

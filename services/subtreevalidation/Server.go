@@ -171,7 +171,8 @@ type Server struct {
 	// validation once it is RUNNING again.
 	skippedSubtrees skippedSubtrees
 
-	// replaySubtreeFn replaces subtreesHandler for a replayed subtree; nil in production.
+	// replaySubtreeFn replaces the validation of a replayed subtree, after its admission, age and
+	// RUNNING checks; nil in production.
 	replaySubtreeFn func(ctx context.Context, hash *chainhash.Hash, baseURL *url.URL, peerID string) error
 }
 

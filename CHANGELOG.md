@@ -732,9 +732,10 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   are now validated through the normal peer-subtree path once the node is RUNNING
   again, using at most half of `subtreevalidation_peerSubtreeConcurrency`, so
   expect a burst of peer subtree validation right after a catchup. Subtrees
-  announced while IDLE, or kept for more than 30 minutes, are still dropped. New metric:
+  announced while IDLE, or more than 30 minutes before their replay, are still
+  dropped. New metric:
   `teranode_subtreevalidation_skipped_peer_subtrees_total{outcome}` (recorded,
-  evicted, replayed, replay_failed). Set the key to `0` for the previous
+  evicted, expired, requeued, replayed, replay_failed). Set the key to `0` for the previous
   behaviour. (#2055)
 
 - **Mining candidates no longer build on the old tip during a reorg.** While block
