@@ -2392,6 +2392,8 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 	currentState := blockchain.FSMStateRUNNING
 	mockBlockchainClient.On("GetFSMCurrentState", mock.Anything).
 		Return(&currentState, nil).Maybe()
+	mockBlockchainClient.On("GetBestBlockHeader", mock.Anything).
+		Return(multiBatchTip, &model.BlockHeaderMeta{ID: 100}, nil).Maybe()
 
 	afCfg := adaptivefetch.DefaultConfig()
 	afCfg.BootstrapMode = adaptivefetch.ModePessimistic

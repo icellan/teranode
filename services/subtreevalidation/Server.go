@@ -964,11 +964,11 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 		// peer-facing branch below.
 		//
 		// Block assembly interaction (why the flag is safe with assembly
-		// enabled in RUNNING): a floater child blessed at the candidate
-		// height and added to assembly is the same transaction policy-mode
-		// admission would have accepted into assembly anyway (policy
-		// substitutes tip+1 for unconfirmed parents — equal to the candidate
-		// height at the tip, and era flags cannot differ post-Genesis).
+		// enabled in RUNNING): assembly is fed only when the block extends
+		// the tip, so the candidate height is tip+1, the height assembly
+		// mines at. A floater child blessed there and added to assembly is
+		// the same transaction policy-mode admission would have accepted
+		// (policy substitutes tip+1 for unconfirmed parents).
 		// Accepted-block txs are mined-removed from assembly as always.
 		validatorOptions := []validator.Option{
 			validator.WithSkipPolicyChecks(true),
@@ -986,10 +986,14 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 
 		// While catching up blocks, disable adding transactions to block
 		// assembly: bulk-history txs do not belong in our template. In
-		// RUNNING, assembly stays enabled so txs from a legacy-bridge tip
-		// block survive in the mempool if the block loses a reorg.
-		// IDLE is included: an operator STOP can land while catchup is running.
-		if *currentState != blockchain.FSMStateRUNNING {
+		// RUNNING, assembly stays enabled for a tip block so its txs survive
+		// in the mempool if the block loses a reorg. See feedsBlockAssembly.
+		feeds, err := u.feedsBlockAssembly(ctx, *currentState, previousBlockHash)
+		if err != nil {
+			return false, errors.NewProcessingError("[CheckSubtree] Failed to decide block assembly feed", err)
+		}
+
+		if !feeds {
 			validatorOptions = append(validatorOptions, validator.WithAddTXToBlockAssembly(false))
 		}
 

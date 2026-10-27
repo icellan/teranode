@@ -20,6 +20,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// multiBatchTip is the best block header setupTestServer serves; blocks from
+// buildMultiBatchBlock extend it.
+var multiBatchTip = &model.BlockHeader{
+	Version:        1,
+	HashPrevBlock:  &chainhash.Hash{},
+	HashMerkleRoot: &chainhash.Hash{},
+	Timestamp:      1700000000,
+	Bits:           model.NBit{},
+	Nonce:          0,
+}
+
 // buildMultiBatchBlock creates n single-tx subtrees, stores each one's
 // FileTypeSubtreeToCheck marker and FileTypeSubtreeData locally (so the batch
 // loader resolves them without any HTTP fetch), and returns a block whose
@@ -64,7 +75,7 @@ func buildMultiBatchBlock(t *testing.T, server *Server, n int) *model.Block {
 
 	header := &model.BlockHeader{
 		Version:        1,
-		HashPrevBlock:  &chainhash.Hash{},
+		HashPrevBlock:  multiBatchTip.Hash(),
 		HashMerkleRoot: &chainhash.Hash{},
 		Timestamp:      uint32(time.Now().Unix()),
 		Bits:           model.NBit{},
@@ -83,15 +94,6 @@ func buildMultiBatchBlock(t *testing.T, server *Server, n int) *model.Block {
 func wireMultiBatchMocks(server *Server) {
 	server.settings.SubtreeValidation.TxBatchSize = 1
 
-	server.blockchainClient.(*blockchain.Mock).On("GetBestBlockHeader", mock.Anything).
-		Return(&model.BlockHeader{
-			Version:        1,
-			HashPrevBlock:  &chainhash.Hash{},
-			HashMerkleRoot: &chainhash.Hash{},
-			Timestamp:      uint32(time.Now().Unix()),
-			Bits:           model.NBit{},
-			Nonce:          0,
-		}, &model.BlockHeaderMeta{ID: 100}, nil).Maybe()
 	server.blockchainClient.(*blockchain.Mock).On("GetBlockHeaderIDs",
 		mock.Anything, mock.Anything, mock.Anything).
 		Return([]uint32{1, 2, 3}, nil).Maybe()
@@ -224,5 +226,52 @@ func TestCheckBlockSubtrees_OnlyRunningFeedsBlockAssembly(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCheckBlockSubtrees_SideBlockBelowGenesisDoesNotFeedBlockAssembly reproduces
+// the route in issue 4940: a peer-announced side block below Genesis, whose parent
+// is not the tip, is validated under pre-Genesis script rules at its own height. In
+// RUNNING its transactions must not reach block assembly, which mines at tip+1
+// (post-Genesis) without re-checking scripts.
+func TestCheckBlockSubtrees_SideBlockBelowGenesisDoesNotFeedBlockAssembly(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	wireMultiBatchMocks(server) // FSM RUNNING
+
+	genesis := server.settings.ChainCfgParams.GenesisActivationHeight
+	bc := server.blockchainClient.(*blockchain.Mock)
+	for _, call := range bc.ExpectedCalls {
+		if call.Method == "GetBestBlockHeader" {
+			call.ReturnArguments[1] = &model.BlockHeaderMeta{ID: 100, Height: genesis + 50}
+		}
+	}
+
+	mockValidator := server.validatorClient.(*validator.MockValidator)
+	mockValidator.UtxoStore = server.utxoStore
+	recording := newRecordingValidatorClient(mockValidator)
+	server.validatorClient = recording
+
+	block := buildMultiBatchBlock(t, server, 1)
+	block.Header.HashPrevBlock = &chainhash.Hash{} // an old main-chain block, not the tip
+	block.Height = genesis - 1
+	blockBytes, err := block.Bytes()
+	require.NoError(t, err)
+
+	_, err = server.CheckBlockSubtrees(context.Background(), &subtreevalidation_api.CheckBlockSubtreesRequest{
+		Block:   blockBytes,
+		BaseUrl: "http://test.com",
+	})
+	require.NoError(t, err)
+
+	recording.mu.Lock()
+	defer recording.mu.Unlock()
+	require.NotEmpty(t, recording.callsByTx, "no transaction was validated")
+	for _, calls := range recording.callsByTx {
+		for _, opts := range calls {
+			require.False(t, opts.AddTXToBlockAssembly,
+				"pre-Genesis side-block tx was sent to block assembly, which mines it at the post-Genesis tip")
+		}
 	}
 }

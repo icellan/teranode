@@ -68,7 +68,9 @@ func TestCheckpointValidationCallSites(t *testing.T) {
 						require.NoError(t, client.AddBlock(ctx, block, "test"))
 						prev = block.Hash()
 					}
-					settings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 2, Hash: prev}}
+					// The checkpoint sits above the tip: a fork below a checkpoint the tip has
+					// passed is rejected by the fork rule before the gates under test run.
+					settings.ChainCfgParams.Checkpoints = []chaincfg.Checkpoint{{Height: 3, Hash: prev}}
 					_, best, err := client.GetBestBlockHeader(ctx)
 					require.NoError(t, err)
 					require.Equal(t, uint32(2), best.Height)

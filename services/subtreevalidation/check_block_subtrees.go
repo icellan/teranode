@@ -393,6 +393,26 @@ func (u *Server) getSubtreeToCheck(ctx context.Context, request *subtreevalidati
 	return subtreeToCheck, nil
 }
 
+// feedsBlockAssembly reports whether a block's transactions may be added to
+// block assembly. Only in RUNNING (IDLE can follow an operator STOP while a
+// catchup batch is still validating historical blocks), and only when the block
+// extends the tip: its transactions are validated at the block's own height,
+// while assembly mines at tip+1 without re-checking scripts. A side block in an
+// older script era (below Genesis or Chronicle) would otherwise put transactions
+// into the template that the rest of the network rejects (issue 4940).
+func (u *Server) feedsBlockAssembly(ctx context.Context, state blockchain.FSMStateType, parentHash *chainhash.Hash) (bool, error) {
+	if state != blockchain.FSMStateRUNNING {
+		return false, nil
+	}
+
+	tip, _, err := u.blockchainClient.GetBestBlockHeader(ctx)
+	if err != nil {
+		return false, errors.NewServiceError("failed to get best block header", err)
+	}
+
+	return tip.Hash().IsEqual(parentHash), nil
+}
+
 // CheckBlockSubtrees validates every subtree a block references, fetching any it
 // does not hold, and reports whether the block's transactions are valid.
 //
@@ -587,9 +607,10 @@ func (u *Server) CheckBlockSubtrees(ctx context.Context, request *subtreevalidat
 		return nil, errors.WrapGRPC(errors.NewProcessingError("[CheckBlockSubtrees] Failed to get FSM current state", err))
 	}
 
-	// Only RUNNING feeds block assembly. IDLE can follow an operator STOP while
-	// a catchup batch is still validating historical blocks.
-	addTXToBlockAssembly := *currentState == blockchain.FSMStateRUNNING
+	addTXToBlockAssembly, err := u.feedsBlockAssembly(ctx, *currentState, block.Header.HashPrevBlock)
+	if err != nil {
+		return nil, errors.WrapGRPC(errors.NewProcessingError("[CheckBlockSubtrees] Failed to decide block assembly feed", err))
+	}
 
 	// BATCHED SUBTREE LOADING: Get blockIds once before batching
 	blockHeaderIDs, err := u.blockchainClient.GetBlockHeaderIDs(ctx, block.Header.HashPrevBlock, uint64(u.settings.GetUtxoStoreBlockHeightRetention()*2))
