@@ -325,6 +325,21 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   `utxo_pruner_pruned_set_rotations`. These metrics reported zero because the pruner
   no longer skipped parents. After this upgrade, their queries give no data. (#1969)
 
+- **Block validation keeps a worker slot free for the tip, and holds a block behind a
+  parent that is still validating.** Blocks that do not extend the current tip may now
+  hold at most `blockvalidation_max_parallel_forks - 1` worker slots. With
+  `blockvalidation_max_parallel_forks = 1` nothing changes. A block whose parent is still
+  being fetched, queued or validated (by a worker, catchup, gRPC or legacy sync) now waits
+  in the queue for it instead of starting catchup, so the node no longer moves to
+  CATCHINGBLOCKS and stops mining while a slow parent validates. `blockValidationMaxRetries` (default 3), until now unread, caps how often a
+  block is requeued after a failed fetch (retried after 5 s) or after validation hits a
+  deadline such as `subtreevalidation_check_block_subtrees_timeout` (retried after
+  1 min). A block that timed out used to be dropped until a peer announced it again;
+  failed fetches were never actually retried. `0` turns these retries off.
+  `teranode_blockvalidation_priority_queue_processed_total` now labels `priority` with the
+  block's class (`chain_extending`, `near_fork`, `deep_fork`) instead of always `unknown`;
+  update any dashboard query that filters on `unknown`. (#1997)
+
 - **Peer-announced subtrees are validated at most 32 at a time.** The new
   `subtreevalidation_peerSubtreeConcurrency` (default 32) bounds how many peer
   subtrees a subtree validator works on at once; until now the bound was NumCPU. After a
@@ -734,6 +749,20 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   subtrees. Nothing to configure. (bsv-blockchain/teranode#2052)
 
 ### Not breaking, but worth knowing
+
+- **Peer subtrees announced during a catchup are validated afterwards instead of
+  lost.** While catching up, the subtree validator used to drop every
+  peer-announced subtree, so the next block arrived with all of them unvalidated
+  and had to read their transactions from the UTXO store. Up to
+  `subtreevalidation_skippedSubtreeBackfillMax` (default 4096, newest kept) of them
+  are now validated through the normal peer-subtree path once the node is RUNNING
+  again, using at most half of `subtreevalidation_peerSubtreeConcurrency`, so
+  expect a burst of peer subtree validation right after a catchup. Subtrees
+  announced while IDLE, or more than 30 minutes before their replay, are still
+  dropped. New metric:
+  `teranode_subtreevalidation_skipped_peer_subtrees_total{outcome}` (recorded,
+  evicted, expired, requeued, dropped, replayed, replay_failed). Set the key to `0` for the previous
+  behaviour. (#2055)
 
 - **Mining candidates no longer build on the old tip during a reorg.** While block
   assembly is in the `reorging`, `reconciling` or `resetting` state, it can still
