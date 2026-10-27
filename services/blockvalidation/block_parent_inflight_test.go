@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -755,10 +756,12 @@ func TestClaimFetchMark_DuplicateOfInFlightBlockReleased(t *testing.T) {
 	}
 }
 
-// TestClaimFetchMark_AfterFirstFetcherQueued pins oskarszoon's interleaving: the first fetcher
-// queues the block and drops its mark, then a duplicate claims. Taking the mark before checking
-// means the duplicate always sees the block queued (or further along) and lets go.
-func TestClaimFetchMark_AfterFirstFetcherQueued(t *testing.T) {
+// TestClaimFetchMark_FirstFetcherQueuesDuringDuplicateCheck pins oskarszoon's interleaving: a
+// duplicate sees the block not yet in flight, then the first fetcher queues it and drops its mark.
+// Checking before marking let the duplicate take a mark after that and keep it, so once the block
+// was stored its children waited on the duplicate's fetch. The first fetcher's queue-and-release
+// runs inside the duplicate's in-flight check, the window that order left open.
+func TestClaimFetchMark_FirstFetcherQueuesDuringDuplicateCheck(t *testing.T) {
 	initPrometheusMetrics()
 	server, hashes := newParentInFlightServer(t)
 	parent := hashes[0]
@@ -766,13 +769,30 @@ func TestClaimFetchMark_AfterFirstFetcherQueued(t *testing.T) {
 	first := server.claimFetchMark(parent)
 	require.True(t, fetchMarked(server.blockPriorityQueue, parent))
 
-	server.blockPriorityQueue.Add(processBlockFound{hash: parent}, PriorityChainExtending, 2)
-	first()
+	var queueOnce sync.Once
+
+	firstQueuesAndReleases := func() {
+		queueOnce.Do(func() {
+			server.blockPriorityQueue.Add(processBlockFound{hash: parent}, PriorityChainExtending, 2)
+			first()
+		})
+	}
+
+	server.forkManager.SetValidatingCheck(func(hash *chainhash.Hash) bool {
+		if hash.IsEqual(parent) {
+			firstQueuesAndReleases()
+		}
+
+		return false
+	})
 
 	duplicate := server.claimFetchMark(parent)
 	defer duplicate()
 
-	require.False(t, fetchMarked(server.blockPriorityQueue, parent))
+	// The duplicate may not have looked at the block at all; the first fetcher finishes either way.
+	firstQueuesAndReleases()
+
+	require.False(t, fetchMarked(server.blockPriorityQueue, parent), "a duplicate must not keep a mark taken after the first fetcher queued the block")
 }
 
 // TestClaimFetchMark_FreeBlockHeldUntilReleased pins the normal case and that releasing twice is
@@ -808,6 +828,32 @@ func TestSettleValidatedBlock_ClearsFetchingMark(t *testing.T) {
 	taken, status := server.blockPriorityQueue.Get(context.Background(), server.forkManager)
 	require.Equal(t, GetOK, status, "the child must no longer wait on the duplicate fetch")
 	require.Equal(t, child, taken.hash)
+}
+
+// TestWireValidationInFlight_SuccessClearsDuplicateFetchMark: end to end through the installed
+// validation-done hook. A duplicate fetch still holds the parent's mark when the parent validates
+// outside the queue; the child must be handed out once the validation is done. The hook is the
+// only production path that drops that mark.
+func TestWireValidationInFlight_SuccessClearsDuplicateFetchMark(t *testing.T) {
+	initPrometheusMetrics()
+	server, blocks := newParentInFlightServerWithBlocks(t)
+	parent, child := blocks[2], blocks[3].Hash()
+	server.wireValidationInFlight()
+
+	require.True(t, server.blockPriorityQueue.MarkFetching(parent.Hash()), "the duplicate fetch holds the mark")
+	server.blockPriorityQueue.Add(processBlockFound{hash: child, parentHash: parent.Hash()}, PriorityChainExtending, 3)
+
+	require.NoError(t, server.blockValidation.runOncePerBlock(parent.Hash(), nil, func(*ValidateBlockOptions) error {
+		return server.blockchainClient.AddBlock(context.Background(), parent, "test-peer")
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	taken, status := server.blockPriorityQueue.WaitForBlock(ctx, server.forkManager)
+	require.Equal(t, GetOK, status, "the child must not wait on the duplicate fetch once its parent validated")
+	require.Equal(t, child, taken.hash)
+	require.False(t, fetchMarked(server.blockPriorityQueue, parent.Hash()))
 }
 
 // TestSettleValidatedBlock_FailedValidationKeepsFetchingMark pins that a failed validation leaves
