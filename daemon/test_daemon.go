@@ -665,9 +665,15 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 		}
 	}
 
-	// The daemon's own BlockValidation service (always started above) sets the
+	// When the daemon runs its own BlockValidation service, that service sets the
 	// mined status of blocks; a second setMined worker on the same stores races
-	// it and can leave an invalidated block's transactions marked mined.
+	// it and can leave an invalidated block's transactions marked mined. Without
+	// the service, this instance is the only one and keeps its worker.
+	blockValidationOpts := []interface{}{p2pClient}
+	if _, err = d.ServiceManager.GetService("BlockValidation"); err == nil {
+		blockValidationOpts = append(blockValidationOpts, blockvalidation.NoSetMined{})
+	}
+
 	blockValidation := blockvalidation.NewBlockValidation(
 		d.Ctx,
 		logger,
@@ -678,8 +684,7 @@ func NewTestDaemon(t *testing.T, opts TestOptions) *TestDaemon {
 		utxoStore,
 		validatorClient,
 		subtreeValidationClient,
-		p2pClient,
-		blockvalidation.NoSetMined{},
+		blockValidationOpts...,
 	)
 
 	assert.NotNil(t, blockchainClient)

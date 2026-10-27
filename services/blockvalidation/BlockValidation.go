@@ -415,6 +415,10 @@ type NoSetMined struct{}
 func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *settings.Settings, blockchainClient blockchain.ClientI, subtreeStore blob.Store,
 	txStore blob.Store, utxoStore utxo.Store, validatorClient validator.Interface, subtreeValidationClient subtreevalidation.Interface, opts ...interface{},
 ) *BlockValidation {
+	// The background goroutines below set package metrics; a BlockValidation built
+	// without the Server, such as the test daemon's, must not find them nil.
+	initPrometheusMetrics()
+
 	logger.Infof("optimisticMining = %v", tSettings.BlockValidation.OptimisticMining)
 	if tSettings.BlockValidation.OptimisticMining && !tSettings.BlockValidation.OptimisticMiningPeerBlocks {
 		logger.Warnf("optimistic mining is enabled but stays off on every validation path until blockvalidation_optimistic_mining_peer_blocks is also set (bitcoin-sv/teranode#4692)")
@@ -505,7 +509,8 @@ func NewBlockValidation(ctx context.Context, logger ulogger.Logger, tSettings *s
 		subscribeCancel context.CancelFunc
 	)
 
-	if bv.blockchainClient != nil {
+	// The subscription only feeds the setMined worker, so a NoSetMined instance skips it.
+	if bv.blockchainClient != nil && !bv.setMinedDisabled {
 		go func() {
 			for {
 				select {
@@ -2202,7 +2207,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 		// Wait for reValidationBlock to do its thing
 		// When waitForPreviousBlocksToBeProcessed is done, all the previous blocks will be processed
 		if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
-			// Parent block isn't mined yet - re-trigger the setMinedChan for the parent block
+			// Parent block isn't mined yet - re-trigger the setMinedChan for the parent block.
+			// A NoSetMined instance queues nothing here and waits on the BlockValidation
+			// that owns setMined to mark the parent mined.
 			u.enqueueSetMined(block.Header.HashPrevBlock)
 
 			if err = u.waitForPreviousBlocksToBeProcessed(ctx, block, blockHeaders); err != nil {
