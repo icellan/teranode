@@ -154,11 +154,18 @@ func getBDKChainNameFromParams(l ulogger.Logger, pa *chaincfg.Params) string {
 //   - l: Logger instance for verification operations
 //   - po: Policy settings for validation rules
 //   - pa: Network parameters
+//   - consensusRerunSlots: Maximum concurrent consensus re-runs (validator_consensusRerunSlots)
 //
 // Returns:
 //   - bdkValidator: The created GoBDK validation adapter
-func newScriptVerifierGoBDK(l ulogger.Logger, po *settings.PolicySettings, pa *chaincfg.Params) bdkValidator {
+func newScriptVerifierGoBDK(l ulogger.Logger, po *settings.PolicySettings, pa *chaincfg.Params, consensusRerunSlots int) bdkValidator {
 	l.Infof("Use GoBDK transaction validator, version : %v", gobdk.BDK_VERSION_STRING())
+
+	// A nil channel never has a free slot, so 0 or less disables the re-run.
+	var rerunSlots chan struct{}
+	if consensusRerunSlots > 0 {
+		rerunSlots = make(chan struct{}, consensusRerunSlots)
+	}
 
 	return &scriptVerifierGoBDK{
 		logger: l,
@@ -170,6 +177,7 @@ func newScriptVerifierGoBDK(l ulogger.Logger, po *settings.PolicySettings, pa *c
 		// transaction that is already rejected and pays nothing. See
 		// classifyPolicyScriptError.
 		consensusRerun: newBDKTxValidator(l, po, pa, int64(po.MaxStackMemoryUsagePolicy)),
+		rerunSlots:     rerunSlots,
 	}
 }
 
@@ -281,8 +289,10 @@ type scriptVerifierGoBDK struct {
 	policy *settings.PolicySettings
 	params *chaincfg.Params
 	se     bdkNativeTxValidator
-	// consensusRerun runs the consensus re-run of a policy script failure.
+	// consensusRerun runs the consensus re-run of a policy script failure, and
+	// rerunSlots bounds how many run at once.
 	consensusRerun bdkNativeTxValidator
+	rerunSlots     chan struct{}
 }
 
 func bdkBlockHeight(blockHeight uint32, consensus bool) (int32, error) {
@@ -349,7 +359,8 @@ func (v *scriptVerifierGoBDK) ValidateTransaction(tx *bt.Tx, blockHeight uint32,
 // again in consensus mode. An error code alone cannot tell: SCRIPTNUM_OVERFLOW is
 // both a number over maxscriptnumlengthpolicy and an int64 overflow, and OP_COUNT
 // and the other size limits are consensus failures on a pre-Genesis UTXO. sv-node
-// does the same in CheckInputScripts.
+// makes the same distinction in CheckInputScripts, though it re-runs only the
+// failing input.
 //
 // Only the scripts run again: the transaction-level checks already passed, and a
 // consensus ValidateTransaction would reject an unconfirmed parent as
@@ -357,16 +368,29 @@ func (v *scriptVerifierGoBDK) ValidateTransaction(tx *bt.Tx, blockHeight uint32,
 // unconfirmed parents stay at the candidate height.
 //
 // The re-run uses consensus limits, far above policy's, for a transaction that
-// is already rejected and pays nothing, so maxnonstdtxvalidationduration bounds
-// its time and consensusRerun holds its stack memory to the policy limit.
-// Reaching that limit is STACK_SIZE, which mapBDKValidationError reports as
-// policy in consensus mode too. A re-run that does not finish in time is reported as policy, which is what
-// sv-node does: subtree validation validates every transaction it takes from the
-// policy-rejected cache in consensus mode anyway.
+// is already rejected and pays nothing, so three things bound it:
+//   - consensusRerun holds its stack memory to the policy limit; reaching that is
+//     STACK_SIZE, reported as policy.
+//   - maxnonstdtxvalidationduration cancels it, but only between opcodes: one
+//     OP_MUL on consensus-size numbers can run for minutes.
+//   - rerunSlots caps how many run at once, and so the cores they can take.
+//
+// A re-run that is cancelled or finds no free slot is reported as policy, as
+// sv-node does for a timed-out re-check: subtree validation validates every
+// transaction it takes from the policy-rejected cache in consensus mode anyway.
 func (v *scriptVerifierGoBDK) classifyPolicyScriptError(tx *bt.Tx, eTxBytes []byte, utxoHeights []int32, blockHeight uint32, errVerify error) error {
 	intBlockHeight, errConv := bdkBlockHeight(blockHeight, true)
 	if errConv != nil {
 		return errors.NewInvalidArgumentError("failed conversion for block height", errConv)
+	}
+
+	select {
+	case v.rerunSlots <- struct{}{}:
+		defer func() { <-v.rerunSlots }()
+	default:
+		v.logger.Debugf("%s txID=%s no free consensus re-run slot, reporting policy error=%v", errMsgInvalidTx, tx.TxID(), errVerify)
+
+		return v.mapBDKValidationError(errVerify, false)
 	}
 
 	ctx := context.Background()
@@ -384,14 +408,36 @@ func (v *scriptVerifierGoBDK) classifyPolicyScriptError(tx *bt.Tx, eTxBytes []by
 	case errConsensus == nil:
 		return v.mapBDKValidationError(errVerify, false)
 	case errors.Is(errConsensus, bdkscript.ErrCancelled):
-		v.logger.Warnf("%s txID=%s consensus re-run did not finish within maxnonstdtxvalidationduration=%dms, reporting policy error=%v", errMsgInvalidTx, tx.TxID(), v.policy.MaxNonStdTxValidationDuration, errVerify)
+		v.logger.Debugf("%s txID=%s consensus re-run did not finish within maxnonstdtxvalidationduration=%dms, reporting policy error=%v", errMsgInvalidTx, tx.TxID(), v.policy.MaxNonStdTxValidationDuration, errVerify)
 
 		return v.mapBDKValidationError(errVerify, false)
-	default:
-		v.logger.Warnf("%s txID=%s consensus re-run of policy error=%v failed: %v", errMsgInvalidTx, tx.TxID(), errVerify, errConsensus)
-
-		return v.mapBDKValidationError(errConsensus, true)
 	}
+
+	v.logger.Debugf("%s txID=%s consensus re-run of policy error=%v failed: %v", errMsgInvalidTx, tx.TxID(), errVerify, errConsensus)
+
+	// STACK_SIZE is both the stack memory cap, which is policy, and the pre-Genesis
+	// 1000-element limit, which is consensus. BDK does not say which input failed,
+	// so any pre-Genesis input makes it consensus: wrongly so only for a
+	// transaction that mixes one with a memory-cap failure, which errs towards not
+	// publishing.
+	var scriptErr bdkscript.ScriptError
+	if errors.As(errConsensus, &scriptErr) && scriptErr.Code() == bdkscript.SCRIPT_ERR_STACK_SIZE && v.hasPreGenesisInput(utxoHeights) {
+		return errors.NewTxInvalidError(errMsgInvalidTx, bdkCause(errors.ERR_TX_INVALID, errConsensus))
+	}
+
+	return v.mapBDKValidationError(errConsensus, true)
+}
+
+// hasPreGenesisInput reports whether any input spends a UTXO created before
+// Genesis activation.
+func (v *scriptVerifierGoBDK) hasPreGenesisInput(utxoHeights []int32) bool {
+	for _, h := range utxoHeights {
+		if h >= 0 && uint32(h) < v.params.GenesisActivationHeight {
+			return true
+		}
+	}
+
+	return false
 }
 
 // bdkCause turns the engine's own description of the failure into a typed link

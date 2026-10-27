@@ -79,7 +79,7 @@ func TestScriptVerifierGoBDK(t *testing.T) {
 			params, err := chaincfg.GetChainParams(tt.args.network)
 			require.NoError(t, err)
 
-			bdkValidator := newScriptVerifierGoBDK(ulogger.TestLogger{}, settings.NewPolicySettings(), params)
+			bdkValidator := newScriptVerifierGoBDK(ulogger.TestLogger{}, settings.NewPolicySettings(), params, 1)
 			tt.wantErr(t, bdkValidator.ValidateTransaction(tt.args.tx, tt.args.blockHeight, true, tt.args.utxoHeights))
 		})
 	}
@@ -423,7 +423,7 @@ func TestSkipPath_MoneyChecks_MatchBDKPath(t *testing.T) {
 	mainnetParams, err := chaincfg.GetChainParams("mainnet")
 	require.NoError(t, err)
 
-	bdkValidator := newScriptVerifierGoBDK(ulogger.TestLogger{}, settings.NewPolicySettings(), mainnetParams)
+	bdkValidator := newScriptVerifierGoBDK(ulogger.TestLogger{}, settings.NewPolicySettings(), mainnetParams, 1)
 
 	const bdkBlockHeight = uint32(110300)
 

@@ -493,6 +493,7 @@ func NewSettings(alternativeContext ...string) *Settings {
 			HTTPRateLimit:                        getInt("validator_httpRateLimit", 1024, alternativeContext...),
 			HTTPBodyLimit:                        getString("validator_httpBodyLimit", "100MB", alternativeContext...),
 			KafkaMaxMessageBytes:                 getInt("validator_kafka_maxMessageBytes", 1024*1024, alternativeContext...), // Default 1MB
+			ConsensusRerunSlots:                  getInt("validator_consensusRerunSlots", 1, alternativeContext...),
 			UseLocalValidator:                    getBool("useLocalValidator", false, alternativeContext...),
 			TxMetaKafkaBatchSize:                 getInt("validator_txmeta_kafka_batchSize", 1024, alternativeContext...),
 			TxMetaKafkaBatchTimeoutMs:            getInt("validator_txmeta_kafka_batchTimeoutMs", 5, alternativeContext...),

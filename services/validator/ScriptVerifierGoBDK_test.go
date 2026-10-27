@@ -81,7 +81,7 @@ var testTxs = []TestTx{
 //
 //	go clean -testcache &&go test -v -run Test_ScriptVerificationGoBDK ./services/validator/...
 func Test_ScriptVerificationGoBDK(t *testing.T) {
-	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, settings.NewPolicySettings(), &chaincfg.MainNetParams)
+	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, settings.NewPolicySettings(), &chaincfg.MainNetParams, 1)
 
 	for _, test := range testTxs {
 		tx, errTx := bt.NewTxFromString(test.ExtendedTx)
@@ -182,7 +182,14 @@ func TestScriptVerifierGoBDKReRunsPolicyScriptErrorsInConsensusMode(t *testing.T
 		policy := settings.NewPolicySettings()
 		policy.MaxNonStdTxValidationDuration = 1000
 
-		return &scriptVerifierGoBDK{logger: ulogger.TestLogger{}, policy: policy, se: fake, consensusRerun: fake}, fake
+		return &scriptVerifierGoBDK{
+			logger:         ulogger.TestLogger{},
+			policy:         policy,
+			params:         &chaincfg.TestNetParams,
+			se:             fake,
+			consensusRerun: fake,
+			rerunSlots:     make(chan struct{}, 1),
+		}, fake
 	}
 
 	policyScriptErr := bdkscript.NewScriptError(bdkscript.SCRIPT_ERR_SCRIPTNUM_OVERFLOW)
@@ -221,6 +228,31 @@ func TestScriptVerifierGoBDKReRunsPolicyScriptErrorsInConsensusMode(t *testing.T
 		err := verifier.ValidateTransaction(aTx, 100, false, []uint32{1, 2})
 		require.ErrorIs(t, err, errors.ErrTxPolicy)
 		require.False(t, errors.Is(err, errors.ErrProcessing))
+	})
+
+	t.Run("no free re-run slot: TxPolicy without a re-run", func(t *testing.T) {
+		verifier, fake := newVerifier(policyScriptErr, nil)
+		verifier.rerunSlots <- struct{}{}
+
+		err := verifier.ValidateTransaction(aTx, 100, false, []uint32{1, 2})
+		require.ErrorIs(t, err, errors.ErrTxPolicy)
+		require.Zero(t, fake.rerunCalls)
+	})
+
+	t.Run("stack size in the re-run", func(t *testing.T) {
+		genesis := chaincfg.TestNetParams.GenesisActivationHeight
+		stackErr := bdkscript.NewScriptError(bdkscript.SCRIPT_ERR_STACK_SIZE)
+
+		// Post-Genesis, STACK_SIZE in the re-run is the policy stack memory cap.
+		verifier, _ := newVerifier(policyScriptErr, stackErr)
+		err := verifier.ValidateTransaction(aTx, genesis+100, false, []uint32{genesis + 1, genesis + 2})
+		require.ErrorIs(t, err, errors.ErrTxPolicy)
+
+		// On a pre-Genesis UTXO it can be the 1000-element consensus limit.
+		verifier, _ = newVerifier(policyScriptErr, stackErr)
+		err = verifier.ValidateTransaction(aTx, genesis+100, false, []uint32{genesis + 1, genesis - 1})
+		require.ErrorIs(t, err, errors.ErrTxInvalid)
+		require.False(t, errors.Is(err, errors.ErrTxPolicy), "%v", err)
 	})
 
 	t.Run("engine fault in the re-run: Processing", func(t *testing.T) {
@@ -637,7 +669,7 @@ func TestScriptVerifierGoBDKClassifiesUnknownDomainErrorAsNodeFault(t *testing.T
 }
 
 func Test_ScriptVerificationGoBDK_invalid(t *testing.T) {
-	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, settings.NewPolicySettings(), &chaincfg.MainNetParams)
+	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, settings.NewPolicySettings(), &chaincfg.MainNetParams, 1)
 
 	for _, test := range testTxs {
 		tx, errTx := bt.NewTxFromString(test.ExtendedTx)
@@ -698,7 +730,7 @@ func newSpendTx(t *testing.T, lockingScript, unlockingScript []byte) *bt.Tx {
 // mode must report it as TxInvalid too, or the transaction would be published as
 // consensus-valid on KAFKA_TX_POLICY_REJECTED.
 func TestScriptVerifierGoBDKRejectsInt64ScriptNumOverflow(t *testing.T) {
-	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, test.CreateBaseTestSettings(t).Policy, &chaincfg.MainNetParams)
+	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, test.CreateBaseTestSettings(t).Policy, &chaincfg.MainNetParams, 1)
 
 	// Each unlocking script pushes "abc" and an OP_LEFT length; the locking script
 	// is OP_LEFT OP_DROP OP_1.
@@ -734,7 +766,7 @@ func TestScriptVerifierGoBDKClassifiesScriptNumOverPolicyLengthAsPolicy(t *testi
 	policy := test.CreateBaseTestSettings(t).Policy
 	policy.MaxScriptNumLengthPolicy = 5
 
-	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, policy, &chaincfg.MainNetParams)
+	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, policy, &chaincfg.MainNetParams, 1)
 
 	// The unlocking script pushes a 6-byte number; the locking script is
 	// OP_1ADD OP_DROP OP_1.
@@ -754,7 +786,7 @@ func TestScriptVerifierGoBDKClassifiesScriptNumOverPolicyLengthAsPolicy(t *testi
 func TestScriptVerifierGoBDKClassifiesPreGenesisOpCountAsInvalid(t *testing.T) {
 	// Testnet does not require standard inputs, so BDK reaches script execution.
 	params := &chaincfg.TestNetParams
-	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, test.CreateBaseTestSettings(t).Policy, params)
+	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, test.CreateBaseTestSettings(t).Policy, params, 1)
 
 	lockingScript := bytes.Repeat([]byte{0x61}, 501) // 501 x OP_NOP
 	tx := newSpendTx(t, lockingScript, []byte{0x51})
@@ -785,7 +817,7 @@ func TestScriptVerifierGoBDKBoundsTheConsensusReRun(t *testing.T) {
 		policy.MaxOpsPerScriptPolicy = 10
 		policy.MaxNonStdTxValidationDuration = durationMillis
 
-		return newScriptVerifierGoBDK(ulogger.TestLogger{}, policy, &chaincfg.MainNetParams)
+		return newScriptVerifierGoBDK(ulogger.TestLogger{}, policy, &chaincfg.MainNetParams, 1)
 	}
 
 	t.Run("unbounded re-run finds the consensus failure", func(t *testing.T) {
@@ -820,15 +852,31 @@ func TestScriptVerifierGoBDKCapsTheConsensusReRunStackMemory(t *testing.T) {
 	policy.MaxStackMemoryUsageConsensus = 0 // unlimited
 	policy.MaxStackMemoryUsagePolicy = 1_000_000
 
-	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, policy, &chaincfg.MainNetParams)
+	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, policy, &chaincfg.MainNetParams, 1)
 
 	// Unlimited in consensus mode: the script runs to its end.
 	err := verifier.ValidateTransaction(tx, blockHeight, true, utxoHeights)
+	require.Error(t, err)
 	require.Contains(t, err.Error(), bdkscript.NewScriptError(bdkscript.SCRIPT_ERR_EVAL_FALSE).Error())
 
 	// The re-run stops at the policy stack limit and reports policy.
 	err = verifier.ValidateTransaction(tx, blockHeight, false, utxoHeights)
 	require.ErrorIs(t, err, errors.ErrTxPolicy)
+	require.Contains(t, err.Error(), bdkscript.NewScriptError(bdkscript.SCRIPT_ERR_STACK_SIZE).Error())
+}
+
+// TestScriptVerifierGoBDKClassifiesPreGenesisStackSizeAsInvalid covers the
+// pre-Genesis 1000-element stack limit, a consensus failure that BDK reports with
+// the same code as the stack memory cap.
+func TestScriptVerifierGoBDKClassifiesPreGenesisStackSizeAsInvalid(t *testing.T) {
+	params := &chaincfg.TestNetParams
+	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, test.CreateBaseTestSettings(t).Policy, params, 1)
+
+	tx := newSpendTx(t, []byte{0x51}, bytes.Repeat([]byte{0x51}, 1001)) // 1002 x OP_1
+
+	err := verifier.ValidateTransaction(tx, params.GenesisActivationHeight+100, false, []uint32{params.GenesisActivationHeight - 100})
+	require.ErrorIs(t, err, errors.ErrTxInvalid)
+	require.False(t, errors.Is(err, errors.ErrTxPolicy), "a pre-Genesis stack size failure is a consensus failure: %v", err)
 	require.Contains(t, err.Error(), bdkscript.NewScriptError(bdkscript.SCRIPT_ERR_STACK_SIZE).Error())
 }
 
@@ -839,7 +887,7 @@ func TestScriptVerifierGoBDKCapsTheConsensusReRunStackMemory(t *testing.T) {
 // element. On an ordinary element both bounds reject the position, so this test
 // passes against earlier GoBDK pins too.
 func TestScriptVerifierGoBDKRejectsSplitPastInt32Max(t *testing.T) {
-	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, test.CreateBaseTestSettings(t).Policy, &chaincfg.MainNetParams)
+	verifier := newScriptVerifierGoBDK(ulogger.TestLogger{}, test.CreateBaseTestSettings(t).Policy, &chaincfg.MainNetParams, 1)
 
 	// Each unlocking script pushes "abc" and a split position; the locking script
 	// is OP_SPLIT OP_2DROP OP_1.

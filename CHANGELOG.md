@@ -115,8 +115,13 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   consensus limit is `TX_INVALID` instead of `TX_POLICY`. `maxnonstdtxvalidationduration`
   is now read, with a default of 1000 ms, and bounds the re-run only. A re-run that does
   not finish in time is reported as `TX_POLICY`, as sv-node does. Set it to 0 to remove
-  the bound. The re-run's stack memory is capped at `maxstackmemoryusagepolicy`, not the
-  unlimited consensus default, and a re-run that reaches the cap is also `TX_POLICY`. RPC and propagation clients that act on the error code see the new codes.
+  the bound. The timeout is checked only between opcodes, so a new setting,
+  `validator_consensusRerunSlots` (default 1), caps how many re-runs run at once. When
+  no slot is free the tx is reported as `TX_POLICY` without a re-run. Set it to 0 to
+  turn re-runs off. The re-run's stack memory is capped at `maxstackmemoryusagepolicy`
+  rather than the unlimited consensus default. Reaching the cap is `TX_POLICY`, unless
+  an input is pre-Genesis, where `STACK_SIZE` can be a consensus failure and is
+  reported as `TX_INVALID`. RPC and propagation clients that act on the error code see the new codes.
 
 - **A block's tx is created as conflicting only when it is a double spend and nothing
   else.** Block validation used to create a tx as conflicting as soon as one of its inputs
