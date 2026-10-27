@@ -802,7 +802,6 @@ func TestMinedOnChainTracker_NewWriteStartsOver(t *testing.T) {
 	require.NotEqual(t, gen, b.gen, "a new write is a new generation; a repair in progress for the old one is abandoned")
 	require.False(t, b.done, "the new write clears the txs again, so the block needs repairing again")
 	require.False(t, b.stamped)
-	require.False(t, b.written, "and must not be repaired until the new write completes")
 
 	tracker.update(hash, gen, func(e *minedOnChainBlock) { e.done = true })
 	require.False(t, tracker.snapshot()[hash].done, "an update for the old generation is ignored")
@@ -813,7 +812,7 @@ func TestMinedOnChainTracker_Nil(t *testing.T) {
 	hash := chainhash.HashH([]byte("b"))
 
 	tracker.track(hash, 1, 1)
-	tracker.seed(hash, 1, 1, true)
+	tracker.seed(hash, 1, 1)
 	require.False(t, tracker.markWritten(hash))
 	tracker.update(hash, 1, func(e *minedOnChainBlock) { e.done = true })
 	tracker.drop(hash)
@@ -1060,6 +1059,14 @@ func TestRepairOvertakenTips_StuckJobYields(t *testing.T) {
 	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
 	_ = f.overtakeB(t)
 
+	f.store.failMarkFalse.Store(1 << 30)
+
+	// B's job starts first and gets stuck.
+	_, err := bv.tipRepairSlice(f.ctx, bv.blockchainClient)
+	require.NoError(t, err)
+	require.NotNil(t, bv.tipRepairJob)
+	require.Equal(t, *f.blockB.Hash(), bv.tipRepairJob.hash)
+
 	// A second overtaken block, written mined while it was on the chain. It has no txs, so
 	// its repair finishes in one step.
 	time.Sleep(10 * time.Millisecond)
@@ -1070,14 +1077,6 @@ func TestRepairOvertakenTips_StuckJobYields(t *testing.T) {
 	_, forkMeta, err := f.blockchainClient.GetBlockHeader(f.ctx, fork.Hash())
 	require.NoError(t, err)
 	require.False(t, f.onChain(t, forkMeta.ID))
-
-	f.store.failMarkFalse.Store(1 << 30)
-
-	// B's job starts first and gets stuck.
-	_, err = bv.tipRepairSlice(f.ctx, bv.blockchainClient)
-	require.NoError(t, err)
-	require.NotNil(t, bv.tipRepairJob)
-	require.Equal(t, *f.blockB.Hash(), bv.tipRepairJob.hash)
 
 	bv.minedOnChain.track(*fork.Hash(), forkMeta.ID, forkMeta.Height)
 	require.True(t, bv.minedOnChain.markWritten(*fork.Hash()))
@@ -1123,4 +1122,77 @@ func TestRepairOvertakenTips_RemineSkipsTxNotInBlock(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, m.BlockIDs, "precondition: the re-created tx is in no block")
 	require.NotZero(t, m.UnminedSince, "a tx in no block must stay unmined")
+}
+
+// TestRepairOvertakenTips_PartialWriteRetryKeepsFailing: B's setTxMined clears its txs and
+// then fails, and every retry fails too, so B's mined_set is never written. Once the
+// competing chain overtakes B, the cleared txs must be re-marked without waiting for a retry
+// to succeed, whether the process kept B's tracking or restarted and seeded it.
+func TestRepairOvertakenTips_PartialWriteRetryKeepsFailing(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(map[bool]string{false: "in process", true: "after restart"}[restart], func(t *testing.T) {
+			f := newOvertakeFixture(t)
+			bv := f.newBlockValidation(t)
+
+			f.store.failAfterSetMined.Store(true)
+			require.Error(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+			require.Zero(t, f.unminedSince(t, f.bOnly), "precondition: the failed write cleared B's txs")
+
+			blockC2 := f.overtakeB(t)
+
+			if restart {
+				bv = f.newBlockValidation(t)
+
+				f.store.failAfterSetMined.Store(false)
+				require.NoError(t, bv.setTxMinedStatus(f.ctx, blockC2.Hash()))
+				f.store.failAfterSetMined.Store(true)
+			}
+
+			require.Error(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()), "B's retry, off the longest chain, fails again")
+
+			_, err := drainTipRepair(t, bv)
+			require.NoError(t, err)
+
+			require.NotZero(t, f.unminedSince(t, f.bOnly), "a tx cleared by the failed write must be unmined again")
+			require.Zero(t, f.unminedSince(t, f.shared), "a tx also mined on the winning chain must stay mined")
+		})
+	}
+}
+
+// failingSubtreeStore fails the next fail subtree reads with a storage error: a blob store
+// that is briefly unavailable.
+type failingSubtreeStore struct {
+	blob.Store
+	fail atomic.Int32
+}
+
+func (s *failingSubtreeStore) GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...blobopts.FileOption) (io.ReadCloser, error) {
+	if s.fail.Add(-1) >= 0 {
+		return nil, errors.NewStorageError("injected subtree store failure")
+	}
+
+	return s.Store.GetIoReader(ctx, key, fileType, opts...)
+}
+
+// TestRepairOvertakenTips_TransientSubtreeReadErrorRetried: a subtree store that stays
+// unavailable through every read attempt of a step must not get the subtree skipped as gone;
+// the step is retried once the store is back.
+func TestRepairOvertakenTips_TransientSubtreeReadErrorRetried(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	store := &failingSubtreeStore{Store: f.subtreeStore}
+	store.fail.Store(tipRepairSubtreeReadAttempts)
+	bv.subtreeStore = store
+
+	_, err := drainTipRepair(t, bv)
+	require.Error(t, err, "the step fails while the store is down")
+	require.False(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "the subtree is not skipped")
+
+	_, err = drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "the subtree is repaired once the store is back")
 }

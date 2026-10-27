@@ -88,16 +88,14 @@ func isPermanentRepairError(err error) bool {
 		errors.Is(err, errors.ErrBlobNotFound) || errors.Is(err, errors.ErrNotFound)
 }
 
-// minedOnChainBlock is a block setTxMined wrote with onLongestChain=true.
+// minedOnChainBlock is a block whose txs setTxMined may have marked mined on the longest
+// chain, in a write that completed or one that failed part way.
 type minedOnChainBlock struct {
 	id     uint32
 	height uint32
 	// gen changes whenever a new on-chain write of the block starts. A repair in progress
 	// for an older gen is abandoned: the new write cleared the txs again.
 	gen uint64
-	// written is set once the block's setTxMined write has completed. A repair only starts
-	// on a written block.
-	written bool
 	// stamped is set once any of the block's txs were re-marked not on the longest chain,
 	// so they need marking mined again if the block comes back onto the chain.
 	stamped bool
@@ -137,7 +135,7 @@ func (t *minedOnChainTracker) track(hash chainhash.Hash, id, height uint32) {
 }
 
 // seed watches a block found by the restart seed. A block already watched keeps its state.
-func (t *minedOnChainTracker) seed(hash chainhash.Hash, id, height uint32, written bool) {
+func (t *minedOnChainTracker) seed(hash chainhash.Hash, id, height uint32) {
 	if t == nil {
 		return
 	}
@@ -150,11 +148,12 @@ func (t *minedOnChainTracker) seed(hash chainhash.Hash, id, height uint32, writt
 	}
 
 	t.nextGen++
-	t.blocks[hash] = minedOnChainBlock{id: id, height: height, gen: t.nextGen, written: written}
+	t.blocks[hash] = minedOnChainBlock{id: id, height: height, gen: t.nextGen}
 }
 
-// markWritten records that the block's setTxMined write has completed and reports whether
-// the block is tracked, in which case the caller asks for a repair slice.
+// markWritten records that a setTxMined write of the block has completed and reports
+// whether the block is tracked, in which case the caller asks for a repair slice. The write
+// may have cleared txs after a repair read them, so a finished repair runs again.
 func (t *minedOnChainTracker) markWritten(hash chainhash.Hash) bool {
 	if t == nil {
 		return false
@@ -168,7 +167,7 @@ func (t *minedOnChainTracker) markWritten(hash chainhash.Hash) bool {
 		return false
 	}
 
-	b.written = true
+	b.done = false
 	t.blocks[hash] = b
 
 	return true
@@ -291,8 +290,8 @@ func (u *BlockValidation) runTipRepairSlice(ctx context.Context, blockchainClien
 }
 
 // seedMinedOnChainTrackerLocked rebuilds the in-memory tracker after a restart: the
-// main-chain blocks inside the window that are mined, and the mined fork blocks within
-// tipRepairSeedForkDepth of the best height, which may have been the tip before the restart.
+// main-chain blocks inside the window, and the fork blocks within tipRepairSeedForkDepth of
+// the best height, which may have been the tip before the restart.
 func (u *BlockValidation) seedMinedOnChainTrackerLocked(ctx context.Context, blockchainClient blockchain.ClientI) error {
 	bestHeader, bestMeta, err := blockchainClient.GetBestBlockHeader(ctx)
 	if err != nil {
@@ -333,11 +332,10 @@ func (u *BlockValidation) seedMinedOnChainTrackerLocked(ctx context.Context, blo
 			continue
 		}
 
-		// A block whose mined_set is not written may still have had txs cleared by a
-		// setTxMined that failed part way before the restart. Its retry, with
-		// onLongestChain=false once it is off the chain, leaves unmined_since alone, so it
-		// is watched unwritten and becomes repairable when that retry completes.
-		u.minedOnChain.seed(*header.Hash(), meta.ID, meta.Height, meta.MinedSet)
+		// A block whose mined_set is not written is watched too: a setTxMined that failed
+		// part way before the restart may have cleared some of its txs, and its retry,
+		// with onLongestChain=false once it is off the chain, leaves unmined_since alone.
+		u.minedOnChain.seed(*header.Hash(), meta.ID, meta.Height)
 	}
 
 	u.tipRepairSeeded = true
@@ -347,11 +345,13 @@ func (u *BlockValidation) seedMinedOnChainTrackerLocked(ctx context.Context, blo
 
 func (u *BlockValidation) trackMinedHeaders(headers []*model.BlockHeader, metas []*model.BlockHeaderMeta) {
 	for i, meta := range metas {
-		if i >= len(headers) || meta == nil || !meta.MinedSet || meta.Invalid {
+		if i >= len(headers) || meta == nil || meta.Invalid {
 			continue
 		}
 
-		u.minedOnChain.seed(*headers[i].Hash(), meta.ID, meta.Height, true)
+		// A block whose mined_set is not written too: a setTxMined that failed part way
+		// may have cleared some of its txs.
+		u.minedOnChain.seed(*headers[i].Hash(), meta.ID, meta.Height)
 	}
 }
 
@@ -395,7 +395,7 @@ func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient b
 	for hash, b := range tracked {
 		switch {
 		case tipRepairExpired(b.height, bestHeight):
-			if b.written && !onMainChain[b.id] && !b.done {
+			if !onMainChain[b.id] && !b.done {
 				u.logger.Warnf("[repairOvertakenTips][%s] block left the repair window before its repair finished; some of its txs may still look mined", hash.String())
 			}
 
@@ -461,7 +461,7 @@ func (u *BlockValidation) startNextJob(ctx context.Context, blockchainClient blo
 	}
 
 	for hash, b := range tracked {
-		if b.deferred != deferred || !b.written || b.done || onMainChain[b.id] {
+		if b.deferred != deferred || b.done || onMainChain[b.id] {
 			continue
 		}
 
@@ -689,7 +689,8 @@ func (u *BlockValidation) repairFailed(hash chainhash.Hash, gen uint64, err erro
 // loadSubtreeNodes returns the nodes of one subtree, read like setTxMined reads it
 // (Block.GetSubtrees): from the .subtree file, or the .subtreeToCheck file when that is
 // missing. A read that fails, for example truncated while another service moves the file, is
-// tried again; one that still cannot be deserialized is a corrupt subtree.
+// tried again; one that still cannot be deserialized is a corrupt subtree, and any other
+// error is left for the next step to retry.
 func (u *BlockValidation) loadSubtreeNodes(ctx context.Context, subtreeHash *chainhash.Hash) ([]subtreepkg.Node, error) {
 	var err error
 
@@ -712,7 +713,13 @@ func (u *BlockValidation) loadSubtreeNodes(ctx context.Context, subtreeHash *cha
 		}
 	}
 
-	return nil, errors.NewSubtreeNotFoundError("failed to read subtree %s", subtreeHash.String(), err)
+	// Only a subtree that still cannot be deserialized is corrupt. Any other error, such
+	// as a blob store that is briefly down, is returned as it is, so the step is retried.
+	if errors.Is(err, errors.ErrProcessing) {
+		return nil, errors.NewSubtreeNotFoundError("failed to read subtree %s", subtreeHash.String(), err)
+	}
+
+	return nil, err
 }
 
 func (u *BlockValidation) readSubtreeNodes(ctx context.Context, subtreeHash *chainhash.Hash) ([]subtreepkg.Node, error) {

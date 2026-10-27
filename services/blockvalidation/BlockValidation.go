@@ -1657,8 +1657,8 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 			// provenance is attached; the p2p consumer falls back to its peer map.
 			return u.markBlockAsInvalid(ctx, block, "contains transactions already on our chain: "+err.Error(), "", "")
 		} else if errors.Is(err, errors.ErrBlockParentNotMined) {
-			// Another call for this block is in flight. Its tracking stays: that write
-			// marks it written when it completes.
+			// Another call for this block is in flight. Its tracking stays, and that write
+			// has the block repaired again when it completes.
 			u.logger.Warnf("[setTxMined][%s] skipping, already in progress of setMined for block", block.Hash().String())
 			return nil
 		}
@@ -1666,10 +1666,9 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		return errors.NewProcessingError("[setTxMined][%s] error updating tx mined status", block.Hash().String(), err)
 	}
 
-	// The write is complete, whichever onLongestChain this attempt used: a block tracked by
-	// an earlier attempt (whose clears may have landed) becomes eligible for the repair now.
-	// Ask for a slice: a chain change that happened while the write was in flight would
-	// otherwise wait for the next one.
+	// The write is complete, whichever onLongestChain this attempt used. Ask for a slice: a
+	// chain change that happened while the write was in flight would otherwise wait for the
+	// next one.
 	if u.minedOnChain.markWritten(*blockHash) {
 		u.signalTipRepair()
 	}
