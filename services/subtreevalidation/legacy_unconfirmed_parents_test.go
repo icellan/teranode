@@ -21,18 +21,11 @@ import (
 // to a fixed state. The LocalClient test double always reports RUNNING, but
 // the legacy branch's option pairing is FSM-gated on
 // CATCHINGBLOCKS — tests need to drive both sides of that gate. It also pins
-// the best block header, which the test double's empty MockStore lacks.
+// the tip height, which the test double's empty MockStore lacks.
 type fsmStateOverrideClient struct {
 	blockchain.ClientI
-	state blockchain.FSMStateType
-}
-
-// legacyTestTip is the best block header fsmStateOverrideClient reports.
-var legacyTestTip = &model.BlockHeader{
-	Version:        1,
-	HashPrevBlock:  &chainhash.Hash{},
-	HashMerkleRoot: &chainhash.Hash{},
-	Timestamp:      1700000000,
+	state     blockchain.FSMStateType
+	tipHeight uint32
 }
 
 func (c *fsmStateOverrideClient) GetFSMCurrentState(_ context.Context) (*blockchain.FSMStateType, error) {
@@ -41,7 +34,7 @@ func (c *fsmStateOverrideClient) GetFSMCurrentState(_ context.Context) (*blockch
 }
 
 func (c *fsmStateOverrideClient) GetBestBlockHeader(_ context.Context) (*model.BlockHeader, *model.BlockHeaderMeta, error) {
-	return legacyTestTip, &model.BlockHeaderMeta{Height: 99}, nil
+	return &model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}, &model.BlockHeaderMeta{Height: c.tipHeight}, nil
 }
 
 // TestCheckSubtreeFromBlockLegacyUnconfirmedParents is the subtreevalidation
@@ -100,7 +93,8 @@ func TestCheckSubtreeFromBlockLegacyUnconfirmedParents(t *testing.T) {
 		nilConsumer := &kafka.KafkaConsumerGroup{}
 		tSettings := test.CreateBaseTestSettings(t)
 
-		fsmClient := &fsmStateOverrideClient{ClientI: blockchainClient, state: fsmState}
+		// The tip sits just below the candidate block, so blockHeight is tip+1.
+		fsmClient := &fsmStateOverrideClient{ClientI: blockchainClient, state: fsmState, tipHeight: blockHeight - 1}
 
 		server, err := New(newCancelCtx(t), ulogger.TestLogger{}, tSettings, subtreeStore, txStore, utxoStore, recordingClient, fsmClient, nilConsumer, nilConsumer, nil, nil)
 		require.NoError(t, err)
@@ -163,10 +157,7 @@ func TestCheckSubtreeFromBlockLegacyUnconfirmedParents(t *testing.T) {
 		childSubtree := singleNodeSubtree(t, childHash)
 		server, recordingClient := newServerWithFSMState(t, blockchain.FSMStateRUNNING, subtreeFixture{childSubtree, childTx.ExtendedBytes()})
 
-		request := legacyRequest(childSubtree)
-		request.PreviousBlockHash = legacyTestTip.Hash()[:]
-
-		response, err := server.CheckSubtreeFromBlock(context.Background(), request)
+		response, err := server.CheckSubtreeFromBlock(context.Background(), legacyRequest(childSubtree))
 		require.NoError(t, err)
 		require.True(t, response.Blessed)
 
@@ -177,19 +168,23 @@ func TestCheckSubtreeFromBlockLegacyUnconfirmedParents(t *testing.T) {
 			require.True(t, opts.UnconfirmedParentsAtCandidateHeight,
 				"resolution flag must be active in RUNNING too — FSM-gating it wedged testnet catch-up at 1740437")
 			require.True(t, opts.AddTXToBlockAssembly,
-				"RUNNING-state legacy tip blocks must keep feeding block assembly (reorg resilience) — upstream behaviour")
+				"RUNNING-state legacy blocks must keep feeding block assembly (reorg resilience) — upstream behaviour")
 		}
 	})
 
-	t.Run("RUNNING state, parent is not the tip: assembly disabled", func(t *testing.T) {
+	t.Run("RUNNING state, side block below Genesis: assembly disabled", func(t *testing.T) {
 		InitPrometheusMetrics()
 
-		// A side block is validated at its own height, which can be in an older
-		// script era than the tip+1 block assembly mines at (issue 4940).
+		// A side block is validated at its own height, here one below the tip+1
+		// (Genesis) block assembly mines at, so under older script rules (issue 4940).
 		childSubtree := singleNodeSubtree(t, childHash)
 		server, recordingClient := newServerWithFSMState(t, blockchain.FSMStateRUNNING, subtreeFixture{childSubtree, childTx.ExtendedBytes()})
+		require.Equal(t, blockHeight, server.settings.ChainCfgParams.GenesisActivationHeight)
 
-		response, err := server.CheckSubtreeFromBlock(context.Background(), legacyRequest(childSubtree))
+		request := legacyRequest(childSubtree)
+		request.BlockHeight = blockHeight - 1
+
+		response, err := server.CheckSubtreeFromBlock(context.Background(), request)
 		require.NoError(t, err)
 		require.True(t, response.Blessed)
 
@@ -197,7 +192,7 @@ func TestCheckSubtreeFromBlockLegacyUnconfirmedParents(t *testing.T) {
 		require.NotEmpty(t, recorded, "child transaction was not validated")
 
 		for _, opts := range recorded {
-			require.False(t, opts.AddTXToBlockAssembly, "a block that does not extend the tip must not feed block assembly")
+			require.False(t, opts.AddTXToBlockAssembly, "a block in an older script era than tip+1 must not feed block assembly")
 		}
 	})
 

@@ -311,7 +311,7 @@ func TestCheckBlockSubtrees_AssembledPath_SkipLevelAndMixedParent(t *testing.T) 
 	mockBC.On("GetFSMCurrentState", mock.Anything).Return(&currentState, nil).Maybe()
 	mockBC.On("IsFSMCurrentState", mock.Anything, blockchain.FSMStateRUNNING).Return(true, nil).Maybe()
 	mockBC.On("GetBestBlockHeader", mock.Anything).
-		Return(&model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}}, &model.BlockHeaderMeta{}, nil).Maybe()
+		Return(&model.BlockHeader{}, &model.BlockHeaderMeta{}, nil).Maybe()
 	// Block IDs lookup — return a small set; the validator just checks
 	// membership of the parents' chain.
 	mockBC.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).

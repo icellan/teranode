@@ -964,11 +964,12 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 		// peer-facing branch below.
 		//
 		// Block assembly interaction (why the flag is safe with assembly
-		// enabled in RUNNING): assembly is fed only when the block extends
-		// the tip, so the candidate height is tip+1, the height assembly
-		// mines at. A floater child blessed there and added to assembly is
-		// the same transaction policy-mode admission would have accepted
-		// (policy substitutes tip+1 for unconfirmed parents).
+		// enabled in RUNNING): a floater child blessed at the candidate
+		// height and added to assembly is the same transaction policy-mode
+		// admission would have accepted into assembly anyway (policy
+		// substitutes tip+1 for unconfirmed parents). Assembly is fed only
+		// when the candidate height and tip+1 share the same transaction
+		// rules; see feedsBlockAssembly.
 		// Accepted-block txs are mined-removed from assembly as always.
 		validatorOptions := []validator.Option{
 			validator.WithSkipPolicyChecks(true),
@@ -986,9 +987,10 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 
 		// While catching up blocks, disable adding transactions to block
 		// assembly: bulk-history txs do not belong in our template. In
-		// RUNNING, assembly stays enabled for a tip block so its txs survive
-		// in the mempool if the block loses a reorg. See feedsBlockAssembly.
-		feeds, err := u.feedsBlockAssembly(ctx, *currentState, previousBlockHash)
+		// RUNNING, assembly stays enabled so txs from a legacy-bridge block
+		// survive in the mempool if the block loses a reorg, unless the block
+		// is in a different script era from tip+1. See feedsBlockAssembly.
+		feeds, err := u.feedsBlockAssembly(ctx, *currentState, request.BlockHeight)
 		if err != nil {
 			return false, errors.NewProcessingError("[CheckSubtree] Failed to decide block assembly feed", err)
 		}

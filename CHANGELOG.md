@@ -106,13 +106,18 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 
 ### Breaking — behaviour changes on upgrade
 
-- **A block below a checkpoint the tip has passed is rejected as invalid.** Block
-  validation now applies bitcoin-sv's `bad-fork-prior-to-checkpoint` rule. A block whose
-  height is below a checkpoint that the current tip has reached is marked invalid
-  instead of being validated. Initial sync is unaffected: checkpoints above the tip do
-  not count. Separately, a block's transactions go to block assembly only when the node
-  is RUNNING and the block extends the current tip. Transactions from a side block or a
-  revalidated block no longer reach the mining template. Nothing to configure. (#2069)
+- **A block below a checkpoint the tip has passed is rejected.** Block validation now
+  applies bitcoin-sv's `bad-fork-prior-to-checkpoint` rule. A block whose height is
+  below a checkpoint the current tip has reached fails validation with that reason
+  before its transactions are checked. Nothing is persisted, and the invalid-block
+  notification strikes the peer that sent it. Initial sync is unaffected: checkpoints
+  above the tip do not count. Separately, in RUNNING a block's transactions now go to
+  block assembly only when the block's height and the next height to mine (tip+1)
+  fall under the same transaction rules: no Genesis, Chronicle, CSV, BIP65, BIP66 or
+  UAHF activation between them. Transactions from a side block in an older era no
+  longer reach the mining template. On mainnet and testnet the checkpoint rule
+  already rejects such blocks; regtest, STN and networks without checkpoints rely on
+  this check. Nothing to configure. (#2069)
 
 - **A block's tx is created as conflicting only when it is a double spend and nothing
   else.** Block validation used to create a tx as conflicting as soon as one of its inputs
