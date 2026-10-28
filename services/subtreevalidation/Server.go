@@ -990,7 +990,8 @@ func (u *Server) checkSubtreeFromBlock(ctx context.Context, request *subtreevali
 		// assembly: bulk-history txs do not belong in our template. In
 		// RUNNING, assembly stays enabled so txs from a legacy-bridge block
 		// survive in the mempool if the block loses a reorg, unless the block
-		// is in a different script era from tip+1. See feedsBlockAssembly.
+		// is above tip+1 or under different transaction rules from tip+1. See
+		// feedsBlockAssembly.
 		feeds, err := u.feedsBlockAssembly(ctx, *currentState, request.BlockHeight)
 		if err != nil {
 			return false, errors.NewProcessingError("[CheckSubtree] Failed to decide block assembly feed", err)

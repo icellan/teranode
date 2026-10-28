@@ -198,6 +198,14 @@ func TestCheckBlockSubtrees_OnlyRunningFeedsBlockAssembly(t *testing.T) {
 					call.ReturnArguments = mock.Arguments{&fsmState, nil}
 				}
 			}
+
+			// A tip past Chronicle, so the block extends it within one era.
+			// Registered before wireMultiBatchMocks: testify serves the first match.
+			tipHeight := server.settings.ChainCfgParams.ChronicleActivationHeight + 50
+			bc.On("GetBestBlockHeader", mock.Anything).
+				Return(&model.BlockHeader{HashPrevBlock: &chainhash.Hash{}, HashMerkleRoot: &chainhash.Hash{}},
+					&model.BlockHeaderMeta{ID: 100, Height: tipHeight}, nil)
+
 			wireMultiBatchMocks(server)
 
 			mockValidator := server.validatorClient.(*validator.MockValidator)
@@ -206,6 +214,7 @@ func TestCheckBlockSubtrees_OnlyRunningFeedsBlockAssembly(t *testing.T) {
 			server.validatorClient = recording
 
 			block := buildMultiBatchBlock(t, server, 2)
+			block.Height = tipHeight + 1
 			blockBytes, err := block.Bytes()
 			require.NoError(t, err)
 
@@ -233,6 +242,8 @@ func TestCheckBlockSubtrees_OnlyRunningFeedsBlockAssembly(t *testing.T) {
 // Genesis would put pre-Genesis-valid txs into the template (issue 4940); a
 // same-era competitor whose parent is not the tip must still feed, or its txs are
 // stranded when it loses: ErrTxExists keeps them out of assembly on resubmission.
+// A block above tip+1 does not feed: a height locktime final there may not be
+// final at tip+1.
 func TestCheckBlockSubtrees_BlockAssemblyFeedFollowsScriptEra(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -241,6 +252,7 @@ func TestCheckBlockSubtrees_BlockAssemblyFeedFollowsScriptEra(t *testing.T) {
 	}{
 		{"side block below Genesis", func(genesis uint32) uint32 { return genesis - 1 }, false},
 		{"same-era competitor at the tip height", func(genesis uint32) uint32 { return genesis + 50 }, true},
+		{"same-era block above tip+1", func(genesis uint32) uint32 { return genesis + 52 }, false},
 	}
 
 	for _, tt := range tests {

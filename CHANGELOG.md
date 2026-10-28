@@ -109,15 +109,17 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
 - **A block below a checkpoint the tip has passed is rejected.** Block validation now
   applies bitcoin-sv's `bad-fork-prior-to-checkpoint` rule. A block whose height is
   below a checkpoint the current tip has reached fails validation with that reason
-  before its transactions are checked. Nothing is persisted, and the invalid-block
+  before its transactions are checked, and again just before it is stored, in case
+  the tip passes a checkpoint meanwhile. Nothing is persisted, and the invalid-block
   notification strikes the peer that sent it. Initial sync is unaffected: checkpoints
   above the tip do not count. Separately, in RUNNING a block's transactions now go to
-  block assembly only when the block's height and the next height to mine (tip+1)
-  fall under the same transaction rules: no Genesis, Chronicle, CSV, BIP65, BIP66 or
-  UAHF activation between them. Transactions from a side block in an older era no
-  longer reach the mining template. On mainnet and testnet the checkpoint rule
-  already rejects such blocks; regtest, STN and networks without checkpoints rely on
-  this check. Nothing to configure. (#2069)
+  block assembly only when the block is not above the next height to mine (tip+1)
+  and both heights fall under the same transaction rules: the same consensus script
+  flags, as the script engine computes them, and no BIP68 activation between them.
+  Transactions from a side block in an older era no longer reach the mining
+  template. On mainnet and testnet the checkpoint rule already rejects such blocks;
+  regtest, STN and networks without checkpoints rely on this check. Nothing to
+  configure. (#2069)
 
 - **A policy-mode script error is classified by a consensus re-run.** When policy
   validation fails on `SCRIPTNUM_OVERFLOW`, `OP_COUNT`, `SCRIPT_SIZE`, `PUBKEY_COUNT`,

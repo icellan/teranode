@@ -2,10 +2,14 @@ package blockvalidation
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 
+	subtreepkg "github.com/bsv-blockchain/go-subtree"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
+	"github.com/bsv-blockchain/teranode/pkg/fileformat"
+	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/stretchr/testify/mock"
@@ -59,4 +63,80 @@ func TestValidateBlock_RejectsForkBelowCheckpoint(t *testing.T) {
 
 	require.Equal(t, int32(0), countingClient.checkBlockSubtreesCalls.Load(),
 		"a fork below the checkpoint must be rejected before its transactions are validated")
+	mockBlockchain.AssertNotCalled(t, "AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestValidateBlock_RejectsForkBelowCheckpointPassedDuringValidation pins the re-check
+// before the block is stored: the tip is below the checkpoint when validation starts and
+// passes it while the block's subtrees are checked, so the block must not be stored.
+func TestValidateBlock_RejectsForkBelowCheckpointPassedDuringValidation(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx := context.Background()
+
+	utxoStore, subtreeValidationClient, _, txStore, subtreeStore, cleanup := setup(t)
+	defer cleanup()
+
+	passingClient := &passingSubtreeValidationClient{Interface: subtreeValidationClient}
+
+	tSettings := test.CreateBaseTestSettings(t)
+	tSettings.BlockValidation.OptimisticMining = false
+
+	// Checkpoint at 1000, block at height 1.
+	block, mockBlockchain, subtree := belowCheckpointPoWFixture(t, tSettings)
+
+	subtreeBytes, err := subtree.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, subtreeStore.Set(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes))
+
+	subtreeMetaBytes, err := subtreepkg.NewSubtreeMeta(subtree).Serialize()
+	require.NoError(t, err)
+	require.NoError(t, subtreeStore.Set(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtreeMeta, subtreeMetaBytes))
+
+	replicated := subtree.Duplicate()
+	replicated.ReplaceRootNode(block.CoinbaseTx.TxIDChainHash(), 0, uint64(block.CoinbaseTx.Size())) //nolint:gosec
+	block.Header.HashMerkleRoot = replicated.RootHash()
+
+	nBits, err := model.NewNBitFromString("207fffff")
+	require.NoError(t, err)
+	block.Header.Bits = *nBits
+	for ok, _, _ := block.Header.HasMetTargetDifficulty(); !ok; ok, _, _ = block.Header.HasMetTargetDifficulty() {
+		block.Header.Nonce++
+	}
+
+	// The first tip lookup is below the checkpoint, every later one has passed it.
+	for _, call := range mockBlockchain.ExpectedCalls {
+		if call.Method == "GetBestBlockHeader" {
+			call.ReturnArguments[1] = &model.BlockHeaderMeta{Height: 900}
+			call.Once()
+		}
+	}
+	mockBlockchain.On("GetBestBlockHeader", mock.Anything).Return(block.Header, &model.BlockHeaderMeta{Height: 1500}, nil)
+	mockBlockchain.On("GetNextWorkRequired", mock.Anything, mock.Anything, mock.Anything).Return(nBits, nil).Maybe()
+	mockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{0}, nil).Maybe()
+	mockBlockchain.On("SetBlockSubtreesSet", mock.Anything, mock.Anything).Return(nil).Maybe()
+	mockBlockchain.On("GetBlockHeadersFromHeight", mock.Anything, mock.Anything, mock.Anything).
+		Return(nil, nil, errors.NewNotFoundError("no main-chain header")).Maybe()
+	mockBlockchain.On("GetBlockExists", mock.Anything, block.Header.Hash()).Return(false, nil).Maybe()
+	mockBlockchain.On("AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil).Maybe()
+
+	bv := NewBlockValidation(ctx, ulogger.TestLogger{}, tSettings, mockBlockchain, subtreeStore, txStore, utxoStore, nil, passingClient)
+
+	err = bv.ValidateBlock(ctx, block, "test")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errors.ErrBlockInvalid), "a fork below the checkpoint must surface as BlockInvalid, got: %v", err)
+	require.Contains(t, err.Error(), "bad-fork-prior-to-checkpoint")
+	require.Equal(t, int32(1), passingClient.checkBlockSubtreesCalls.Load(), "the block must reach subtree validation before the tip passes the checkpoint")
+	mockBlockchain.AssertNotCalled(t, "AddBlock", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// passingSubtreeValidationClient reports every block's subtrees valid and counts the calls.
+type passingSubtreeValidationClient struct {
+	subtreevalidation.Interface
+	checkBlockSubtreesCalls atomic.Int32
+}
+
+func (c *passingSubtreeValidationClient) CheckBlockSubtrees(context.Context, *model.Block, string, string) error {
+	c.checkBlockSubtreesCalls.Add(1)
+	return nil
 }
