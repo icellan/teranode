@@ -490,14 +490,15 @@ func (u *Server) releaseCatchupLock(ctx *CatchupContext, err *error) {
 
 		// TODO: all of these should be using error types, and not checking the strings (!)
 		switch {
-		case ctx.panicked || isConcurrentValidationPanic(*err):
+		case ctx.panicked || isLocalPanic(*err):
 			// catchup() recovered a panic and set *err only to stop this function from recording
-			// a success (BV-STARTUP-007). Or a validation in this catchup waited in
-			// runOncePerBlock on a validation of the same block that panicked on another
-			// goroutine, and got that panic's error. A panic is a bug in this node, not evidence
-			// against the peer, so no case below may score it. It must come first: the
-			// ERR_PROCESSING error would otherwise fall through to unknown_error with isPeerError
-			// left true.
+			// a success (BV-STARTUP-007). Or an errgroup goroutine in this catchup panicked
+			// and recoverChildPanic returned its error (issue 4993). Or a validation in this
+			// catchup waited in runOncePerBlock on a validation of the same block that panicked
+			// on another goroutine, and got that panic's error. A panic is a bug in this node,
+			// not evidence against the peer, so no case below may score it. It must come first:
+			// the ERR_PROCESSING error would otherwise fall through to unknown_error with
+			// isPeerError left true.
 			errorType = "local_panic"
 			isPeerError = false
 		case errors.Is(*err, errors.ErrStorageError):
@@ -1401,19 +1402,22 @@ func (u *Server) fetchAndValidateBlocks(ctx context.Context, catchupCtx *Catchup
 			numWriteWorkers = 16
 		}
 		for i := 0; i < numWriteWorkers; i++ {
-			errorGroup.Go(func() error {
+			errorGroup.Go(func() (err error) {
+				defer recoverChildPanic(u.logger, recoveredPanicPathCatchupFetch, &err, nil, "[catchup] subtreeWriteWorker")
 				return u.blockValidation.subtreeWriteWorker(gCtx, writeJobsChan)
 			})
 		}
 	}
 
 	// Start fetching blocks
-	errorGroup.Go(func() error {
+	errorGroup.Go(func() (err error) {
+		defer recoverChildPanic(u.logger, recoveredPanicPathCatchupFetch, &err, nil, "[catchup][%s] fetchBlocksConcurrently", catchupCtx.blockUpTo.Hash().String())
 		return u.fetchBlocksConcurrently(gCtx, catchupCtx, validateBlocksChan, &size)
 	})
 
 	// Start validation in parallel
-	errorGroup.Go(func() error {
+	errorGroup.Go(func() (err error) {
+		defer recoverChildPanic(u.logger, recoveredPanicPathCatchupFetch, &err, nil, "[catchup][%s] validateBlocksOnChannel", catchupCtx.blockUpTo.Hash().String())
 		if writeJobsChan != nil {
 			defer close(writeJobsChan)
 		}
@@ -2142,6 +2146,36 @@ func (u *Server) tryQuickValidation(ctx context.Context, block *model.Block, cat
 			case <-ctx.Done():
 				// See the corrupt-branch comment above: skip cleanup rather than risk
 				// hanging on jobs no worker will ever receive.
+				u.logger.Warnf("[catchup:tryQuickValidation][%s] block %s: catch-up context cancelled while waiting for subtree writes to settle, skipping cleanup",
+					catchupCtx.blockUpTo.Hash().String(), block.Hash().String())
+			}
+
+			return false, err
+		}
+
+		// A goroutine of quick validation panicked (issue 4993). recoverChildPanic turned the
+		// panic into an error, so it ends up here and not in catchup's own recover. Falling
+		// through to normal validation would drop the error, and with it the local-panic
+		// marker: the run would carry on as if nothing happened, releaseCatchupLock would never
+		// reach its local_panic case, and the same bug could fire again on the next block.
+		// Stop this catch-up attempt instead and return the error unchanged.
+		//
+		// Settle and sweep exactly as the local-fault branch below does, for the same reason:
+		// the panic is this node's fault, so only quick validation's own build output is
+		// stale, and the fetched blobs stay for the retry. The cleanup error is logged, not
+		// returned, because returning it would replace the error that carries the marker.
+		if isLocalPanic(err) {
+			u.logger.Errorf("[catchup:tryQuickValidation][%s] block %s: a goroutine panicked during quick validation, aborting this catch-up attempt, see the PANIC log line: %v",
+				catchupCtx.blockUpTo.Hash().String(), block.Hash().String(), err)
+
+			select {
+			case <-waitDone:
+				if delErr := u.removeCatchupSubtreeFiles(ctx, catchupCtx, freshlyWritten); delErr != nil {
+					u.logger.Errorf("[catchup:tryQuickValidation][%s] block %s: failed to remove this attempt's .subtree files after a local panic: %v",
+						catchupCtx.blockUpTo.Hash().String(), block.Hash().String(), delErr)
+				}
+			case <-ctx.Done():
+				// See the corrupt-branch comment above: skip cleanup rather than risk hanging.
 				u.logger.Warnf("[catchup:tryQuickValidation][%s] block %s: catch-up context cancelled while waiting for subtree writes to settle, skipping cleanup",
 					catchupCtx.blockUpTo.Hash().String(), block.Hash().String())
 			}
