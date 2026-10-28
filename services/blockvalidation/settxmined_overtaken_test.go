@@ -722,7 +722,21 @@ func TestRepairOvertakenTips_RunsOnTheSetMinedWorker(t *testing.T) {
 	}, 10*time.Second, 10*time.Millisecond, "the setMined worker marks B mined")
 	require.Zero(t, f.unminedSince(t, f.bOnly), "precondition: B's txs are mined")
 
-	_ = f.overtakeB(t)
+	// B' writes shared mined before C' overtakes B. The test writes it straight to the
+	// store, outside the worker, so a repair slice running in between would race it.
+	time.Sleep(10 * time.Millisecond)
+
+	blockB2 := coinbaseOnlyBlock(t, f.tSettings.ChainCfgParams.GenesisHash, f.nBits, 1, 0xb2)
+	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, blockB2, "test", blockchainoptions.WithSubtreesSet(true)))
+	require.True(t, f.onChain(t, f.blockBID), "precondition: B' alone does not overtake B")
+
+	_, metaB2, err := f.blockchainClient.GetBlockHeader(f.ctx, blockB2.Hash())
+	require.NoError(t, err)
+	f.mineSharedIn(t, metaB2.ID)
+
+	blockC2 := coinbaseOnlyBlock(t, blockB2.Hash(), f.nBits, 2, 0xc2)
+	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, blockC2, "test", blockchainoptions.WithSubtreesSet(true)))
+	require.False(t, f.onChain(t, f.blockBID), "precondition: the competing chain overtook B")
 
 	require.Eventually(t, func() bool {
 		m, err := f.store.Store.Get(f.ctx, f.bOnly, fields.UnminedSince)
@@ -1195,4 +1209,27 @@ func TestRepairOvertakenTips_TransientSubtreeReadErrorRetried(t *testing.T) {
 	_, err = drainTipRepair(t, bv)
 	require.NoError(t, err)
 	require.NotZero(t, f.unminedSince(t, f.bOnly), "the subtree is repaired once the store is back")
+}
+
+// TestRepairOvertakenTips_ShortReadsOutlastAttemptsRetried: short subtree reads through every
+// read attempt of a step must not get the subtree skipped as corrupt, which would leave its
+// txs looking mined for good; the step is retried and recovers once reads are whole again.
+func TestRepairOvertakenTips_ShortReadsOutlastAttemptsRetried(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	store := &truncatingSubtreeStore{Store: f.subtreeStore}
+	store.truncate.Store(tipRepairSubtreeReadAttempts)
+	bv.subtreeStore = store
+
+	_, err := drainTipRepair(t, bv)
+	require.Error(t, err, "the step fails while reads are short")
+	require.False(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "the subtree is not skipped")
+
+	_, err = drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "the subtree is repaired once reads are whole")
 }

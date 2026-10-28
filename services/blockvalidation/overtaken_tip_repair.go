@@ -689,8 +689,7 @@ func (u *BlockValidation) repairFailed(hash chainhash.Hash, gen uint64, err erro
 // loadSubtreeNodes returns the nodes of one subtree, read like setTxMined reads it
 // (Block.GetSubtrees): from the .subtree file, or the .subtreeToCheck file when that is
 // missing. A read that fails, for example truncated while another service moves the file, is
-// tried again; one that still cannot be deserialized is a corrupt subtree, and any other
-// error is left for the next step to retry.
+// tried again, and an error that outlasts the attempts is left for the next step to retry.
 func (u *BlockValidation) loadSubtreeNodes(ctx context.Context, subtreeHash *chainhash.Hash) ([]subtreepkg.Node, error) {
 	var err error
 
@@ -713,12 +712,9 @@ func (u *BlockValidation) loadSubtreeNodes(ctx context.Context, subtreeHash *cha
 		}
 	}
 
-	// Only a subtree that still cannot be deserialized is corrupt. Any other error, such
-	// as a blob store that is briefly down, is returned as it is, so the step is retried.
-	if errors.Is(err, errors.ErrProcessing) {
-		return nil, errors.NewSubtreeNotFoundError("failed to read subtree %s", subtreeHash.String(), err)
-	}
-
+	// Not a permanent error, even when the subtree still cannot be deserialized: a short
+	// read looks the same as a corrupt file, and skipping the subtree would leave its txs
+	// looking mined for good. The step is retried; a job that keeps failing is set aside.
 	return nil, err
 }
 
