@@ -3631,8 +3631,15 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 		default:
 		}
 
-		chunkResult, err := s.setMinedMultiChunk(ctx, hashes[i:end], minedBlockInfo)
+		var chunkResult map[chainhash.Hash][]uint32
 
+		err := retryWriteOnLockError(ctx, s.logger, end-i, func() error {
+			var err error
+
+			chunkResult, err = s.setMinedMultiChunk(ctx, hashes[i:end], minedBlockInfo)
+
+			return err
+		})
 		if err != nil {
 			return nil, errors.NewStorageError("SQL error in SetMinedMulti (chunk %d-%d): %v", i, end-1, err)
 		}
@@ -3643,6 +3650,31 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 	}
 
 	return resultMap, nil
+}
+
+// setMinedMultiRetries bounds how many times one SetMinedMulti chunk is tried
+// when the database refuses it with a lock error.
+const setMinedMultiRetries = 3
+
+// retryWriteOnLockError runs write up to setMinedMultiRetries times while it
+// fails with an error isDeadlock recognises, and returns its last error. A
+// chunk is one transaction, rolled back when it fails, so running it again is
+// safe.
+func retryWriteOnLockError(ctx context.Context, logger ulogger.Logger, txs int, write func() error) error {
+	for attempt := 1; ; attempt++ {
+		err := write()
+		if err == nil || !isDeadlock(err) || attempt >= setMinedMultiRetries {
+			return err
+		}
+
+		logger.Warnf("[SetMinedMulti] lock error (attempt %d/%d), retrying chunk of %d txs: %v", attempt, setMinedMultiRetries, txs, err)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt) * 10 * time.Millisecond):
+		}
+	}
 }
 
 // setMinedMultiChunk processes a single chunk of hashes (up to maxINClauseSize).

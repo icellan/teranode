@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/url"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -52,14 +51,7 @@ type overtakeTestStore struct {
 }
 
 func (s *overtakeTestStore) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, minedBlockInfo utxostore.MinedBlockInfo) (map[chainhash.Hash][]uint32, error) {
-	// The sqlitememory engine reports two of its connections waiting on each other as a
-	// table lock, which the sql store's SetMinedMulti does not retry; SQLite's remedy is to
-	// run the transaction again.
 	res, err := s.Store.SetMinedMulti(ctx, hashes, minedBlockInfo)
-	for attempt := 1; attempt < 5 && err != nil && strings.Contains(err.Error(), "database table is locked"); attempt++ {
-		res, err = s.Store.SetMinedMulti(ctx, hashes, minedBlockInfo)
-	}
-
 	if err == nil && s.failAfterSetMined.Load() {
 		return nil, errors.NewStorageError("injected failure after the write")
 	}
