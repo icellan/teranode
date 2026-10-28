@@ -1277,7 +1277,8 @@ func TestRepairOvertakenTips_ShortReadsOutlastAttemptsRetried(t *testing.T) {
 
 // TestRepairOvertakenTips_CorruptSubtreeSkippedAfterMaxAttempts: a subtree that can never be
 // deserialized must not hold the job forever, which would leave the block's later subtrees
-// unrepaired. It is retried for tipRepairMaxAttempts steps, then skipped and the job goes on.
+// unrepaired. It is retried for tipRepairMaxAttempts steps, then set aside and the job
+// finishes, with the block not done and the subtree pending for its next job.
 func TestRepairOvertakenTips_CorruptSubtreeSkippedAfterMaxAttempts(t *testing.T) {
 	f := newOvertakeFixture(t)
 	bv := f.newBlockValidation(t)
@@ -1295,21 +1296,27 @@ func TestRepairOvertakenTips_CorruptSubtreeSkippedAfterMaxAttempts(t *testing.T)
 		require.False(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "the subtree is not skipped after %d steps", i)
 	}
 
-	_, err := drainTipRepair(t, bv)
+	_, err := bv.tipRepairSlice(f.ctx, bv.blockchainClient)
 	require.NoError(t, err)
-	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "the subtree is skipped and the job finishes")
+	require.Nil(t, bv.tipRepairJob, "the subtree is set aside and the job finishes")
+
+	b := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
+	require.False(t, b.done)
+	require.True(t, b.deferred, "other blocks go first")
+	require.Equal(t, []*chainhash.Hash{f.blockB.Subtrees[0]}, b.pending)
 }
 
-// corruptSubtreeStore returns a truncated reader for every read of one subtree: a subtree
-// file that is corrupt on disk.
-type corruptSubtreeStore struct {
+// shortReadSubtreeStore returns a truncated reader for the next short reads of one subtree;
+// set short to 1<<30 for a subtree file that is corrupt on disk.
+type shortReadSubtreeStore struct {
 	blob.Store
-	key []byte
+	key   []byte
+	short atomic.Int32
 }
 
-func (s *corruptSubtreeStore) GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...blobopts.FileOption) (io.ReadCloser, error) {
+func (s *shortReadSubtreeStore) GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...blobopts.FileOption) (io.ReadCloser, error) {
 	reader, err := s.Store.GetIoReader(ctx, key, fileType, opts...)
-	if err != nil || !bytes.Equal(key, s.key) {
+	if err != nil || !bytes.Equal(key, s.key) || s.short.Add(-1) < 0 {
 		return reader, err
 	}
 
@@ -1319,9 +1326,27 @@ func (s *corruptSubtreeStore) GetIoReader(ctx context.Context, key []byte, fileT
 	}{io.LimitReader(reader, 10), reader}, nil
 }
 
+// shortReads wraps store so the next n reads of the block's subtree idx are short.
+func (f *overtakeFixture) shortReads(store blob.Store, idx int, n int32) *shortReadSubtreeStore {
+	s := &shortReadSubtreeStore{Store: store, key: f.blockB.Subtrees[idx][:]}
+	s.short.Store(n)
+
+	return s
+}
+
+// settleTipRepair runs the repair, as the worker's periodic tick would, until settled holds
+// or a bound is hit, ignoring failed steps.
+func settleTipRepair(t *testing.T, bv *BlockValidation, settled func() bool) {
+	t.Helper()
+
+	for i := 0; i < 10*tipRepairMaxAttempts && !settled(); i++ {
+		_, _ = drainTipRepair(t, bv)
+	}
+}
+
 // TestRepairOvertakenTips_CorruptSubtreeDoesNotBlockLaterSubtrees: a corrupt earlier
 // subtree of the overtaken block must not keep its later, intact subtrees from being
-// repaired. Their txs would otherwise keep looking mined while off the chain.
+// repaired, and must stay pending: the block is not done while it is unread.
 func TestRepairOvertakenTips_CorruptSubtreeDoesNotBlockLaterSubtrees(t *testing.T) {
 	f := newOvertakeFixtureWithLaterSubtree(t)
 	bv := f.newBlockValidation(t)
@@ -1330,7 +1355,7 @@ func TestRepairOvertakenTips_CorruptSubtreeDoesNotBlockLaterSubtrees(t *testing.
 	require.Zero(t, f.unminedSince(t, f.later), "precondition: setTxMined marked the later subtree's tx mined")
 	_ = f.overtakeB(t)
 
-	bv.subtreeStore = &corruptSubtreeStore{Store: f.subtreeStore, key: f.blockB.Subtrees[0][:]}
+	bv.subtreeStore = f.shortReads(f.subtreeStore, 0, 1<<30)
 
 	for i := 1; i < tipRepairMaxAttempts; i++ {
 		_, err := drainTipRepair(t, bv)
@@ -1338,8 +1363,84 @@ func TestRepairOvertakenTips_CorruptSubtreeDoesNotBlockLaterSubtrees(t *testing.
 		require.Zero(t, f.unminedSince(t, f.later), "the corrupt subtree is retried, not skipped, after %d steps", i)
 	}
 
-	_, err := drainTipRepair(t, bv)
-	require.NoError(t, err)
+	settleTipRepair(t, bv, func() bool { return f.unminedSince(t, f.later) != 0 })
 	require.NotZero(t, f.unminedSince(t, f.later), "the later, intact subtree is repaired")
+
+	b := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
+	require.False(t, b.done, "the block is not done while a subtree is unread")
+	require.Equal(t, []*chainhash.Hash{f.blockB.Subtrees[0]}, b.pending, "the corrupt subtree is read again later")
+}
+
+// TestRepairOvertakenTips_ShortReadsThenRecoveryRepairsSkippedSubtree: a subtree skipped
+// after a long run of short reads must be repaired once its reads are whole again, not left
+// with its txs looking mined. The later subtree is repaired meanwhile.
+func TestRepairOvertakenTips_ShortReadsThenRecoveryRepairsSkippedSubtree(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	bv.subtreeStore = f.shortReads(f.subtreeStore, 0, 3*tipRepairSubtreeReadAttempts*tipRepairMaxAttempts)
+
+	settleTipRepair(t, bv, func() bool { return bv.minedOnChain.snapshot()[*f.blockB.Hash()].done })
+
+	require.NotZero(t, f.unminedSince(t, f.later), "the later subtree is repaired")
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "the skipped subtree is repaired once its reads are whole")
 	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done)
+}
+
+// TestRepairOvertakenTips_SkipFailuresCountedPerSubtree: the failed steps that got a corrupt
+// subtree skipped must not count toward skipping the next one. One step of short reads on
+// the intact later subtree, right after the skip, must leave it to be retried.
+func TestRepairOvertakenTips_SkipFailuresCountedPerSubtree(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	corrupt := f.shortReads(f.subtreeStore, 0, 1<<30)
+	bv.subtreeStore = f.shortReads(corrupt, 1, tipRepairSubtreeReadAttempts)
+
+	settleTipRepair(t, bv, func() bool { return f.unminedSince(t, f.later) != 0 })
+
+	require.NotZero(t, f.unminedSince(t, f.later), "the later subtree is retried and repaired, not skipped")
+}
+
+// TestRepairOvertakenTips_PendingClearedBackOnChain: a block with a subtree set aside that
+// comes back onto the chain must be repaired in full if it leaves again: its other txs may
+// have been marked mined again meanwhile.
+func TestRepairOvertakenTips_PendingClearedBackOnChain(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	bv.subtreeStore = f.shortReads(f.subtreeStore, 0, 1<<30)
+	settleTipRepair(t, bv, func() bool { return bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending != nil })
+	require.NotNil(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending, "precondition: a subtree is set aside")
+
+	f.extendB(t)
+
+	_, _ = bv.tipRepairSlice(f.ctx, bv.blockchainClient)
+	require.Nil(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending)
+}
+
+// TestMinedOnChainTracker_WriteClearsPending: a completed setTxMined write may have cleared
+// any of the block's txs, so the next repair reads the whole block, not only the subtrees
+// set aside.
+func TestMinedOnChainTracker_WriteClearsPending(t *testing.T) {
+	tracker := newMinedOnChainTracker()
+	hash := chainhash.HashH([]byte("b"))
+	subtree := chainhash.HashH([]byte("s"))
+
+	tracker.track(hash, 1, 1)
+
+	gen := tracker.snapshot()[hash].gen
+	tracker.update(hash, gen, func(e *minedOnChainBlock) { e.pending = []*chainhash.Hash{&subtree} })
+
+	require.True(t, tracker.markWritten(hash))
+	require.Nil(t, tracker.snapshot()[hash].pending)
 }
