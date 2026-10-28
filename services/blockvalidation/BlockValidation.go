@@ -2107,8 +2107,9 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 			return errors.NewBlockInvalidError("[ValidateBlock][%s] block conflicts with hardcoded checkpoint", block.Hash().String(), err)
 		}
 
-		// Fork-below-checkpoint rule, before any subtree work. It runs again just before the
-		// block is stored, in case the tip passes a checkpoint while the block validates.
+		// Fork-below-checkpoint rule, before any subtree work. The non-optimistic path runs it
+		// again just before the block is stored, in case the tip passes a checkpoint while the
+		// subtrees validate.
 		if err = u.rejectForkBelowCheckpoint(ctx, block, opts, baseURL); err != nil {
 			return err
 		}
@@ -2509,10 +2510,6 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 				return err
 			}
 
-			if err = u.rejectForkBelowCheckpoint(ctx, block, opts, baseURL); err != nil {
-				return err
-			}
-
 			ctxLogger.Infof("[ValidateBlock][%s] adding block optimistically to blockchain", block.Hash().String())
 
 			if err := u.computeAndSetCoinbaseBUMP(ctx, block); err != nil {
@@ -2820,7 +2817,14 @@ func (u *BlockValidation) ValidateBlockWithOptions(ctx context.Context, block *m
 
 			u.logger.Infof("[ValidateBlock][%s] validating block DONE", block.Hash().String())
 
-			if err = u.rejectForkBelowCheckpoint(ctx, block, opts, baseURL); err != nil {
+			// Re-check the checkpoint fork rule: the tip can pass a checkpoint while the
+			// subtrees validate. Like the store below, it must not fail on a cancelled
+			// parent context after the subtree work is done.
+			recheckCtx, recheckCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err = u.rejectForkBelowCheckpoint(recheckCtx, block, opts, baseURL)
+			recheckCancel()
+
+			if err != nil {
 				releaseBlockNodes(block)
 				return err
 			}
@@ -3015,8 +3019,9 @@ func (u *BlockValidation) storeInvalidBlock(ctx context.Context, block *model.Bl
 // Such a block is validated at its own height, so below Genesis or Chronicle its txs get
 // the older script rules (issue 4940). Only blocks at or below the highest checkpoint can
 // trip it, so the tip lookup is skipped for every block above it. ValidateBlock runs it
-// before subtree work and again just before storing the block, since the tip can pass a
-// checkpoint in between during initial sync.
+// before subtree work and, on the non-optimistic path, again just before storing the
+// block, since the tip can pass a checkpoint in between during initial sync. The
+// optimistic path stores the block before any subtree work, right after the first check.
 func (u *BlockValidation) rejectForkBelowCheckpoint(ctx context.Context, block *model.Block, opts *ValidateBlockOptions, baseURL string) error {
 	checkpoints := u.settings.ChainCfgParams.Checkpoints
 	if !model.BelowCheckpoint(checkpoints, block.Height) {
