@@ -1,6 +1,7 @@
 package blockvalidation
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/url"
@@ -111,9 +112,24 @@ type overtakeFixture struct {
 	bOnlyTx                 *bt.Tx
 	bOnly                   *chainhash.Hash
 	shared                  *chainhash.Hash
+	later                   *chainhash.Hash // only with newOvertakeFixtureWithLaterSubtree
 }
 
 func newOvertakeFixture(t *testing.T) *overtakeFixture {
+	t.Helper()
+
+	return newOvertakeFixtureSubtrees(t, false)
+}
+
+// newOvertakeFixtureWithLaterSubtree is newOvertakeFixture with a second subtree in B that
+// mines one more mempool tx, later, only ever in B.
+func newOvertakeFixtureWithLaterSubtree(t *testing.T) *overtakeFixture {
+	t.Helper()
+
+	return newOvertakeFixtureSubtrees(t, true)
+}
+
+func newOvertakeFixtureSubtrees(t *testing.T, withLater bool) *overtakeFixture {
 	t.Helper()
 	initPrometheusMetrics()
 
@@ -149,6 +165,31 @@ func newOvertakeFixture(t *testing.T) *overtakeFixture {
 	require.NoError(t, err)
 	require.NoError(t, subtreeStore.Set(ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes))
 
+	subtreeHashes := []*chainhash.Hash{subtree.RootHash()}
+	txCount := uint64(subtree.Length())                                      //nolint:gosec
+	totalSize := uint64(coinbaseB.Size() + bOnlyTx.Size() + sharedTx.Size()) //nolint:gosec
+
+	var later *chainhash.Hash
+
+	if withLater {
+		_, laterTx, _, _ := createCoinbaseAndChildTx(t)
+		_, _, err = innerUtxoStore.SpendAndCreate(ctx, laterTx, 1, utxostore.WithCreateOnly())
+		require.NoError(t, err)
+
+		laterSubtree, err := subtreepkg.NewTreeByLeafCount(2)
+		require.NoError(t, err)
+		require.NoError(t, laterSubtree.AddNode(*laterTx.TxIDChainHash(), uint64(laterTx.Size()), 0)) //nolint:gosec
+
+		laterBytes, err := laterSubtree.Serialize()
+		require.NoError(t, err)
+		require.NoError(t, subtreeStore.Set(ctx, laterSubtree.RootHash()[:], fileformat.FileTypeSubtree, laterBytes))
+
+		subtreeHashes = append(subtreeHashes, laterSubtree.RootHash())
+		txCount += uint64(laterSubtree.Length()) //nolint:gosec
+		totalSize += uint64(laterTx.Size())      //nolint:gosec
+		later = laterTx.TxIDChainHash()
+	}
+
 	replicated := subtree.Duplicate()
 	replicated.ReplaceRootNode(coinbaseB.TxIDChainHash(), 0, uint64(coinbaseB.Size())) //nolint:gosec
 
@@ -156,8 +197,7 @@ func newOvertakeFixture(t *testing.T) *overtakeFixture {
 	require.NoError(t, err)
 
 	headerB := mineBlockHeader(t, tSettings.ChainCfgParams.GenesisHash, replicated.RootHash(), nBits)
-	totalSize := uint64(coinbaseB.Size() + bOnlyTx.Size() + sharedTx.Size())                                                            //nolint:gosec
-	blockB, err := model.NewBlock(headerB, coinbaseB, []*chainhash.Hash{subtree.RootHash()}, uint64(subtree.Length()), totalSize, 1, 0) //nolint:gosec
+	blockB, err := model.NewBlock(headerB, coinbaseB, subtreeHashes, txCount, totalSize, 1, 0)
 	require.NoError(t, err)
 
 	require.NoError(t, blockchainClient.AddBlock(ctx, blockB, "test", blockchainoptions.WithSubtreesSet(true)))
@@ -179,6 +219,7 @@ func newOvertakeFixture(t *testing.T) *overtakeFixture {
 		bOnlyTx:                 bOnlyTx,
 		bOnly:                   bOnlyTx.TxIDChainHash(),
 		shared:                  sharedTx.TxIDChainHash(),
+		later:                   later,
 	}
 }
 
@@ -1257,4 +1298,48 @@ func TestRepairOvertakenTips_CorruptSubtreeSkippedAfterMaxAttempts(t *testing.T)
 	_, err := drainTipRepair(t, bv)
 	require.NoError(t, err)
 	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "the subtree is skipped and the job finishes")
+}
+
+// corruptSubtreeStore returns a truncated reader for every read of one subtree: a subtree
+// file that is corrupt on disk.
+type corruptSubtreeStore struct {
+	blob.Store
+	key []byte
+}
+
+func (s *corruptSubtreeStore) GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...blobopts.FileOption) (io.ReadCloser, error) {
+	reader, err := s.Store.GetIoReader(ctx, key, fileType, opts...)
+	if err != nil || !bytes.Equal(key, s.key) {
+		return reader, err
+	}
+
+	return struct {
+		io.Reader
+		io.Closer
+	}{io.LimitReader(reader, 10), reader}, nil
+}
+
+// TestRepairOvertakenTips_CorruptSubtreeDoesNotBlockLaterSubtrees: a corrupt earlier
+// subtree of the overtaken block must not keep its later, intact subtrees from being
+// repaired. Their txs would otherwise keep looking mined while off the chain.
+func TestRepairOvertakenTips_CorruptSubtreeDoesNotBlockLaterSubtrees(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	require.Zero(t, f.unminedSince(t, f.later), "precondition: setTxMined marked the later subtree's tx mined")
+	_ = f.overtakeB(t)
+
+	bv.subtreeStore = &corruptSubtreeStore{Store: f.subtreeStore, key: f.blockB.Subtrees[0][:]}
+
+	for i := 1; i < tipRepairMaxAttempts; i++ {
+		_, err := drainTipRepair(t, bv)
+		require.Error(t, err, "step %d fails at the corrupt subtree", i)
+		require.Zero(t, f.unminedSince(t, f.later), "the corrupt subtree is retried, not skipped, after %d steps", i)
+	}
+
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.NotZero(t, f.unminedSince(t, f.later), "the later, intact subtree is repaired")
+	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done)
 }
