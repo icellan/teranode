@@ -69,6 +69,10 @@ const (
 	// defaultTipRepairSliceSize is used when BlockValidation.TipRepairSliceSize is unset.
 	defaultTipRepairSliceSize = 250_000
 
+	// tipRepairPendingMaxBackoff caps, in blocks, how long a block with subtrees set aside
+	// waits for its next pass over them.
+	tipRepairPendingMaxBackoff = 128
+
 	// tipRepairSubtreeReadAttempts and tipRepairSubtreeReadBackoff match Block.GetSubtrees.
 	tipRepairSubtreeReadAttempts = 3
 	tipRepairSubtreeReadBackoff  = 100 * time.Millisecond
@@ -109,6 +113,18 @@ type minedOnChainBlock struct {
 	// pending holds the subtrees an unmark job could not read and set aside; the block is
 	// not done, and its next unmark job reads only these. nil means all of them.
 	pending []*chainhash.Hash
+	// passes counts the unmark jobs that ended with subtrees set aside, and nextPassHeight
+	// is the best height the next one waits for, so a subtree that stays unreadable is read
+	// again a few times over the window rather than on every slice.
+	passes         int
+	nextPassHeight uint32
+}
+
+// clearPending has the block's next unmark job read all of it again.
+func (b *minedOnChainBlock) clearPending() {
+	b.pending = nil
+	b.passes = 0
+	b.nextPassHeight = 0
 }
 
 // minedOnChainTracker holds the blocks the overtaken-tip repair watches. A nil tracker
@@ -171,7 +187,7 @@ func (t *minedOnChainTracker) markWritten(hash chainhash.Hash) bool {
 	}
 
 	b.done = false
-	b.pending = nil
+	b.clearPending()
 	t.blocks[hash] = b
 
 	return true
@@ -261,6 +277,8 @@ type tipRepairJob struct {
 	subtreeFailures int
 	// unreadable holds the subtrees set aside because they could not be read.
 	unreadable []*chainhash.Hash
+	// startHeight is the best height when the job started.
+	startHeight uint32
 }
 
 // signalTipRepair asks the setMined worker for a repair slice. Never blocks; a pending
@@ -412,8 +430,8 @@ func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient b
 
 		case onMainChain[b.id] && b.pending != nil:
 			// Back on the chain: if it leaves again, all of it needs repairing.
-			u.minedOnChain.update(hash, b.gen, func(e *minedOnChainBlock) { e.pending = nil })
-			b.pending = nil
+			u.minedOnChain.update(hash, b.gen, func(e *minedOnChainBlock) { e.clearPending() })
+			b.clearPending()
 			tracked[hash] = b
 
 		case onMainChain[b.id] && b.done && !b.stamped:
@@ -455,7 +473,7 @@ func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient b
 
 	// Blocks set aside after failing come last.
 	for _, deferred := range []bool{false, true} {
-		if more, started, err := u.startNextJob(ctx, blockchainClient, tracked, onMainChain, deferred); started {
+		if more, started, err := u.startNextJob(ctx, blockchainClient, tracked, onMainChain, bestHeight, deferred); started {
 			return more, err
 		}
 	}
@@ -466,16 +484,16 @@ func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient b
 // startNextJob starts a job on the next block that needs one, among the blocks whose deferred
 // flag matches, and reports whether it found one.
 func (u *BlockValidation) startNextJob(ctx context.Context, blockchainClient blockchain.ClientI, tracked map[chainhash.Hash]minedOnChainBlock,
-	onMainChain map[uint32]bool, deferred bool) (more, started bool, err error) {
+	onMainChain map[uint32]bool, bestHeight uint32, deferred bool) (more, started bool, err error) {
 	// A re-marked block back on the chain first: its txs look unmined while mined.
 	for hash, b := range tracked {
 		if b.deferred == deferred && b.stamped && onMainChain[b.id] {
-			return true, true, u.startJob(ctx, blockchainClient, remineJob, hash, b)
+			return true, true, u.startJob(ctx, blockchainClient, remineJob, hash, b, bestHeight)
 		}
 	}
 
 	for hash, b := range tracked {
-		if b.deferred != deferred || b.done || onMainChain[b.id] {
+		if b.deferred != deferred || b.done || onMainChain[b.id] || (b.pending != nil && bestHeight < b.nextPassHeight) {
 			continue
 		}
 
@@ -494,7 +512,7 @@ func (u *BlockValidation) startNextJob(ctx context.Context, blockchainClient blo
 			continue
 		}
 
-		return true, true, u.startJob(ctx, blockchainClient, unmarkJob, hash, b)
+		return true, true, u.startJob(ctx, blockchainClient, unmarkJob, hash, b, bestHeight)
 	}
 
 	return false, false, nil
@@ -548,7 +566,7 @@ func (u *BlockValidation) mainChainIDsLocked(ctx context.Context, blockchainClie
 }
 
 // startJob begins a job over the block: it reads the block's subtree list, not its txs.
-func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockchain.ClientI, kind tipRepairJobKind, hash chainhash.Hash, b minedOnChainBlock) error {
+func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockchain.ClientI, kind tipRepairJobKind, hash chainhash.Hash, b minedOnChainBlock, bestHeight uint32) error {
 	block, err := blockchainClient.GetBlock(ctx, &hash)
 	if err != nil {
 		return u.repairFailed(hash, b.gen, errors.NewServiceError("[repairOvertakenTips][%s] failed to get block", hash.String(), err))
@@ -559,7 +577,7 @@ func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockch
 
 		if kind == remineJob {
 			e.done = false
-			e.pending = nil
+			e.clearPending()
 		}
 	})
 
@@ -568,7 +586,7 @@ func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockch
 		subtrees = b.pending
 	}
 
-	u.tipRepairJob = &tipRepairJob{kind: kind, hash: hash, id: b.id, gen: b.gen, subtrees: subtrees}
+	u.tipRepairJob = &tipRepairJob{kind: kind, hash: hash, id: b.id, gen: b.gen, subtrees: subtrees, startHeight: bestHeight}
 
 	return nil
 }
@@ -576,9 +594,12 @@ func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockch
 // jobStep writes the next slice of the job's txs, first loading the next subtree if the
 // current one is used up, and finishes the job with its last slice. A subtree that is gone
 // is skipped with an error log. One that still cannot be deserialized after
-// tipRepairMaxAttempts failed loads is set aside, so the rest of the block is repaired, and
-// read again by the block's next job: a run of short reads looks the same as a corrupt
-// file. Any other load error fails the step, to be retried.
+// tipRepairMaxAttempts failed loads is set aside, so the rest of the block is repaired: a
+// run of short reads looks the same as a corrupt file. An unmark job's set-aside subtrees
+// are read again by the block's next unmark job (see finishJob). A remine job does not
+// come back to them, which is the safe direction: their txs stay flagged unmined until
+// fixUnminedSinceInconsistencies clears them. Any other load error fails the step, to be
+// retried.
 func (u *BlockValidation) jobStep(ctx context.Context, blockchainClient blockchain.ClientI, job *tipRepairJob, onMainChain map[uint32]bool) error {
 	for len(job.current) == 0 {
 		if job.nextSubtree >= len(job.subtrees) {
@@ -674,12 +695,18 @@ func (u *BlockValidation) finishJob(job *tipRepairJob) {
 	switch job.kind {
 	case unmarkJob:
 		// A block with subtrees set aside is not done: its next job reads them again,
-		// after the other blocks have had their turn.
+		// after the other blocks have had their turn and the best height has moved on by
+		// twice as many blocks as last time.
 		u.minedOnChain.update(job.hash, job.gen, func(e *minedOnChainBlock) {
 			e.done = len(job.unreadable) == 0
 			e.pending = job.unreadable
 			e.deferred = !e.done
 			e.failures = 0
+
+			if !e.done {
+				e.passes++
+				e.nextPassHeight = job.startHeight + uint32(min(1<<min(e.passes, 30), tipRepairPendingMaxBackoff)) //nolint:gosec // capped at tipRepairPendingMaxBackoff
+			}
 		})
 
 		u.logger.Warnf("[repairOvertakenTips][%s] block left the longest chain after its txs were marked mined, marked %d of %d txs as not on longest chain", job.hash.String(), job.marked, job.total)
@@ -747,8 +774,8 @@ func (u *BlockValidation) loadSubtreeNodes(ctx context.Context, subtreeHash *cha
 	}
 
 	// Not a permanent error, even when the subtree still cannot be deserialized: a short
-	// read looks the same as a corrupt file. The step is retried, and jobStep skips the
-	// subtree only after it has failed for tipRepairMaxAttempts steps.
+	// read looks the same as a corrupt file. The step is retried, and jobStep sets the
+	// subtree aside only after it has failed for tipRepairMaxAttempts steps.
 	return nil, err
 }
 

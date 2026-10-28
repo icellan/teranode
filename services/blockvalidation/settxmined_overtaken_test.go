@@ -1371,18 +1371,23 @@ func TestRepairOvertakenTips_CorruptSubtreeDoesNotBlockLaterSubtrees(t *testing.
 	require.Equal(t, []*chainhash.Hash{f.blockB.Subtrees[0]}, b.pending, "the corrupt subtree is read again later")
 }
 
-// TestRepairOvertakenTips_ShortReadsThenRecoveryRepairsSkippedSubtree: a subtree skipped
-// after a long run of short reads must be repaired once its reads are whole again, not left
-// with its txs looking mined. The later subtree is repaired meanwhile.
+// TestRepairOvertakenTips_ShortReadsThenRecoveryRepairsSkippedSubtree: a subtree set aside
+// after a long run of short reads must be repaired once its reads are whole again, on the
+// pass after the best height has moved, not left with its txs looking mined. The later
+// subtree is repaired meanwhile.
 func TestRepairOvertakenTips_ShortReadsThenRecoveryRepairsSkippedSubtree(t *testing.T) {
 	f := newOvertakeFixtureWithLaterSubtree(t)
 	bv := f.newBlockValidation(t)
 
 	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
-	_ = f.overtakeB(t)
+	blockC2 := f.overtakeB(t)
 
-	bv.subtreeStore = f.shortReads(f.subtreeStore, 0, 3*tipRepairSubtreeReadAttempts*tipRepairMaxAttempts)
+	bv.subtreeStore = f.shortReads(f.subtreeStore, 0, tipRepairSubtreeReadAttempts*tipRepairMaxAttempts)
 
+	settleTipRepair(t, bv, func() bool { return bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending != nil })
+	require.NotZero(t, f.unminedSince(t, f.later), "the later subtree is repaired while subtree 0 is set aside")
+
+	f.extendWinning(t, blockC2)
 	settleTipRepair(t, bv, func() bool { return bv.minedOnChain.snapshot()[*f.blockB.Hash()].done })
 
 	require.NotZero(t, f.unminedSince(t, f.later), "the later subtree is repaired")
@@ -1443,4 +1448,51 @@ func TestMinedOnChainTracker_WriteClearsPending(t *testing.T) {
 
 	require.True(t, tracker.markWritten(hash))
 	require.Nil(t, tracker.snapshot()[hash].pending)
+}
+
+// extendWinning adds two blocks on tip, the winning chain's tip at height 2, which moves the
+// best height past the first back-off of a block with subtrees set aside.
+func (f *overtakeFixture) extendWinning(t *testing.T, tip *model.Block) {
+	t.Helper()
+
+	time.Sleep(10 * time.Millisecond)
+
+	blockD2 := coinbaseOnlyBlock(t, tip.Hash(), f.nBits, 3, 0xd4)
+	blockE2 := coinbaseOnlyBlock(t, blockD2.Hash(), f.nBits, 4, 0xe4)
+	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, blockD2, "test", blockchainoptions.WithSubtreesSet(true)))
+	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, blockE2, "test", blockchainoptions.WithSubtreesSet(true)))
+}
+
+// TestRepairOvertakenTips_PendingPassesBackOffByHeight: a block whose subtree stays
+// unreadable must not be read again on every slice until it leaves the window. The next
+// pass over its pending subtrees waits for the best height to move, by twice as many blocks
+// each time.
+func TestRepairOvertakenTips_PendingPassesBackOffByHeight(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	blockC2 := f.overtakeB(t)
+
+	store := f.shortReads(f.subtreeStore, 0, 1<<30)
+	bv.subtreeStore = store
+
+	settleTipRepair(t, bv, func() bool {
+		b := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
+		return b.pending != nil && bv.tipRepairJob == nil
+	})
+	require.NotNil(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending, "precondition: the corrupt subtree is set aside")
+
+	left := store.short.Load()
+
+	for i := 0; i < 5; i++ {
+		_, _ = drainTipRepair(t, bv)
+	}
+
+	require.Equal(t, left, store.short.Load(), "no new pass while the best height has not moved")
+
+	f.extendWinning(t, blockC2)
+
+	_, _ = drainTipRepair(t, bv)
+	require.Less(t, store.short.Load(), left, "a new pass reads the pending subtree once the height has moved")
 }
