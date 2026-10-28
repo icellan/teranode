@@ -554,8 +554,10 @@ func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockch
 }
 
 // jobStep writes the next slice of the job's txs, first loading the next subtree if the
-// current one is used up, and finishes the job with its last slice. A subtree that is gone
-// or unreadable is skipped with an error log, so the rest of the block is still repaired.
+// current one is used up, and finishes the job with its last slice. A subtree that is gone,
+// or still cannot be deserialized on the job's tipRepairMaxAttempts-th failed step in a row,
+// is skipped with an error log, so the rest of the block is still repaired. Any other load
+// error fails the step, to be retried.
 func (u *BlockValidation) jobStep(ctx context.Context, blockchainClient blockchain.ClientI, job *tipRepairJob, onMainChain map[uint32]bool) error {
 	for len(job.current) == 0 {
 		if job.nextSubtree >= len(job.subtrees) {
@@ -567,7 +569,11 @@ func (u *BlockValidation) jobStep(ctx context.Context, blockchainClient blockcha
 
 		nodes, err := u.loadSubtreeNodes(ctx, subtreeHash)
 		if err != nil {
-			if !isPermanentRepairError(err) {
+			// The failed steps in a row are all at this subtree: a step that finished the
+			// previous one succeeded and reset the count. A short read looks the same as a
+			// corrupt file, so only that many failures make it corrupt.
+			corrupt := errors.Is(err, errors.ErrSubtreeInvalid) && job.failures+1 >= tipRepairMaxAttempts
+			if !corrupt && !isPermanentRepairError(err) {
 				return errors.NewProcessingError("[repairOvertakenTips][%s] failed to load subtree %d", job.hash.String(), job.nextSubtree, err)
 			}
 
@@ -713,8 +719,8 @@ func (u *BlockValidation) loadSubtreeNodes(ctx context.Context, subtreeHash *cha
 	}
 
 	// Not a permanent error, even when the subtree still cannot be deserialized: a short
-	// read looks the same as a corrupt file, and skipping the subtree would leave its txs
-	// looking mined for good. The step is retried; a job that keeps failing is set aside.
+	// read looks the same as a corrupt file. The step is retried, and jobStep skips the
+	// subtree only after it has failed for tipRepairMaxAttempts steps.
 	return nil, err
 }
 
@@ -734,7 +740,7 @@ func (u *BlockValidation) readSubtreeNodes(ctx context.Context, subtreeHash *cha
 
 	subtree, err := subtreepkg.NewSubtreeFromReader(bufio.NewReader(reader))
 	if err != nil {
-		return nil, errors.NewProcessingError("failed to deserialize subtree %s", subtreeHash.String(), err)
+		return nil, errors.NewSubtreeInvalidError("failed to deserialize subtree %s", subtreeHash.String(), err)
 	}
 
 	return subtree.Nodes, nil

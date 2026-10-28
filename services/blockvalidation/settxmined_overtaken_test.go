@@ -1233,3 +1233,28 @@ func TestRepairOvertakenTips_ShortReadsOutlastAttemptsRetried(t *testing.T) {
 	require.NoError(t, err)
 	require.NotZero(t, f.unminedSince(t, f.bOnly), "the subtree is repaired once reads are whole")
 }
+
+// TestRepairOvertakenTips_CorruptSubtreeSkippedAfterMaxAttempts: a subtree that can never be
+// deserialized must not hold the job forever, which would leave the block's later subtrees
+// unrepaired. It is retried for tipRepairMaxAttempts steps, then skipped and the job goes on.
+func TestRepairOvertakenTips_CorruptSubtreeSkippedAfterMaxAttempts(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	store := &truncatingSubtreeStore{Store: f.subtreeStore}
+	store.truncate.Store(1 << 30)
+	bv.subtreeStore = store
+
+	for i := 1; i < tipRepairMaxAttempts; i++ {
+		_, err := drainTipRepair(t, bv)
+		require.Error(t, err, "step %d fails", i)
+		require.False(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "the subtree is not skipped after %d steps", i)
+	}
+
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "the subtree is skipped and the job finishes")
+}
