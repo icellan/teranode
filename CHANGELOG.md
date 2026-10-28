@@ -116,6 +116,22 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   restart are not repaired. A deployment that runs more than one block validation
   replica loses no data, but transactions can stay flagged unmined until block
   assembly's next unmined load. No action needed for a single-instance deployment. (#2065)
+- **Catch-up quick validation waits for each block's `.subtree` writes before it commits
+  the block, and a shutdown waits for a block's in-flight commit.** A block was stored with
+  `subtrees_set` while its `.subtree` files could still be in flight, so a failed write
+  left a block recorded as having files it did not have. Each quick-validated block now
+  waits for its own writes to land; a write that fails leaves the block uncommitted for
+  the next catch-up run. Once the block is stored, unlocking its outputs is retried on a
+  context that a cancel does not stop, for up to 5 minutes. When `AddBlock` returns an
+  error, a retried existence check, bounded at 15 seconds, decides whether to finish the
+  commit or retry the block later. Shutdown now waits for a block's commit that is already
+  under way, including that check and the unlock, but only up to `service_manager_stopTimeout`
+  (default 30s), less up to 5s that shutdown keeps for flushing the invalid-block Kafka
+  producer. A stop during catch-up can now use the rest of that time. If the blockchain or
+  UTXO store hangs past the stop timeout at shutdown, the block's outputs stay locked
+  (tracked in #2015). To give the commit longer at shutdown, raise
+  `service_manager_stopTimeout` and the pod's `terminationGracePeriodSeconds` together.
+  (#2011)
 
 - **A mining candidate keeps its coinbase, and a solution without one is mined with it.**
   Affects miners and pools that use `getminingcandidate` and `submitminingsolution`. As in
@@ -139,6 +155,7 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   minute. Upgrade block assembly no later than the RPC service: an RPC service on this
   build answers `getminingcandidate` with `coinbase=true` with an error while it is talking
   to an older block assembly, which sends no coinbase. (#2027)
+
 - **A policy-mode script error is classified by a consensus re-run.** When policy
   validation fails on `SCRIPTNUM_OVERFLOW`, `OP_COUNT`, `SCRIPT_SIZE`, `PUBKEY_COUNT`,
   `SCRIPTNUM_MINENCODE` or `STACK_SIZE`, the validator runs the scripts again under
