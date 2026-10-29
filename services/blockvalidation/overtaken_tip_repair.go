@@ -2,7 +2,12 @@ package blockvalidation
 
 import (
 	"bufio"
+	"bytes"
+	"cmp"
 	"context"
+	"database/sql"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -336,31 +341,53 @@ type tipRepairJob struct {
 	height uint32
 }
 
-// drainTipRepair runs repair slices until none is due. setTxMinedStatus calls it before
-// setting a block's mined_set, which is what lets the pruner process that height: a repair
-// the chain has made due is finished first, so its txs are re-marked, and their parents
-// preserved by the pruner's next phase 1, before any parent can be pruned. A pass over
-// subtrees set aside is due on every new block, so a subtree whose reads have recovered is
-// read here too. One that still cannot be read stays set aside: its txs cannot be named, and
-// tipRepairSubtreesSetAside reports it. A slice that keeps failing returns its error after
-// tipRepairMaxAttempts in a row; the caller leaves mined_set unset, to be retried.
-func (u *BlockValidation) drainTipRepair(ctx context.Context, blockchainClient blockchain.ClientI) error {
-	for failures := 0; ; {
-		more, err := u.tipRepairSlice(ctx, blockchainClient)
-		if err != nil {
-			if failures++; failures >= tipRepairMaxAttempts || ctx.Err() != nil {
-				return err
-			}
+// writeRepairHoldLocked records in the blockchain state the tracked blocks that are off the
+// main chain and not yet repaired, pending or with subtrees set aside: their transactions may
+// look mined while off the chain, and the pruner deletes nothing while any is listed. A block
+// on the chain owing a remine is not listed: its transactions look unmined while mined, which
+// only keeps their parents longer. The record is written only when it changes. It is not
+// written before the tracker is seeded, so a hold recorded before a restart is read back
+// first (seedMinedOnChainTrackerLocked).
+func (u *BlockValidation) writeRepairHoldLocked(ctx context.Context, blockchainClient blockchain.ClientI) error {
+	if !u.tipRepairSeeded {
+		return nil
+	}
 
-			continue
-		}
+	held := make([]model.HeldBlock, 0)
 
-		failures = 0
-
-		if !more {
-			return nil
+	for hash, b := range u.minedOnChain.snapshot() {
+		if !u.tipRepairMainChain[b.id] && !b.done {
+			held = append(held, model.HeldBlock{Hash: hash, ID: b.id, Height: b.height})
 		}
 	}
+
+	slices.SortFunc(held, func(a, b model.HeldBlock) int {
+		if c := cmp.Compare(a.Height, b.Height); c != 0 {
+			return c
+		}
+
+		return bytes.Compare(a.Hash[:], b.Hash[:])
+	})
+
+	data := model.EncodeOvertakenTipRepairHold(held)
+	if u.tipRepairHoldWritten && bytes.Equal(data, u.tipRepairHold) {
+		return nil
+	}
+
+	if err := blockchainClient.SetState(ctx, model.OvertakenTipRepairHoldKey, data); err != nil {
+		return errors.NewServiceError("[repairOvertakenTips] failed to record the pruning hold", err)
+	}
+
+	if len(held) > 0 {
+		u.logger.Warnf("[repairOvertakenTips] holding pruning for %d overtaken blocks still being repaired, lowest at height %d", len(held), held[0].Height)
+	} else if u.tipRepairHoldWritten && len(u.tipRepairHold) > 0 {
+		u.logger.Infof("[repairOvertakenTips] every overtaken block is repaired, pruning released")
+	}
+
+	u.tipRepairHold = data
+	u.tipRepairHoldWritten = true
+
+	return nil
 }
 
 // signalTipRepair asks the setMined worker for a repair slice. Never blocks; a pending
@@ -416,6 +443,13 @@ func (u *BlockValidation) runTipRepairSlice(ctx context.Context, blockchainClien
 // main-chain blocks inside the window, and the fork blocks within tipRepairSeedForkDepth of
 // the best height, which may have been the tip before the restart.
 func (u *BlockValidation) seedMinedOnChainTrackerLocked(ctx context.Context, blockchainClient blockchain.ClientI) error {
+	// The blocks held before the restart first: their repair had not finished, and the
+	// window and fork depth below may no longer reach them. Read before anything here can
+	// write the hold again.
+	if err := u.seedHeldBlocksLocked(ctx, blockchainClient); err != nil {
+		return err
+	}
+
 	bestHeader, bestMeta, err := blockchainClient.GetBestBlockHeader(ctx)
 	if err != nil {
 		return errors.NewServiceError("[repairOvertakenTips] seed: failed to get best block header", err)
@@ -511,6 +545,35 @@ func (u *BlockValidation) seedMinedOnChainTrackerLocked(ctx context.Context, blo
 	return nil
 }
 
+// seedHeldBlocksLocked tracks the blocks a hold recorded before the restart lists. No record
+// means a node that has never held pruning.
+func (u *BlockValidation) seedHeldBlocksLocked(ctx context.Context, blockchainClient blockchain.ClientI) error {
+	data, err := blockchainClient.GetState(ctx, model.OvertakenTipRepairHoldKey)
+	if err != nil {
+		if errors.Is(err, errors.ErrNotFound) || strings.Contains(err.Error(), sql.ErrNoRows.Error()) {
+			return nil
+		}
+
+		return errors.NewServiceError("[repairOvertakenTips] seed: failed to read the pruning hold", err)
+	}
+
+	held, err := model.DecodeOvertakenTipRepairHold(data)
+	if err != nil {
+		// Unreadable, it protects nothing; the hold is written again from the tracker.
+		u.logger.Errorf("[repairOvertakenTips] seed: ignoring an unreadable pruning hold: %v", err)
+		return nil
+	}
+
+	for _, b := range held {
+		u.minedOnChain.seed(b.Hash, b.ID, b.Height)
+	}
+
+	u.tipRepairHold = data
+	u.tipRepairHoldWritten = true
+
+	return nil
+}
+
 // mainChainHeaders returns the tipRepairWindow headers ending at best, best first, read in
 // pages within blockchain_maxBlockHeadersPerRequest, which the blockchain service enforces
 // and may be set below the window.
@@ -582,26 +645,66 @@ func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient b
 		prometheusBlockValidationTipRepairSubtreesSetAside.Set(float64(u.minedOnChain.setAsideSubtrees()))
 	}()
 
+	tracked, onMainChain, bestHeight, active, err := u.tipRepairHousekeepingLocked(ctx, blockchainClient)
+	if err != nil || !active {
+		return false, err
+	}
+
+	// The step may finish a block's repair, or set its subtrees aside: record the hold as it
+	// stands after it.
+	defer func() {
+		if holdErr := u.writeRepairHoldLocked(ctx, blockchainClient); holdErr != nil && err == nil {
+			more, err = true, holdErr
+		}
+	}()
+
+	return u.tipRepairStepLocked(ctx, blockchainClient, tracked, onMainChain, bestHeight)
+}
+
+// refreshRepairHold brings the pruning hold up to date with the chain as it is now, without
+// repairing anything: setTxMinedStatus calls it before setting a block's mined_set, which is
+// what lets the pruner process that height. A block the chain has just overtaken is held
+// before the pruner can see the new height, so the pruner deletes nothing until its repair
+// has finished. It reads the chain from the blockchain service and writes the hold there, the
+// same service SetBlockMinedSet writes to; it does no repair work, so a repair that fails does
+// not stop healthy blocks from being set mined.
+func (u *BlockValidation) refreshRepairHold(ctx context.Context, blockchainClient blockchain.ClientI) error {
+	u.tipRepairMu.Lock()
+	defer u.tipRepairMu.Unlock()
+
+	if _, _, _, active, err := u.tipRepairHousekeepingLocked(ctx, blockchainClient); err != nil || !active {
+		return err
+	}
+
+	return u.writeRepairHoldLocked(ctx, blockchainClient)
+}
+
+// tipRepairHousekeepingLocked seeds the tracker after a restart, reads the main chain, and
+// drops or reopens tracked blocks as the chain has moved. active is false until this process
+// has tracked a block, when there is nothing to do.
+func (u *BlockValidation) tipRepairHousekeepingLocked(ctx context.Context, blockchainClient blockchain.ClientI) (tracked map[chainhash.Hash]minedOnChainBlock,
+	onMainChain map[uint32]bool, bestHeight uint32, active bool, err error) {
 	// Nothing to do until this process has written a block as on the longest chain. The
 	// restart seed waits for that too: after a restart the next block's setTxMined comes
 	// within one block interval, and a process that never marks blocks mined (or a test
-	// harness that never runs setTxMined) makes no blockchain calls here at all.
+	// harness that never runs setTxMined) makes no blockchain calls here at all. A hold
+	// recorded before the restart stays as it is until then.
 	if !u.tipRepairSeeded && u.minedOnChain.empty() {
-		return false, nil
+		return nil, nil, 0, false, nil
 	}
 
 	if !u.tipRepairSeeded {
 		if err = u.seedMinedOnChainTrackerLocked(ctx, blockchainClient); err != nil {
-			return false, err
+			return nil, nil, 0, false, err
 		}
 	}
 
-	onMainChain, bestHeight, err := u.mainChainIDsLocked(ctx, blockchainClient)
+	onMainChain, bestHeight, err = u.mainChainIDsLocked(ctx, blockchainClient)
 	if err != nil {
-		return false, err
+		return nil, nil, 0, false, err
 	}
 
-	tracked := u.minedOnChain.snapshot()
+	tracked = u.minedOnChain.snapshot()
 
 	for hash, b := range tracked {
 		switch {
@@ -640,6 +743,12 @@ func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient b
 		}
 	}
 
+	return tracked, onMainChain, bestHeight, true, nil
+}
+
+// tipRepairStepLocked does one step of the job in progress, or starts the next job.
+func (u *BlockValidation) tipRepairStepLocked(ctx context.Context, blockchainClient blockchain.ClientI, tracked map[chainhash.Hash]minedOnChainBlock,
+	onMainChain map[uint32]bool, bestHeight uint32) (more bool, err error) {
 	if job := u.tipRepairJob; job != nil {
 		b, ok := tracked[job.hash]
 

@@ -2092,57 +2092,88 @@ func (c *minedSetProbe) SetBlockMinedSet(ctx context.Context, blockHash *chainha
 	return c.ClientI.SetBlockMinedSet(ctx, blockHash)
 }
 
-// TestSetTxMinedStatus_RepairsOvertakenBlockBeforeMinedSet: the pruner processes a height
-// only once its block has mined_set. So the setTxMined of the block that overtook B must
-// finish B's repair before it sets mined_set, or the pruner can delete a parent of a tx of
-// B that still looks mined.
-func TestSetTxMinedStatus_RepairsOvertakenBlockBeforeMinedSet(t *testing.T) {
+// heldBlocks returns the blocks the pruning hold in the blockchain state lists.
+func (f *overtakeFixture) heldBlocks(t *testing.T) []chainhash.Hash {
+	t.Helper()
+
+	data, err := f.blockchainClient.GetState(f.ctx, model.OvertakenTipRepairHoldKey)
+	if err != nil {
+		return nil
+	}
+
+	held, err := model.DecodeOvertakenTipRepairHold(data)
+	require.NoError(t, err)
+
+	hashes := make([]chainhash.Hash, 0, len(held))
+	for _, b := range held {
+		hashes = append(hashes, b.Hash)
+	}
+
+	return hashes
+}
+
+// TestSetTxMinedStatus_HoldsOvertakenBlockBeforeMinedSet: the pruner processes a height only
+// once its block has mined_set. So the setTxMined of the block that overtook B must put B in
+// the pruning hold before it sets mined_set, or the pruner can delete a parent of a tx of B
+// that still looks mined. It must not wait for B's repair to do so.
+func TestSetTxMinedStatus_HoldsOvertakenBlockBeforeMinedSet(t *testing.T) {
 	f := newOvertakeFixture(t)
 	bv := f.newBlockValidation(t)
 
 	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
 	blockC2 := f.overtakeB(t)
 
-	var atMinedSet uint32
+	var heldAtMinedSet []chainhash.Hash
 
-	probe := &minedSetProbe{ClientI: f.blockchainClient, block: *blockC2.Hash(), at: func() { atMinedSet = f.unminedSince(t, f.bOnly) }}
+	probe := &minedSetProbe{ClientI: f.blockchainClient, block: *blockC2.Hash(), at: func() { heldAtMinedSet = f.heldBlocks(t) }}
 	bv.blockchainClient = probe
 
 	require.NoError(t, bv.setTxMinedStatus(f.ctx, blockC2.Hash()))
 	require.Equal(t, int32(1), probe.calls.Load(), "precondition: C' was set mined")
-	require.NotZero(t, atMinedSet, "B's tx is re-marked before C' gets mined_set")
+	require.Equal(t, []chainhash.Hash{*f.blockB.Hash()}, heldAtMinedSet, "B is held before C' gets mined_set")
+	require.Zero(t, f.unminedSince(t, f.bOnly), "the hold does not wait for B's repair")
+
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "precondition: B is repaired")
+	require.Empty(t, f.heldBlocks(t), "the hold is released once B is repaired")
 }
 
-// TestSetTxMinedStatus_RepairsRecoveredSubtreeBeforeMinedSet: a subtree set aside whose
-// reads have recovered is due again on the next block. That block's setTxMined must read it
-// before setting mined_set, not leave it to a later slice that may lose to the pruner.
-func TestSetTxMinedStatus_RepairsRecoveredSubtreeBeforeMinedSet(t *testing.T) {
+// TestRepairOvertakenTips_SetAsideSubtreeHoldsPruning: a subtree that cannot be read cannot
+// be repaired, and the parents of its txs cannot be named. The hold stays while it is set
+// aside, across new blocks, and is released only once the subtree reads and is repaired.
+func TestRepairOvertakenTips_SetAsideSubtreeHoldsPruning(t *testing.T) {
 	f := newOvertakeFixtureWithLaterSubtree(t)
 	bv := f.newBlockValidation(t)
-	_ = f.fakeTipRepairClock(bv)
+	clock := f.fakeTipRepairClock(bv)
 
 	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
 	blockC2 := f.overtakeB(t)
 
-	bv.subtreeStore = f.shortReads(f.subtreeStore, 0, tipRepairSubtreeReadAttempts*tipRepairMaxAttempts)
+	store := f.shortReads(f.subtreeStore, 0, 1<<30)
+	bv.subtreeStore = store
 
 	settleTipRepair(t, bv, func() bool { return bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending != nil })
 	require.NotNil(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending, "precondition: subtree 0 is set aside")
-	require.Zero(t, f.unminedSince(t, f.bOnly), "precondition: subtree 0's tx still looks mined")
+	require.NotZero(t, f.unminedSince(t, f.later), "precondition: the readable subtree is repaired")
+	require.Equal(t, []chainhash.Hash{*f.blockB.Hash()}, f.heldBlocks(t), "a block with a subtree set aside is held")
 
 	time.Sleep(10 * time.Millisecond)
 
 	blockD2 := coinbaseOnlyBlock(t, blockC2.Hash(), f.nBits, 3, 0xd4)
 	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, blockD2, "test", blockchainoptions.WithSubtreesSet(true)))
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, blockD2.Hash()), "a new block is set mined while the subtree stays unreadable")
 
-	var atMinedSet uint32
+	settleTipRepair(t, bv, func() bool { return false })
+	require.Equal(t, []chainhash.Hash{*f.blockB.Hash()}, f.heldBlocks(t), "still held after a new block and more passes")
 
-	probe := &minedSetProbe{ClientI: f.blockchainClient, block: *blockD2.Hash(), at: func() { atMinedSet = f.unminedSince(t, f.bOnly) }}
-	bv.blockchainClient = probe
+	store.short.Store(0)
+	clock.advance(tipRepairPendingMaxBackoff)
 
-	require.NoError(t, bv.setTxMinedStatus(f.ctx, blockD2.Hash()))
-	require.Equal(t, int32(1), probe.calls.Load(), "precondition: D' was set mined")
-	require.NotZero(t, atMinedSet, "the recovered subtree's tx is re-marked before D' gets mined_set")
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "the subtree is repaired once it reads")
+	require.Empty(t, f.heldBlocks(t), "and the hold is released")
 }
 
 // cappedHeadersClient rejects header and block-summary requests over the configured caps,
@@ -2264,29 +2295,70 @@ func TestRepairOvertakenTips_SeedPagesForkBlocksWithinCap(t *testing.T) {
 	require.True(t, tracked, "fork block Y, below a full page at height 2, is seeded")
 }
 
-// TestSetTxMinedStatus_FailedRepairLeavesMinedSetUnset: when the repair keeps failing, the
-// block is not set mined, so the pruner cannot process its height. The error is the
-// repair's, not the block's: a tracked block that is gone must not make the worker take the
-// block it is setting mined for gone too and drop its retry.
-func TestSetTxMinedStatus_FailedRepairLeavesMinedSetUnset(t *testing.T) {
+// TestSetTxMinedStatus_FailingRepairDoesNotStopHealthyBlocks: a repair that keeps failing
+// holds pruning, not the chain. A healthy new block is still set mined, so its children pass
+// the parent-mined check, while the overtaken block stays held.
+func TestSetTxMinedStatus_FailingRepairDoesNotStopHealthyBlocks(t *testing.T) {
 	f := newOvertakeFixture(t)
 	bv := f.newBlockValidation(t)
 
 	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	blockC2 := f.overtakeB(t)
 
-	// A tracked block the blockchain no longer has: every attempt to repair it fails.
-	bv.minedOnChain.track(chainhash.HashH([]byte("gone")), 999, 1)
+	// Every attempt to re-mark B's txs fails, as a store fault that does not clear would.
+	f.store.failMarkFalse.Store(1 << 30)
+
+	settleTipRepair(t, bv, func() bool { return false })
+	require.Zero(t, f.unminedSince(t, f.bOnly), "precondition: B's repair keeps failing")
 
 	time.Sleep(10 * time.Millisecond)
 
-	blockD := coinbaseOnlyBlock(t, f.blockB.Hash(), f.nBits, 2, 0xd0)
-	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, blockD, "test", blockchainoptions.WithSubtreesSet(true)))
+	blockD2 := coinbaseOnlyBlock(t, blockC2.Hash(), f.nBits, 3, 0xd4)
+	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, blockD2, "test", blockchainoptions.WithSubtreesSet(true)))
 
-	err := bv.setTxMinedStatus(f.ctx, blockD.Hash())
-	require.Error(t, err)
-	require.False(t, errors.Is(err, errors.ErrBlockNotFound), "the error is not the block's own: %v", err)
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, blockD2.Hash()))
 
-	_, meta, err := f.blockchainClient.GetBlockHeader(f.ctx, blockD.Hash())
+	_, meta, err := f.blockchainClient.GetBlockHeader(f.ctx, blockD2.Hash())
 	require.NoError(t, err)
-	require.False(t, meta.MinedSet, "mined_set stays unset while the repair fails")
+	require.True(t, meta.MinedSet, "the healthy block is set mined")
+	require.Equal(t, []chainhash.Hash{*f.blockB.Hash()}, f.heldBlocks(t), "B stays held while its repair fails")
+}
+
+// TestRepairOvertakenTips_HoldSurvivesRestart: the blocks held when the process stops are read
+// back from the hold when it starts again, so their repair finishes even when they are too
+// deep below the tip for the seed to find, and the hold is not released before.
+func TestRepairOvertakenTips_HoldSurvivesRestart(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	blockC2 := f.overtakeB(t)
+
+	f.store.failMarkFalse.Store(1 << 30)
+	settleTipRepair(t, bv, func() bool { return false })
+	require.Equal(t, []chainhash.Hash{*f.blockB.Hash()}, f.heldBlocks(t), "precondition: B is held")
+
+	// The winning chain grows past the seed's fork depth while the process is down.
+	time.Sleep(10 * time.Millisecond)
+
+	tip := blockC2
+	for height := uint32(3); height <= 3+tipRepairSeedForkDepth; height++ {
+		next := coinbaseOnlyBlock(t, tip.Hash(), f.nBits, height, 0xe0)
+		require.NoError(t, f.blockchainClient.AddBlock(f.ctx, next, "test", blockchainoptions.WithSubtreesSet(true)))
+		tip = next
+	}
+
+	f.store.failMarkFalse.Store(0)
+
+	restarted := f.newBlockValidation(t)
+	require.NoError(t, restarted.setTxMinedStatus(f.ctx, tip.Hash()))
+
+	_, tracked := restarted.minedOnChain.snapshot()[*f.blockB.Hash()]
+	require.True(t, tracked, "B is tracked again from the hold")
+	require.Equal(t, []chainhash.Hash{*f.blockB.Hash()}, f.heldBlocks(t), "the hold is not released before B is repaired")
+
+	_, err := drainTipRepair(t, restarted)
+	require.NoError(t, err)
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "B is repaired after the restart")
+	require.Empty(t, f.heldBlocks(t), "and the hold is released")
 }

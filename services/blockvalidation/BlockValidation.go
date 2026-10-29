@@ -343,6 +343,10 @@ type BlockValidation struct {
 	// tipRepairMu), so a best block that only extends the chain costs one call.
 	tipRepairMainChain map[uint32]bool
 	tipRepairBestHash  chainhash.Hash
+	// tipRepairHold is the pruning hold last written or read back, once tipRepairHoldWritten
+	// is set (guarded by tipRepairMu).
+	tipRepairHold        []byte
+	tipRepairHoldWritten bool
 	// tipRepairRetry is set while the last slice failed, so the periodic tick retries it.
 	tipRepairRetry atomic.Bool
 	// tipRepairWake requests a slice when the earliest pass over subtrees set aside comes
@@ -1814,16 +1818,14 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		u.logger.Warnf("[setTxMined][%s] failed closing subtrees after setting mined: %v", block.Hash().String(), releaseErr)
 	}
 
-	// The pruner processes a height only once its block has mined_set. Every repair due on
-	// the chain as this block sees it runs first, so a tx that looks mined off the chain is
-	// re-marked, and its parents preserved by the pruner's next phase 1, before the pruner
-	// can process this height. An overtake that only becomes visible later is repaired by
-	// the worker's next slice or the next block's drain, within the slack between
-	// utxostore_blockHeightRetention and utxostore_unminedTxRetention. The repair's error
-	// is about another block, so it is kept as text: wrapped, a tracked block that is gone
-	// would read as this block being gone, and the worker would not retry it.
-	if err = u.drainTipRepair(ctx, u.blockchainClient); err != nil {
-		return errors.NewProcessingError("[setTxMined][%s] overtaken-tip repair failed, mined_set not set: %s", block.Hash().String(), err.Error())
+	// The pruner processes a height only once its block has mined_set. A block the chain
+	// has overtaken goes into the pruning hold first, so the pruner deletes nothing until
+	// its repair has finished, however long that takes. This reads the chain and writes the
+	// hold; it repairs nothing, so a repair that keeps failing does not stop this block. Its
+	// error is kept as text: it may be about another block, and wrapped, a block that is
+	// gone would read as this block being gone, and the worker would not retry it.
+	if err = u.refreshRepairHold(ctx, u.blockchainClient); err != nil {
+		return errors.NewServiceError("[setTxMined][%s] failed to update the overtaken-tip pruning hold, mined_set not set: %s", block.Hash().String(), err.Error())
 	}
 
 	// update block mined_set to true

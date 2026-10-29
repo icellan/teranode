@@ -102,16 +102,19 @@ type batchSpend struct {
 
 // Store implements the UTXO store interface using a SQL database backend.
 type Store struct {
-	logger        ulogger.Logger
-	settings      *settings.Settings
-	db            *usql.DB
-	storeURL      *url.URL
-	engine        string
-	ctx           context.Context
-	spendBatcher  *batcher.Batcher[batchSpend]
-	getBatcher    *batcher.Batcher[batchGetItem]
-	createBatcher *batcher.Batcher[batchCreateItem]
-	unlockBatcher *batcher.Batcher[batchUnlockItem]
+	logger ulogger.Logger
+	// parentOutputsReadHook, when set by a test, runs before each parent-output chunk read
+	// and fails the read with its error. Always nil in production.
+	parentOutputsReadHook func() error
+	settings              *settings.Settings
+	db                    *usql.DB
+	storeURL              *url.URL
+	engine                string
+	ctx                   context.Context
+	spendBatcher          *batcher.Batcher[batchSpend]
+	getBatcher            *batcher.Batcher[batchGetItem]
+	createBatcher         *batcher.Batcher[batchCreateItem]
+	unlockBatcher         *batcher.Batcher[batchUnlockItem]
 
 	// utxo.BlockStateFields supplies the chain-tip height and median block time
 	// as one atomic snapshot, and with them the Store interface's six

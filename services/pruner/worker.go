@@ -2,11 +2,14 @@ package pruner
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
+	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	"github.com/bsv-blockchain/teranode/util/retry"
@@ -66,6 +69,46 @@ func (s *Server) checkBlockAssemblySafeForPruner(ctx context.Context, phase stri
 	}
 
 	// Block Assembly is ready
+	return true
+}
+
+// overtakenTipRepairHeld reports whether block validation holds pruning for an overtaken
+// block whose repair has not finished (model.OvertakenTipRepairHoldKey). No record means no
+// hold. A record that cannot be read may be holding, so it counts as held.
+func (s *Server) overtakenTipRepairHeld(ctx context.Context, blockHashStr string, blockHeight uint32) bool {
+	if s.blockchainClient == nil {
+		return false
+	}
+
+	data, err := s.blockchainClient.GetState(ctx, model.OvertakenTipRepairHoldKey)
+	if err != nil {
+		if errors.Is(err, errors.ErrNotFound) || strings.Contains(err.Error(), sql.ErrNoRows.Error()) {
+			prunerOvertakenTipRepairHeldBlocks.Set(0)
+			return false
+		}
+
+		s.logger.Errorf("[pruner][%s:%d] failed to read the overtaken-tip repair hold, deleting nothing this cycle: %v", blockHashStr, blockHeight, err)
+		prunerErrors.WithLabelValues("overtaken_tip_repair_hold").Inc()
+
+		return true
+	}
+
+	held, err := model.DecodeOvertakenTipRepairHold(data)
+	if err != nil {
+		s.logger.Errorf("[pruner][%s:%d] unreadable overtaken-tip repair hold, deleting nothing this cycle: %v", blockHashStr, blockHeight, err)
+		prunerErrors.WithLabelValues("overtaken_tip_repair_hold").Inc()
+
+		return true
+	}
+
+	prunerOvertakenTipRepairHeldBlocks.Set(float64(len(held)))
+
+	if len(held) == 0 {
+		return false
+	}
+
+	s.logger.Warnf("[pruner][%s:%d] deleting nothing: block validation is still repairing %d overtaken blocks, lowest %s at height %d", blockHashStr, blockHeight, len(held), held[0].Hash.String(), held[0].Height)
+
 	return true
 }
 
@@ -199,15 +242,24 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 				continue
 			}
 
+			// While block validation is repairing an overtaken block, some transactions may look
+			// mined while off the longest chain, and Phase 1 cannot preserve their parents.
+			// Nothing is deleted until the repair finishes: no blob deletion, which would take
+			// the overtaken block's subtrees the repair reads, and no Phase 2.
+			held := s.overtakenTipRepairHeld(ctx, blockHashStr, blockHeight)
+
 			// Safety check passed - wake blob deletion worker to run concurrently with Phase 1&2.
 			// It works off the blockchain service's queued blob batches, independent of parent
-			// preservation, so it runs even in a cycle whose Phase 1 fails.
-			select {
-			case <-s.blobNotify:
-			default:
+			// preservation, so it runs even in a cycle whose Phase 1 fails. A held cycle skips
+			// it; the next notification deletes everything queued up to its height.
+			if !held {
+				select {
+				case <-s.blobNotify:
+				default:
+				}
+				s.blobNotify <- sig
+				s.logger.Debugf("[pruner][%s:%d] notified blob deletion worker", blockHashStr, blockHeight)
 			}
-			s.blobNotify <- sig
-			s.logger.Debugf("[pruner][%s:%d] notified blob deletion worker", blockHashStr, blockHeight)
 
 			prunerActive.Set(1)
 
@@ -271,6 +323,14 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			if phase1Failed {
 				s.logger.Warnf("[pruner][%s:%d] phase 2: skipped because phase 1 failed; the next block notification retries pruning", blockHashStr, blockHeight)
 				prunerSkipped.WithLabelValues("preserve_parents_failed").Inc()
+				prunerActive.Set(0)
+
+				// Do not update lastProcessedHeight: the next notification must be processed
+				continue
+			}
+
+			if held {
+				prunerSkipped.WithLabelValues("overtaken_tip_repair_hold").Inc()
 				prunerActive.Set(0)
 
 				// Do not update lastProcessedHeight: the next notification must be processed

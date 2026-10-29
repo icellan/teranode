@@ -124,6 +124,12 @@ func (s *Store) parentOutputsChunkWithRetry(ctx context.Context, chunk []outpoin
 // every outpoint whose transaction exists. Outpoints with no transaction row are
 // absent from the map.
 func (s *Store) parentOutputsChunk(ctx context.Context, chunk []outpointPair) (map[utxo.Outpoint]utxo.ParentOutput, error) {
+	if s.parentOutputsReadHook != nil {
+		if err := s.parentOutputsReadHook(); err != nil {
+			return nil, err
+		}
+	}
+
 	valuesClause, args := buildCompositeValuesPairs(chunk, 1, s.engine)
 
 	// The CTE form works on both Postgres and SQLite (see PreviousOutputsDecorate).

@@ -110,19 +110,24 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   only the transactions it moved back and that are not mined on the new chain. Block
   validation now repairs a block it marked mined that a competing chain later overtakes,
   on its setMined worker, in slices of `blockvalidation_tipRepairSliceSize` transactions
-  (new setting, default 250000). A block's `mined_set` is written only once every repair
-  due on its chain has run, so the pruner cannot process that height first. After a
-  reorg, the new tip's `mined_set`, and with it the validation of its child, waits for
-  the overtaken blocks' repair, which costs about one setTxMined per overtaken block. A
-  subtree of an overtaken block that cannot be read is set aside, read again on every
-  block, and counted in `teranode_blockvalidation_tip_repair_subtrees_set_aside`; until it
-  reads, its transactions can look mined and their parents are not protected from the
-  pruner, so a gauge above zero for long needs looking at. The repair assumes a single
-  block validation instance writes mined status for the chain, and its state is in
-  memory: fork blocks more than 10 below the tip at a restart are not repaired. A
-  deployment that runs more than one block validation replica loses no data, but
-  transactions can stay flagged unmined until block assembly's next unmined load. No
-  action needed for a single-instance deployment. (#2065)
+  (new setting, default 250000); each slice can delay the next block's mined status by
+  one slice. **The pruner deletes nothing while a repair is unfinished.** Block validation
+  records the overtaken blocks it has not finished repairing under the blockchain state
+  key `OvertakenTipRepairHold`, before it sets the mined status of the block that
+  overtook them, and the pruner skips UTXO deletion (phase 2) and blob deletion while any
+  is listed; parent preservation (phase 1) still runs, and deletion resumes on its own
+  once the repair finishes. A subtree of an overtaken block that cannot be read is read
+  again on every block and holds pruning until it reads or the block leaves the
+  1000-block repair window. `teranode_pruner_overtaken_tip_repair_held_blocks` and
+  `teranode_blockvalidation_tip_repair_subtrees_set_aside` show a hold; a hold that stays
+  above zero means a subtree file is corrupt or a store keeps failing, and disk use grows
+  until it is resolved. A repair that keeps failing no longer stops healthy blocks: their
+  mined status does not wait for it. The hold survives a restart, and the blocks it lists
+  are repaired after it. **A single block validation instance must write mined status
+  for the chain**: the hold is one record, so two instances can release each other's
+  hold. A block overtaken while block validation is down and more than 10 blocks below
+  the tip when it starts is not repaired. No action needed for a single-instance
+  deployment. (#2065)
 - **`GetLastNBlocks` honours `fromHeight` when orphans are included.** The SQL
   blockchain store ignored `fromHeight` with `includeOrphans=true` and always returned
   the highest blocks. It now returns only blocks at or below `fromHeight`, as documented.
