@@ -2225,3 +2225,68 @@ func TestRepairOvertakenTips_SetAsideSubtreesGauge(t *testing.T) {
 	require.NoError(t, err)
 	require.InDelta(t, 0, testutil.ToFloat64(prometheusBlockValidationTipRepairSubtreesSetAside), 0)
 }
+
+// TestRepairOvertakenTips_SeedPagesForkBlocksWithinCap: the restart seed finds fork blocks
+// near the tip with GetLastNBlocks, which blockchain_maxBlocksByHeightRange may cap below the
+// seed's reach. It must page down past full pages of blocks at one height, not stop there:
+// with a cap of 2, the fork blocks X at height 2 and Y at height 1 each sit below a full page.
+func TestRepairOvertakenTips_SeedPagesForkBlocksWithinCap(t *testing.T) {
+	f := newOvertakeFixture(t)
+	f.tSettings.BlockChain.MaxBlocksByHeightRange = 2
+
+	bv := f.newBlockValidation(t)
+	client := &cappedHeadersClient{ClientI: f.blockchainClient, maxHeaders: tipRepairWindow, maxBlocks: 2}
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+
+	time.Sleep(10 * time.Millisecond)
+
+	// genesis - B - D - E, with forks D - F, B - X and genesis - Y.
+	blockY := coinbaseOnlyBlock(t, f.tSettings.ChainCfgParams.GenesisHash, f.nBits, 1, 0xb0)
+	blockD := coinbaseOnlyBlock(t, f.blockB.Hash(), f.nBits, 2, 0xd0)
+	blockX := coinbaseOnlyBlock(t, f.blockB.Hash(), f.nBits, 2, 0xa0)
+	blockE := coinbaseOnlyBlock(t, blockD.Hash(), f.nBits, 3, 0xe0)
+	blockF := coinbaseOnlyBlock(t, blockD.Hash(), f.nBits, 3, 0xf0)
+
+	for _, block := range []*model.Block{blockY, blockD, blockX, blockE, blockF} {
+		require.NoError(t, f.blockchainClient.AddBlock(f.ctx, block, "test", blockchainoptions.WithSubtreesSet(true)))
+	}
+
+	bv.tipRepairSeeded = false
+
+	_, err := bv.tipRepairSlice(f.ctx, client)
+	require.NoError(t, err)
+
+	_, tracked := bv.minedOnChain.snapshot()[*blockX.Hash()]
+	require.True(t, tracked, "fork block X, below a full page at height 3, is seeded")
+
+	_, tracked = bv.minedOnChain.snapshot()[*blockY.Hash()]
+	require.True(t, tracked, "fork block Y, below a full page at height 2, is seeded")
+}
+
+// TestSetTxMinedStatus_FailedRepairLeavesMinedSetUnset: when the repair keeps failing, the
+// block is not set mined, so the pruner cannot process its height. The error is the
+// repair's, not the block's: a tracked block that is gone must not make the worker take the
+// block it is setting mined for gone too and drop its retry.
+func TestSetTxMinedStatus_FailedRepairLeavesMinedSetUnset(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+
+	// A tracked block the blockchain no longer has: every attempt to repair it fails.
+	bv.minedOnChain.track(chainhash.HashH([]byte("gone")), 999, 1)
+
+	time.Sleep(10 * time.Millisecond)
+
+	blockD := coinbaseOnlyBlock(t, f.blockB.Hash(), f.nBits, 2, 0xd0)
+	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, blockD, "test", blockchainoptions.WithSubtreesSet(true)))
+
+	err := bv.setTxMinedStatus(f.ctx, blockD.Hash())
+	require.Error(t, err)
+	require.False(t, errors.Is(err, errors.ErrBlockNotFound), "the error is not the block's own: %v", err)
+
+	_, meta, err := f.blockchainClient.GetBlockHeader(f.ctx, blockD.Hash())
+	require.NoError(t, err)
+	require.False(t, meta.MinedSet, "mined_set stays unset while the repair fails")
+}

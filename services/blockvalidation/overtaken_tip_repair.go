@@ -485,11 +485,25 @@ func (u *BlockValidation) seedMinedOnChainTrackerLocked(ctx context.Context, blo
 			u.minedOnChain.seed(*header.Hash(), meta.ID, meta.Height)
 		}
 
-		if int64(len(recent)) < page || !added || recent[len(recent)-1].Height == 0 {
+		lowest := recent[len(recent)-1].Height
+		if int64(len(recent)) < page || lowest == 0 {
 			break
 		}
 
-		fromHeight = recent[len(recent)-1].Height
+		// The next page starts at the lowest height of this one, which it may share. A page
+		// with nothing new, or one all at the height it started from, would be read again
+		// as it is: step below it. Blocks at one height beyond the cap cannot be reached and
+		// are left out.
+		next := lowest
+		if !added || (fromHeight != 0 && lowest >= fromHeight) {
+			next = lowest - 1
+		}
+
+		if fromHeight != 0 && next >= fromHeight {
+			break // the store did not bound the page by fromHeight
+		}
+
+		fromHeight = next
 	}
 
 	u.tipRepairSeeded = true

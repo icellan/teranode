@@ -110,12 +110,25 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   only the transactions it moved back and that are not mined on the new chain. Block
   validation now repairs a block it marked mined that a competing chain later overtakes,
   on its setMined worker, in slices of `blockvalidation_tipRepairSliceSize` transactions
-  (new setting, default 250000). Each slice can delay the next block's mined status by
-  one slice. The repair assumes a single block validation instance writes mined status
-  for the chain, and its state is in memory: fork blocks more than 10 below the tip at a
-  restart are not repaired. A deployment that runs more than one block validation
-  replica loses no data, but transactions can stay flagged unmined until block
-  assembly's next unmined load. No action needed for a single-instance deployment. (#2065)
+  (new setting, default 250000). A block's `mined_set` is written only once every repair
+  due on its chain has run, so the pruner cannot process that height first. After a
+  reorg, the new tip's `mined_set`, and with it the validation of its child, waits for
+  the overtaken blocks' repair, which costs about one setTxMined per overtaken block. A
+  subtree of an overtaken block that cannot be read is set aside, read again on every
+  block, and counted in `teranode_blockvalidation_tip_repair_subtrees_set_aside`; until it
+  reads, its transactions can look mined and their parents are not protected from the
+  pruner, so a gauge above zero for long needs looking at. The repair assumes a single
+  block validation instance writes mined status for the chain, and its state is in
+  memory: fork blocks more than 10 below the tip at a restart are not repaired. A
+  deployment that runs more than one block validation replica loses no data, but
+  transactions can stay flagged unmined until block assembly's next unmined load. No
+  action needed for a single-instance deployment. (#2065)
+- **`GetLastNBlocks` honours `fromHeight` when orphans are included.** The SQL
+  blockchain store ignored `fromHeight` with `includeOrphans=true` and always returned
+  the highest blocks. It now returns only blocks at or below `fromHeight`, as documented.
+  This changes the asset API's block list endpoints when a client passes both
+  `includeOrphans` and `fromHeight`: they now page down instead of repeating the top of
+  the chain. (#2065)
 - **Catch-up quick validation waits for each block's `.subtree` writes before it commits
   the block, and a shutdown waits for a block's in-flight commit.** A block was stored with
   `subtrees_set` while its `.subtree` files could still be in flight, so a failed write
