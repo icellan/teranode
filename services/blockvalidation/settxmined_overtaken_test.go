@@ -857,7 +857,7 @@ func TestMinedOnChainTracker_NewWriteStartsOver(t *testing.T) {
 	b := tracker.snapshot()[hash]
 	require.NotEqual(t, gen, b.gen, "a new write is a new generation; a repair in progress for the old one is abandoned")
 	require.False(t, b.done, "the new write clears the txs again, so the block needs repairing again")
-	require.False(t, b.stamped)
+	require.True(t, b.stamped, "kept in case the new write fails before clearing the re-marked txs")
 
 	tracker.update(hash, gen, func(e *minedOnChainBlock) { e.done = true })
 	require.False(t, tracker.snapshot()[hash].done, "an update for the old generation is ignored")
@@ -1731,4 +1731,54 @@ func TestFinishJob_WarnsOnlyWhenTxsMarked(t *testing.T) {
 
 	bv.finishJob(&tipRepairJob{kind: unmarkJob, hash: hash, id: b.id, gen: b.gen, marked: 2, total: 3})
 	require.Len(t, logger.warns, 1, "a warning when txs were marked")
+}
+
+// TestRepairOvertakenTips_ThirdChainReopensDoneBlock: B's repair left shared mined because
+// B', which also holds it, was on the chain. B' got there through its child C', so no
+// setTxMined of B' tracks it. When a third chain overtakes B' -> C', shared is in no block
+// on the chain any more, and B must be repaired again to mark it.
+func TestRepairOvertakenTips_ThirdChainReopensDoneBlock(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	blockC2 := f.overtakeB(t)
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, blockC2.Hash()))
+
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "precondition: B is repaired")
+	require.Zero(t, f.unminedSince(t, f.shared), "precondition: shared is mined in B' on the chain")
+
+	time.Sleep(10 * time.Millisecond)
+
+	parent := f.tSettings.ChainCfgParams.GenesisHash
+
+	for height := uint32(1); height <= 3; height++ {
+		block := coinbaseOnlyBlock(t, parent, f.nBits, height, 0xf0+byte(height))
+		require.NoError(t, f.blockchainClient.AddBlock(f.ctx, block, "test", blockchainoptions.WithSubtreesSet(true)))
+		parent = block.Hash()
+	}
+
+	require.False(t, f.onChain(t, f.blockBID), "precondition: the third chain overtook both")
+
+	_, err = drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.NotZero(t, f.unminedSince(t, f.shared), "shared is in no block on the chain and must look unmined")
+}
+
+// TestMinedOnChainTracker_TrackKeepsStamped: a new on-chain write of a block whose txs were
+// re-marked not on the longest chain must not forget that they were: if the write fails
+// before clearing them, the remine job is the only thing left to mark them mined again.
+func TestMinedOnChainTracker_TrackKeepsStamped(t *testing.T) {
+	tracker := newMinedOnChainTracker()
+	hash := chainhash.HashH([]byte("b"))
+
+	tracker.track(hash, 1, 1)
+
+	gen := tracker.snapshot()[hash].gen
+	tracker.update(hash, gen, func(e *minedOnChainBlock) { e.stamped = true })
+
+	tracker.track(hash, 1, 1)
+	require.True(t, tracker.snapshot()[hash].stamped)
 }

@@ -177,8 +177,10 @@ func (t *minedOnChainTracker) track(hash chainhash.Hash, id, height uint32) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	// stamped stays: if this write fails before clearing the re-marked txs again, the remine
+	// job is what marks them mined, and a remine over txs already mined writes nothing.
 	t.nextGen++
-	t.blocks[hash] = minedOnChainBlock{id: id, height: height, gen: t.nextGen, failures: t.blocks[hash].failures}
+	t.blocks[hash] = minedOnChainBlock{id: id, height: height, gen: t.nextGen, failures: t.blocks[hash].failures, stamped: t.blocks[hash].stamped}
 }
 
 // seed watches a block found by the restart seed. A block already watched keeps its state.
@@ -450,10 +452,18 @@ func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient b
 		}
 	}
 
+	hadMainChain, prevBestID := u.tipRepairMainChain != nil, u.tipRepairBestID
+
 	onMainChain, bestHeight, err := u.mainChainIDsLocked(ctx, blockchainClient)
 	if err != nil {
 		return false, err
 	}
+
+	// The last best block left the chain. A finished unmark job left a tx mined when another
+	// block holding it was on the chain, and that block may have just left with it, untracked
+	// if it reached the chain only through a child. Every finished off-chain block is read
+	// again.
+	reorged := hadMainChain && !onMainChain[prevBestID]
 
 	tracked := u.minedOnChain.snapshot()
 
@@ -476,6 +486,11 @@ func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient b
 			})
 			b.clearPending()
 			b.deferred = false
+			tracked[hash] = b
+
+		case reorged && !onMainChain[b.id] && b.done:
+			u.minedOnChain.update(hash, b.gen, func(e *minedOnChainBlock) { e.done = false })
+			b.done = false
 			tracked[hash] = b
 
 		case onMainChain[b.id] && b.done && !b.stamped:
@@ -589,6 +604,7 @@ func (u *BlockValidation) mainChainIDsLocked(ctx context.Context, blockchainClie
 		// blocks before the set is consulted for them.
 		u.tipRepairMainChain[ids[0]] = true
 		u.tipRepairBestHash = bestHash
+		u.tipRepairBestID = ids[0]
 
 		return u.tipRepairMainChain, bestMeta.Height, nil
 	}
@@ -605,6 +621,10 @@ func (u *BlockValidation) mainChainIDsLocked(ctx context.Context, blockchainClie
 
 	u.tipRepairMainChain = onMainChain
 	u.tipRepairBestHash = bestHash
+
+	if len(ids) > 0 {
+		u.tipRepairBestID = ids[0]
+	}
 
 	return onMainChain, bestMeta.Height, nil
 }

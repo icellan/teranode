@@ -332,6 +332,7 @@ type BlockValidation struct {
 	// tipRepairMu), so a best block that only extends the chain costs one call.
 	tipRepairMainChain map[uint32]bool
 	tipRepairBestHash  chainhash.Hash
+	tipRepairBestID    uint32
 	// tipRepairRetry is set while the last slice failed, so the periodic tick retries it.
 	tipRepairRetry atomic.Bool
 	// tipRepairWake requests a slice when the earliest pass over subtrees set aside comes
