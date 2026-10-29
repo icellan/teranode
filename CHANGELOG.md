@@ -129,8 +129,18 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   are repaired after it. **A single block validation instance must write mined status
   for the chain**: the hold is one record, so two instances can release each other's
   hold. A block overtaken while block validation is down and more than 10 blocks below
-  the tip when it starts is not repaired. No action needed for a single-instance
-  deployment. (#2065)
+  the tip when it starts is not repaired. Upgrade the pruner no later than block
+  validation: a newer block validation with an older pruner writes the hold but nothing
+  reads it. Rolling block validation back after it wrote a non-empty hold leaves the
+  record in place, and a newer pruner keeps holding until block validation is upgraded
+  again or the `OvertakenTipRepairHold` state row is deleted. No action needed for a
+  single-instance deployment. (#2065)
+- **A missing blockchain state key is a not-found error.** `GetState` on the SQL
+  blockchain store returned the raw `sql.ErrNoRows` for a key never written; it now
+  returns an `ERR_NOT_FOUND` error wrapping it, whose code survives gRPC. Its text still
+  contains `sql: no rows in result set`, so callers matching on the text are unaffected;
+  a caller that matched `sql.ErrNoRows` with `errors.Is` must match
+  `errors.ErrNotFound`. (#2065)
 - **`GetLastNBlocks` honours `fromHeight` when orphans are included.** The SQL
   blockchain store ignored `fromHeight` with `includeOrphans=true` and always returned
   the highest blocks. It now returns only blocks at or below `fromHeight`, as documented.

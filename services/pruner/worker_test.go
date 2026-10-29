@@ -877,7 +877,7 @@ func TestRepairHoldMissingIsNotHeld(t *testing.T) {
 	defer cancel()
 
 	client := &repairHoldClient{}
-	client.hold.Store(&repairHoldAnswer{err: errors.NewStorageError("no hold", sql.ErrNoRows)})
+	client.hold.Store(&repairHoldAnswer{err: errors.NewNotFoundError("no state for key %s", model.OvertakenTipRepairHoldKey, sql.ErrNoRows)})
 
 	pruneSvc := &recordingPruner{calls: make(chan uint32, 2)}
 	server := newRepairHoldTestServer(ctx, client, pruneSvc)

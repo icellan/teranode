@@ -1823,7 +1823,8 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 
 	// The pruner processes a height only once its block has mined_set. A block the chain
 	// has overtaken goes into the pruning hold first, so the pruner deletes nothing until
-	// its repair has finished, however long that takes. This reads the chain and writes the
+	// its repair has finished, or the repair gives the block up because its data is gone or
+	// it has left the 1000-block repair window. This reads the chain and writes the
 	// hold; it repairs nothing, so a repair that keeps failing does not stop this block. Its
 	// error is kept as text: it may be about another block, and wrapped, a block that is
 	// gone would read as this block being gone, and the worker would not retry it.
