@@ -20,6 +20,7 @@ import (
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/pkg/fileformat"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/services/subtreevalidation"
 	"github.com/bsv-blockchain/teranode/settings"
 	"github.com/bsv-blockchain/teranode/stores/blob"
@@ -32,6 +33,7 @@ import (
 	"github.com/bsv-blockchain/teranode/util/test"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 // overtakeTestStore wraps the UTXO store so a test can act at precise points:
@@ -2424,4 +2426,40 @@ func TestRepairOvertakenTips_HoldReadBackBeforeAnyOnChainWrite(t *testing.T) {
 	require.NoError(t, err)
 	require.NotZero(t, f.unminedSince(t, f.bOnly), "B is repaired")
 	require.Empty(t, f.heldBlocks(t), "and the hold is released")
+}
+
+// wireStateClient sends SetState through a protobuf round trip, as the gRPC blockchain client
+// does, before the store sees it: empty bytes arrive as nil.
+type wireStateClient struct {
+	blockchain.ClientI
+}
+
+func (c *wireStateClient) SetState(ctx context.Context, key string, data []byte) error {
+	wire, err := proto.Marshal(&blockchain_api.SetStateRequest{Key: key, Data: data})
+	if err != nil {
+		return err
+	}
+
+	var req blockchain_api.SetStateRequest
+	if err = proto.Unmarshal(wire, &req); err != nil {
+		return err
+	}
+
+	return c.ClientI.SetState(ctx, req.Key, req.Data)
+}
+
+// TestSetTxMinedStatus_EmptyHoldSurvivesTheWire: the hold with nothing in it is still written
+// through the gRPC blockchain client, where empty bytes arrive as nil and the SQL state table
+// refuses a NULL. A hold that cannot be written stops every block from being set mined.
+func TestSetTxMinedStatus_EmptyHoldSurvivesTheWire(t *testing.T) {
+	f := newOvertakeFixture(t)
+	f.blockchainClient = &wireStateClient{ClientI: f.blockchainClient}
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+
+	_, meta, err := f.blockchainClient.GetBlockHeader(f.ctx, f.blockB.Hash())
+	require.NoError(t, err)
+	require.True(t, meta.MinedSet)
+	require.Empty(t, f.heldBlocks(t))
 }

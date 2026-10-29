@@ -559,7 +559,14 @@ func (u *BlockValidation) holdRecordedLocked(ctx context.Context, blockchainClie
 
 	u.tipRepairHoldChecked = true
 
-	return len(data) > 0, nil
+	if len(data) == 0 {
+		return false, nil
+	}
+
+	// One that cannot be decoded may list blocks: seed, which logs it, and write it again.
+	held, err := model.DecodeOvertakenTipRepairHold(data)
+
+	return err != nil || len(held) > 0, nil
 }
 
 // seedHeldBlocksLocked tracks the blocks a hold recorded before the restart lists. No record
