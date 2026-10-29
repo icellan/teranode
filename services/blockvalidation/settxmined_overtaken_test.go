@@ -2046,3 +2046,29 @@ func TestRepairOvertakenTips_OnChainClearsDeferred(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, bv.minedOnChain.snapshot()[hash].deferred)
 }
+
+// TestRepairOvertakenTips_CleanPassEndsBackOff: once a pass reads the subtrees set aside and
+// the block is done, nothing is owed: no pending pass may be reported, or the worker's wake
+// timer fires at once on every slice while the block stays off the chain.
+func TestRepairOvertakenTips_CleanPassEndsBackOff(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
+	bv := f.newBlockValidation(t)
+	clock := f.fakeTipRepairClock(bv)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	bv.subtreeStore = f.shortReads(f.subtreeStore, 0, tipRepairSubtreeReadAttempts*tipRepairMaxAttempts)
+
+	settleTipRepair(t, bv, func() bool { return bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending != nil })
+	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].stamped, "precondition: the first pass re-marked txs")
+
+	clock.advance(tipRepairPendingBaseBackoff)
+
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "precondition: the clean pass finished the block")
+
+	_, ok := bv.minedOnChain.nextPendingPass()
+	require.False(t, ok, "no pass is owed by a done block off the chain")
+}

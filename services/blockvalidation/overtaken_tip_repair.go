@@ -160,7 +160,8 @@ func (t *minedOnChainTracker) nextPendingPass() (time.Time, bool) {
 	var earliest time.Time
 
 	for _, b := range t.blocks {
-		owed := (b.pending != nil && !b.done) || (b.stamped && b.passes > 0)
+		// What startNextJob would start: a block that is done is owed nothing.
+		owed := !b.done && (b.pending != nil || (b.stamped && b.passes > 0))
 		if owed && (earliest.IsZero() || b.nextPass.Before(earliest)) {
 			earliest = b.nextPass
 		}
@@ -354,12 +355,16 @@ func (u *BlockValidation) runTipRepairSlice(ctx context.Context, blockchainClien
 
 	// Nothing is due now. A pass over subtrees set aside comes due at its nextPass even on
 	// an idle chain, with no block or write to request a slice, so wake for the earliest.
+	// A pass already due that this slice did not start is not waiting on the clock, and
+	// waking for it at once would only repeat this slice.
 	if at, ok := u.minedOnChain.nextPendingPass(); ok {
-		if u.tipRepairWake != nil {
-			u.tipRepairWake.Stop()
-		}
+		if wait := at.Sub(u.minedOnChain.now()); wait > 0 {
+			if u.tipRepairWake != nil {
+				u.tipRepairWake.Stop()
+			}
 
-		u.tipRepairWake = time.AfterFunc(at.Sub(u.minedOnChain.now()), u.signalTipRepair)
+			u.tipRepairWake = time.AfterFunc(wait, u.signalTipRepair)
+		}
 	}
 }
 
@@ -790,7 +795,11 @@ func (u *BlockValidation) finishJob(job *tipRepairJob) {
 			e.deferred = !e.done
 			e.failures = 0
 
-			if !e.done {
+			if e.done {
+				e.passes = 0
+				e.nextPass = time.Time{}
+				e.passHeight = 0
+			} else {
 				u.backOffPass(e, job)
 			}
 
