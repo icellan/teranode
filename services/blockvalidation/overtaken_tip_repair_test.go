@@ -554,10 +554,9 @@ func (c *extraSubtreeClient) GetBlock(ctx context.Context, blockHash *chainhash.
 		block.TransactionCount, block.SizeInBytes, block.Height, block.ID)
 }
 
-// TestRepairOvertakenTips_MissingSubtreeSetAside: a subtree that is gone must not stop the
-// repair of the block's other subtrees. Its txs cannot be named, so it is set aside and the
-// block is not done: it keeps holding pruning, and its next pass waits on the back-off.
-func TestRepairOvertakenTips_MissingSubtreeSetAside(t *testing.T) {
+// TestRepairOvertakenTips_SkipsMissingSubtree: a subtree that is gone must not stop the
+// repair of the block's other subtrees, nor keep the block retrying.
+func TestRepairOvertakenTips_SkipsMissingSubtree(t *testing.T) {
 	f := newOvertakeFixture(t)
 	bv := f.newBlockValidation(t)
 
@@ -571,12 +570,7 @@ func TestRepairOvertakenTips_MissingSubtreeSetAside(t *testing.T) {
 	require.NoError(t, err)
 	require.NotZero(t, f.unminedSince(t, f.bOnly), "the readable subtree is repaired")
 
-	missing, err := client.GetBlock(f.ctx, f.blockB.Hash())
-	require.NoError(t, err)
-
-	b := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
-	require.False(t, b.done, "the block is not done while a subtree is gone")
-	require.Equal(t, []*chainhash.Hash{missing.Subtrees[0]}, b.pending, "the gone subtree is set aside")
+	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "and the block is done, not retried")
 }
 
 // failingGetBlockClient fails GetBlock while fail is set: a blockchain service that is
@@ -633,6 +627,8 @@ func TestRepairOvertakenTips_GivesUpAfterMaxAttempts(t *testing.T) {
 
 	bv.blockchainClient = &blockGoneClient{ClientI: f.blockchainClient}
 
+	before := testutil.ToFloat64(prometheusBlockValidationTipRepairAbandoned.WithLabelValues("block"))
+
 	for i := 0; i < tipRepairMaxAttempts; i++ {
 		_, err := drainTipRepair(t, bv)
 		require.Error(t, err, "attempt %d", i+1)
@@ -640,6 +636,7 @@ func TestRepairOvertakenTips_GivesUpAfterMaxAttempts(t *testing.T) {
 
 	_, tracked := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
 	require.False(t, tracked, "the block is dropped after the last attempt")
+	require.InDelta(t, before+1, testutil.ToFloat64(prometheusBlockValidationTipRepairAbandoned.WithLabelValues("block")), 0, "and counted")
 
 	_, err := drainTipRepair(t, bv)
 	require.NoError(t, err, "and no longer retried")
@@ -2371,11 +2368,11 @@ func TestRepairOvertakenTips_HoldSurvivesRestart(t *testing.T) {
 	require.Empty(t, f.heldBlocks(t), "and the hold is released")
 }
 
-// TestRepairOvertakenTips_GoneSubtreeHoldsPruning: a subtree of an overtaken block that is
-// gone from the store cannot be read any more than a corrupt one, so its txs, which may look
-// mined while off the chain, cannot be named and their parents cannot be protected. The
-// block is not done, and the pruning hold keeps it, instead of skipping the subtree.
-func TestRepairOvertakenTips_GoneSubtreeHoldsPruning(t *testing.T) {
+// TestRepairOvertakenTips_GoneSubtreeGivenUp: a subtree of an overtaken block that is gone
+// from the store can never be read again, so nothing can name its txs: holding pruning for it
+// would only delay the same loss. It is given up as a gone block is, counted so operators see
+// that some txs may stay marked mined, and the rest of the block is repaired and released.
+func TestRepairOvertakenTips_GoneSubtreeGivenUp(t *testing.T) {
 	f := newOvertakeFixtureWithLaterSubtree(t)
 	bv := f.newBlockValidation(t)
 
@@ -2384,13 +2381,15 @@ func TestRepairOvertakenTips_GoneSubtreeHoldsPruning(t *testing.T) {
 
 	bv.subtreeStore = f.erroringReads(f.subtreeStore, 0, 1<<30, errors.NewNotFoundError("subtree is gone"))
 
-	settleTipRepair(t, bv, func() bool { return bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending != nil })
+	before := testutil.ToFloat64(prometheusBlockValidationTipRepairAbandoned.WithLabelValues("subtree"))
 
-	b := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
-	require.False(t, b.done, "a block with a gone subtree is not done")
-	require.Equal(t, []*chainhash.Hash{f.blockB.Subtrees[0]}, b.pending)
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+
+	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "the block is done without the gone subtree")
 	require.NotZero(t, f.unminedSince(t, f.later), "the readable subtree is repaired")
-	require.Equal(t, []chainhash.Hash{*f.blockB.Hash()}, f.heldBlocks(t), "and the block holds pruning")
+	require.Empty(t, f.heldBlocks(t), "a gone subtree does not hold pruning")
+	require.InDelta(t, before+1, testutil.ToFloat64(prometheusBlockValidationTipRepairAbandoned.WithLabelValues("subtree")), 0, "and is counted")
 }
 
 // TestRepairOvertakenTips_HoldReadBackBeforeAnyOnChainWrite: after a restart, the blocks a

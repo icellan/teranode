@@ -945,10 +945,11 @@ func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockch
 
 // jobStep writes the next slice of the job's txs, first loading the next subtree if the
 // current one is used up, and finishes the job with its last slice. A subtree that is gone
-// is set aside at once. One that still cannot be loaded after tipRepairMaxAttempts failed
-// loads, whatever the error, is set aside too, so the rest of the block is repaired: a run
-// of short reads looks the same as a corrupt file, and a store that stays down must not hold
-// up the later subtrees. A block with subtrees set aside is not done, so it holds pruning. The block's next unmark job reads the set-aside subtrees
+// is given up and counted: nothing can name its txs again. One that still cannot be loaded
+// after tipRepairMaxAttempts failed loads, whatever the error, is set aside, so the rest of
+// the block is repaired: a run of short reads looks the same as a corrupt file, and a store
+// that stays down must not hold up the later subtrees. A block with subtrees set aside is
+// not done, so it holds pruning until they read. The block's next unmark job reads the set-aside subtrees
 // again; a remine job with subtrees set aside leaves the block stamped, so a later remine
 // does them (see finishJob). Until a subtree is set aside, a load error fails the step, to
 // be retried.
@@ -967,10 +968,10 @@ func (u *BlockValidation) jobStep(ctx context.Context, blockchainClient blockcha
 
 			switch {
 			case isPermanentRepairError(err):
-				// Gone is no more readable than corrupt: its txs cannot be named, so the block
-				// stays held until it reads or leaves the repair window.
-				u.logger.Errorf("[repairOvertakenTips][%s] subtree %s is gone, setting it aside and holding pruning, its txs may still look mined: %v", job.hash.String(), subtreeHash.String(), err)
-				job.unreadable = append(job.unreadable, subtreeHash)
+				// Gone for good: nothing can name its txs again, so holding pruning for it would
+				// only delay the loss. It is given up, as a gone block is (repairFailed).
+				u.logger.Errorf("[repairOvertakenTips][%s] giving up subtree %s, it is gone; its txs may stay marked mined while off the longest chain: %v", job.hash.String(), subtreeHash.String(), err)
+				prometheusBlockValidationTipRepairAbandoned.WithLabelValues("subtree").Inc()
 			case ctx.Err() == nil && job.subtreeFailures >= tipRepairMaxAttempts:
 				u.logger.Errorf("[repairOvertakenTips][%s] setting subtree %s aside after %d failed loads, it is read again later: %v", job.hash.String(), subtreeHash.String(), job.subtreeFailures, err)
 				job.unreadable = append(job.unreadable, subtreeHash)
@@ -1134,6 +1135,7 @@ func (u *BlockValidation) repairFailed(hash chainhash.Hash, gen uint64, err erro
 
 	if failures >= tipRepairMaxAttempts {
 		u.logger.Errorf("[repairOvertakenTips][%s] giving up after %d failed attempts; its txs may still look mined: %v", hash.String(), tipRepairMaxAttempts, err)
+		prometheusBlockValidationTipRepairAbandoned.WithLabelValues("block").Inc()
 		u.minedOnChain.drop(hash)
 
 		if u.tipRepairJob != nil && u.tipRepairJob.hash == hash {
