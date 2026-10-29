@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1666,4 +1667,68 @@ func TestRepairOvertakenTips_PersistentStoreErrorSetAside(t *testing.T) {
 	b := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
 	require.False(t, b.done)
 	require.Equal(t, []*chainhash.Hash{f.blockB.Subtrees[0]}, b.pending, "the failing subtree is read again later")
+}
+
+// TestRepairOvertakenTips_BackOnChainClearsDeferred: a block whose subtrees were set aside
+// and which is back on the chain must not stay deferred. If it leaves again, its new repair
+// has nothing to do with the old unreadable subtrees and must not wait behind every other
+// block.
+func TestRepairOvertakenTips_BackOnChainClearsDeferred(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	bv.subtreeStore = f.shortReads(f.subtreeStore, 0, 1<<30)
+	settleTipRepair(t, bv, func() bool { return bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending != nil })
+	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].deferred, "precondition: the block is deferred")
+
+	f.extendB(t)
+
+	_, _ = bv.tipRepairSlice(f.ctx, bv.blockchainClient)
+	require.False(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].deferred)
+}
+
+// warnRecorder records the format of every overtaken-tip repair Warnf; the background
+// workers winding down log their own.
+type warnRecorder struct {
+	ulogger.TestLogger
+	mu    sync.Mutex
+	warns []string
+}
+
+func (l *warnRecorder) Warnf(format string, _ ...interface{}) {
+	if !strings.HasPrefix(format, "[repairOvertakenTips]") {
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.warns = append(l.warns, format)
+}
+
+// TestFinishJob_WarnsOnlyWhenTxsMarked: an unmark job that re-marked none of the block's
+// txs, such as one for a fork block the restart seed tracks that was never on the chain, is
+// not reported as a block that left the chain after its txs were marked mined.
+func TestFinishJob_WarnsOnlyWhenTxsMarked(t *testing.T) {
+	f := newOvertakeFixture(t)
+	logger := &warnRecorder{}
+
+	ctx, stop := context.WithCancel(f.ctx)
+	bv := NewBlockValidation(ctx, logger, f.tSettings, f.blockchainClient, f.subtreeStore, f.txStore, f.store, nil, f.subtreeValidationClient)
+	stop()
+	bv.backgroundTasks.Wait()
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+
+	hash := *f.blockB.Hash()
+	b := bv.minedOnChain.snapshot()[hash]
+
+	bv.finishJob(&tipRepairJob{kind: unmarkJob, hash: hash, id: b.id, gen: b.gen, total: 3})
+	require.Empty(t, logger.warns, "no warning when no tx was marked")
+
+	bv.finishJob(&tipRepairJob{kind: unmarkJob, hash: hash, id: b.id, gen: b.gen, marked: 2, total: 3})
+	require.Len(t, logger.warns, 1, "a warning when txs were marked")
 }

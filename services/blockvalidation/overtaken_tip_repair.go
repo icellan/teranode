@@ -468,9 +468,14 @@ func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient b
 			delete(tracked, hash)
 
 		case onMainChain[b.id] && b.pending != nil:
-			// Back on the chain: if it leaves again, all of it needs repairing.
-			u.minedOnChain.update(hash, b.gen, func(e *minedOnChainBlock) { e.clearPending() })
+			// Back on the chain: if it leaves again, all of it needs repairing, and not behind
+			// the other blocks for subtrees it could not read last time.
+			u.minedOnChain.update(hash, b.gen, func(e *minedOnChainBlock) {
+				e.clearPending()
+				e.deferred = false
+			})
 			b.clearPending()
+			b.deferred = false
 			tracked[hash] = b
 
 		case onMainChain[b.id] && b.done && !b.stamped:
@@ -750,7 +755,13 @@ func (u *BlockValidation) finishJob(job *tipRepairJob) {
 			}
 		})
 
-		u.logger.Warnf("[repairOvertakenTips][%s] block left the longest chain after its txs were marked mined, marked %d of %d txs as not on longest chain", job.hash.String(), job.marked, job.total)
+		// A block none of whose txs needed re-marking, such as a fork block the restart seed
+		// tracks that was never on the chain, is not worth a warning.
+		if job.marked > 0 {
+			u.logger.Warnf("[repairOvertakenTips][%s] block left the longest chain after its txs were marked mined, marked %d of %d txs as not on longest chain", job.hash.String(), job.marked, job.total)
+		} else {
+			u.logger.Infof("[repairOvertakenTips][%s] block is off the longest chain, none of its %d txs needed marking as not on longest chain", job.hash.String(), job.total)
+		}
 
 	case remineJob:
 		u.minedOnChain.update(job.hash, job.gen, func(e *minedOnChainBlock) {

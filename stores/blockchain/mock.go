@@ -332,6 +332,10 @@ func (m *MockStore) AssignBlockID(_ context.Context, blockHash *chainhash.Hash) 
 // GetLastNBlocks returns up to n blocks, highest first. Without includeOrphans only the best
 // block's chain is returned; fromHeight, when non-zero, caps the height.
 func (m *MockStore) GetLastNBlocks(ctx context.Context, n int64, includeOrphans bool, fromHeight uint32) ([]*model.BlockInfo, error) {
+	if n <= 0 {
+		return []*model.BlockInfo{}, nil
+	}
+
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
