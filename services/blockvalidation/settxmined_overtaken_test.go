@@ -973,7 +973,7 @@ func (c *seedFailClient) GetBlockHeaderIDs(ctx context.Context, hash *chainhash.
 // TestRepairOvertakenTips_SeedFailures: a blockchain call failing during the restart seed or
 // the main-chain read fails the slice and leaves the seed to run again.
 func TestRepairOvertakenTips_SeedFailures(t *testing.T) {
-	for _, failOn := range []string{"GetBestBlockHeader", "GetBlockHeaders", "GetLastNBlocks", "GetBlockHeader", "GetBlockHeaderIDs"} {
+	for _, failOn := range []string{"GetBestBlockHeader", "GetBlockHeaders", "GetLastNBlocks", "GetBlockHeader"} {
 		t.Run(failOn, func(t *testing.T) {
 			f := newOvertakeFixture(t)
 			bv := f.newBlockValidation(t)
@@ -1894,12 +1894,14 @@ func TestRepairOvertakenTips_BackOffFromPassEnd(t *testing.T) {
 	require.Equal(t, left, store.short.Load(), "no new pass before a block arrives after the last one ended")
 }
 
-// TestRepairOvertakenTips_RemineNeverSetsAside: a remine job whose subtree keeps failing to
-// load must not set it aside and finish: that drops the re-mine of its txs for good. The
-// block stays stamped and the remine is retried.
-func TestRepairOvertakenTips_RemineNeverSetsAside(t *testing.T) {
-	f := newOvertakeFixture(t)
+// TestRepairOvertakenTips_RemineSetsAsideKeepsStamped: a remine job whose subtree keeps
+// failing to load sets it aside and re-mines the later subtrees, but the block stays
+// stamped: the set-aside subtree's re-mine is still owed, and a later pass, once its reads
+// recover, does it.
+func TestRepairOvertakenTips_RemineSetsAsideKeepsStamped(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
 	bv := f.newBlockValidation(t)
+	clock := f.fakeTipRepairClock(bv)
 
 	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
 	_ = f.overtakeB(t)
@@ -1907,16 +1909,88 @@ func TestRepairOvertakenTips_RemineNeverSetsAside(t *testing.T) {
 	_, err := drainTipRepair(t, bv)
 	require.NoError(t, err)
 	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].stamped, "precondition: B's txs were re-marked")
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "precondition")
+	require.NotZero(t, f.unminedSince(t, f.later), "precondition")
 
 	f.extendB(t)
 
-	bv.subtreeStore = f.erroringReads(f.subtreeStore, 0, 1<<30, errors.NewStorageError("injected subtree store failure"))
+	store := f.erroringReads(f.subtreeStore, 0, 1<<30, errors.NewStorageError("injected subtree store failure"))
+	bv.subtreeStore = store
 
-	settleTipRepair(t, bv, func() bool { return !bv.minedOnChain.snapshot()[*f.blockB.Hash()].stamped })
+	for i := 0; i <= tipRepairMaxAttempts; i++ {
+		_, _ = drainTipRepair(t, bv)
+	}
 
-	b := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
-	require.True(t, b.stamped, "the re-mine is still owed")
-	require.Nil(t, b.pending)
+	require.Zero(t, f.unminedSince(t, f.later), "the later subtree is re-mined past the unreadable one")
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "precondition: subtree 0 is not re-mined yet")
+	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].stamped, "the re-mine of subtree 0 is still owed")
+
+	store.fail.Store(0)
+	clock.advance(tipRepairPendingMaxBackoff)
+
+	_, err = drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.Zero(t, f.unminedSince(t, f.bOnly), "subtree 0 is re-mined once it reads")
+	require.False(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].stamped)
+}
+
+// failHeadersOnceClient fails the next GetBlockHeaders call once armed.
+type failHeadersOnceClient struct {
+	blockchain.ClientI
+	fail atomic.Bool
+}
+
+func (c *failHeadersOnceClient) GetBlockHeaders(ctx context.Context, hash *chainhash.Hash, n uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	if c.fail.Swap(false) {
+		return nil, nil, errors.NewServiceError("injected GetBlockHeaders failure")
+	}
+
+	return c.ClientI.GetBlockHeaders(ctx, hash, n)
+}
+
+// TestRepairOvertakenTips_ReorgTrackingSurvivesFailedRead: a failed read on the slice that
+// first sees the reorg must not lose it: the next slice still tracks B', which reached the
+// chain through its child.
+func TestRepairOvertakenTips_ReorgTrackingSurvivesFailedRead(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+	client := &failHeadersOnceClient{ClientI: f.blockchainClient}
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_, err := bv.tipRepairSlice(f.ctx, client)
+	require.NoError(t, err)
+
+	blockC2 := f.overtakeB(t)
+
+	client.fail.Store(true)
+	_, err = bv.tipRepairSlice(f.ctx, client)
+	require.Error(t, err, "precondition: the slice that sees the reorg fails")
+
+	_, err = bv.tipRepairSlice(f.ctx, client)
+	require.NoError(t, err)
+
+	_, tracked := bv.minedOnChain.snapshot()[*blockC2.Header.HashPrevBlock]
+	require.True(t, tracked, "B' is tracked on the retried slice")
+}
+
+// TestMinedOnChainTracker_OffChainWriteKeepsDone: a write as off the longest chain clears no
+// tx, so a finished or backed-off repair is not opened again by it.
+func TestMinedOnChainTracker_OffChainWriteKeepsDone(t *testing.T) {
+	tracker := newMinedOnChainTracker()
+	hash := chainhash.HashH([]byte("b"))
+	subtree := chainhash.HashH([]byte("s"))
+
+	tracker.track(hash, 1, 1)
+	tracker.update(hash, tracker.snapshot()[hash].gen, func(e *minedOnChainBlock) {
+		e.done = true
+		e.pending = []*chainhash.Hash{&subtree}
+	})
+
+	require.True(t, tracker.markWritten(hash, false))
+
+	b := tracker.snapshot()[hash]
+	require.True(t, b.done)
+	require.NotNil(t, b.pending)
 }
 
 // TestMinedOnChainTracker_OnChainWriteClearsStamped: a completed write of the block as on
@@ -1936,22 +2010,22 @@ func TestMinedOnChainTracker_OnChainWriteClearsStamped(t *testing.T) {
 	require.False(t, tracker.snapshot()[hash].stamped, "an on-chain write did the remine's work")
 }
 
-// emptyIDsClient returns no ids from GetBlockHeaderIDs.
-type emptyIDsClient struct {
+// emptyHeadersClient returns no headers from GetBlockHeaders.
+type emptyHeadersClient struct {
 	blockchain.ClientI
 }
 
-func (c *emptyIDsClient) GetBlockHeaderIDs(context.Context, *chainhash.Hash, uint64) ([]uint32, error) {
-	return []uint32{}, nil
+func (c *emptyHeadersClient) GetBlockHeaders(context.Context, *chainhash.Hash, uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	return []*model.BlockHeader{}, []*model.BlockHeaderMeta{}, nil
 }
 
-// TestMainChainIDs_EmptyIsAnError: no ids for the best block is a failed read, not a chain
-// with no blocks on it; taken as one, every tracked block would look off the chain.
+// TestMainChainIDs_EmptyIsAnError: no headers for the best block is a failed read, not a
+// chain with no blocks on it; taken as one, every tracked block would look off the chain.
 func TestMainChainIDs_EmptyIsAnError(t *testing.T) {
 	f := newOvertakeFixture(t)
 	bv := f.newBlockValidation(t)
 
-	_, _, err := bv.mainChainIDsLocked(f.ctx, &emptyIDsClient{ClientI: f.blockchainClient})
+	_, _, err := bv.mainChainIDsLocked(f.ctx, &emptyHeadersClient{ClientI: f.blockchainClient})
 	require.Error(t, err)
 	require.Nil(t, bv.tipRepairMainChain, "nothing is cached")
 }

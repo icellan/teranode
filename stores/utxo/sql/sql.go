@@ -2421,19 +2421,18 @@ func isDeadlock(err error) bool {
 		strings.Contains(msg, "(SQLSTATE "+usql.PgErrDeadlockDetected+")")
 }
 
-// retryOnLockError runs op, over a chunk of items, up to attempts times while it
-// fails with an error isDeadlock recognises, and returns its last error. what
-// names the operation in the warning logged before each retry. op must be safe
-// to run again after such a failure: a failed statement or rolled-back
-// transaction holds no locks.
-func retryOnLockError(ctx context.Context, logger ulogger.Logger, attempts int, what string, items int, op func() error) error {
+// retryOnLockError runs op up to attempts times while it fails with an error
+// isDeadlock recognises, and returns its last error. what names the operation
+// in the warning logged before each retry. op must be safe to run again after
+// such a failure: a failed statement or rolled-back transaction holds no locks.
+func retryOnLockError(ctx context.Context, logger ulogger.Logger, attempts int, what string, op func() error) error {
 	for attempt := 1; ; attempt++ {
 		err := op()
 		if err == nil || !isDeadlock(err) || attempt >= attempts {
 			return err
 		}
 
-		logger.Warnf("%s lock error (attempt %d/%d), retrying chunk of %d: %v", what, attempt, attempts, items, err)
+		logger.Warnf("%s lock error (attempt %d/%d), retrying: %v", what, attempt, attempts, err)
 
 		select {
 		case <-ctx.Done():
@@ -3658,7 +3657,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 
 		var chunkResult map[chainhash.Hash][]uint32
 
-		err := retryOnLockError(ctx, s.logger, setMinedMultiRetries, "[SetMinedMulti]", end-i, func() error {
+		err := retryOnLockError(ctx, s.logger, setMinedMultiRetries, "[SetMinedMulti] chunk", func() error {
 			var err error
 
 			chunkResult, err = s.setMinedMultiChunk(ctx, hashes[i:end], minedBlockInfo)

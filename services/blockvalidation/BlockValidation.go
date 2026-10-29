@@ -332,7 +332,6 @@ type BlockValidation struct {
 	// tipRepairMu), so a best block that only extends the chain costs one call.
 	tipRepairMainChain map[uint32]bool
 	tipRepairBestHash  chainhash.Hash
-	tipRepairBestID    uint32
 	// tipRepairRetry is set while the last slice failed, so the periodic tick retries it.
 	tipRepairRetry atomic.Bool
 	// tipRepairWake requests a slice when the earliest pass over subtrees set aside comes
@@ -1732,7 +1731,7 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 	// The write is complete, whichever onLongestChain this attempt used. Ask for a slice: a
 	// chain change that happened while the write was in flight would otherwise wait for the
 	// next one.
-	if u.minedOnChain.markWritten(*blockHash, onLongestChain) {
+	if u.minedOnChain.markWritten(*blockHash, onLongestChain && (len(unsetMined) == 0 || !unsetMined[0])) {
 		u.signalTipRepair()
 	}
 
