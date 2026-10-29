@@ -30,6 +30,7 @@ import (
 	"github.com/bsv-blockchain/teranode/stores/utxo/fields"
 	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util/test"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -2071,4 +2072,156 @@ func TestRepairOvertakenTips_CleanPassEndsBackOff(t *testing.T) {
 
 	_, ok := bv.minedOnChain.nextPendingPass()
 	require.False(t, ok, "no pass is owed by a done block off the chain")
+}
+
+// minedSetProbe runs at on each SetBlockMinedSet of block, before the write: the moment the
+// pruner may start processing that height. calls counts the runs of at that have returned.
+type minedSetProbe struct {
+	blockchain.ClientI
+	block chainhash.Hash
+	at    func()
+	calls atomic.Int32
+}
+
+func (c *minedSetProbe) SetBlockMinedSet(ctx context.Context, blockHash *chainhash.Hash) error {
+	if *blockHash == c.block {
+		c.at()
+		c.calls.Add(1)
+	}
+
+	return c.ClientI.SetBlockMinedSet(ctx, blockHash)
+}
+
+// TestSetTxMinedStatus_RepairsOvertakenBlockBeforeMinedSet: the pruner processes a height
+// only once its block has mined_set. So the setTxMined of the block that overtook B must
+// finish B's repair before it sets mined_set, or the pruner can delete a parent of a tx of
+// B that still looks mined.
+func TestSetTxMinedStatus_RepairsOvertakenBlockBeforeMinedSet(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	blockC2 := f.overtakeB(t)
+
+	var atMinedSet uint32
+
+	probe := &minedSetProbe{ClientI: f.blockchainClient, block: *blockC2.Hash(), at: func() { atMinedSet = f.unminedSince(t, f.bOnly) }}
+	bv.blockchainClient = probe
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, blockC2.Hash()))
+	require.Equal(t, int32(1), probe.calls.Load(), "precondition: C' was set mined")
+	require.NotZero(t, atMinedSet, "B's tx is re-marked before C' gets mined_set")
+}
+
+// TestSetTxMinedStatus_RepairsRecoveredSubtreeBeforeMinedSet: a subtree set aside whose
+// reads have recovered is due again on the next block. That block's setTxMined must read it
+// before setting mined_set, not leave it to a later slice that may lose to the pruner.
+func TestSetTxMinedStatus_RepairsRecoveredSubtreeBeforeMinedSet(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
+	bv := f.newBlockValidation(t)
+	_ = f.fakeTipRepairClock(bv)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	blockC2 := f.overtakeB(t)
+
+	bv.subtreeStore = f.shortReads(f.subtreeStore, 0, tipRepairSubtreeReadAttempts*tipRepairMaxAttempts)
+
+	settleTipRepair(t, bv, func() bool { return bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending != nil })
+	require.NotNil(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending, "precondition: subtree 0 is set aside")
+	require.Zero(t, f.unminedSince(t, f.bOnly), "precondition: subtree 0's tx still looks mined")
+
+	time.Sleep(10 * time.Millisecond)
+
+	blockD2 := coinbaseOnlyBlock(t, blockC2.Hash(), f.nBits, 3, 0xd4)
+	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, blockD2, "test", blockchainoptions.WithSubtreesSet(true)))
+
+	var atMinedSet uint32
+
+	probe := &minedSetProbe{ClientI: f.blockchainClient, block: *blockD2.Hash(), at: func() { atMinedSet = f.unminedSince(t, f.bOnly) }}
+	bv.blockchainClient = probe
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, blockD2.Hash()))
+	require.Equal(t, int32(1), probe.calls.Load(), "precondition: D' was set mined")
+	require.NotZero(t, atMinedSet, "the recovered subtree's tx is re-marked before D' gets mined_set")
+}
+
+// cappedHeadersClient rejects header and block-summary requests over the configured caps,
+// as the blockchain gRPC server does; LocalClient enforces neither.
+type cappedHeadersClient struct {
+	blockchain.ClientI
+	maxHeaders, maxBlocks uint64
+}
+
+func (c *cappedHeadersClient) GetBlockHeaders(ctx context.Context, hash *chainhash.Hash, n uint64) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	if n > c.maxHeaders {
+		return nil, nil, errors.NewInvalidArgumentError("[Blockchain][GetBlockHeaders] %d headers requested, maximum is %d", n, c.maxHeaders)
+	}
+
+	return c.ClientI.GetBlockHeaders(ctx, hash, n)
+}
+
+func (c *cappedHeadersClient) GetLastNBlocks(ctx context.Context, n int64, includeOrphans bool, fromHeight uint32) ([]*model.BlockInfo, error) {
+	if uint64(n) > c.maxBlocks { //nolint:gosec // test
+		return nil, errors.NewInvalidArgumentError("[Blockchain][GetLastNBlocks] invalid count %d, maximum is %d", n, c.maxBlocks)
+	}
+
+	return c.ClientI.GetLastNBlocks(ctx, n, includeOrphans, fromHeight)
+}
+
+// TestRepairOvertakenTips_ReadsWithinConfiguredCaps: blockchain_maxBlockHeadersPerRequest and
+// blockchain_maxBlocksByHeightRange may be set below the repair window. The restart seed and
+// the main-chain read must page within them, not fail every slice.
+func TestRepairOvertakenTips_ReadsWithinConfiguredCaps(t *testing.T) {
+	f := newOvertakeFixture(t)
+	f.tSettings.BlockChain.MaxBlockHeadersPerRequest = 1
+	f.tSettings.BlockChain.MaxBlocksByHeightRange = 1
+
+	bv := f.newBlockValidation(t)
+	client := &cappedHeadersClient{ClientI: f.blockchainClient, maxHeaders: 1, maxBlocks: 1}
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	blockC2 := f.overtakeB(t)
+
+	// The seed runs in the first slice, then the main-chain read.
+	bv.tipRepairSeeded = false
+
+	_, err := bv.tipRepairSlice(f.ctx, client)
+	require.NoError(t, err)
+
+	_, tracked := bv.minedOnChain.snapshot()[*blockC2.Header.HashPrevBlock]
+	require.True(t, tracked, "B' is tracked from a main-chain read paged within the cap")
+
+	for i := 0; i < 20; i++ {
+		if more, err := bv.tipRepairSlice(f.ctx, client); err != nil || !more {
+			require.NoError(t, err)
+			break
+		}
+	}
+
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "B is repaired with every read within the caps")
+}
+
+// TestRepairOvertakenTips_SetAsideSubtreesGauge: a subtree set aside cannot be repaired, and
+// its txs' parents cannot be protected, until it reads again. Operators see how many there
+// are, and the count drops once they are read.
+func TestRepairOvertakenTips_SetAsideSubtreesGauge(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
+	bv := f.newBlockValidation(t)
+	clock := f.fakeTipRepairClock(bv)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	store := f.shortReads(f.subtreeStore, 0, 1<<30)
+	bv.subtreeStore = store
+
+	settleTipRepair(t, bv, func() bool { return bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending != nil })
+	require.InDelta(t, 1, testutil.ToFloat64(prometheusBlockValidationTipRepairSubtreesSetAside), 0)
+
+	store.short.Store(0)
+	clock.advance(tipRepairPendingMaxBackoff)
+
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.InDelta(t, 0, testutil.ToFloat64(prometheusBlockValidationTipRepairSubtreesSetAside), 0)
 }

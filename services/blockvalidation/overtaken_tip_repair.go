@@ -170,6 +170,23 @@ func (t *minedOnChainTracker) nextPendingPass() (time.Time, bool) {
 	return earliest, !earliest.IsZero()
 }
 
+// setAsideSubtrees returns how many subtrees of the tracked blocks an unmark job set aside.
+func (t *minedOnChainTracker) setAsideSubtrees() int {
+	if t == nil {
+		return 0
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	n := 0
+	for _, b := range t.blocks {
+		n += len(b.pending)
+	}
+
+	return n
+}
+
 // track watches a block whose on-chain write is starting: the write clears the block's txs
 // again, so the block gets a new gen and starts over.
 func (t *minedOnChainTracker) track(hash chainhash.Hash, id, height uint32) {
@@ -319,6 +336,33 @@ type tipRepairJob struct {
 	height uint32
 }
 
+// drainTipRepair runs repair slices until none is due. setTxMinedStatus calls it before
+// setting a block's mined_set, which is what lets the pruner process that height: a repair
+// the chain has made due is finished first, so its txs are re-marked, and their parents
+// preserved by the pruner's next phase 1, before any parent can be pruned. A pass over
+// subtrees set aside is due on every new block, so a subtree whose reads have recovered is
+// read here too. One that still cannot be read stays set aside: its txs cannot be named, and
+// tipRepairSubtreesSetAside reports it. A slice that keeps failing returns its error after
+// tipRepairMaxAttempts in a row; the caller leaves mined_set unset, to be retried.
+func (u *BlockValidation) drainTipRepair(ctx context.Context, blockchainClient blockchain.ClientI) error {
+	for failures := 0; ; {
+		more, err := u.tipRepairSlice(ctx, blockchainClient)
+		if err != nil {
+			if failures++; failures >= tipRepairMaxAttempts || ctx.Err() != nil {
+				return err
+			}
+
+			continue
+		}
+
+		failures = 0
+
+		if !more {
+			return nil
+		}
+	}
+}
+
 // signalTipRepair asks the setMined worker for a repair slice. Never blocks; a pending
 // request covers any number of calls.
 func (u *BlockValidation) signalTipRepair() {
@@ -377,49 +421,119 @@ func (u *BlockValidation) seedMinedOnChainTrackerLocked(ctx context.Context, blo
 		return errors.NewServiceError("[repairOvertakenTips] seed: failed to get best block header", err)
 	}
 
-	headers, metas, err := blockchainClient.GetBlockHeaders(ctx, bestHeader.Hash(), tipRepairWindow)
+	headers, metas, err := u.mainChainHeaders(ctx, blockchainClient, *bestHeader.Hash())
 	if err != nil {
 		return errors.NewServiceError("[repairOvertakenTips] seed: failed to get main chain headers", err)
 	}
 
 	u.trackMinedHeaders(headers, metas)
 
-	// Fork blocks near the tip: one query for the highest blocks, side chains included.
-	// GetChainTips would do too, but on SQLite it holds a row cursor open across nested
-	// queries and deadlocks against a concurrent write transaction.
-	recent, err := blockchainClient.GetLastNBlocks(ctx, tipRepairSeedMaxBlocks, true, 0)
-	if err != nil {
-		return errors.NewServiceError("[repairOvertakenTips] seed: failed to get recent blocks", err)
+	// Fork blocks near the tip: the highest blocks, side chains included, in pages within
+	// blockchain_maxBlocksByHeightRange. GetChainTips would do too, but on SQLite it holds a
+	// row cursor open across nested queries and deadlocks against a concurrent write
+	// transaction.
+	pageMax := int64(u.settings.BlockChain.MaxBlocksByHeightRange)
+	if pageMax <= 0 {
+		pageMax = tipRepairSeedMaxBlocks
 	}
 
-	for _, info := range recent {
-		if info.Height+tipRepairSeedForkDepth < bestMeta.Height {
-			break // highest first
-		}
+	seen := make(map[chainhash.Hash]bool)
+	fromHeight := uint32(0) // 0 is no upper bound
 
-		header, err := model.NewBlockHeaderFromBytes(info.BlockHeader)
+	for read := int64(0); read < tipRepairSeedMaxBlocks; {
+		page := min(tipRepairSeedMaxBlocks-read, pageMax)
+
+		recent, err := blockchainClient.GetLastNBlocks(ctx, page, true, fromHeight)
 		if err != nil {
-			return errors.NewProcessingError("[repairOvertakenTips] seed: invalid block header at height %d", info.Height, err)
+			return errors.NewServiceError("[repairOvertakenTips] seed: failed to get recent blocks", err)
 		}
 
-		_, meta, err := blockchainClient.GetBlockHeader(ctx, header.Hash())
-		if err != nil {
-			return errors.NewServiceError("[repairOvertakenTips] seed: failed to get block header %s", header.Hash().String(), err)
+		read += int64(len(recent))
+		added := false
+
+		for _, info := range recent {
+			if info.Height+tipRepairSeedForkDepth < bestMeta.Height {
+				u.tipRepairSeeded = true // highest first: the rest are deeper
+				return nil
+			}
+
+			header, err := model.NewBlockHeaderFromBytes(info.BlockHeader)
+			if err != nil {
+				return errors.NewProcessingError("[repairOvertakenTips] seed: invalid block header at height %d", info.Height, err)
+			}
+
+			// A page starts at the lowest height of the last one, which it may share.
+			if seen[*header.Hash()] {
+				continue
+			}
+
+			seen[*header.Hash()] = true
+			added = true
+
+			_, meta, err := blockchainClient.GetBlockHeader(ctx, header.Hash())
+			if err != nil {
+				return errors.NewServiceError("[repairOvertakenTips] seed: failed to get block header %s", header.Hash().String(), err)
+			}
+
+			if meta == nil || meta.Invalid {
+				continue
+			}
+
+			// A block whose mined_set is not written is watched too: a setTxMined that failed
+			// part way before the restart may have cleared some of its txs, and its retry,
+			// with onLongestChain=false once it is off the chain, leaves unmined_since alone.
+			u.minedOnChain.seed(*header.Hash(), meta.ID, meta.Height)
 		}
 
-		if meta == nil || meta.Invalid {
-			continue
+		if int64(len(recent)) < page || !added || recent[len(recent)-1].Height == 0 {
+			break
 		}
 
-		// A block whose mined_set is not written is watched too: a setTxMined that failed
-		// part way before the restart may have cleared some of its txs, and its retry,
-		// with onLongestChain=false once it is off the chain, leaves unmined_since alone.
-		u.minedOnChain.seed(*header.Hash(), meta.ID, meta.Height)
+		fromHeight = recent[len(recent)-1].Height
 	}
 
 	u.tipRepairSeeded = true
 
 	return nil
+}
+
+// mainChainHeaders returns the tipRepairWindow headers ending at best, best first, read in
+// pages within blockchain_maxBlockHeadersPerRequest, which the blockchain service enforces
+// and may be set below the window.
+func (u *BlockValidation) mainChainHeaders(ctx context.Context, blockchainClient blockchain.ClientI, best chainhash.Hash) ([]*model.BlockHeader, []*model.BlockHeaderMeta, error) {
+	pageMax := uint64(tipRepairWindow)
+	if limit := u.settings.BlockChain.MaxBlockHeadersPerRequest; limit > 0 {
+		pageMax = min(pageMax, uint64(limit))
+	}
+
+	headers := make([]*model.BlockHeader, 0, tipRepairWindow)
+	metas := make([]*model.BlockHeaderMeta, 0, tipRepairWindow)
+	next := best
+
+	for uint64(len(headers)) < tipRepairWindow {
+		page := min(tipRepairWindow-uint64(len(headers)), pageMax)
+
+		pageHeaders, pageMetas, err := blockchainClient.GetBlockHeaders(ctx, &next, page)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		headers = append(headers, pageHeaders...)
+		metas = append(metas, pageMetas...)
+
+		if uint64(len(pageHeaders)) < page {
+			break // reached genesis
+		}
+
+		prev := pageHeaders[len(pageHeaders)-1].HashPrevBlock
+		if prev == nil || prev.IsEqual(&chainhash.Hash{}) {
+			break
+		}
+
+		next = *prev
+	}
+
+	return headers, metas, nil
 }
 
 func (u *BlockValidation) trackMinedHeaders(headers []*model.BlockHeader, metas []*model.BlockHeaderMeta) {
@@ -449,6 +563,10 @@ func (u *BlockValidation) trackMinedHeaders(headers []*model.BlockHeader, metas 
 func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient blockchain.ClientI) (more bool, err error) {
 	u.tipRepairMu.Lock()
 	defer u.tipRepairMu.Unlock()
+
+	defer func() {
+		prometheusBlockValidationTipRepairSubtreesSetAside.Set(float64(u.minedOnChain.setAsideSubtrees()))
+	}()
 
 	// Nothing to do until this process has written a block as on the longest chain. The
 	// restart seed waits for that too: after a restart the next block's setTxMined comes
@@ -625,7 +743,7 @@ func (u *BlockValidation) mainChainIDsLocked(ctx context.Context, blockchainClie
 	// Blocks written on the chain by setTxMined are; one that reached the chain only through
 	// a child, its own setTxMined having run while it was off the chain, is tracked here,
 	// before the set is cached, so a failed read is retried in full.
-	headers, metas, err := blockchainClient.GetBlockHeaders(ctx, &bestHash, tipRepairWindow)
+	headers, metas, err := u.mainChainHeaders(ctx, blockchainClient, bestHash)
 	if err != nil {
 		return nil, 0, errors.NewServiceError("[repairOvertakenTips] failed to get main chain headers", err)
 	}

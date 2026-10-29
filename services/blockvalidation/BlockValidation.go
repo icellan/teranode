@@ -1808,6 +1808,13 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 		u.logger.Warnf("[setTxMined][%s] failed closing subtrees after setting mined: %v", block.Hash().String(), releaseErr)
 	}
 
+	// The pruner processes a height only once its block has mined_set. Every repair this
+	// block's chain makes due runs first, so no parent of a tx that still looks mined off the
+	// chain is pruned before the tx is re-marked and its parents preserved.
+	if err = u.drainTipRepair(ctx, u.blockchainClient); err != nil {
+		return errors.NewProcessingError("[setTxMined][%s] overtaken-tip repair failed, mined_set not set", block.Hash().String(), err)
+	}
+
 	// update block mined_set to true
 	if err = u.blockchainClient.SetBlockMinedSet(ctx, blockHash); err != nil {
 		return errors.NewServiceError("[setTxMined][%s] failed to set block mined", block.Hash().String(), err)
