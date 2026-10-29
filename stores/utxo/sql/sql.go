@@ -2414,8 +2414,11 @@ func isDeadlock(err error) bool {
 	if errors.As(err, &sqliteErr) && usql.IsSQLiteLockCode(sqliteErr.Code()) {
 		return true
 	}
+	// A teranode error keeps only the text of a driver error it wraps, so a
+	// PostgreSQL deadlock wrapped before it gets here is matched by its SQLSTATE.
 	msg := err.Error()
-	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database table is locked")
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database table is locked") ||
+		strings.Contains(msg, "(SQLSTATE "+usql.PgErrDeadlockDetected+")")
 }
 
 // sendSpendBatch is the batcher callback that processes a batch of spend operations
