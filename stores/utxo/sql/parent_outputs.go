@@ -2,13 +2,12 @@ package sql
 
 import (
 	"context"
-	"time"
+	"fmt"
 
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
-	"github.com/bsv-blockchain/teranode/ulogger"
 	"github.com/bsv-blockchain/teranode/util"
 	"github.com/bsv-blockchain/teranode/util/tracing"
 )
@@ -111,7 +110,7 @@ const parentOutputsReadRetries = 3
 func (s *Store) parentOutputsChunkWithRetry(ctx context.Context, chunk []outpointPair) (map[utxo.Outpoint]utxo.ParentOutput, error) {
 	var found map[utxo.Outpoint]utxo.ParentOutput
 
-	err := retryReadOnLockError(ctx, s.logger, len(chunk), func() error {
+	err := retryOnLockError(ctx, s.logger, parentOutputsReadRetries, fmt.Sprintf("[ParentOutputsForValidation] chunk of %d outpoints", len(chunk)), func() error {
 		var err error
 
 		found, err = s.parentOutputsChunk(ctx, chunk)
@@ -120,25 +119,6 @@ func (s *Store) parentOutputsChunkWithRetry(ctx context.Context, chunk []outpoin
 	})
 
 	return found, err
-}
-
-// retryReadOnLockError runs read up to parentOutputsReadRetries times while it
-// fails with an error isDeadlock recognises, and returns its last error.
-func retryReadOnLockError(ctx context.Context, logger ulogger.Logger, outpoints int, read func() error) error {
-	for attempt := 1; ; attempt++ {
-		err := read()
-		if err == nil || !isDeadlock(err) || attempt >= parentOutputsReadRetries {
-			return err
-		}
-
-		logger.Warnf("[ParentOutputsForValidation] lock error (attempt %d/%d), retrying chunk of %d outpoints: %v", attempt, parentOutputsReadRetries, outpoints, err)
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Duration(attempt) * 10 * time.Millisecond):
-		}
-	}
 }
 
 // parentOutputsChunk runs one statement for chunk and returns an answer for

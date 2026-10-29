@@ -2421,6 +2421,27 @@ func isDeadlock(err error) bool {
 		strings.Contains(msg, "(SQLSTATE "+usql.PgErrDeadlockDetected+")")
 }
 
+// retryOnLockError runs op up to attempts times while it fails with an error
+// isDeadlock recognises, and returns its last error. what names the operation
+// in the warning logged before each retry. op must be safe to run again after
+// such a failure: a failed statement or rolled-back transaction holds no locks.
+func retryOnLockError(ctx context.Context, logger ulogger.Logger, attempts int, what string, op func() error) error {
+	for attempt := 1; ; attempt++ {
+		err := op()
+		if err == nil || !isDeadlock(err) || attempt >= attempts {
+			return err
+		}
+
+		logger.Warnf("%s: lock error (attempt %d/%d), retrying: %v", what, attempt, attempts, err)
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt) * 10 * time.Millisecond):
+		}
+	}
+}
+
 // sendSpendBatch is the batcher callback that processes a batch of spend operations
 // in a single DB transaction. Called by the go-batcher when the batch is full or
 // the timeout fires. Same SQL for both PostgreSQL and SQLite.
@@ -3636,7 +3657,7 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 
 		var chunkResult map[chainhash.Hash][]uint32
 
-		err := retryWriteOnLockError(ctx, s.logger, end-i, func() error {
+		err := retryOnLockError(ctx, s.logger, setMinedMultiRetries, fmt.Sprintf("[SetMinedMulti] chunk of %d txs", end-i), func() error {
 			var err error
 
 			chunkResult, err = s.setMinedMultiChunk(ctx, hashes[i:end], minedBlockInfo)
@@ -3658,27 +3679,6 @@ func (s *Store) SetMinedMulti(ctx context.Context, hashes []*chainhash.Hash, min
 // setMinedMultiRetries bounds how many times one SetMinedMulti chunk is tried
 // when the database refuses it with a lock error.
 const setMinedMultiRetries = 3
-
-// retryWriteOnLockError runs write up to setMinedMultiRetries times while it
-// fails with an error isDeadlock recognises, and returns its last error. A
-// chunk is one transaction, rolled back when it fails, so running it again is
-// safe.
-func retryWriteOnLockError(ctx context.Context, logger ulogger.Logger, txs int, write func() error) error {
-	for attempt := 1; ; attempt++ {
-		err := write()
-		if err == nil || !isDeadlock(err) || attempt >= setMinedMultiRetries {
-			return err
-		}
-
-		logger.Warnf("[SetMinedMulti] lock error (attempt %d/%d), retrying chunk of %d txs: %v", attempt, setMinedMultiRetries, txs, err)
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Duration(attempt) * 10 * time.Millisecond):
-		}
-	}
-}
 
 // setMinedMultiChunk processes a single chunk of hashes (up to maxINClauseSize).
 // Uses portable IN ($1,$2,...,$N) clauses that work on both PostgreSQL and SQLite.

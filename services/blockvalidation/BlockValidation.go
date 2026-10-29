@@ -1714,8 +1714,9 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 			// provenance is attached; the p2p consumer falls back to its peer map.
 			return u.markBlockAsInvalid(ctx, block, "contains transactions already on our chain: "+err.Error(), "", "")
 		} else if errors.Is(err, errors.ErrBlockParentNotMined) {
-			// Another call for this block is in flight. Its tracking stays, and that write
-			// has the block repaired again when it completes.
+			// Another call for this block is in flight. This worker is the only caller here,
+			// so it is another BlockValidation in this process, with its own tracker. This
+			// tracker keeps the block as track() left it, not done, so its repair runs again.
 			u.logger.Warnf("[setTxMined][%s] skipping, already in progress of setMined for block", block.Hash().String())
 			return nil
 		}
