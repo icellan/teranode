@@ -334,6 +334,9 @@ type BlockValidation struct {
 	tipRepairBestHash  chainhash.Hash
 	// tipRepairRetry is set while the last slice failed, so the periodic tick retries it.
 	tipRepairRetry atomic.Bool
+	// tipRepairWake requests a slice when the earliest pass over subtrees set aside comes
+	// due. Only the setMined worker sets it.
+	tipRepairWake *time.Timer
 
 	// revalidateBlockChan receives blocks that need revalidation
 	revalidateBlockChan chan revalidateBlockData

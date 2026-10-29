@@ -1531,3 +1531,73 @@ func TestRepairOvertakenTips_PendingBackOffCapped(t *testing.T) {
 		require.LessOrEqual(t, wait, tipRepairPendingMaxBackoff, "pass %d", pass)
 	}
 }
+
+// extendWinning adds one block on tip, the winning chain's tip at height 2, which moves the
+// best height.
+func (f *overtakeFixture) extendWinning(t *testing.T, tip *model.Block) {
+	t.Helper()
+
+	time.Sleep(10 * time.Millisecond)
+
+	blockD2 := coinbaseOnlyBlock(t, tip.Hash(), f.nBits, 3, 0xd4)
+	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, blockD2, "test", blockchainoptions.WithSubtreesSet(true)))
+}
+
+// TestRepairOvertakenTips_PendingPassOnNewBlock: a subtree set aside whose reads recover must
+// be repaired on the next block even while the back-off is still running. The pruner works
+// block by block, so a parent the subtree's txs spent can reach its prune height on any
+// block; the back-off must not hold the repair past one.
+func TestRepairOvertakenTips_PendingPassOnNewBlock(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
+	bv := f.newBlockValidation(t)
+	_ = f.fakeTipRepairClock(bv)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	blockC2 := f.overtakeB(t)
+
+	bv.subtreeStore = f.shortReads(f.subtreeStore, 0, tipRepairSubtreeReadAttempts*tipRepairMaxAttempts)
+
+	settleTipRepair(t, bv, func() bool { return bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending != nil })
+	require.NotNil(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending, "precondition: subtree 0 is set aside")
+
+	_, _ = drainTipRepair(t, bv)
+	require.Zero(t, f.unminedSince(t, f.bOnly), "precondition: no pass before the back-off or a new block")
+
+	f.extendWinning(t, blockC2)
+
+	_, _ = drainTipRepair(t, bv)
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "the recovered subtree is repaired on the next block")
+	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done)
+}
+
+// TestRepairOvertakenTips_PendingPassWakesIdleWorker: on an idle chain, with no block and no
+// write to wake it, the running setMined worker must still make the pending pass once the
+// back-off has passed, and repair a subtree whose reads recovered.
+func TestRepairOvertakenTips_PendingPassWakesIdleWorker(t *testing.T) {
+	f := newOvertakeFixture(t)
+	f.tSettings.BlockValidation.PeriodicProcessingInterval = 20 * time.Millisecond
+
+	reads := f.shortReads(f.subtreeStore, 0, 0)
+	f.subtreeStore = reads
+	_ = f.newRunningBlockValidation(f.ctx)
+
+	require.Eventually(t, func() bool {
+		subscribers, err := f.blockchainClient.GetSubscribers(f.ctx)
+		return err == nil && slices.Contains(subscribers, blockchain.SubscriberBlockValidation)
+	}, 10*time.Second, 10*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		_, meta, err := f.blockchainClient.GetBlockHeader(f.ctx, f.blockB.Hash())
+		return err == nil && meta.MinedSet
+	}, 10*time.Second, 10*time.Millisecond, "the setMined worker marks B mined")
+
+	// Exactly enough short reads to set subtree 0 aside, then whole reads.
+	reads.short.Store(tipRepairSubtreeReadAttempts * tipRepairMaxAttempts)
+	_ = f.overtakeB(t)
+
+	require.Eventually(t, func() bool { return reads.short.Load() <= 0 }, 30*time.Second, 10*time.Millisecond,
+		"precondition: the worker read the subtree until it was set aside")
+
+	require.Eventually(t, func() bool { return f.unminedSince(t, f.bOnly) != 0 }, 10*tipRepairPendingBaseBackoff, 20*time.Millisecond,
+		"the idle worker repairs the recovered subtree once the back-off has passed")
+}

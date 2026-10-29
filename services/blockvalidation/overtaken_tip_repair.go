@@ -116,11 +116,12 @@ type minedOnChainBlock struct {
 	// pending holds the subtrees an unmark job could not read and set aside; the block is
 	// not done, and its next unmark job reads only these. nil means all of them.
 	pending []*chainhash.Hash
-	// passes counts the unmark jobs that ended with subtrees set aside, and nextPass is
-	// when the next one may start, so a subtree that stays unreadable is not read again on
-	// every slice.
-	passes   int
-	nextPass time.Time
+	// passes counts the unmark jobs that ended with subtrees set aside. The next one may
+	// start at nextPass, or sooner once the best height is above passHeight, so a subtree
+	// that stays unreadable is not read again on every slice, but is on every block.
+	passes     int
+	nextPass   time.Time
+	passHeight uint32
 }
 
 // clearPending has the block's next unmark job read all of it again.
@@ -128,6 +129,7 @@ func (b *minedOnChainBlock) clearPending() {
 	b.pending = nil
 	b.passes = 0
 	b.nextPass = time.Time{}
+	b.passHeight = 0
 }
 
 // minedOnChainTracker holds the blocks the overtaken-tip repair watches. A nil tracker
@@ -142,6 +144,26 @@ type minedOnChainTracker struct {
 
 func newMinedOnChainTracker() *minedOnChainTracker {
 	return &minedOnChainTracker{blocks: make(map[chainhash.Hash]minedOnChainBlock), now: time.Now}
+}
+
+// nextPendingPass returns the earliest nextPass of the blocks with subtrees set aside.
+func (t *minedOnChainTracker) nextPendingPass() (time.Time, bool) {
+	if t == nil {
+		return time.Time{}, false
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var earliest time.Time
+
+	for _, b := range t.blocks {
+		if b.pending != nil && !b.done && (earliest.IsZero() || b.nextPass.Before(earliest)) {
+			earliest = b.nextPass
+		}
+	}
+
+	return earliest, !earliest.IsZero()
 }
 
 // track watches a block whose on-chain write is starting: the write clears the block's txs
@@ -282,6 +304,8 @@ type tipRepairJob struct {
 	subtreeFailures int
 	// unreadable holds the subtrees set aside because they could not be read.
 	unreadable []*chainhash.Hash
+	// startHeight is the best height when the job started.
+	startHeight uint32
 }
 
 // signalTipRepair asks the setMined worker for a repair slice. Never blocks; a pending
@@ -315,6 +339,17 @@ func (u *BlockValidation) runTipRepairSlice(ctx context.Context, blockchainClien
 
 	if more {
 		u.signalTipRepair()
+		return
+	}
+
+	// Nothing is due now. A pass over subtrees set aside comes due at its nextPass even on
+	// an idle chain, with no block or write to request a slice, so wake for the earliest.
+	if at, ok := u.minedOnChain.nextPendingPass(); ok {
+		if u.tipRepairWake != nil {
+			u.tipRepairWake.Stop()
+		}
+
+		u.tipRepairWake = time.AfterFunc(at.Sub(u.minedOnChain.now()), u.signalTipRepair)
 	}
 }
 
@@ -476,7 +511,7 @@ func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient b
 
 	// Blocks set aside after failing come last.
 	for _, deferred := range []bool{false, true} {
-		if more, started, err := u.startNextJob(ctx, blockchainClient, tracked, onMainChain, deferred); started {
+		if more, started, err := u.startNextJob(ctx, blockchainClient, tracked, onMainChain, bestHeight, deferred); started {
 			return more, err
 		}
 	}
@@ -487,16 +522,16 @@ func (u *BlockValidation) tipRepairSlice(ctx context.Context, blockchainClient b
 // startNextJob starts a job on the next block that needs one, among the blocks whose deferred
 // flag matches, and reports whether it found one.
 func (u *BlockValidation) startNextJob(ctx context.Context, blockchainClient blockchain.ClientI, tracked map[chainhash.Hash]minedOnChainBlock,
-	onMainChain map[uint32]bool, deferred bool) (more, started bool, err error) {
+	onMainChain map[uint32]bool, bestHeight uint32, deferred bool) (more, started bool, err error) {
 	// A re-marked block back on the chain first: its txs look unmined while mined.
 	for hash, b := range tracked {
 		if b.deferred == deferred && b.stamped && onMainChain[b.id] {
-			return true, true, u.startJob(ctx, blockchainClient, remineJob, hash, b)
+			return true, true, u.startJob(ctx, blockchainClient, remineJob, hash, b, bestHeight)
 		}
 	}
 
 	for hash, b := range tracked {
-		if b.deferred != deferred || b.done || onMainChain[b.id] || (b.pending != nil && u.minedOnChain.now().Before(b.nextPass)) {
+		if b.deferred != deferred || b.done || onMainChain[b.id] || (b.pending != nil && u.minedOnChain.now().Before(b.nextPass) && bestHeight <= b.passHeight) {
 			continue
 		}
 
@@ -515,7 +550,7 @@ func (u *BlockValidation) startNextJob(ctx context.Context, blockchainClient blo
 			continue
 		}
 
-		return true, true, u.startJob(ctx, blockchainClient, unmarkJob, hash, b)
+		return true, true, u.startJob(ctx, blockchainClient, unmarkJob, hash, b, bestHeight)
 	}
 
 	return false, false, nil
@@ -569,7 +604,7 @@ func (u *BlockValidation) mainChainIDsLocked(ctx context.Context, blockchainClie
 }
 
 // startJob begins a job over the block: it reads the block's subtree list, not its txs.
-func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockchain.ClientI, kind tipRepairJobKind, hash chainhash.Hash, b minedOnChainBlock) error {
+func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockchain.ClientI, kind tipRepairJobKind, hash chainhash.Hash, b minedOnChainBlock, bestHeight uint32) error {
 	block, err := blockchainClient.GetBlock(ctx, &hash)
 	if err != nil {
 		return u.repairFailed(hash, b.gen, errors.NewServiceError("[repairOvertakenTips][%s] failed to get block", hash.String(), err))
@@ -589,7 +624,7 @@ func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockch
 		subtrees = b.pending
 	}
 
-	u.tipRepairJob = &tipRepairJob{kind: kind, hash: hash, id: b.id, gen: b.gen, subtrees: subtrees}
+	u.tipRepairJob = &tipRepairJob{kind: kind, hash: hash, id: b.id, gen: b.gen, subtrees: subtrees, startHeight: bestHeight}
 
 	return nil
 }
@@ -698,7 +733,8 @@ func (u *BlockValidation) finishJob(job *tipRepairJob) {
 	switch job.kind {
 	case unmarkJob:
 		// A block with subtrees set aside is not done: its next job reads them again,
-		// after the other blocks have had their turn and twice as long as last time.
+		// after the other blocks have had their turn, and once twice as long as last time
+		// has passed or a new block has arrived, whichever comes first.
 		u.minedOnChain.update(job.hash, job.gen, func(e *minedOnChainBlock) {
 			e.done = len(job.unreadable) == 0
 			e.pending = job.unreadable
@@ -708,6 +744,7 @@ func (u *BlockValidation) finishJob(job *tipRepairJob) {
 			if !e.done {
 				e.passes++
 				e.nextPass = u.minedOnChain.now().Add(min(tipRepairPendingBaseBackoff<<min(e.passes-1, 30), tipRepairPendingMaxBackoff))
+				e.passHeight = job.startHeight
 			}
 		})
 
