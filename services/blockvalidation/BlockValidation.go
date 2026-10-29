@@ -347,6 +347,9 @@ type BlockValidation struct {
 	// is set (guarded by tipRepairMu).
 	tipRepairHold        []byte
 	tipRepairHoldWritten bool
+	// tipRepairHoldChecked is set once a hold recorded before this process started has been
+	// looked for (guarded by tipRepairMu).
+	tipRepairHoldChecked bool
 	// tipRepairRetry is set while the last slice failed, so the periodic tick retries it.
 	tipRepairRetry atomic.Bool
 	// tipRepairWake requests a slice when the earliest pass over subtrees set aside comes

@@ -13,7 +13,9 @@ import (
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
 	blockassembly_api "github.com/bsv-blockchain/teranode/services/blockassembly/blockassembly_api"
 	"github.com/bsv-blockchain/teranode/services/blockchain"
+	"github.com/bsv-blockchain/teranode/services/blockchain/blockchain_api"
 	"github.com/bsv-blockchain/teranode/settings"
+	"github.com/bsv-blockchain/teranode/stores/blob/storetypes"
 	"github.com/bsv-blockchain/teranode/stores/utxo"
 	prunerstore "github.com/bsv-blockchain/teranode/stores/utxo/pruner"
 	"github.com/bsv-blockchain/teranode/ulogger"
@@ -778,10 +780,19 @@ func TestSkipPreserveParentsStillPrunes(t *testing.T) {
 }
 
 // repairHoldClient answers GetState for the overtaken-tip repair hold with whatever hold
-// holds; the pruner makes no other blockchain call in these tests.
+// holds, or with next after the first read when next is set; it records blob deletion batch
+// requests and makes no other blockchain call.
 type repairHoldClient struct {
 	blockchain.ClientI
-	hold atomic.Pointer[repairHoldAnswer]
+	hold     atomic.Pointer[repairHoldAnswer]
+	next     atomic.Pointer[repairHoldAnswer]
+	reads    atomic.Int32
+	acquired atomic.Int32
+}
+
+func (c *repairHoldClient) AcquireBlobDeletionBatch(context.Context, uint32, int, int, []storetypes.BlobStoreType) (string, []*blockchain_api.ScheduledDeletion, error) {
+	c.acquired.Add(1)
+	return "", nil, nil
 }
 
 type repairHoldAnswer struct {
@@ -795,6 +806,9 @@ func (c *repairHoldClient) GetState(_ context.Context, key string) ([]byte, erro
 	}
 
 	a := c.hold.Load()
+	if c.reads.Add(1) > 1 && c.next.Load() != nil {
+		a = c.next.Load()
+	}
 
 	return a.data, a.err
 }
@@ -903,4 +917,56 @@ func TestRepairHoldReadErrorHolds(t *testing.T) {
 
 	require.Empty(t, pruneSvc.calls, "no DAH deletion when the hold cannot be read")
 	require.Equal(t, uint32(0), server.lastProcessedHeight.Load())
+}
+
+// A hold written while a cycle's phase 1 runs must still stop that cycle's phase 2: the hold
+// is read again just before deleting.
+func TestRepairHoldReadAgainBeforePhase2(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := &repairHoldClient{}
+	client.hold.Store(&repairHoldAnswer{data: model.EncodeOvertakenTipRepairHold(nil)})
+	client.next.Store(&repairHoldAnswer{data: model.EncodeOvertakenTipRepairHold([]model.HeldBlock{{Hash: chainhash.HashH([]byte("b")), ID: 7, Height: 90}})})
+
+	pruneSvc := &recordingPruner{calls: make(chan uint32, 2)}
+	server := newRepairHoldTestServer(ctx, client, pruneSvc)
+
+	skippedBefore := getCounterValue(t, prunerSkipped, "overtaken_tip_repair_hold")
+
+	go server.prunerProcessor(ctx)
+	server.pruneNotify <- pruneSignal{blockHeight: 101, blockHash: chainhash.Hash{}}
+
+	require.Eventually(t, func() bool {
+		return getCounterValue(t, prunerSkipped, "overtaken_tip_repair_hold") == skippedBefore+1
+	}, 2*time.Second, 10*time.Millisecond, "the cycle is held by the second read")
+
+	require.Empty(t, pruneSvc.calls, "no DAH deletion")
+	require.Equal(t, uint32(0), server.lastProcessedHeight.Load())
+}
+
+// The blob deletion worker checks the hold itself: a signal queued before the hold was
+// written, or a pass already under way, must not delete an overtaken block's subtrees while
+// its repair still needs them.
+func TestRepairHoldStopsBlobDeletion(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := &repairHoldClient{}
+	client.hold.Store(&repairHoldAnswer{data: model.EncodeOvertakenTipRepairHold([]model.HeldBlock{{Hash: chainhash.HashH([]byte("b")), ID: 7, Height: 90}})})
+
+	server := newRepairHoldTestServer(ctx, client, &recordingPruner{calls: make(chan uint32, 1)})
+	server.settings.Pruner.BlobDeletionBatchSize = 10
+
+	server.processBlobDeletionsAtHeight(101, chainhash.Hash{})
+	require.Zero(t, client.acquired.Load(), "no deletion batch is taken while held")
+
+	client.hold.Store(&repairHoldAnswer{data: model.EncodeOvertakenTipRepairHold(nil)})
+
+	server.processBlobDeletionsAtHeight(102, chainhash.Hash{})
+	require.NotZero(t, client.acquired.Load(), "deletion resumes once the hold is released")
 }

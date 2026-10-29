@@ -116,9 +116,9 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   key `OvertakenTipRepairHold`, before it sets the mined status of the block that
   overtook them, and the pruner skips UTXO deletion (phase 2) and blob deletion while any
   is listed; parent preservation (phase 1) still runs, and deletion resumes on its own
-  once the repair finishes. A subtree of an overtaken block that cannot be read is read
-  again on every block and holds pruning until it reads or the block leaves the
-  1000-block repair window. `teranode_pruner_overtaken_tip_repair_held_blocks` and
+  once the repair finishes. A subtree of an overtaken block that cannot be read, or is
+  gone from the subtree store, is tried again on every block and holds pruning until it
+  reads or the block leaves the 1000-block repair window. `teranode_pruner_overtaken_tip_repair_held_blocks` and
   `teranode_blockvalidation_tip_repair_subtrees_set_aside` show a hold; a hold that stays
   above zero means a subtree file is corrupt or a store keeps failing, and disk use grows
   until it is resolved. A repair that keeps failing no longer stops healthy blocks: their

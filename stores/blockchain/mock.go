@@ -50,6 +50,8 @@ type MockStore struct {
 	blockIDReservations map[chainhash.Hash]uint64
 	// state tracks the current state of the mock store (e.g., IDLE)
 	state string
+	// keyedState holds what SetState wrote, by key
+	keyedState map[string][]byte
 	// MainChainFastPathDisabled, when true, makes MainChainBlockHashesByHeights
 	// return ok=false so callers exercise the per-height walk fallback (test hook).
 	MainChainFastPathDisabled bool
@@ -742,12 +744,31 @@ func (m *MockStore) GetBlockHeaderIDs(ctx context.Context, blockHash *chainhash.
 	return []uint32{}, nil
 }
 
+// GetState returns what SetState wrote under key, or a not-found error.
 func (m *MockStore) GetState(ctx context.Context, key string) ([]byte, error) {
-	panic(implementMe)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	data, ok := m.keyedState[key]
+	if !ok {
+		return nil, errors.NewNotFoundError("no state for key %s", key)
+	}
+
+	return data, nil
 }
 
+// SetState stores data under key.
 func (m *MockStore) SetState(ctx context.Context, key string, data []byte) error {
-	panic(implementMe)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.keyedState == nil {
+		m.keyedState = map[string][]byte{}
+	}
+
+	m.keyedState[key] = append([]byte(nil), data...)
+
+	return nil
 }
 
 func (m *MockStore) GetBlockIsMined(_ context.Context, blockHash *chainhash.Hash) (bool, error) {

@@ -554,21 +554,29 @@ func (c *extraSubtreeClient) GetBlock(ctx context.Context, blockHash *chainhash.
 		block.TransactionCount, block.SizeInBytes, block.Height, block.ID)
 }
 
-// TestRepairOvertakenTips_SkipsMissingSubtree: a subtree that is gone must not stop the
-// repair of the block's other subtrees, nor keep the block retrying.
-func TestRepairOvertakenTips_SkipsMissingSubtree(t *testing.T) {
+// TestRepairOvertakenTips_MissingSubtreeSetAside: a subtree that is gone must not stop the
+// repair of the block's other subtrees. Its txs cannot be named, so it is set aside and the
+// block is not done: it keeps holding pruning, and its next pass waits on the back-off.
+func TestRepairOvertakenTips_MissingSubtreeSetAside(t *testing.T) {
 	f := newOvertakeFixture(t)
 	bv := f.newBlockValidation(t)
 
 	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
 	_ = f.overtakeB(t)
 
-	bv.blockchainClient = &extraSubtreeClient{ClientI: f.blockchainClient}
+	client := &extraSubtreeClient{ClientI: f.blockchainClient}
+	bv.blockchainClient = client
 
 	_, err := drainTipRepair(t, bv)
 	require.NoError(t, err)
 	require.NotZero(t, f.unminedSince(t, f.bOnly), "the readable subtree is repaired")
-	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "and the block is done, not retried")
+
+	missing, err := client.GetBlock(f.ctx, f.blockB.Hash())
+	require.NoError(t, err)
+
+	b := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
+	require.False(t, b.done, "the block is not done while a subtree is gone")
+	require.Equal(t, []*chainhash.Hash{missing.Subtrees[0]}, b.pending, "the gone subtree is set aside")
 }
 
 // failingGetBlockClient fails GetBlock while fail is set: a blockchain service that is
@@ -2360,5 +2368,61 @@ func TestRepairOvertakenTips_HoldSurvivesRestart(t *testing.T) {
 	_, err := drainTipRepair(t, restarted)
 	require.NoError(t, err)
 	require.NotZero(t, f.unminedSince(t, f.bOnly), "B is repaired after the restart")
+	require.Empty(t, f.heldBlocks(t), "and the hold is released")
+}
+
+// TestRepairOvertakenTips_GoneSubtreeHoldsPruning: a subtree of an overtaken block that is
+// gone from the store cannot be read any more than a corrupt one, so its txs, which may look
+// mined while off the chain, cannot be named and their parents cannot be protected. The
+// block is not done, and the pruning hold keeps it, instead of skipping the subtree.
+func TestRepairOvertakenTips_GoneSubtreeHoldsPruning(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	bv.subtreeStore = f.erroringReads(f.subtreeStore, 0, 1<<30, errors.NewNotFoundError("subtree is gone"))
+
+	settleTipRepair(t, bv, func() bool { return bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending != nil })
+
+	b := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
+	require.False(t, b.done, "a block with a gone subtree is not done")
+	require.Equal(t, []*chainhash.Hash{f.blockB.Subtrees[0]}, b.pending)
+	require.NotZero(t, f.unminedSince(t, f.later), "the readable subtree is repaired")
+	require.Equal(t, []chainhash.Hash{*f.blockB.Hash()}, f.heldBlocks(t), "and the block holds pruning")
+}
+
+// TestRepairOvertakenTips_HoldReadBackBeforeAnyOnChainWrite: after a restart, the blocks a
+// hold recorded are read back on the first setTxMined, even when that block is off the chain
+// and tracks nothing, so their repair, and the release of the hold, does not wait for the
+// first block written on the chain.
+func TestRepairOvertakenTips_HoldReadBackBeforeAnyOnChainWrite(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	f.store.failMarkFalse.Store(1 << 30)
+	settleTipRepair(t, bv, func() bool { return false })
+	require.Equal(t, []chainhash.Hash{*f.blockB.Hash()}, f.heldBlocks(t), "precondition: B is held")
+
+	f.store.failMarkFalse.Store(0)
+
+	time.Sleep(10 * time.Millisecond)
+
+	fork := coinbaseOnlyBlock(t, f.tSettings.ChainCfgParams.GenesisHash, f.nBits, 1, 0xf7)
+	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, fork, "test", blockchainoptions.WithSubtreesSet(true)))
+
+	restarted := f.newBlockValidation(t)
+	require.NoError(t, restarted.setTxMinedStatus(f.ctx, fork.Hash()))
+
+	_, tracked := restarted.minedOnChain.snapshot()[*f.blockB.Hash()]
+	require.True(t, tracked, "B is tracked again from the hold")
+
+	_, err := drainTipRepair(t, restarted)
+	require.NoError(t, err)
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "B is repaired")
 	require.Empty(t, f.heldBlocks(t), "and the hold is released")
 }

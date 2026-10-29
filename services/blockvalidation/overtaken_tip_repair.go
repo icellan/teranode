@@ -545,6 +545,23 @@ func (u *BlockValidation) seedMinedOnChainTrackerLocked(ctx context.Context, blo
 	return nil
 }
 
+// holdRecordedLocked reports whether a hold recorded before this process started lists any
+// block. It reads the record once: after that, only this process writes it.
+func (u *BlockValidation) holdRecordedLocked(ctx context.Context, blockchainClient blockchain.ClientI) (bool, error) {
+	if u.tipRepairHoldChecked {
+		return false, nil
+	}
+
+	data, err := blockchainClient.GetState(ctx, model.OvertakenTipRepairHoldKey)
+	if err != nil && !errors.Is(err, errors.ErrNotFound) && !strings.Contains(err.Error(), sql.ErrNoRows.Error()) {
+		return false, errors.NewServiceError("[repairOvertakenTips] failed to read the pruning hold", err)
+	}
+
+	u.tipRepairHoldChecked = true
+
+	return len(data) > 0, nil
+}
+
 // seedHeldBlocksLocked tracks the blocks a hold recorded before the restart lists. No record
 // means a node that has never held pruning.
 func (u *BlockValidation) seedHeldBlocksLocked(ctx context.Context, blockchainClient blockchain.ClientI) error {
@@ -684,13 +701,16 @@ func (u *BlockValidation) refreshRepairHold(ctx context.Context, blockchainClien
 // has tracked a block, when there is nothing to do.
 func (u *BlockValidation) tipRepairHousekeepingLocked(ctx context.Context, blockchainClient blockchain.ClientI) (tracked map[chainhash.Hash]minedOnChainBlock,
 	onMainChain map[uint32]bool, bestHeight uint32, active bool, err error) {
-	// Nothing to do until this process has written a block as on the longest chain. The
-	// restart seed waits for that too: after a restart the next block's setTxMined comes
-	// within one block interval, and a process that never marks blocks mined (or a test
-	// harness that never runs setTxMined) makes no blockchain calls here at all. A hold
-	// recorded before the restart stays as it is until then.
+	// Nothing to do until this process has written a block as on the longest chain, unless a
+	// hold recorded before a restart lists blocks still to repair: the restart seed waits for
+	// one or the other. After a restart the next block's setTxMined comes within one block
+	// interval, and a process that never marks blocks mined (or a test harness that never runs
+	// setTxMined) makes one state read here at most.
 	if !u.tipRepairSeeded && u.minedOnChain.empty() {
-		return nil, nil, 0, false, nil
+		held, err := u.holdRecordedLocked(ctx, blockchainClient)
+		if err != nil || !held {
+			return nil, nil, 0, false, err
+		}
 	}
 
 	if !u.tipRepairSeeded {
@@ -925,10 +945,10 @@ func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockch
 
 // jobStep writes the next slice of the job's txs, first loading the next subtree if the
 // current one is used up, and finishes the job with its last slice. A subtree that is gone
-// is skipped with an error log. One that still cannot be loaded after tipRepairMaxAttempts
-// failed loads, whatever the error, is set aside, so the rest of the block is repaired: a
-// run of short reads looks the same as a corrupt file, and a store that stays down must not
-// hold up the later subtrees. The block's next unmark job reads the set-aside subtrees
+// is set aside at once. One that still cannot be loaded after tipRepairMaxAttempts failed
+// loads, whatever the error, is set aside too, so the rest of the block is repaired: a run
+// of short reads looks the same as a corrupt file, and a store that stays down must not hold
+// up the later subtrees. A block with subtrees set aside is not done, so it holds pruning. The block's next unmark job reads the set-aside subtrees
 // again; a remine job with subtrees set aside leaves the block stamped, so a later remine
 // does them (see finishJob). Until a subtree is set aside, a load error fails the step, to
 // be retried.
@@ -947,7 +967,10 @@ func (u *BlockValidation) jobStep(ctx context.Context, blockchainClient blockcha
 
 			switch {
 			case isPermanentRepairError(err):
-				u.logger.Errorf("[repairOvertakenTips][%s] skipping subtree %s, its txs may still look mined: %v", job.hash.String(), subtreeHash.String(), err)
+				// Gone is no more readable than corrupt: its txs cannot be named, so the block
+				// stays held until it reads or leaves the repair window.
+				u.logger.Errorf("[repairOvertakenTips][%s] subtree %s is gone, setting it aside and holding pruning, its txs may still look mined: %v", job.hash.String(), subtreeHash.String(), err)
+				job.unreadable = append(job.unreadable, subtreeHash)
 			case ctx.Err() == nil && job.subtreeFailures >= tipRepairMaxAttempts:
 				u.logger.Errorf("[repairOvertakenTips][%s] setting subtree %s aside after %d failed loads, it is read again later: %v", job.hash.String(), subtreeHash.String(), job.subtreeFailures, err)
 				job.unreadable = append(job.unreadable, subtreeHash)

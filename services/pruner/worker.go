@@ -329,6 +329,11 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 				continue
 			}
 
+			// Read again: block validation may have written a hold while phase 1 ran.
+			if !held {
+				held = s.overtakenTipRepairHeld(ctx, blockHashStr, blockHeight)
+			}
+
 			if held {
 				prunerSkipped.WithLabelValues("overtaken_tip_repair_hold").Inc()
 				prunerActive.Set(0)
