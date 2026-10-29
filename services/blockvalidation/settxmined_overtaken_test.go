@@ -843,7 +843,7 @@ func TestMinedOnChainTracker_NewWriteStartsOver(t *testing.T) {
 	hash := chainhash.HashH([]byte("b"))
 
 	tracker.track(hash, 1, 1)
-	require.True(t, tracker.markWritten(hash))
+	require.True(t, tracker.markWritten(hash, true))
 
 	gen := tracker.snapshot()[hash].gen
 	tracker.update(hash, gen, func(e *minedOnChainBlock) {
@@ -869,7 +869,7 @@ func TestMinedOnChainTracker_Nil(t *testing.T) {
 
 	tracker.track(hash, 1, 1)
 	tracker.seed(hash, 1, 1)
-	require.False(t, tracker.markWritten(hash))
+	require.False(t, tracker.markWritten(hash, true))
 	tracker.update(hash, 1, func(e *minedOnChainBlock) { e.done = true })
 	tracker.drop(hash)
 	require.True(t, tracker.empty())
@@ -1135,7 +1135,7 @@ func TestRepairOvertakenTips_StuckJobYields(t *testing.T) {
 	require.False(t, f.onChain(t, forkMeta.ID))
 
 	bv.minedOnChain.track(*fork.Hash(), forkMeta.ID, forkMeta.Height)
-	require.True(t, bv.minedOnChain.markWritten(*fork.Hash()))
+	require.True(t, bv.minedOnChain.markWritten(*fork.Hash(), true))
 
 	for i := 0; i < 3*tipRepairMaxAttempts; i++ {
 		_, _ = bv.tipRepairSlice(f.ctx, bv.blockchainClient)
@@ -1448,7 +1448,7 @@ func TestMinedOnChainTracker_WriteClearsPending(t *testing.T) {
 	gen := tracker.snapshot()[hash].gen
 	tracker.update(hash, gen, func(e *minedOnChainBlock) { e.pending = []*chainhash.Hash{&subtree} })
 
-	require.True(t, tracker.markWritten(hash))
+	require.True(t, tracker.markWritten(hash, true))
 	require.Nil(t, tracker.snapshot()[hash].pending)
 }
 
@@ -1580,7 +1580,15 @@ func TestRepairOvertakenTips_PendingPassWakesIdleWorker(t *testing.T) {
 
 	reads := f.shortReads(f.subtreeStore, 0, 0)
 	f.subtreeStore = reads
-	_ = f.newRunningBlockValidation(f.ctx)
+
+	// Registered after the fixture's cleanups, so it runs first: the worker stops before the
+	// stores it uses are closed.
+	ctx, stop := context.WithCancel(f.ctx)
+	bv := f.newRunningBlockValidation(ctx)
+	t.Cleanup(func() {
+		stop()
+		bv.backgroundTasks.Wait()
+	})
 
 	require.Eventually(t, func() bool {
 		subscribers, err := f.blockchainClient.GetSubscribers(f.ctx)
@@ -1731,21 +1739,66 @@ func TestFinishJob_WarnsOnlyWhenTxsMarked(t *testing.T) {
 
 	bv.finishJob(&tipRepairJob{kind: unmarkJob, hash: hash, id: b.id, gen: b.gen, marked: 2, total: 3})
 	require.Len(t, logger.warns, 1, "a warning when txs were marked")
+
+	bv.finishJob(&tipRepairJob{kind: unmarkJob, hash: hash, id: b.id, gen: b.gen, unreadable: f.blockB.Subtrees[:1]})
+	require.Len(t, logger.warns, 2, "a warning when subtrees were set aside, though none was marked yet")
 }
 
-// TestRepairOvertakenTips_ThirdChainReopensDoneBlock: B's repair left shared mined because
-// B', which also holds it, was on the chain. B' got there through its child C', so no
-// setTxMined of B' tracks it. When a third chain overtakes B' -> C', shared is in no block
-// on the chain any more, and B must be repaired again to mark it.
-func TestRepairOvertakenTips_ThirdChainReopensDoneBlock(t *testing.T) {
+// blockWithShared returns a block on parent whose one subtree holds shared, with its
+// subtree stored, as the competing chain's block that also mines shared.
+func (f *overtakeFixture) blockWithShared(t *testing.T, parent *chainhash.Hash, height uint32, tag byte) *model.Block {
+	t.Helper()
+
+	coinbaseTx := bt.NewTx()
+	require.NoError(t, coinbaseTx.From("0000000000000000000000000000000000000000000000000000000000000000", 0xffffffff, "", 0))
+	coinbaseTx.Inputs[0].UnlockingScript = bscript.NewFromBytes([]byte{0x03, byte(height), 0x00, 0x00, tag, '/', 'T', 'e', 's', 't'})
+	require.NoError(t, coinbaseTx.AddP2PKHOutputFromAddress("1MUMxUTXcPQ1kAqB7MtJWneeAwVW4cHzzp", 50*100000000))
+
+	subtree, err := subtreepkg.NewTreeByLeafCount(2)
+	require.NoError(t, err)
+	require.NoError(t, subtree.AddCoinbaseNode())
+	require.NoError(t, subtree.AddNode(*f.shared, 100, 0))
+
+	subtreeBytes, err := subtree.Serialize()
+	require.NoError(t, err)
+	require.NoError(t, f.subtreeStore.Set(f.ctx, subtree.RootHash()[:], fileformat.FileTypeSubtree, subtreeBytes))
+
+	replicated := subtree.Duplicate()
+	replicated.ReplaceRootNode(coinbaseTx.TxIDChainHash(), 0, uint64(coinbaseTx.Size())) //nolint:gosec
+
+	header := mineBlockHeader(t, parent, replicated.RootHash(), f.nBits)
+
+	block, err := model.NewBlock(header, coinbaseTx, []*chainhash.Hash{subtree.RootHash()}, uint64(subtree.Length()), uint64(coinbaseTx.Size())+100, height, 0) //nolint:gosec
+	require.NoError(t, err)
+
+	return block
+}
+
+// TestRepairOvertakenTips_ThirdChainRepairsBlockJoinedThroughAChild: B's repair leaves
+// shared mined because B', which also holds it, is on the chain. B' got there through its
+// child C', so no on-chain setTxMined of B' tracked it. When a third chain overtakes
+// B' -> C', shared is in no block on the chain any more, and the repair of B' itself must mark it.
+func TestRepairOvertakenTips_ThirdChainRepairsBlockJoinedThroughAChild(t *testing.T) {
 	f := newOvertakeFixture(t)
 	bv := f.newBlockValidation(t)
 
 	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
-	blockC2 := f.overtakeB(t)
-	require.NoError(t, bv.setTxMinedStatus(f.ctx, blockC2.Hash()))
-
 	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+
+	time.Sleep(10 * time.Millisecond)
+
+	blockB2 := f.blockWithShared(t, f.tSettings.ChainCfgParams.GenesisHash, 1, 0xb2)
+	blockC2 := coinbaseOnlyBlock(t, blockB2.Hash(), f.nBits, 2, 0xc2)
+	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, blockB2, "test", blockchainoptions.WithSubtreesSet(true)))
+	require.NoError(t, f.blockchainClient.AddBlock(f.ctx, blockC2, "test", blockchainoptions.WithSubtreesSet(true)))
+	require.False(t, f.onChain(t, f.blockBID), "precondition: the competing chain overtook B")
+
+	_, metaB2, err := f.blockchainClient.GetBlockHeader(f.ctx, blockB2.Hash())
+	require.NoError(t, err)
+	f.mineSharedIn(t, metaB2.ID)
+
+	_, err = drainTipRepair(t, bv)
 	require.NoError(t, err)
 	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].done, "precondition: B is repaired")
 	require.Zero(t, f.unminedSince(t, f.shared), "precondition: shared is mined in B' on the chain")
@@ -1760,7 +1813,7 @@ func TestRepairOvertakenTips_ThirdChainReopensDoneBlock(t *testing.T) {
 		parent = block.Hash()
 	}
 
-	require.False(t, f.onChain(t, f.blockBID), "precondition: the third chain overtook both")
+	require.False(t, f.onChain(t, metaB2.ID), "precondition: the third chain overtook B'")
 
 	_, err = drainTipRepair(t, bv)
 	require.NoError(t, err)
@@ -1781,4 +1834,141 @@ func TestMinedOnChainTracker_TrackKeepsStamped(t *testing.T) {
 
 	tracker.track(hash, 1, 1)
 	require.True(t, tracker.snapshot()[hash].stamped)
+}
+
+// TestRepairOvertakenTips_ReorgTracksBlocksJoiningThroughAChild: B' reaches the chain only
+// through its child C', so no on-chain setTxMined of B' tracks it. The reorg that brings it
+// in must, so that when B' leaves, its own repair marks the txs other blocks' repairs left
+// mined because B' was on the chain, whether those repairs finished, are still running, or
+// wait on subtrees set aside.
+func TestRepairOvertakenTips_ReorgTracksBlocksJoiningThroughAChild(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+
+	blockC2 := f.overtakeB(t)
+
+	_, err = bv.tipRepairSlice(f.ctx, bv.blockchainClient)
+	require.NoError(t, err)
+
+	_, tracked := bv.minedOnChain.snapshot()[*blockC2.Header.HashPrevBlock]
+	require.True(t, tracked, "B' is tracked once the reorg brings it onto the chain")
+}
+
+// TestRepairOvertakenTips_BackOffFromPassEnd: a pass over a subtree that keeps failing spans
+// several blocks. The next pass is due a block after the pass ended, not after it started,
+// or it starts again at once and a hopeless subtree holds the repair's one job slot.
+func TestRepairOvertakenTips_BackOffFromPassEnd(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
+	bv := f.newBlockValidation(t)
+	_ = f.fakeTipRepairClock(bv)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	blockC2 := f.overtakeB(t)
+
+	store := f.shortReads(f.subtreeStore, 0, 1<<30)
+	bv.subtreeStore = store
+
+	_, err := drainTipRepair(t, bv)
+	require.Error(t, err, "precondition: the pass is under way, failing")
+
+	f.extendWinning(t, blockC2)
+
+	settleTipRepair(t, bv, func() bool {
+		return bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending != nil && bv.tipRepairJob == nil
+	})
+	require.NotNil(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].pending, "precondition: the subtree is set aside")
+
+	require.Equal(t, 1, bv.minedOnChain.snapshot()[*f.blockB.Hash()].passes,
+		"the block that arrived during the pass does not start another one as soon as it ends")
+
+	left := store.short.Load()
+
+	for i := 0; i < 5; i++ {
+		_, _ = drainTipRepair(t, bv)
+	}
+
+	require.Equal(t, left, store.short.Load(), "no new pass before a block arrives after the last one ended")
+}
+
+// TestRepairOvertakenTips_RemineNeverSetsAside: a remine job whose subtree keeps failing to
+// load must not set it aside and finish: that drops the re-mine of its txs for good. The
+// block stays stamped and the remine is retried.
+func TestRepairOvertakenTips_RemineNeverSetsAside(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.True(t, bv.minedOnChain.snapshot()[*f.blockB.Hash()].stamped, "precondition: B's txs were re-marked")
+
+	f.extendB(t)
+
+	bv.subtreeStore = f.erroringReads(f.subtreeStore, 0, 1<<30, errors.NewStorageError("injected subtree store failure"))
+
+	settleTipRepair(t, bv, func() bool { return !bv.minedOnChain.snapshot()[*f.blockB.Hash()].stamped })
+
+	b := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
+	require.True(t, b.stamped, "the re-mine is still owed")
+	require.Nil(t, b.pending)
+}
+
+// TestMinedOnChainTracker_OnChainWriteClearsStamped: a completed write of the block as on
+// the longest chain cleared every one of its txs, so no remine is owed. A write as off the
+// chain cleared none.
+func TestMinedOnChainTracker_OnChainWriteClearsStamped(t *testing.T) {
+	tracker := newMinedOnChainTracker()
+	hash := chainhash.HashH([]byte("b"))
+
+	tracker.track(hash, 1, 1)
+	tracker.update(hash, tracker.snapshot()[hash].gen, func(e *minedOnChainBlock) { e.stamped = true })
+
+	require.True(t, tracker.markWritten(hash, false))
+	require.True(t, tracker.snapshot()[hash].stamped, "an off-chain write leaves the remine owed")
+
+	require.True(t, tracker.markWritten(hash, true))
+	require.False(t, tracker.snapshot()[hash].stamped, "an on-chain write did the remine's work")
+}
+
+// emptyIDsClient returns no ids from GetBlockHeaderIDs.
+type emptyIDsClient struct {
+	blockchain.ClientI
+}
+
+func (c *emptyIDsClient) GetBlockHeaderIDs(context.Context, *chainhash.Hash, uint64) ([]uint32, error) {
+	return []uint32{}, nil
+}
+
+// TestMainChainIDs_EmptyIsAnError: no ids for the best block is a failed read, not a chain
+// with no blocks on it; taken as one, every tracked block would look off the chain.
+func TestMainChainIDs_EmptyIsAnError(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	_, _, err := bv.mainChainIDsLocked(f.ctx, &emptyIDsClient{ClientI: f.blockchainClient})
+	require.Error(t, err)
+	require.Nil(t, bv.tipRepairMainChain, "nothing is cached")
+}
+
+// TestRepairOvertakenTips_OnChainClearsDeferred: a block deferred after its job kept failing
+// that is on the chain with no remine owed is not deferred any more, so if it leaves the
+// chain its repair does not wait behind every other block.
+func TestRepairOvertakenTips_OnChainClearsDeferred(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+
+	hash := *f.blockB.Hash()
+	bv.minedOnChain.update(hash, bv.minedOnChain.snapshot()[hash].gen, func(e *minedOnChainBlock) { e.deferred = true })
+
+	_, err := drainTipRepair(t, bv)
+	require.NoError(t, err)
+	require.False(t, bv.minedOnChain.snapshot()[hash].deferred)
 }

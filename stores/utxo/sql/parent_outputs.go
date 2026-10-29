@@ -2,7 +2,6 @@ package sql
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/bsv-blockchain/go-bt/v2/bscript"
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -110,7 +109,7 @@ const parentOutputsReadRetries = 3
 func (s *Store) parentOutputsChunkWithRetry(ctx context.Context, chunk []outpointPair) (map[utxo.Outpoint]utxo.ParentOutput, error) {
 	var found map[utxo.Outpoint]utxo.ParentOutput
 
-	err := retryOnLockError(ctx, s.logger, parentOutputsReadRetries, fmt.Sprintf("[ParentOutputsForValidation] chunk of %d outpoints", len(chunk)), func() error {
+	err := retryOnLockError(ctx, s.logger, parentOutputsReadRetries, "[ParentOutputsForValidation]", len(chunk), func() error {
 		var err error
 
 		found, err = s.parentOutputsChunk(ctx, chunk)

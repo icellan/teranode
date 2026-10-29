@@ -38,7 +38,7 @@ func TestSetMinedMultiRetriesLockError(t *testing.T) {
 
 		var blockIDs map[chainhash.Hash][]uint32
 
-		err := retryOnLockError(ctx, ulogger.TestLogger{}, setMinedMultiRetries, "[SetMinedMulti]", func() error {
+		err := retryOnLockError(ctx, ulogger.TestLogger{}, setMinedMultiRetries, "[SetMinedMulti]", 1, func() error {
 			attempts++
 			if attempts < setMinedMultiRetries {
 				return lockErr
@@ -58,7 +58,7 @@ func TestSetMinedMultiRetriesLockError(t *testing.T) {
 	t.Run("a lock that never clears returns the lock error", func(t *testing.T) {
 		attempts := 0
 
-		err := retryOnLockError(ctx, ulogger.TestLogger{}, setMinedMultiRetries, "[SetMinedMulti]", func() error {
+		err := retryOnLockError(ctx, ulogger.TestLogger{}, setMinedMultiRetries, "[SetMinedMulti]", 1, func() error {
 			attempts++
 			return lockErr
 		})
@@ -70,7 +70,7 @@ func TestSetMinedMultiRetriesLockError(t *testing.T) {
 		attempts := 0
 		other := errors.NewTxNotFoundError("transaction not found")
 
-		err := retryOnLockError(ctx, ulogger.TestLogger{}, setMinedMultiRetries, "[SetMinedMulti]", func() error {
+		err := retryOnLockError(ctx, ulogger.TestLogger{}, setMinedMultiRetries, "[SetMinedMulti]", 1, func() error {
 			attempts++
 			return other
 		})
@@ -82,7 +82,7 @@ func TestSetMinedMultiRetriesLockError(t *testing.T) {
 		cctx, cancel := context.WithCancel(ctx)
 		attempts := 0
 
-		err := retryOnLockError(cctx, ulogger.TestLogger{}, setMinedMultiRetries, "[SetMinedMulti]", func() error {
+		err := retryOnLockError(cctx, ulogger.TestLogger{}, setMinedMultiRetries, "[SetMinedMulti]", 1, func() error {
 			attempts++
 			cancel()
 

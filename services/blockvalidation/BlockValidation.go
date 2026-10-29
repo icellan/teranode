@@ -776,6 +776,11 @@ func (u *BlockValidation) start(ctx context.Context) error {
 	go func() {
 		defer u.backgroundTasks.Done()
 		defer u.logger.Infof("[BlockValidation:start] setMinedChan worker stopped")
+		defer func() {
+			if u.tipRepairWake != nil {
+				u.tipRepairWake.Stop()
+			}
+		}()
 
 		for {
 			// One slice of the overtaken-tip repair between blocks, when one is pending.
@@ -1727,7 +1732,7 @@ func (u *BlockValidation) setTxMinedStatus(ctx context.Context, blockHash *chain
 	// The write is complete, whichever onLongestChain this attempt used. Ask for a slice: a
 	// chain change that happened while the write was in flight would otherwise wait for the
 	// next one.
-	if u.minedOnChain.markWritten(*blockHash) {
+	if u.minedOnChain.markWritten(*blockHash, onLongestChain) {
 		u.signalTipRepair()
 	}
 
