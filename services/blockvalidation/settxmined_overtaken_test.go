@@ -1601,3 +1601,69 @@ func TestRepairOvertakenTips_PendingPassWakesIdleWorker(t *testing.T) {
 	require.Eventually(t, func() bool { return f.unminedSince(t, f.bOnly) != 0 }, 10*tipRepairPendingBaseBackoff, 20*time.Millisecond,
 		"the idle worker repairs the recovered subtree once the back-off has passed")
 }
+
+// erroringSubtreeStore fails the next fail reads of one subtree with err.
+type erroringSubtreeStore struct {
+	blob.Store
+	key  []byte
+	err  error
+	fail atomic.Int32
+}
+
+func (s *erroringSubtreeStore) GetIoReader(ctx context.Context, key []byte, fileType fileformat.FileType, opts ...blobopts.FileOption) (io.ReadCloser, error) {
+	if bytes.Equal(key, s.key) && s.fail.Add(-1) >= 0 {
+		return nil, s.err
+	}
+
+	return s.Store.GetIoReader(ctx, key, fileType, opts...)
+}
+
+// erroringReads wraps store so the next n reads of the block's subtree idx fail with err.
+func (f *overtakeFixture) erroringReads(store blob.Store, idx int, n int32, err error) *erroringSubtreeStore {
+	s := &erroringSubtreeStore{Store: store, key: f.blockB.Subtrees[idx][:], err: err}
+	s.fail.Store(n)
+
+	return s
+}
+
+// TestRepairOvertakenTips_StorageErrorOverNotFoundRetried: a storage error is the store
+// failing while it looked, whatever it wraps, so one over a not-found must not get the
+// subtree skipped as gone (the subtreeAbsent rule). The step is retried once the store is
+// back, and the subtree is repaired.
+func TestRepairOvertakenTips_StorageErrorOverNotFoundRetried(t *testing.T) {
+	f := newOvertakeFixture(t)
+	bv := f.newBlockValidation(t)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	storageErr := errors.NewStorageError("store failed while reading", errors.NewNotFoundError("not found"))
+	bv.subtreeStore = f.erroringReads(f.subtreeStore, 0, 2*tipRepairSubtreeReadAttempts, storageErr)
+
+	settleTipRepair(t, bv, func() bool { return bv.minedOnChain.snapshot()[*f.blockB.Hash()].done })
+
+	require.NotZero(t, f.unminedSince(t, f.bOnly), "the subtree is repaired once the store is back, not skipped")
+}
+
+// TestRepairOvertakenTips_PersistentStoreErrorSetAside: a subtree whose reads keep failing
+// with any error, not only a deserialize failure, is set aside after tipRepairMaxAttempts
+// failed loads, so the later subtrees are repaired and the job does not start over from the
+// first subtree each time it is deferred.
+func TestRepairOvertakenTips_PersistentStoreErrorSetAside(t *testing.T) {
+	f := newOvertakeFixtureWithLaterSubtree(t)
+	bv := f.newBlockValidation(t)
+	_ = f.fakeTipRepairClock(bv)
+
+	require.NoError(t, bv.setTxMinedStatus(f.ctx, f.blockB.Hash()))
+	_ = f.overtakeB(t)
+
+	bv.subtreeStore = f.erroringReads(f.subtreeStore, 0, 1<<30, errors.NewStorageError("injected subtree store failure"))
+
+	settleTipRepair(t, bv, func() bool { return f.unminedSince(t, f.later) != 0 })
+
+	require.NotZero(t, f.unminedSince(t, f.later), "the later subtree is repaired")
+
+	b := bv.minedOnChain.snapshot()[*f.blockB.Hash()]
+	require.False(t, b.done)
+	require.Equal(t, []*chainhash.Hash{f.blockB.Subtrees[0]}, b.pending, "the failing subtree is read again later")
+}

@@ -89,10 +89,11 @@ func tipRepairExpired(height, bestHeight uint32) bool {
 }
 
 // isPermanentRepairError reports whether a repair error means the block can never be
-// repaired: the block or its subtrees are gone.
+// repaired: the block or its subtrees are gone. A storage error is the store failing while
+// it looked, whatever it wraps, so it is never permanent (the subtreeAbsent rule).
 func isPermanentRepairError(err error) bool {
-	return errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrSubtreeNotFound) ||
-		errors.Is(err, errors.ErrBlobNotFound) || errors.Is(err, errors.ErrNotFound)
+	return (errors.Is(err, errors.ErrBlockNotFound) || errors.Is(err, errors.ErrSubtreeNotFound) ||
+		errors.Is(err, errors.ErrBlobNotFound) || errors.Is(err, errors.ErrNotFound)) && !errors.Is(err, errors.ErrStorageError)
 }
 
 // minedOnChainBlock is a block whose txs setTxMined may have marked mined on the longest
@@ -631,12 +632,13 @@ func (u *BlockValidation) startJob(ctx context.Context, blockchainClient blockch
 
 // jobStep writes the next slice of the job's txs, first loading the next subtree if the
 // current one is used up, and finishes the job with its last slice. A subtree that is gone
-// is skipped with an error log. One that still cannot be deserialized after
-// tipRepairMaxAttempts failed loads is set aside, so the rest of the block is repaired: a
-// run of short reads looks the same as a corrupt file. An unmark job's set-aside subtrees
+// is skipped with an error log. One that still cannot be loaded after tipRepairMaxAttempts
+// failed loads, whatever the error, is set aside, so the rest of the block is repaired: a
+// run of short reads looks the same as a corrupt file, and a store that stays down must not
+// hold up the later subtrees. An unmark job's set-aside subtrees
 // are read again by the block's next unmark job (see finishJob). A remine job does not
 // come back to them, which is the safe direction: their txs stay flagged unmined until
-// fixUnminedSinceInconsistencies clears them. Any other load error fails the step, to be
+// fixUnminedSinceInconsistencies clears them. Until then a load error fails the step, to be
 // retried.
 func (u *BlockValidation) jobStep(ctx context.Context, blockchainClient blockchain.ClientI, job *tipRepairJob, onMainChain map[uint32]bool) error {
 	for len(job.current) == 0 {
@@ -654,7 +656,7 @@ func (u *BlockValidation) jobStep(ctx context.Context, blockchainClient blockcha
 			switch {
 			case isPermanentRepairError(err):
 				u.logger.Errorf("[repairOvertakenTips][%s] skipping subtree %s, its txs may still look mined: %v", job.hash.String(), subtreeHash.String(), err)
-			case errors.Is(err, errors.ErrSubtreeInvalid) && job.subtreeFailures >= tipRepairMaxAttempts:
+			case ctx.Err() == nil && job.subtreeFailures >= tipRepairMaxAttempts:
 				u.logger.Errorf("[repairOvertakenTips][%s] setting subtree %s aside after %d failed loads, it is read again later: %v", job.hash.String(), subtreeHash.String(), job.subtreeFailures, err)
 				job.unreadable = append(job.unreadable, subtreeHash)
 			default:
@@ -807,7 +809,7 @@ func (u *BlockValidation) loadSubtreeNodes(ctx context.Context, subtreeHash *cha
 			return nodes, nil
 		}
 
-		if errors.Is(err, errors.ErrNotFound) {
+		if subtreeAbsent(err) {
 			return nil, err
 		}
 	}
@@ -820,7 +822,7 @@ func (u *BlockValidation) loadSubtreeNodes(ctx context.Context, subtreeHash *cha
 
 func (u *BlockValidation) readSubtreeNodes(ctx context.Context, subtreeHash *chainhash.Hash) ([]subtreepkg.Node, error) {
 	reader, err := u.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtree)
-	if errors.Is(err, errors.ErrNotFound) {
+	if subtreeAbsent(err) {
 		reader, err = u.subtreeStore.GetIoReader(ctx, subtreeHash[:], fileformat.FileTypeSubtreeToCheck)
 	}
 
