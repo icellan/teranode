@@ -26,7 +26,7 @@ func TestSQLGetState(t *testing.T) {
 		// over gRPC too; the store error's text is kept for callers that match on it.
 		_, err = s.GetState(context.Background(), "test")
 		require.ErrorIs(t, err, errors.ErrNotFound)
-		require.Contains(t, err.Error(), sql.ErrNoRows.Error())
+		require.ErrorIs(t, err, sql.ErrNoRows, "callers matching the raw error still match")
 
 		err = s.SetState(context.Background(), "test", []byte("test data"))
 		require.NoError(t, err)

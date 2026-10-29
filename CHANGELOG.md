@@ -119,9 +119,10 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   once the repair finishes. A subtree of an overtaken block that cannot be read is tried
   again on every block and holds pruning until it reads or the block leaves the
   1000-block repair window. A subtree or block that is gone from its store can never be
-  read, so it is given up at once and counted in
-  `teranode_blockvalidation_tip_repair_abandoned_total`: its transactions may stay marked
-  mined while off the chain, and the pruner can then delete parents they need. `teranode_pruner_overtaken_tip_repair_held_blocks` and
+  read: a gone subtree is given up at once, and a gone block after 10 attempts, both
+  counted in `teranode_blockvalidation_tip_repair_abandoned_total`. Their transactions
+  may stay marked mined while off the chain, and the pruner can then delete parents they
+  need. `teranode_pruner_overtaken_tip_repair_held_blocks` and
   `teranode_blockvalidation_tip_repair_subtrees_set_aside` show a hold; a hold that stays
   above zero means a subtree file is corrupt or a store keeps failing, and disk use grows
   until it is resolved. A repair that keeps failing no longer stops healthy blocks: their
@@ -137,10 +138,9 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   single-instance deployment. (#2065)
 - **A missing blockchain state key is a not-found error.** `GetState` on the SQL
   blockchain store returned the raw `sql.ErrNoRows` for a key never written; it now
-  returns an `ERR_NOT_FOUND` error wrapping it, whose code survives gRPC. Its text still
-  contains `sql: no rows in result set`, so callers matching on the text are unaffected;
-  a caller that matched `sql.ErrNoRows` with `errors.Is` must match
-  `errors.ErrNotFound`. (#2065)
+  returns an `ERR_NOT_FOUND` error wrapping it, whose code survives gRPC. Callers that
+  match `sql.ErrNoRows`, with `errors.Is` or on its text, still match, locally and over
+  gRPC; new callers should match `errors.ErrNotFound`. (#2065)
 - **`GetLastNBlocks` honours `fromHeight` when orphans are included.** The SQL
   blockchain store ignored `fromHeight` with `includeOrphans=true` and always returned
   the highest blocks. It now returns only blocks at or below `fromHeight`, as documented.
