@@ -3600,6 +3600,8 @@ func setupRevalidateBlockTest(t *testing.T) (*BlockValidation, *model.Block, *bl
 
 	mockBlockchain.On("GetBlock", mock.Anything, mock.Anything).Return(block, nil)
 	mockBlockchain.On("GetBlockHeaderIDs", mock.Anything, mock.Anything, mock.Anything).Return([]uint32{100}, nil)
+	// reValidateBlock waits for the parent to be mined before block.Valid reads tx BlockIDs.
+	mockBlockchain.On("GetBlockIsMined", mock.Anything, mock.Anything).Return(true, nil)
 
 	return bv, block, mockBlockchain, coinbaseTx
 }
@@ -3612,7 +3614,7 @@ func TestBlockValidation_reValidateBlock_Success(t *testing.T) {
 		baseURL: "test",
 	}
 
-	err := bv.reValidateBlock(blockData)
+	err := bv.reValidateBlock(context.Background(), blockData)
 	require.NoError(t, err)
 }
 
@@ -3655,7 +3657,7 @@ func TestBlockValidation_reValidateBlock_InvalidBlock(t *testing.T) {
 		baseURL: "test",
 	}
 
-	err = bv.reValidateBlock(blockData)
+	err = bv.reValidateBlock(context.Background(), blockData)
 	require.Error(t, err)
 
 	invalidateBlockCallCount := 0
