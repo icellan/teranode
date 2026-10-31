@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
+	"github.com/bsv-blockchain/go-chaincfg"
 	"github.com/bsv-blockchain/teranode/errors"
 	"github.com/bsv-blockchain/teranode/model"
 	"github.com/bsv-blockchain/teranode/services/blockassembly"
@@ -969,4 +970,133 @@ func TestRepairHoldStopsBlobDeletion(t *testing.T) {
 
 	server.processBlobDeletionsAtHeight(102, chainhash.Hash{})
 	require.NotZero(t, client.acquired.Load(), "deletion resumes once the hold is released")
+}
+
+// blockingPruner blocks Prune until its context is done or release is closed, and reports
+// whether the context was cancelled.
+type blockingPruner struct {
+	prunerstore.Service
+	started   chan struct{}
+	release   chan struct{}
+	cancelled atomic.Bool
+	calls     chan uint32
+}
+
+func (p *blockingPruner) Prune(ctx context.Context, height uint32, _ string) (int64, error) {
+	p.calls <- height
+	close(p.started)
+
+	select {
+	case <-ctx.Done():
+		p.cancelled.Store(true)
+		return 0, ctx.Err()
+	case <-p.release:
+		return 0, nil
+	}
+}
+
+// A hold written while phase 2 is already deleting stops the deletion: the pruner watches the
+// hold while Prune runs and cancels it, and the height is retried.
+func TestRepairHoldCancelsRunningPrune(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := &repairHoldClient{}
+	client.hold.Store(&repairHoldAnswer{data: model.EncodeOvertakenTipRepairHold(nil)})
+
+	pruneSvc := &blockingPruner{started: make(chan struct{}), release: make(chan struct{}), calls: make(chan uint32, 2)}
+	defer close(pruneSvc.release)
+
+	mockStore := &utxo.MockUtxostore{}
+	mockStore.On("GetPrunableUnminedTxIterator", mock.Anything).Return(emptyIterator{}, nil)
+	mockStore.On("ProcessExpiredPreservations", mock.Anything, mock.Anything).Return(nil)
+
+	server := newPhase1TestServer(ctx, mockStore, nil, false)
+	server.prunerService = pruneSvc
+	server.blockchainClient = client
+	server.repairHoldPollInterval = 10 * time.Millisecond
+	server.repairHoldRecheckInterval = time.Hour
+
+	go server.prunerProcessor(ctx)
+	server.pruneNotify <- pruneSignal{blockHeight: 101, blockHash: chainhash.Hash{}}
+
+	select {
+	case <-pruneSvc.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("phase 2 did not start")
+	}
+
+	client.hold.Store(&repairHoldAnswer{data: model.EncodeOvertakenTipRepairHold([]model.HeldBlock{{Hash: chainhash.HashH([]byte("b")), ID: 7, Height: 90}})})
+
+	require.Eventually(t, pruneSvc.cancelled.Load, 2*time.Second, 10*time.Millisecond, "the running deletion is cancelled")
+	require.Never(t, func() bool { return server.lastProcessedHeight.Load() != 0 }, 200*time.Millisecond, 20*time.Millisecond, "the height is retried")
+}
+
+// On an idle chain, a held height is pruned once the hold is released, without waiting for
+// another block.
+func TestRepairHoldReleaseResumesIdlePruning(t *testing.T) {
+	initPrometheusMetrics()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := &repairHoldClient{}
+	client.hold.Store(&repairHoldAnswer{data: model.EncodeOvertakenTipRepairHold([]model.HeldBlock{{Hash: chainhash.HashH([]byte("b")), ID: 7, Height: 90}})})
+
+	pruneSvc := &recordingPruner{calls: make(chan uint32, 2)}
+	server := newRepairHoldTestServer(ctx, client, pruneSvc)
+	server.repairHoldRecheckInterval = 20 * time.Millisecond
+
+	go server.prunerProcessor(ctx)
+	server.pruneNotify <- pruneSignal{blockHeight: 101, blockHash: chainhash.Hash{}}
+
+	require.Never(t, func() bool { return len(pruneSvc.calls) > 0 }, 100*time.Millisecond, 10*time.Millisecond, "precondition: held")
+
+	client.hold.Store(&repairHoldAnswer{data: model.EncodeOvertakenTipRepairHold(nil)})
+
+	select {
+	case h := <-pruneSvc.calls:
+		require.Equal(t, uint32(101), h)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the held height was not pruned once the hold was released")
+	}
+}
+
+// On mainnet and testnet the pruner refuses to start when the gap between the UTXO retention
+// and the unmined retention is below the deepest fork the node accepts (CoinbaseMaturity): a
+// hold written after a cycle's last check would then not be enough to protect a due parent.
+// Other networks only log it.
+func TestInitRefusesInsufficientRepairHoldSlack(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		params chaincfg.Params
+		refuse bool
+	}{
+		{"mainnet", chaincfg.MainNetParams, true},
+		{"testnet", chaincfg.TestNetParams, true},
+		{"regtest", chaincfg.RegressionNetParams, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			params := tc.params
+			server := &Server{
+				logger: ulogger.TestLogger{},
+				settings: &settings.Settings{
+					ChainCfgParams:             &params,
+					GlobalBlockHeightRetention: 150,
+					UtxoStore:                  settings.UtxoStoreSettings{UnminedTxRetention: 100},
+				},
+			}
+
+			err := server.Init(context.Background())
+			require.Error(t, err, "no UTXO store is set, so Init fails either way")
+
+			if tc.refuse {
+				require.Contains(t, err.Error(), "repair hold slack")
+			} else {
+				require.NotContains(t, err.Error(), "repair hold slack")
+			}
+		})
+	}
 }

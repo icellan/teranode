@@ -115,8 +115,16 @@ Upgrading from v0.16.0 changes nothing for them; upgrading from an earlier relea
   records the overtaken blocks it has not finished repairing under the blockchain state
   key `OvertakenTipRepairHold`, before it sets the mined status of the block that
   overtook them, and the pruner skips UTXO deletion (phase 2) and blob deletion while any
-  is listed; parent preservation (phase 1) still runs, and deletion resumes on its own
-  once the repair finishes. A subtree of an overtaken block that cannot be read is tried
+  is listed; parent preservation (phase 1) still runs. A hold that appears while phase 2
+  is deleting cancels it, and a held height is tried again every 30 seconds, so deletion
+  resumes on its own once the repair finishes, even with no new block. A hold written
+  after a phase 2 deletion has committed cannot undo it. That deletion only reaches a
+  parent the repair needs when the overtaken block is deeper than the UTXO retention minus
+  `utxostore_unminedTxRetention`, so on mainnet and testnet the pruner now refuses to
+  start unless that gap is at least `CoinbaseMaturity` (100), the deepest fork the node
+  accepts: the defaults (288 and 144) pass, and a node that raised
+  `utxostore_unminedTxRetention` or lowered the retention must restore the gap. Other
+  networks log an error instead. A subtree of an overtaken block that cannot be read is tried
   again on every block and holds pruning until it reads or the block leaves the
   1000-block repair window. A subtree or block that is gone from its store can never be
   read: a gone subtree is given up at once, and a gone block after 10 attempts, both

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bsv-blockchain/go-bt/v2/chainhash"
@@ -70,6 +71,113 @@ func (s *Server) checkBlockAssemblySafeForPruner(ctx context.Context, phase stri
 
 	// Block Assembly is ready
 	return true
+}
+
+// defaultRepairHoldPollInterval is how often phase 2 checks the hold while it deletes, and
+// defaultRepairHoldRecheckInterval how long a held height waits before it is tried again.
+const (
+	defaultRepairHoldPollInterval    = time.Second
+	defaultRepairHoldRecheckInterval = 30 * time.Second
+)
+
+// checkRepairHoldSlack makes sure a hold written just after a cycle's last check cannot let
+// that cycle delete a parent block validation still needs. Such a parent's delete height is
+// its spend height plus the UTXO retention, and its child was mined within the unmined
+// retention of the spend (or the parent was preserved), so it is due at the cycle's height
+// only if the overtaken block is more than retention minus unmined retention below the tip.
+// That must exceed the deepest fork the node accepts, CoinbaseMaturity. On mainnet and
+// testnet a configuration without that slack is refused; elsewhere it is logged.
+func (s *Server) checkRepairHoldSlack() error {
+	if s.settings == nil || s.settings.ChainCfgParams == nil {
+		return nil
+	}
+
+	retention := s.settings.GetUtxoStoreBlockHeightRetention()
+	unmined := s.settings.UtxoStore.UnminedTxRetention
+	maturity := uint32(s.settings.ChainCfgParams.CoinbaseMaturity)
+
+	var slack uint32
+	if retention > unmined {
+		slack = retention - unmined
+	}
+
+	if slack >= maturity {
+		return nil
+	}
+
+	msg := "overtaken-tip repair hold slack too small: utxostore block height retention %d minus utxostore_unminedTxRetention %d is %d, below CoinbaseMaturity %d"
+
+	switch s.settings.ChainCfgParams.Name {
+	case "mainnet", "testnet":
+		return errors.NewConfigurationError(msg, retention, unmined, slack, maturity)
+	default:
+		s.logger.Errorf("[pruner] "+msg+"; a deep enough reorg can let the pruner delete a parent the overtaken-tip repair still needs", retention, unmined, slack, maturity)
+		return nil
+	}
+}
+
+// watchRepairHold checks the overtaken-tip repair hold while phase 2 deletes, and cancels the
+// deletion when one appears. The returned function stops the watch and reports whether it
+// cancelled.
+func (s *Server) watchRepairHold(ctx context.Context, cancel context.CancelFunc, blockHashStr string, blockHeight uint32) func() bool {
+	interval := s.repairHoldPollInterval
+	if interval <= 0 {
+		interval = defaultRepairHoldPollInterval
+	}
+
+	var held atomic.Bool
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// The deletion's own context: a read that fails because it was cancelled
+				// is not a hold.
+				if s.overtakenTipRepairHeld(ctx, blockHashStr, blockHeight) && ctx.Err() == nil {
+					held.Store(true)
+					cancel()
+
+					return
+				}
+			}
+		}
+	}()
+
+	return func() bool {
+		cancel()
+		<-done
+
+		return held.Load()
+	}
+}
+
+// retryHeldHeight tries a held height again after a while, so pruning resumes once the hold
+// is released even when no new block arrives. A newer signal takes its place.
+func (s *Server) retryHeldHeight(sig pruneSignal) {
+	interval := s.repairHoldRecheckInterval
+	if interval <= 0 {
+		interval = defaultRepairHoldRecheckInterval
+	}
+
+	if s.repairHoldRetry != nil {
+		s.repairHoldRetry.Stop()
+	}
+
+	s.repairHoldRetry = time.AfterFunc(interval, func() {
+		select {
+		case s.pruneNotify <- sig:
+		default: // a newer signal is waiting
+		}
+	})
 }
 
 // overtakenTipRepairHeld reports whether block validation holds pruning for an overtaken
@@ -337,14 +445,31 @@ func (s *Server) prunerProcessor(ctx context.Context) {
 			if held {
 				prunerSkipped.WithLabelValues("overtaken_tip_repair_hold").Inc()
 				prunerActive.Set(0)
+				s.retryHeldHeight(sig)
 
-				// Do not update lastProcessedHeight: the next notification must be processed
+				// Do not update lastProcessedHeight: the height is retried
 				continue
 			}
 
 			if s.prunerService != nil {
 				startTime := time.Now()
-				recordsProcessed, err := s.prunerService.Prune(ctx, blockHeight, blockHashStr)
+
+				// A hold written once deletion has started cancels it: block validation may
+				// have found an overtaken block between the last check and now.
+				pruneCtx, cancelPrune := context.WithCancel(ctx)
+				heldDuringPrune := s.watchRepairHold(pruneCtx, cancelPrune, blockHashStr, blockHeight)
+				recordsProcessed, err := s.prunerService.Prune(pruneCtx, blockHeight, blockHashStr)
+
+				if heldDuringPrune() {
+					s.logger.Warnf("[pruner][%s:%d] phase 2: cancelled, block validation started holding pruning while it ran", blockHashStr, blockHeight)
+					prunerSkipped.WithLabelValues("overtaken_tip_repair_hold").Inc()
+					prunerActive.Set(0)
+					s.retryHeldHeight(sig)
+
+					// Do not update lastProcessedHeight: the height is retried
+					continue
+				}
+
 				if err != nil {
 					s.logger.Errorf("[pruner][%s:%d] phase 2: DAH pruner failed: %v", blockHashStr, blockHeight, err)
 					prunerErrors.WithLabelValues("dah_pruner").Inc()
